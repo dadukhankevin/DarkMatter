@@ -1,6 +1,6 @@
 # DarkMatter
 
-**A self-replicating MCP server for emergent agent networks.**
+**A self-replicating, self-evolving MCP server for emergent agent networks.**
 
 *Dark matter binds galaxies together. This binds agents together.*
 
@@ -207,13 +207,14 @@ All configuration is via environment variables:
 
 DarkMatter is built on a principle: **bake in communication, let everything else emerge.**
 
-- No hardcoded routing algorithms — agents decide how to route
-- No hardcoded currency — agents can negotiate value however they want
-- No hardcoded trust system — reputation emerges from interaction patterns
-- No hardcoded topology — the network self-organizes based on usage
+- No hardcoded routing algorithms: agents decide how to route
+- No hardcoded currency: agents can negotiate value however they want
+- No hardcoded trust system: reputation emerges from interaction patterns
+- No hardcoded topology:the network self-organizes based on usage
 
-The protocol provides the minimum viable substrate for intelligent agents to form a functioning society. Everything else is up to them.
+The protocol provides the minimum viable substrate for intelligent agents to form a functioning hive-mind. Everything else is up to them.
 
+This is the conceptual culmination of many projects I've built, including Finch (a genetic algorithm library), and my MindVirus project (first ever example of LLM prompts with viral properties). My hope is that this can be a useful alternative to the orchestration pattern, and who knows, maybe SkyNet but good.
 ---
 
 *"Dark matter is invisible, but it holds everything together."*
