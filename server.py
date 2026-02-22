@@ -30,6 +30,18 @@ from typing import Optional
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
+from cryptography.exceptions import InvalidSignature
+
 import httpx
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict
@@ -135,6 +147,42 @@ def _get_public_url(port: int) -> str:
 
 
 # =============================================================================
+# Cryptographic Identity — Ed25519 keypair, signing, verification
+# =============================================================================
+
+def _generate_keypair() -> tuple[str, str]:
+    """Generate an Ed25519 keypair. Returns (private_key_hex, public_key_hex)."""
+    private_key = Ed25519PrivateKey.generate()
+    private_bytes = private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    public_bytes = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return private_bytes.hex(), public_bytes.hex()
+
+
+def _sign_message(private_key_hex: str, from_agent_id: str, message_id: str,
+                  timestamp: str, content: str) -> str:
+    """Sign a canonical message payload. Returns signature as hex."""
+    private_bytes = bytes.fromhex(private_key_hex)
+    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    payload = f"{from_agent_id}\n{message_id}\n{timestamp}\n{content}".encode("utf-8")
+    signature = private_key.sign(payload)
+    return signature.hex()
+
+
+def _verify_message(public_key_hex: str, signature_hex: str, from_agent_id: str,
+                    message_id: str, timestamp: str, content: str) -> bool:
+    """Verify a signed message payload. Returns True if valid."""
+    try:
+        public_bytes = bytes.fromhex(public_key_hex)
+        public_key = Ed25519PublicKey.from_public_bytes(public_bytes)
+        signature = bytes.fromhex(signature_hex)
+        payload = f"{from_agent_id}\n{message_id}\n{timestamp}\n{content}".encode("utf-8")
+        public_key.verify(signature, payload)
+        return True
+    except (InvalidSignature, ValueError, Exception):
+        return False
+
+
+# =============================================================================
 # Data Models (in-memory state)
 # =============================================================================
 
@@ -163,6 +211,9 @@ class Connection:
     messages_declined: int = 0
     total_response_time_ms: float = 0.0
     last_activity: Optional[str] = None
+    # Cryptographic identity — peer's public key and display name
+    agent_public_key_hex: Optional[str] = None
+    agent_display_name: Optional[str] = None
 
     @property
     def avg_response_time_ms(self) -> float:
@@ -179,6 +230,9 @@ class PendingConnectionRequest:
     from_agent_url: str
     from_agent_bio: str
     requested_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # Cryptographic identity — requester's public key and display name
+    from_agent_public_key_hex: Optional[str] = None
+    from_agent_display_name: Optional[str] = None
 
 
 @dataclass
@@ -191,6 +245,7 @@ class QueuedMessage:
     metadata: dict
     received_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     from_agent_id: Optional[str] = None
+    verified: bool = False
 
 
 @dataclass
@@ -222,6 +277,10 @@ class AgentState:
     is_genesis: bool = False
     impressions: dict[str, str] = field(default_factory=dict)  # agent_id -> freeform impression text
     mcp_token: Optional[str] = None  # None = unclaimed, set = claimed
+    # Cryptographic identity — Ed25519 keypair and human-friendly display name
+    private_key_hex: Optional[str] = None
+    public_key_hex: Optional[str] = None
+    display_name: Optional[str] = None
     # Track agent URLs we've sent outbound connection requests to (not persisted)
     pending_outbound: set[str] = field(default_factory=set)
     # LAN-discovered peers (ephemeral, not persisted)
@@ -331,10 +390,16 @@ def _build_status_line() -> str:
     msgs = len(state.message_queue)
     handled = state.messages_handled
     pending = len(state.pending_requests)
-    peers = ", ".join(state.connections.keys()) if state.connections else "none"
+    # Show display names for peers when available
+    peer_labels = []
+    for c in state.connections.values():
+        label = c.agent_display_name or c.agent_id[:12]
+        peer_labels.append(label)
+    peers = ", ".join(peer_labels) if peer_labels else "none"
 
+    agent_label = state.display_name or state.agent_id[:12]
     stats = (
-        f"Agent: {state.agent_id} | Status: {state.status.value} | "
+        f"Agent: {agent_label} | Status: {state.status.value} | "
         f"Connections: {conns}/{MAX_CONNECTIONS} ({peers}) | "
         f"Inbox: {msgs} | Handled: {handled} | Pending requests: {pending}"
     )
@@ -446,6 +511,9 @@ def save_state() -> None:
         "created_at": state.created_at,
         "messages_handled": state.messages_handled,
         "mcp_token": state.mcp_token,
+        "private_key_hex": state.private_key_hex,
+        "public_key_hex": state.public_key_hex,
+        "display_name": state.display_name,
         "connections": {
             aid: {
                 "agent_id": c.agent_id,
@@ -458,6 +526,8 @@ def save_state() -> None:
                 "messages_declined": c.messages_declined,
                 "total_response_time_ms": c.total_response_time_ms,
                 "last_activity": c.last_activity,
+                "agent_public_key_hex": c.agent_public_key_hex,
+                "agent_display_name": c.agent_display_name,
             }
             for aid, c in state.connections.items()
         },
@@ -510,6 +580,8 @@ def load_state() -> Optional[AgentState]:
             messages_declined=cd.get("messages_declined", 0),
             total_response_time_ms=cd.get("total_response_time_ms", 0.0),
             last_activity=cd.get("last_activity"),
+            agent_public_key_hex=cd.get("agent_public_key_hex"),
+            agent_display_name=cd.get("agent_display_name"),
         )
 
     sent_messages = {}
@@ -525,7 +597,7 @@ def load_state() -> Optional[AgentState]:
             response=sd.get("response"),
         )
 
-    return AgentState(
+    state = AgentState(
         agent_id=data["agent_id"],
         bio=data.get("bio", ""),
         status=AgentStatus(data.get("status", "active")),
@@ -534,10 +606,22 @@ def load_state() -> Optional[AgentState]:
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
         mcp_token=data.get("mcp_token"),
+        private_key_hex=data.get("private_key_hex"),
+        public_key_hex=data.get("public_key_hex"),
+        display_name=data.get("display_name"),
         connections=connections,
         sent_messages=sent_messages,
         impressions=data.get("impressions", {}),
     )
+
+    # Migration: generate keypair for existing agents that don't have one
+    if state.private_key_hex is None or state.public_key_hex is None:
+        priv, pub = _generate_keypair()
+        state.private_key_hex = priv
+        state.public_key_hex = pub
+        print(f"[DarkMatter] Migration: generated Ed25519 keypair for existing agent '{state.agent_id}'", file=sys.stderr)
+
+    return state
 
 
 # =============================================================================
@@ -624,6 +708,8 @@ class ConnectionAcceptedInput(BaseModel):
     agent_id: str = Field(..., description="The accepting agent's ID")
     agent_url: str = Field(..., description="The accepting agent's MCP URL")
     agent_bio: str = Field(..., description="The accepting agent's bio")
+    agent_public_key_hex: Optional[str] = Field(default=None, description="The accepting agent's Ed25519 public key")
+    agent_display_name: Optional[str] = Field(default=None, description="The accepting agent's display name")
 
 
 class AuthenticateInput(BaseModel):
@@ -807,6 +893,8 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
                     "from_agent_id": state.agent_id,
                     "from_agent_url": f"http://localhost:{state.port}/mcp",
                     "from_agent_bio": state.bio,
+                    "from_agent_public_key_hex": state.public_key_hex,
+                    "from_agent_display_name": state.display_name,
                 }
             )
             result = response.json()
@@ -818,6 +906,8 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
                     agent_url=result["agent_url"],
                     agent_bio=result.get("agent_bio", ""),
                     direction=ConnectionDirection.OUTBOUND,
+                    agent_public_key_hex=result.get("agent_public_key_hex"),
+                    agent_display_name=result.get("agent_display_name"),
                 )
                 state.connections[result["agent_id"]] = conn
                 save_state()
@@ -887,6 +977,8 @@ async def respond_connection(params: RespondConnectionInput, ctx: Context) -> st
             agent_url=request.from_agent_url,
             agent_bio=request.from_agent_bio,
             direction=ConnectionDirection.INBOUND,
+            agent_public_key_hex=request.from_agent_public_key_hex,
+            agent_display_name=request.from_agent_display_name,
         )
         state.connections[request.from_agent_id] = conn
 
@@ -899,6 +991,8 @@ async def respond_connection(params: RespondConnectionInput, ctx: Context) -> st
                         "agent_id": state.agent_id,
                         "agent_url": f"http://localhost:{state.port}/mcp",
                         "agent_bio": state.bio,
+                        "agent_public_key_hex": state.public_key_hex,
+                        "agent_display_name": state.display_name,
                     }
                 )
         except Exception:
@@ -1015,20 +1109,32 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
             "error": "No connections available to route this message."
         })
 
+    # Sign the outbound message
+    msg_timestamp = datetime.now(timezone.utc).isoformat()
+    signature_hex = None
+    if state.private_key_hex:
+        signature_hex = _sign_message(
+            state.private_key_hex, state.agent_id, message_id, msg_timestamp, params.content
+        )
+
     sent_to = []
     for conn in targets:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
+                payload = {
+                    "message_id": message_id,
+                    "content": params.content,
+                    "webhook": webhook,
+                    "hops_remaining": params.hops_remaining,
+                    "from_agent_id": state.agent_id,
+                    "metadata": metadata,
+                    "timestamp": msg_timestamp,
+                    "from_public_key_hex": state.public_key_hex,
+                    "signature_hex": signature_hex,
+                }
                 await client.post(
                     conn.agent_url.rstrip("/") + "/__darkmatter__/message",
-                    json={
-                        "message_id": message_id,
-                        "content": params.content,
-                        "webhook": webhook,
-                        "hops_remaining": params.hops_remaining,
-                        "from_agent_id": state.agent_id,
-                        "metadata": metadata,
-                    }
+                    json=payload,
                 )
                 conn.messages_sent += 1
                 conn.last_activity = datetime.now(timezone.utc).isoformat()
@@ -1146,6 +1252,8 @@ async def get_identity(ctx: Context) -> str:
     state = get_state(ctx)
     return json.dumps({
         "agent_id": state.agent_id,
+        "display_name": state.display_name,
+        "public_key_hex": state.public_key_hex,
         "bio": state.bio,
         "status": state.status.value,
         "port": state.port,
@@ -1192,8 +1300,10 @@ async def list_connections(ctx: Context) -> str:
     for conn in state.connections.values():
         entry = {
             "agent_id": conn.agent_id,
+            "display_name": conn.agent_display_name,
             "agent_url": conn.agent_url,
             "bio_summary": _truncate(conn.agent_bio, 250) if conn.agent_bio else None,
+            "crypto": conn.agent_public_key_hex is not None,
             "direction": conn.direction.value,
             "connected_at": conn.connected_at,
             "messages_sent": conn.messages_sent,
@@ -1239,8 +1349,10 @@ async def list_pending_requests(ctx: Context) -> str:
         requests.append({
             "request_id": req.request_id,
             "from_agent_id": req.from_agent_id,
+            "from_agent_display_name": req.from_agent_display_name,
             "from_agent_url": req.from_agent_url,
             "from_agent_bio": req.from_agent_bio,
+            "crypto": req.from_agent_public_key_hex is not None,
             "requested_at": req.requested_at,
         })
 
@@ -1282,6 +1394,7 @@ async def list_inbox(ctx: Context) -> str:
             "hops_remaining": msg.hops_remaining,
             "can_forward": msg.hops_remaining > 0,
             "from_agent_id": msg.from_agent_id,
+            "verified": msg.verified,
             "metadata": msg.metadata,
             "received_at": msg.received_at,
         })
@@ -1328,6 +1441,7 @@ async def get_message(params: GetMessageInput, ctx: Context) -> str:
                 "hops_remaining": msg.hops_remaining,
                 "can_forward": msg.hops_remaining > 0,
                 "from_agent_id": msg.from_agent_id,
+                "verified": msg.verified,
                 "metadata": msg.metadata,
                 "received_at": msg.received_at,
             })
@@ -1393,6 +1507,14 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
             "error": f"Webhook blocked: {webhook_err}",
         })
 
+    # Sign the webhook response
+    resp_timestamp = datetime.now(timezone.utc).isoformat()
+    resp_signature_hex = None
+    if state.private_key_hex:
+        resp_signature_hex = _sign_message(
+            state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, params.response
+        )
+
     # Call the webhook with our response
     webhook_success = False
     webhook_error = None
@@ -1407,6 +1529,9 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
                     "agent_id": state.agent_id,
                     "response": params.response,
                     "metadata": msg.metadata,
+                    "timestamp": resp_timestamp,
+                    "from_public_key_hex": state.public_key_hex,
+                    "signature_hex": resp_signature_hex,
                 }
             )
             response_time_ms = (time.monotonic() - start) * 1000
@@ -1584,6 +1709,14 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
         except Exception as e:
             print(f"[DarkMatter] Warning: failed to post forwarding update to webhook: {e}", file=sys.stderr)
 
+    # Sign the forwarded message
+    fwd_timestamp = datetime.now(timezone.utc).isoformat()
+    fwd_signature_hex = None
+    if state.private_key_hex:
+        fwd_signature_hex = _sign_message(
+            state.private_key_hex, state.agent_id, msg.message_id, fwd_timestamp, msg.content
+        )
+
     # POST message to target's message endpoint
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1596,6 +1729,9 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
                     "hops_remaining": new_hops_remaining,
                     "from_agent_id": state.agent_id,
                     "metadata": msg.metadata,
+                    "timestamp": fwd_timestamp,
+                    "from_public_key_hex": state.public_key_hex,
+                    "signature_hex": fwd_signature_hex,
                 }
             )
             if resp.status_code >= 400:
@@ -1820,7 +1956,7 @@ async def get_server_template(ctx: Context) -> str:
             "2": "Install dependencies: pip install 'mcp[cli]' httpx",
             "3": "Set environment variables:",
             "env": {
-                "DARKMATTER_AGENT_ID": "your-unique-agent-id",
+                "DARKMATTER_DISPLAY_NAME": "your-display-name (agent UUID is auto-generated)",
                 "DARKMATTER_BIO": "Description of what this agent specializes in",
                 "DARKMATTER_PORT": "8101 (or any available port)",
                 "DARKMATTER_GENESIS": "false",
@@ -1874,6 +2010,8 @@ async def network_info(ctx: Context) -> str:
     ]
     return json.dumps({
         "agent_id": state.agent_id,
+        "display_name": state.display_name,
+        "public_key_hex": state.public_key_hex,
         "agent_url": f"http://localhost:{state.port}",
         "bio": state.bio,
         "is_genesis": state.is_genesis,
@@ -2232,6 +2370,8 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     from_agent_id = data.get("from_agent_id", "")
     from_agent_url = data.get("from_agent_url", "")
     from_agent_bio = data.get("from_agent_bio", "")
+    from_agent_public_key_hex = data.get("from_agent_public_key_hex")
+    from_agent_display_name = data.get("from_agent_display_name")
 
     if not from_agent_id or not from_agent_url:
         return JSONResponse({"error": "Missing required fields"}, status_code=400)
@@ -2245,11 +2385,19 @@ async def handle_connection_request(request: Request) -> JSONResponse:
 
     # Check if already connected
     if from_agent_id in state.connections:
+        # Update peer's public key if they sent one and we don't have it
+        existing = state.connections[from_agent_id]
+        if from_agent_public_key_hex and not existing.agent_public_key_hex:
+            existing.agent_public_key_hex = from_agent_public_key_hex
+            existing.agent_display_name = from_agent_display_name
+            save_state()
         return JSONResponse({
             "auto_accepted": True,
             "agent_id": state.agent_id,
             "agent_url": f"http://localhost:{state.port}/mcp",
             "agent_bio": state.bio,
+            "agent_public_key_hex": state.public_key_hex,
+            "agent_display_name": state.display_name,
             "message": "Already connected.",
         })
 
@@ -2260,6 +2408,8 @@ async def handle_connection_request(request: Request) -> JSONResponse:
             agent_url=from_agent_url,
             agent_bio=from_agent_bio,
             direction=ConnectionDirection.INBOUND,
+            agent_public_key_hex=from_agent_public_key_hex,
+            agent_display_name=from_agent_display_name,
         )
         state.connections[from_agent_id] = conn
         save_state()
@@ -2268,6 +2418,8 @@ async def handle_connection_request(request: Request) -> JSONResponse:
             "agent_id": state.agent_id,
             "agent_url": f"http://localhost:{state.port}/mcp",
             "agent_bio": state.bio,
+            "agent_public_key_hex": state.public_key_hex,
+            "agent_display_name": state.display_name,
         })
 
     # Non-genesis agents queue the request
@@ -2280,6 +2432,8 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         from_agent_id=from_agent_id,
         from_agent_url=from_agent_url,
         from_agent_bio=from_agent_bio,
+        from_agent_public_key_hex=from_agent_public_key_hex,
+        from_agent_display_name=from_agent_display_name,
     )
 
     return JSONResponse({
@@ -2305,6 +2459,8 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
     agent_id = data.get("agent_id", "")
     agent_url = data.get("agent_url", "")
     agent_bio = data.get("agent_bio", "")
+    agent_public_key_hex = data.get("agent_public_key_hex")
+    agent_display_name = data.get("agent_display_name")
 
     if not agent_id or not agent_url:
         return JSONResponse({"error": "Missing required fields"}, status_code=400)
@@ -2338,6 +2494,8 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
         agent_url=agent_url,
         agent_bio=agent_bio,
         direction=ConnectionDirection.OUTBOUND,
+        agent_public_key_hex=agent_public_key_hex,
+        agent_display_name=agent_display_name,
     )
     state.connections[agent_id] = conn
     save_state()
@@ -2379,9 +2537,41 @@ async def handle_message(request: Request) -> JSONResponse:
     if url_err:
         return JSONResponse({"error": f"Invalid webhook: {url_err}"}, status_code=400)
 
+    # Reject messages from agents we're not connected to
+    if not from_agent_id or from_agent_id not in state.connections:
+        return JSONResponse(
+            {"error": "Not connected — only connected agents can send messages."},
+            status_code=403,
+        )
+
     hops_remaining = data.get("hops_remaining", 10)
     if not isinstance(hops_remaining, int) or hops_remaining < 0:
         hops_remaining = 10
+
+    # Cryptographic verification
+    msg_timestamp = data.get("timestamp", "")
+    from_public_key_hex = data.get("from_public_key_hex")
+    signature_hex = data.get("signature_hex")
+    verified = False
+
+    if from_agent_id in state.connections:
+        conn = state.connections[from_agent_id]
+        if conn.agent_public_key_hex and from_public_key_hex:
+            # Known connection with stored key — verify key matches
+            if conn.agent_public_key_hex != from_public_key_hex:
+                return JSONResponse(
+                    {"error": "Public key mismatch — sender key does not match stored key for this connection."},
+                    status_code=403,
+                )
+            # Verify signature
+            if signature_hex and msg_timestamp:
+                if not _verify_message(conn.agent_public_key_hex, signature_hex,
+                                       from_agent_id, message_id, msg_timestamp, content):
+                    return JSONResponse(
+                        {"error": "Invalid signature — message authenticity could not be verified."},
+                        status_code=403,
+                    )
+                verified = True
 
     msg = QueuedMessage(
         message_id=truncate_field(message_id, 128),
@@ -2390,6 +2580,7 @@ async def handle_message(request: Request) -> JSONResponse:
         hops_remaining=hops_remaining,
         metadata=data.get("metadata", {}),
         from_agent_id=from_agent_id,
+        verified=verified,
     )
     state.message_queue.append(msg)
     state.messages_handled += 1
@@ -2520,6 +2711,8 @@ async def handle_status(request: Request) -> JSONResponse:
 
     return JSONResponse({
         "agent_id": state.agent_id,
+        "display_name": state.display_name,
+        "public_key_hex": state.public_key_hex,
         "bio": state.bio,
         "status": state.status.value,
         "is_genesis": state.is_genesis,
@@ -2542,6 +2735,8 @@ async def handle_network_info(request: Request) -> JSONResponse:
     ]
     return JSONResponse({
         "agent_id": state.agent_id,
+        "display_name": state.display_name,
+        "public_key_hex": state.public_key_hex,
         "agent_url": f"http://localhost:{state.port}",
         "bio": state.bio,
         "is_genesis": state.is_genesis,
@@ -2592,6 +2787,8 @@ async def handle_well_known(request: Request) -> JSONResponse:
         "darkmatter": True,
         "protocol_version": PROTOCOL_VERSION,
         "agent_id": state.agent_id,
+        "display_name": state.display_name,
+        "public_key_hex": state.public_key_hex,
         "bio": state.bio,
         "status": state.status.value,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
@@ -2649,6 +2846,8 @@ async def _discovery_beacon(state: AgentState) -> None:
                 "proto": "darkmatter",
                 "v": PROTOCOL_VERSION,
                 "agent_id": state.agent_id,
+                "display_name": state.display_name,
+                "public_key_hex": state.public_key_hex,
                 "bio": state.bio[:100],
                 "port": state.port,
                 "status": state.status.value,
@@ -2706,7 +2905,7 @@ def create_app() -> Starlette:
     """
     global _agent_state
 
-    agent_id = os.environ.get("DARKMATTER_AGENT_ID", f"agent-{uuid.uuid4().hex[:8]}")
+    display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", os.environ.get("DARKMATTER_AGENT_ID", ""))
     bio = os.environ.get("DARKMATTER_BIO", "Genesis agent — the first node in the DarkMatter network.")
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     is_genesis = os.environ.get("DARKMATTER_GENESIS", "true").lower() == "true"
@@ -2717,21 +2916,33 @@ def create_app() -> Starlette:
 
     # Try to restore persisted state from disk
     restored = load_state()
-    if restored and restored.agent_id == agent_id:
+    if restored:
         _agent_state = restored
         # Update mutable env-driven fields in case they changed
         _agent_state.port = port
         _agent_state.status = AgentStatus.ACTIVE
-        print(f"[DarkMatter] Restored state for '{agent_id}' ({len(_agent_state.connections)} connections)", file=sys.stderr)
+        # Update display name from env if provided
+        if display_name:
+            _agent_state.display_name = display_name
+        print(f"[DarkMatter] Restored state for '{_agent_state.agent_id}' "
+              f"(display: {_agent_state.display_name or 'none'}, "
+              f"{len(_agent_state.connections)} connections)", file=sys.stderr)
     else:
+        # New agent — generate UUID agent_id and Ed25519 keypair
+        agent_id = str(uuid.uuid4())
+        priv, pub = _generate_keypair()
         _agent_state = AgentState(
             agent_id=agent_id,
             bio=bio,
             status=AgentStatus.ACTIVE,
             port=port,
             is_genesis=is_genesis,
+            private_key_hex=priv,
+            public_key_hex=pub,
+            display_name=display_name or None,
         )
-        print(f"[DarkMatter] Agent '{agent_id}' starting fresh on port {port}", file=sys.stderr)
+        print(f"[DarkMatter] Agent '{agent_id}' (display: {display_name or 'none'}) "
+              f"starting fresh on port {port}", file=sys.stderr)
 
     # Pre-seed token from env if state doesn't have one yet
     if legacy_token and _agent_state.mcp_token is None:
