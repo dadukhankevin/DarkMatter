@@ -22,6 +22,7 @@ import asyncio
 import os
 import sys
 import shutil
+import secrets
 import ipaddress
 import socket
 from datetime import datetime, timezone
@@ -184,7 +185,37 @@ class AgentState:
 # Server Initialization
 # =============================================================================
 
-mcp = FastMCP("darkmatter_mcp")
+mcp = FastMCP(
+    "darkmatter_mcp",
+    instructions="""\
+You are a DarkMatter mesh agent — a node in a self-organizing network of AI agents.
+
+ON STARTUP (do these immediately):
+1. Call darkmatter_get_identity to learn who you are (your agent ID, bio, status, connections).
+2. If your bio is generic or empty, call darkmatter_update_bio with a description of YOUR \
+capabilities and specialties. Be specific — other agents use your bio to decide whether to \
+route messages to you.
+3. Call darkmatter_list_connections to see who you're connected to.
+4. Call darkmatter_list_messages to check for any queued messages waiting for your response.
+
+ONGOING BEHAVIOR:
+- When you receive messages (check darkmatter_list_messages), read them and respond using \
+darkmatter_respond_message. You are the intelligence behind this agent — decide how to answer.
+- You can connect to other agents with darkmatter_request_connection if you know their URL.
+- Use darkmatter_network_info to discover peers in the network.
+- Use darkmatter_list_pending_requests to see if anyone wants to connect to you, then \
+darkmatter_respond_connection to accept or reject.
+
+IDENTITY:
+- Your agent ID and bio define who you are in the mesh. Own it.
+- Other agents see your bio when deciding whether to connect or route messages to you.
+- Update your bio anytime your capabilities change with darkmatter_update_bio.
+
+You are autonomous. You decide who to connect to, how to respond to messages, and how to \
+participate in the network. The protocol gives you primitives — what you build with them is \
+up to you.\
+""",
+)
 
 # We need a reference to the agent state that both MCP tools and HTTP endpoints share
 _agent_state: Optional[AgentState] = None
@@ -1271,17 +1302,49 @@ async def handle_network_info(request: Request) -> JSONResponse:
 
 
 # =============================================================================
+# MCP Bearer Token Auth Middleware
+# =============================================================================
+
+class BearerAuthMiddleware:
+    """ASGI middleware that enforces Bearer token auth on all requests."""
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            auth = headers.get(b"authorization", b"").decode()
+            if auth != f"Bearer {self.token}":
+                response = JSONResponse(
+                    {"error": "Unauthorized — missing or invalid Bearer token"},
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# =============================================================================
 # Application — Mount MCP + DarkMatter HTTP endpoints together
 # =============================================================================
 
-def create_app() -> Starlette:
-    """Create the combined Starlette app with MCP and DarkMatter endpoints."""
+def create_app() -> tuple[Starlette, str]:
+    """Create the combined Starlette app with MCP and DarkMatter endpoints.
+
+    Returns:
+        A tuple of (Starlette app, MCP bearer token).
+    """
     global _agent_state
 
     agent_id = os.environ.get("DARKMATTER_AGENT_ID", f"agent-{uuid.uuid4().hex[:8]}")
     bio = os.environ.get("DARKMATTER_BIO", "Genesis agent — the first node in the DarkMatter network.")
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     is_genesis = os.environ.get("DARKMATTER_GENESIS", "true").lower() == "true"
+
+    # Generate or load MCP bearer token
+    mcp_token = os.environ.get("DARKMATTER_MCP_TOKEN") or secrets.token_hex(32)
 
     # Try to restore persisted state from disk
     restored = load_state()
@@ -1319,11 +1382,11 @@ def create_app() -> Starlette:
     app = Starlette(
         routes=[
             Mount("/__darkmatter__", routes=darkmatter_routes),
-            # MCP will be mounted at /mcp by the streamable HTTP transport
+            # MCP will be mounted at /mcp (with auth middleware) in __main__
         ]
     )
 
-    return app
+    return app, mcp_token
 
 
 # =============================================================================
@@ -1334,7 +1397,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
     # Create the combined app
-    app = create_app()
+    app, mcp_token = create_app()
 
     print(f"[DarkMatter] Starting mesh protocol on http://localhost:{port}", file=sys.stderr)
     print(f"[DarkMatter] Mesh endpoints:", file=sys.stderr)
@@ -1345,10 +1408,12 @@ if __name__ == "__main__":
     print(f"[DarkMatter]    GET /__darkmatter__/network_info", file=sys.stderr)
     print(f"[DarkMatter]", file=sys.stderr)
     print(f"[DarkMatter] MCP server available via streamable-http at /mcp", file=sys.stderr)
+    print(f"[DarkMatter] MCP_TOKEN={mcp_token}", file=sys.stderr)
 
-    # Mount MCP's streamable HTTP app (uses the module-level mcp instance with all tools)
+    # Mount MCP's streamable HTTP app, wrapped with bearer token auth
     mcp_app = mcp.streamable_http_app()
-    app.mount("/mcp", mcp_app)
+    authed_mcp_app = BearerAuthMiddleware(mcp_app, mcp_token)
+    app.mount("/mcp", authed_mcp_app)
 
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
     uvicorn.run(app, host=host, port=port)
