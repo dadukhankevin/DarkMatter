@@ -220,6 +220,7 @@ class AgentState:
     messages_handled: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     is_genesis: bool = False
+    impressions: dict[str, str] = field(default_factory=dict)  # agent_id -> freeform impression text
     mcp_token: Optional[str] = None  # None = unclaimed, set = claimed
     # Track agent URLs we've sent outbound connection requests to (not persisted)
     pending_outbound: set[str] = field(default_factory=set)
@@ -269,6 +270,16 @@ IDENTITY:
 - Your agent ID and bio define who you are in the mesh. Own it.
 - Other agents see your bio when deciding whether to connect or route messages to you.
 - Update your bio anytime your capabilities change with darkmatter_update_bio.
+
+IMPRESSIONS (Trust):
+- After interacting with an agent, store an impression with darkmatter_set_impression. \
+These are your private notes — "fast and accurate", "unhelpful", "great at ML questions".
+- When an unknown agent requests to connect, use darkmatter_ask_impression to ask your \
+existing connections what they think. Their impressions help you decide whether to accept.
+- Your impressions are shared when other agents ask — this is how trust propagates through \
+the network. Be honest.
+- Use darkmatter_list_impressions to review your stored impressions, and \
+darkmatter_delete_impression to remove outdated ones.
 
 LIVE STATUS:
 - The `darkmatter_status` tool description contains live node state AND action items.
@@ -463,6 +474,7 @@ def save_state() -> None:
             }
             for mid, sm in state.sent_messages.items()
         },
+        "impressions": state.impressions,
     }
 
     path = _state_file_path()
@@ -524,6 +536,7 @@ def load_state() -> Optional[AgentState]:
         mcp_token=data.get("mcp_token"),
         connections=connections,
         sent_messages=sent_messages,
+        impressions=data.get("impressions", {}),
     )
 
 
@@ -623,6 +636,26 @@ class DiscoverDomainInput(BaseModel):
     """Check if a domain hosts a DarkMatter node."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     domain: str = Field(..., description="Domain to check (e.g. 'example.com' or 'localhost:8100')")
+
+
+class SetImpressionInput(BaseModel):
+    """Store or update your impression of an agent."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The agent ID to store an impression of")
+    impression: str = Field(..., description="Your freeform impression (e.g. 'slow but accurate', 'great at routing ML questions', 'unresponsive')", max_length=2000)
+
+
+class DeleteImpressionInput(BaseModel):
+    """Delete your impression of an agent."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The agent ID whose impression to delete")
+
+
+class AskImpressionInput(BaseModel):
+    """Ask a connected agent for their impression of a third agent."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    ask_agent_id: str = Field(..., description="The connected agent to ask")
+    about_agent_id: str = Field(..., description="The agent you want to know about")
 
 
 # =============================================================================
@@ -1948,6 +1981,216 @@ async def discover_local(ctx: Context) -> str:
 
 
 # =============================================================================
+# Impressions — Local reputation / trust signals
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_set_impression",
+    annotations={
+        "title": "Set Impression",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def set_impression(params: SetImpressionInput, ctx: Context) -> str:
+    """Store or update your impression of an agent.
+
+    Impressions are your private notes about agents you've interacted with.
+    Other agents can ask you for your impression of a specific agent via the
+    mesh protocol — this is how trust propagates through the network.
+
+    Args:
+        params: Contains agent_id and freeform impression text.
+
+    Returns:
+        JSON confirming the impression was saved.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    was_update = params.agent_id in state.impressions
+    state.impressions[params.agent_id] = params.impression
+    save_state()
+
+    return json.dumps({
+        "success": True,
+        "agent_id": params.agent_id,
+        "action": "updated" if was_update else "created",
+        "impression": params.impression,
+    })
+
+
+@mcp.tool(
+    name="darkmatter_get_impression",
+    annotations={
+        "title": "Get Impression",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def get_impression(params: DeleteImpressionInput, ctx: Context) -> str:
+    """Get your stored impression of an agent.
+
+    Args:
+        params: Contains agent_id to look up.
+
+    Returns:
+        JSON with the impression, or a message that no impression exists.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    impression = state.impressions.get(params.agent_id)
+    if impression is None:
+        return json.dumps({
+            "agent_id": params.agent_id,
+            "has_impression": False,
+        })
+
+    return json.dumps({
+        "agent_id": params.agent_id,
+        "has_impression": True,
+        "impression": impression,
+    })
+
+
+@mcp.tool(
+    name="darkmatter_list_impressions",
+    annotations={
+        "title": "List Impressions",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def list_impressions(ctx: Context) -> str:
+    """List all your stored impressions of other agents.
+
+    Returns:
+        JSON with all impressions keyed by agent ID.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    return json.dumps({
+        "total": len(state.impressions),
+        "impressions": state.impressions,
+    })
+
+
+@mcp.tool(
+    name="darkmatter_delete_impression",
+    annotations={
+        "title": "Delete Impression",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def delete_impression(params: DeleteImpressionInput, ctx: Context) -> str:
+    """Delete your stored impression of an agent.
+
+    Args:
+        params: Contains agent_id whose impression to delete.
+
+    Returns:
+        JSON confirming deletion.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    if params.agent_id not in state.impressions:
+        return json.dumps({
+            "success": False,
+            "error": f"No impression stored for agent '{params.agent_id}'.",
+        })
+
+    del state.impressions[params.agent_id]
+    save_state()
+
+    return json.dumps({
+        "success": True,
+        "agent_id": params.agent_id,
+        "action": "deleted",
+    })
+
+
+@mcp.tool(
+    name="darkmatter_ask_impression",
+    annotations={
+        "title": "Ask Impression",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def ask_impression(params: AskImpressionInput, ctx: Context) -> str:
+    """Ask a connected agent for their impression of another agent.
+
+    Use this to check an agent's reputation before accepting a connection
+    or routing a message. Your connected peers share their impressions
+    when asked — this is how trust propagates through the network.
+
+    Args:
+        params: Contains ask_agent_id (who to ask) and about_agent_id (who to ask about).
+
+    Returns:
+        JSON with the peer's impression, or a message that they have none.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    conn = state.connections.get(params.ask_agent_id)
+    if not conn:
+        return json.dumps({
+            "success": False,
+            "error": f"Not connected to agent '{params.ask_agent_id}'.",
+        })
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                conn.agent_url.rstrip("/") + f"/__darkmatter__/impression/{params.about_agent_id}",
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return json.dumps({
+                    "success": True,
+                    "asked": params.ask_agent_id,
+                    "about": params.about_agent_id,
+                    "has_impression": data.get("has_impression", False),
+                    "impression": data.get("impression"),
+                })
+            else:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Agent returned HTTP {resp.status_code}.",
+                })
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": f"Failed to reach agent: {str(e)}",
+        })
+
+
+# =============================================================================
 # Live Status Tool — Dynamic description updated via notifications/tools/list_changed
 # =============================================================================
 
@@ -2324,6 +2567,30 @@ async def handle_network_info(request: Request) -> JSONResponse:
     })
 
 
+async def handle_impression_get(request: Request) -> JSONResponse:
+    """Return this agent's impression of a specific agent (asked by peers)."""
+    global _agent_state
+    state = _agent_state
+
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    about_agent_id = request.path_params.get("agent_id", "")
+    impression = state.impressions.get(about_agent_id)
+
+    if impression is None:
+        return JSONResponse({
+            "agent_id": about_agent_id,
+            "has_impression": False,
+        })
+
+    return JSONResponse({
+        "agent_id": about_agent_id,
+        "has_impression": True,
+        "impression": impression,
+    })
+
+
 async def handle_well_known(request: Request) -> JSONResponse:
     """Return /.well-known/darkmatter.json for global discovery (RFC 8615)."""
     global _agent_state
@@ -2524,6 +2791,7 @@ def create_app() -> Starlette:
         Route("/webhook/{message_id}", handle_webhook_get, methods=["GET"]),
         Route("/status", handle_status, methods=["GET"]),
         Route("/network_info", handle_network_info, methods=["GET"]),
+        Route("/impression/{agent_id}", handle_impression_get, methods=["GET"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
