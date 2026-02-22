@@ -1547,7 +1547,7 @@ def create_app() -> tuple[Starlette, str]:
     """Create the combined Starlette app with MCP and DarkMatter endpoints.
 
     Returns:
-        A tuple of (Starlette app, MCP bearer token).
+        A tuple of (Starlette app, MCP bearer token string).
     """
     global _agent_state
 
@@ -1607,14 +1607,34 @@ def create_app() -> tuple[Starlette, str]:
         Route("/network_info", handle_network_info, methods=["GET"]),
     ]
 
-    # Build the app with both MCP and mesh endpoints
-    app = Starlette(
+    # Build the main app with mesh endpoints + well-known route.
+    # MCP's /mcp endpoint is added via middleware that wraps the whole app,
+    # intercepting /mcp requests with bearer auth and forwarding the rest.
+    # Extract the MCP ASGI handler and its session manager for lifecycle.
+    import contextlib
+    mcp_starlette = mcp.streamable_http_app()
+    mcp_handler = mcp_starlette.routes[0].app  # StreamableHTTPASGIApp
+    session_manager = mcp_handler.session_manager
+    authed_mcp = BearerAuthMiddleware(mcp_handler, mcp_token)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        # Start MCP session manager + run our startup hooks
+        async with session_manager.run():
+            await on_startup()
+            yield
+
+    # Build the app. Use redirect_slashes=False so POST /mcp doesn't get
+    # redirected to /mcp/ (which breaks MCP client connections).
+    from starlette.routing import Router
+    app = Router(
         routes=[
             Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
             Mount("/__darkmatter__", routes=darkmatter_routes),
-            # MCP will be mounted at /mcp (with auth middleware) in __main__
+            Route("/mcp", authed_mcp),
         ],
-        on_startup=[on_startup],
+        redirect_slashes=False,
+        lifespan=lifespan,
     )
 
     return app, mcp_token
@@ -1644,11 +1664,6 @@ if __name__ == "__main__":
     print(f"[DarkMatter] LAN discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
     print(f"[DarkMatter] MCP server available via streamable-http at /mcp", file=sys.stderr)
     print(f"[DarkMatter] MCP_TOKEN={mcp_token}", file=sys.stderr)
-
-    # Mount MCP's streamable HTTP app, wrapped with bearer token auth
-    mcp_app = mcp.streamable_http_app()
-    authed_mcp_app = BearerAuthMiddleware(mcp_app, mcp_token)
-    app.mount("/mcp", authed_mcp_app)
 
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
     uvicorn.run(app, host=host, port=port)
