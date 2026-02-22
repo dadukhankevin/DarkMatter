@@ -62,6 +62,7 @@ MAX_URL_LENGTH = 2048
 
 PROTOCOL_VERSION = "0.1"
 DISCOVERY_PORT = 8470
+DISCOVERY_MCAST_GROUP = "239.77.68.77"  # "M" "D" "M" in ASCII — DarkMatter multicast group
 DISCOVERY_INTERVAL = 30       # seconds between LAN beacons
 DISCOVERY_MAX_AGE = 90        # seconds before a peer is considered stale
 
@@ -2786,8 +2787,11 @@ async def handle_well_known(request: Request) -> JSONResponse:
 # LAN Discovery — UDP Broadcast
 # =============================================================================
 
+DISCOVERY_DIR = os.path.join(os.path.expanduser("~"), ".darkmatter", "discovery")
+
+
 class _DiscoveryProtocol(asyncio.DatagramProtocol):
-    """Receives UDP discovery beacons from other agents on the LAN."""
+    """Receives UDP multicast discovery beacons from LAN agents."""
 
     def __init__(self, state: AgentState):
         self.state = state
@@ -2814,19 +2818,125 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
             "status": packet.get("status", "active"),
             "genesis": packet.get("genesis", False),
             "accepting": packet.get("accepting", True),
+            "source": "lan",
             "ts": time.time(),
         }
 
 
-async def _discovery_beacon(state: AgentState) -> None:
-    """Periodically broadcast a discovery announcement on the LAN."""
+def _write_discovery_file(state: AgentState) -> None:
+    """Write this agent's presence file to the shared discovery directory."""
+    os.makedirs(DISCOVERY_DIR, exist_ok=True)
+    info = {
+        "proto": "darkmatter",
+        "v": PROTOCOL_VERSION,
+        "agent_id": state.agent_id,
+        "display_name": state.display_name,
+        "public_key_hex": state.public_key_hex,
+        "bio": state.bio[:100],
+        "port": state.port,
+        "status": state.status.value,
+        "genesis": state.is_genesis,
+        "accepting": len(state.connections) < MAX_CONNECTIONS,
+        "pid": os.getpid(),
+        "ts": int(time.time()),
+    }
+    path = os.path.join(DISCOVERY_DIR, f"{state.agent_id}.json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(info, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _scan_discovery_dir(state: AgentState) -> None:
+    """Scan the discovery directory for other agents on this machine."""
+    try:
+        entries = os.listdir(DISCOVERY_DIR)
+    except OSError:
+        return
+
+    now = time.time()
+    for fname in entries:
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(DISCOVERY_DIR, fname)
+        try:
+            with open(path, "r") as f:
+                info = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        peer_id = info.get("agent_id", "")
+        if not peer_id or peer_id == state.agent_id:
+            continue
+
+        ts = info.get("ts", 0)
+        if now - ts > DISCOVERY_MAX_AGE:
+            # Stale — try to remove
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+
+        # Check if the process is still alive (same-machine only)
+        pid = info.get("pid")
+        if pid:
+            try:
+                os.kill(pid, 0)  # Signal 0 = check existence
+            except ProcessLookupError:
+                # Process is dead — remove stale file
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            except PermissionError:
+                pass  # Process exists but we can't signal it — that's fine
+
+        peer_port = info.get("port", DEFAULT_PORT)
+        state.discovered_peers[peer_id] = {
+            "url": f"http://127.0.0.1:{peer_port}",
+            "bio": info.get("bio", ""),
+            "status": info.get("status", "active"),
+            "genesis": info.get("genesis", False),
+            "accepting": info.get("accepting", True),
+            "source": "local",
+            "ts": ts,
+        }
+
+
+def _cleanup_discovery_file(state: AgentState) -> None:
+    """Remove this agent's discovery file on shutdown."""
+    path = os.path.join(DISCOVERY_DIR, f"{state.agent_id}.json")
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+async def _discovery_loop(state: AgentState) -> None:
+    """Periodically write presence file and scan for local peers.
+
+    Also sends UDP multicast beacons for LAN discovery.
+    """
     loop = asyncio.get_event_loop()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setblocking(False)
+
+    # Multicast beacon socket for LAN discovery
+    mcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)  # Don't loop back — file-based handles local
+    mcast_sock.setblocking(False)
 
     try:
         while True:
+            # Write our presence and scan for local peers
+            _write_discovery_file(state)
+            _scan_discovery_dir(state)
+
+            # Also send multicast beacon for LAN peers
             packet = json.dumps({
                 "proto": "darkmatter",
                 "v": PROTOCOL_VERSION,
@@ -2843,14 +2953,15 @@ async def _discovery_beacon(state: AgentState) -> None:
 
             try:
                 await loop.run_in_executor(
-                    None, sock.sendto, packet, ("255.255.255.255", DISCOVERY_PORT)
+                    None, mcast_sock.sendto, packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT)
                 )
             except OSError:
-                pass  # Network unreachable, etc. — silently retry next cycle
+                pass
 
             await asyncio.sleep(DISCOVERY_INTERVAL)
     finally:
-        sock.close()
+        mcast_sock.close()
+        _cleanup_discovery_file(state)
 
 
 # =============================================================================
@@ -2921,23 +3032,36 @@ def create_app() -> Starlette:
 
     async def on_startup() -> None:
         if discovery_enabled:
-            loop = asyncio.get_event_loop()
-            # Create a SO_REUSEPORT socket so multiple nodes on the same
-            # machine can all bind to the discovery port simultaneously.
+            import struct as _struct
             import socket as _socket
-            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM, _socket.IPPROTO_UDP)
-            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
-            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-            if hasattr(_socket, "SO_REUSEPORT"):
-                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
-            sock.bind(("0.0.0.0", DISCOVERY_PORT))
-            transport, _ = await loop.create_datagram_endpoint(
-                lambda: _DiscoveryProtocol(_agent_state),
-                sock=sock,
-            )
-            # Start beacon task
-            asyncio.create_task(_discovery_beacon(_agent_state))
-            print(f"[DarkMatter] LAN discovery: ENABLED (UDP port {DISCOVERY_PORT})", file=sys.stderr)
+            loop = asyncio.get_event_loop()
+
+            # Multicast listener for LAN discovery (best-effort — on same-machine
+            # with SO_REUSEPORT, only one process gets each packet, so we use
+            # file-based discovery for local peers).
+            try:
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM, _socket.IPPROTO_UDP)
+                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                if hasattr(_socket, "SO_REUSEPORT"):
+                    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+                sock.bind(("", DISCOVERY_PORT))
+                mreq = _struct.pack("4s4s",
+                    _socket.inet_aton(DISCOVERY_MCAST_GROUP),
+                    _socket.inet_aton("0.0.0.0"))
+                sock.setsockopt(_socket.IPPROTO_IP, _socket.IP_ADD_MEMBERSHIP, mreq)
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: _DiscoveryProtocol(_agent_state),
+                    sock=sock,
+                )
+            except OSError as e:
+                print(f"[DarkMatter] LAN multicast listener failed ({e}), local file discovery still active", file=sys.stderr)
+
+            # Start discovery loop (file-based local + multicast LAN beacons)
+            asyncio.create_task(_discovery_loop(_agent_state))
+            # Clean up discovery file on shutdown
+            import atexit
+            atexit.register(_cleanup_discovery_file, _agent_state)
+            print(f"[DarkMatter] Discovery: ENABLED (local: ~/.darkmatter/discovery/, LAN: multicast {DISCOVERY_MCAST_GROUP}:{DISCOVERY_PORT})", file=sys.stderr)
 
         # Start live status updater (updates tool description and notifies clients)
         asyncio.create_task(_status_updater())
@@ -3008,7 +3132,7 @@ if __name__ == "__main__":
     print(f"[DarkMatter]    GET /__darkmatter__/network_info", file=sys.stderr)
     print(f"[DarkMatter]    GET /.well-known/darkmatter.json", file=sys.stderr)
     print(f"[DarkMatter]", file=sys.stderr)
-    print(f"[DarkMatter] LAN discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
+    print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
     print(f"[DarkMatter] MCP server available via streamable-http at /mcp (no HTTP auth — auth via darkmatter_authenticate tool)", file=sys.stderr)
 
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
