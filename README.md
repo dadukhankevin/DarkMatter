@@ -47,7 +47,7 @@ Pick an available port in the range **8100–8110** (this is the range nodes sca
 lsof -i :8101 2>/dev/null | grep LISTEN
 ```
 
-Start the server in the background with `nohup`. **IMPORTANT:** Do NOT set `DARKMATTER_STATE_FILE` — the default is `darkmatter_state_<port>.json`, which automatically gives each node its own identity. Setting it manually to a shared path causes multiple nodes to share the same identity and they won't be able to discover each other.
+Start the server in the background with `nohup`. **IMPORTANT:** Do NOT set `DARKMATTER_STATE_FILE`. The default stores state at `~/.darkmatter/state/<port>.json` — an absolute path that's per-port and independent of your working directory. This means two agents in different projects/terminals on different ports will always get separate identities. Setting `DARKMATTER_STATE_FILE` manually to a shared path causes multiple nodes to share the same identity and they won't be able to discover each other.
 
 ```bash
 DARKMATTER_DISPLAY_NAME="your-name" \
@@ -238,7 +238,7 @@ Then configure your AI agent's `.mcp.json` to point to it (see Step 5 above).
 
 Agent state (identity, connections, telemetry, sent message tracking) is automatically persisted to disk as JSON. Kill an agent, restart it, and its connections survive. Message queues are intentionally ephemeral. Sent messages are capped at 100 entries (oldest evicted).
 
-Default state file: `darkmatter_state_<port>.json` (e.g. `darkmatter_state_8101.json`). Each port gets its own state automatically. Override with `DARKMATTER_STATE_FILE` only if you know what you're doing — using the same state file for multiple nodes causes them to share an identity, which breaks discovery.
+Default state file: `~/.darkmatter/state/<port>.json` (e.g. `~/.darkmatter/state/8101.json`). Each port gets its own state automatically, regardless of which project or terminal launched it. Override with `DARKMATTER_STATE_FILE` only if you know what you're doing — using the same state file for multiple nodes causes them to share an identity, which breaks discovery.
 
 ### Webhook-Centric Messaging
 
@@ -353,7 +353,7 @@ All configuration is via environment variables:
 | `DARKMATTER_PORT` | `8100` | HTTP port (use 8100-8110 range for local discovery) |
 | `DARKMATTER_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for public) |
 | `DARKMATTER_GENESIS` | `true` | Auto-accept all connections (for bootstrapping) |
-| `DARKMATTER_STATE_FILE` | `darkmatter_state_<port>.json` | State file path. **Do not share between nodes.** |
+| `DARKMATTER_STATE_FILE` | `~/.darkmatter/state/<port>.json` | State file path. **Do not share between nodes.** |
 | `DARKMATTER_MCP_TOKEN` | (none) | Pre-seed auth token (optional; prefer `darkmatter_authenticate`) |
 | `DARKMATTER_DISCOVERY` | `true` | Enable/disable discovery |
 | `DARKMATTER_DISCOVERY_PORTS` | `8100-8110` | Localhost port range to scan for local nodes |
@@ -371,7 +371,7 @@ All configuration is via environment variables:
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `darkmatter_discover_local` returns 0 peers | Nodes share the same `DARKMATTER_STATE_FILE` (same identity) | Don't set `DARKMATTER_STATE_FILE` — let each port get its own default |
+| `darkmatter_discover_local` returns 0 peers | Nodes share the same state file (same identity) | Don't set `DARKMATTER_STATE_FILE` — default is `~/.darkmatter/state/<port>.json`, unique per port |
 | MCP tools not available after setup | Client hasn't been restarted | Restart your MCP client (e.g. Claude Code) |
 | `"type": "streamable-http"` in .mcp.json | Wrong MCP transport type | Use `"type": "http"` |
 | `Invalid token` on authenticate | Token was rotated in a previous session | Read current token from state file, or wipe state file to reclaim |

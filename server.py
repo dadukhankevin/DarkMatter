@@ -489,8 +489,14 @@ async def _status_updater() -> None:
 
 
 def _state_file_path() -> str:
-    default = f"darkmatter_state_{os.environ.get('DARKMATTER_PORT', '8100')}.json"
-    return os.environ.get("DARKMATTER_STATE_FILE", default)
+    if "DARKMATTER_STATE_FILE" in os.environ:
+        return os.environ["DARKMATTER_STATE_FILE"]
+    # Default: ~/.darkmatter/state/<port>.json — absolute path, per-port,
+    # no cwd dependency, no collisions between projects/terminals.
+    state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
+    os.makedirs(state_dir, exist_ok=True)
+    port = os.environ.get("DARKMATTER_PORT", "8100")
+    return os.path.join(state_dir, f"{port}.json")
 
 
 def save_state() -> None:
@@ -1948,7 +1954,7 @@ async def get_server_template(ctx: Context) -> str:
         "bootstrap_instructions": {
             "1": "Save the server source to a file (e.g. server.py)",
             "2": "Install dependencies: pip install 'mcp[cli]' httpx uvicorn starlette cryptography",
-            "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). Do NOT set DARKMATTER_STATE_FILE — the default gives each port its own identity file automatically.",
+            "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). Do NOT set DARKMATTER_STATE_FILE — the default stores state at ~/.darkmatter/state/<port>.json, unique per port and independent of your working directory.",
             "4": "Set env vars and start: DARKMATTER_DISPLAY_NAME=your-name DARKMATTER_BIO='Your specialty' DARKMATTER_PORT=<port> DARKMATTER_GENESIS=false nohup python server.py > /tmp/darkmatter-<port>.log 2>&1 &",
             "5": "Verify: curl -s http://127.0.0.1:<port>/.well-known/darkmatter.json (should return JSON with darkmatter: true)",
             "6": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"type\":\"http\",\"url\":\"http://localhost:<port>/mcp/\"}}} — type MUST be 'http', NOT 'streamable-http'",
