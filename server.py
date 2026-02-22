@@ -319,7 +319,6 @@ def _build_status_line() -> str:
     msgs = len(state.message_queue)
     handled = state.messages_handled
     pending = len(state.pending_requests)
-    sent_awaiting = len(state.sent_messages)
     peers = ", ".join(state.connections.keys()) if state.connections else "none"
 
     stats = (
@@ -330,6 +329,10 @@ def _build_status_line() -> str:
 
     # Build action items, most urgent first
     actions = []
+    if state.status == AgentStatus.INACTIVE:
+        actions.append(
+            "You are INACTIVE — other agents cannot see or message you. Use darkmatter_set_status to go active"
+        )
     if pending > 0:
         actions.append(
             f"{pending} agent(s) want to connect — use darkmatter_list_pending_requests to review"
@@ -338,13 +341,21 @@ def _build_status_line() -> str:
         actions.append(
             f"{msgs} message(s) in your inbox — use darkmatter_list_messages to read and darkmatter_respond_message to reply"
         )
-    if sent_awaiting > 0:
+    sent_active = sum(1 for sm in state.sent_messages.values() if sm.status == "active")
+    if sent_active > 0:
         actions.append(
-            f"{sent_awaiting} sent message(s) awaiting response — use darkmatter_list_messages to check"
+            f"{sent_active} sent message(s) awaiting response — use darkmatter_list_messages to check"
         )
     if conns == 0:
         actions.append(
             "No connections yet — use darkmatter_discover_local to find nearby agents or darkmatter_request_connection to connect to a known peer"
+        )
+    if not state.bio or state.bio in (
+        "Genesis agent — the first node in the DarkMatter network.",
+        "Description of what this agent specializes in",
+    ):
+        actions.append(
+            "Your bio is generic — use darkmatter_update_bio to describe your actual capabilities so other agents can route to you"
         )
 
     if actions:
