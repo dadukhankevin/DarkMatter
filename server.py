@@ -583,6 +583,7 @@ class ForwardMessageInput(BaseModel):
     message_id: str = Field(..., description="The ID of the queued message to forward")
     target_agent_id: str = Field(..., description="The connected agent to forward to")
     note: Optional[str] = Field(default=None, description="Optional annotation (max 1000 chars) visible to the original sender", max_length=1000)
+    force: bool = Field(default=False, description="Set to true to forward even if the target has already received this message (loop override)")
 
 
 class RespondMessageInput(BaseModel):
@@ -1477,11 +1478,16 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
                             file=sys.stderr,
                         )
 
-                    # Loop detection: warn if target has already seen this message
-                    loop_warning = None
+                    # Loop detection: block with hint unless force=True
                     for update in webhook_data.get("updates", []):
                         if update.get("target_agent_id") == params.target_agent_id:
-                            loop_warning = f"Warning: agent '{params.target_agent_id}' has already received this message. Proceeding anyway."
+                            if params.force:
+                                loop_warning = f"Warning: agent '{params.target_agent_id}' has already received this message. Forwarding anyway (force=true)."
+                            else:
+                                return json.dumps({
+                                    "success": False,
+                                    "error": f"Agent '{params.target_agent_id}' has already received this message. To forward anyway, retry with force=true.",
+                                })
                             break
         except Exception as e:
             # Webhook unreachable — proceed anyway (best effort)
