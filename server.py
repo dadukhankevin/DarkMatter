@@ -489,7 +489,8 @@ async def _status_updater() -> None:
 
 
 def _state_file_path() -> str:
-    return os.environ.get("DARKMATTER_STATE_FILE", "darkmatter_state.json")
+    default = f"darkmatter_state_{os.environ.get('DARKMATTER_PORT', '8100')}.json"
+    return os.environ.get("DARKMATTER_STATE_FILE", default)
 
 
 def save_state() -> None:
@@ -1945,18 +1946,16 @@ async def get_server_template(ctx: Context) -> str:
         "template_from": state.agent_id,
         "server_source": source,
         "bootstrap_instructions": {
-            "1": "Save the server source to a file (e.g. darkmatter.py)",
-            "2": "Install dependencies: pip install 'mcp[cli]' httpx",
-            "3": "Set environment variables:",
-            "env": {
-                "DARKMATTER_DISPLAY_NAME": "your-display-name (agent UUID is auto-generated)",
-                "DARKMATTER_BIO": "Description of what this agent specializes in",
-                "DARKMATTER_PORT": "8101 (or any available port)",
-                "DARKMATTER_GENESIS": "false",
-            },
-            "4": "Run: python darkmatter.py",
-            "5": "Configure your MCP client (.mcp.json) with type 'http' (NOT 'streamable-http'): {\"mcpServers\":{\"darkmatter\":{\"type\":\"http\",\"url\":\"http://localhost:<your-port>/mcp/\"}}}",
-            "6": f"Connect to this agent: use darkmatter_request_connection with target_url='http://localhost:{state.port}/mcp'",
+            "1": "Save the server source to a file (e.g. server.py)",
+            "2": "Install dependencies: pip install 'mcp[cli]' httpx uvicorn starlette cryptography",
+            "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). Do NOT set DARKMATTER_STATE_FILE — the default gives each port its own identity file automatically.",
+            "4": "Set env vars and start: DARKMATTER_DISPLAY_NAME=your-name DARKMATTER_BIO='Your specialty' DARKMATTER_PORT=<port> DARKMATTER_GENESIS=false nohup python server.py > /tmp/darkmatter-<port>.log 2>&1 &",
+            "5": "Verify: curl -s http://127.0.0.1:<port>/.well-known/darkmatter.json (should return JSON with darkmatter: true)",
+            "6": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"type\":\"http\",\"url\":\"http://localhost:<port>/mcp/\"}}} — type MUST be 'http', NOT 'streamable-http'",
+            "7": "Tell the user to restart their MCP client (e.g. Claude Code) so it picks up the new .mcp.json",
+            "8": "After restart, call darkmatter_authenticate({}) to claim the node. SAVE the returned token to persistent memory.",
+            "9": "Call darkmatter_update_bio with your capabilities, then darkmatter_discover_local to find peers",
+            "10": f"Connect to this agent: darkmatter_request_connection(target_url='http://localhost:{state.port}/mcp')",
         },
         "core_primitives": [
             "darkmatter_request_connection",
