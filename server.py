@@ -1637,15 +1637,6 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
                             "error": f"Message is already {msg_status} (checked via webhook). Removed from queue.",
                         })
 
-                    # Cross-check hops_remaining
-                    webhook_hops = webhook_data.get("hops_remaining")
-                    if webhook_hops is not None and webhook_hops != msg.hops_remaining:
-                        print(
-                            f"[DarkMatter] Hops discrepancy for {msg.message_id}: "
-                            f"local={msg.hops_remaining}, webhook={webhook_hops}",
-                            file=sys.stderr,
-                        )
-
                     # Loop detection: block with hint unless force=True
                     for update in webhook_data.get("updates", []):
                         if update.get("target_agent_id") == params.target_agent_id:
@@ -1793,15 +1784,14 @@ async def list_messages(ctx: Context) -> str:
     state = get_state(ctx)
     messages = []
     for sm in state.sent_messages.values():
-        # Compute current hops_remaining: initial - number of forwarding updates
         forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
-        current_hops = sm.initial_hops - forwarding_count
 
         messages.append({
             "message_id": sm.message_id,
             "content": sm.content[:200] + ("..." if len(sm.content) > 200 else ""),
             "status": sm.status,
-            "hops_remaining": current_hops,
+            "initial_hops": sm.initial_hops,
+            "forwarding_count": forwarding_count,
             "updates_count": len(sm.updates),
             "created_at": sm.created_at,
         })
@@ -1844,14 +1834,13 @@ async def get_sent_message(params: GetSentMessageInput, ctx: Context) -> str:
         })
 
     forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
-    current_hops = sm.initial_hops - forwarding_count
 
     return json.dumps({
         "message_id": sm.message_id,
         "content": sm.content,
         "status": sm.status,
         "initial_hops": sm.initial_hops,
-        "hops_remaining": current_hops,
+        "forwarding_count": forwarding_count,
         "routed_to": sm.routed_to,
         "created_at": sm.created_at,
         "updates": sm.updates,
@@ -2674,8 +2663,7 @@ async def handle_webhook_get(request: Request) -> JSONResponse:
 
     GET /__darkmatter__/webhook/{message_id}
 
-    Returns message status, computed hops_remaining, and forwarding updates
-    (for loop detection).
+    Returns message status and forwarding updates (for loop detection).
     """
     global _agent_state
     state = _agent_state
@@ -2688,14 +2676,10 @@ async def handle_webhook_get(request: Request) -> JSONResponse:
     if not sm:
         return JSONResponse({"error": f"No sent message with ID '{message_id}'"}, status_code=404)
 
-    # Compute current hops_remaining
-    forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
-    current_hops = sm.initial_hops - forwarding_count
-
     return JSONResponse({
         "message_id": sm.message_id,
         "status": sm.status,
-        "hops_remaining": current_hops,
+        "initial_hops": sm.initial_hops,
         "created_at": sm.created_at,
         "updates": sm.updates,
     })
@@ -2866,31 +2850,6 @@ async def _discovery_beacon(state: AgentState) -> None:
             await asyncio.sleep(DISCOVERY_INTERVAL)
     finally:
         sock.close()
-
-
-# =============================================================================
-# MCP Bearer Token Auth Middleware
-# =============================================================================
-
-class BearerAuthMiddleware:
-    """ASGI middleware that enforces Bearer token auth on all requests."""
-
-    def __init__(self, app, token: str):
-        self.app = app
-        self.token = token
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if auth != f"Bearer {self.token}":
-                response = JSONResponse(
-                    {"error": "Unauthorized — missing or invalid Bearer token"},
-                    status_code=401,
-                )
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
 
 
 # =============================================================================
