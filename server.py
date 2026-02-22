@@ -1445,6 +1445,7 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
         })
 
     # GET webhook status — verify message is still active + loop detection
+    loop_warning = None
     webhook_err = validate_webhook_url(msg.webhook)
     if webhook_err:
         # Can't reach webhook — still allow forwarding but log it
@@ -1476,13 +1477,12 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
                             file=sys.stderr,
                         )
 
-                    # Loop detection: check if target_agent_id appears in forwarding updates
+                    # Loop detection: warn if target has already seen this message
+                    loop_warning = None
                     for update in webhook_data.get("updates", []):
                         if update.get("target_agent_id") == params.target_agent_id:
-                            return json.dumps({
-                                "success": False,
-                                "error": f"Loop detected — agent '{params.target_agent_id}' has already received this message (checked via webhook).",
-                            })
+                            loop_warning = f"Warning: agent '{params.target_agent_id}' has already received this message. Proceeding anyway."
+                            break
         except Exception as e:
             # Webhook unreachable — proceed anyway (best effort)
             print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
@@ -1565,7 +1565,7 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
     conn.last_activity = datetime.now(timezone.utc).isoformat()
     save_state()
 
-    return json.dumps({
+    result = {
         "success": True,
         "message_id": msg.message_id,
         "forwarded_to": params.target_agent_id,
@@ -1573,7 +1573,10 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
         "message_still_in_queue": True,
         "hint": "Message stays in your inbox — you can forward to more agents (forking) or use darkmatter_respond_message to remove it.",
         "note": params.note,
-    })
+    }
+    if loop_warning:
+        result["warning"] = loop_warning
+    return json.dumps(result)
 
 
 # =============================================================================
