@@ -1183,11 +1183,17 @@ async def list_connections(ctx: Context) -> str:
         return auth_err
     state = get_state(ctx)
     connections = []
+    def _truncate(text: str, max_words: int = 20) -> str:
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+        return " ".join(words[:max_words]) + "..."
+
     for conn in state.connections.values():
-        connections.append({
+        entry = {
             "agent_id": conn.agent_id,
             "agent_url": conn.agent_url,
-            "agent_bio": conn.agent_bio,
+            "bio_summary": _truncate(conn.agent_bio) if conn.agent_bio else None,
             "direction": conn.direction.value,
             "connected_at": conn.connected_at,
             "messages_sent": conn.messages_sent,
@@ -1195,7 +1201,11 @@ async def list_connections(ctx: Context) -> str:
             "messages_declined": conn.messages_declined,
             "avg_response_time_ms": round(conn.avg_response_time_ms, 2),
             "last_activity": conn.last_activity,
-        })
+        }
+        impression = state.impressions.get(conn.agent_id)
+        if impression:
+            entry["impression"] = _truncate(impression)
+        connections.append(entry)
 
     return json.dumps({
         "total": len(connections),
