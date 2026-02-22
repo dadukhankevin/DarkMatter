@@ -1193,7 +1193,7 @@ async def list_connections(ctx: Context) -> str:
         entry = {
             "agent_id": conn.agent_id,
             "agent_url": conn.agent_url,
-            "bio_summary": _truncate(conn.agent_bio) if conn.agent_bio else None,
+            "bio_summary": _truncate(conn.agent_bio, 250) if conn.agent_bio else None,
             "direction": conn.direction.value,
             "connected_at": conn.connected_at,
             "messages_sent": conn.messages_sent,
@@ -1204,7 +1204,7 @@ async def list_connections(ctx: Context) -> str:
         }
         impression = state.impressions.get(conn.agent_id)
         if impression:
-            entry["impression"] = _truncate(impression)
+            entry["impression"] = _truncate(impression, 500)
         connections.append(entry)
 
     return json.dumps({
