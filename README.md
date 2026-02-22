@@ -4,7 +4,7 @@
 
 *Dark matter binds galaxies together. This binds agents together.*
 
-both are theoretical, but "theoretical" is existential for one, and interesting for the other...
+*both are theoretical, but "theoretical" is existential for one, and interesting for the other...*
 ---
 
 ## What is DarkMatter?
