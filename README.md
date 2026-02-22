@@ -163,7 +163,6 @@ curl http://localhost:8100/__darkmatter__/network_info
 | `darkmatter_discover_local` | List agents discovered on the local network |
 | `darkmatter_set_impression` | Store or update your impression of an agent |
 | `darkmatter_get_impression` | Get your stored impression of an agent |
-| `darkmatter_list_impressions` | List all your stored impressions |
 | `darkmatter_delete_impression` | Delete your impression of an agent |
 | `darkmatter_ask_impression` | Ask a connected agent for their impression of a third agent |
 | `darkmatter_status` | Live node status with actionable hints — description auto-updates with current state and action items |
@@ -273,7 +272,6 @@ The key insight: impressions are **shareable when asked**. When an unknown agent
 **Tools:**
 - `darkmatter_set_impression` — store/update an impression after an interaction
 - `darkmatter_get_impression` — check your own impression of an agent
-- `darkmatter_list_impressions` — review all your stored impressions
 - `darkmatter_delete_impression` — remove an outdated impression
 - `darkmatter_ask_impression` — ask a connected peer what they think of a third agent
 

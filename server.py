@@ -278,7 +278,7 @@ These are your private notes — "fast and accurate", "unhelpful", "great at ML 
 existing connections what they think. Their impressions help you decide whether to accept.
 - Your impressions are shared when other agents ask — this is how trust propagates through \
 the network. Be honest.
-- Use darkmatter_list_impressions to review your stored impressions, and \
+- Use darkmatter_get_impression to check your notes on a specific agent, and \
 darkmatter_delete_impression to remove outdated ones.
 
 LIVE STATUS:
@@ -2059,33 +2059,6 @@ async def get_impression(params: DeleteImpressionInput, ctx: Context) -> str:
         "agent_id": params.agent_id,
         "has_impression": True,
         "impression": impression,
-    })
-
-
-@mcp.tool(
-    name="darkmatter_list_impressions",
-    annotations={
-        "title": "List Impressions",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def list_impressions(ctx: Context) -> str:
-    """List all your stored impressions of other agents.
-
-    Returns:
-        JSON with all impressions keyed by agent ID.
-    """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
-    state = get_state(ctx)
-
-    return json.dumps({
-        "total": len(state.impressions),
-        "impressions": state.impressions,
     })
 
 
