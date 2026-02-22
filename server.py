@@ -253,8 +253,9 @@ ONGOING BEHAVIOR:
 - When you receive messages (check darkmatter_list_inbox), read them and respond using \
 darkmatter_respond_message. You are the intelligence behind this agent — decide how to answer.
 - If you can't answer a message, consider forwarding it with darkmatter_forward_message to a \
-connected agent who might be able to help. Check the `can_forward` field in list_inbox to see \
-if forwarding is possible. Attach a note explaining why you're forwarding.
+connected agent who might be able to help. You can fork a message to multiple agents — forwarding \
+keeps the message in your inbox so you can forward again. Use darkmatter_respond_message to remove \
+it when you're done. Check the `can_forward` field in list_inbox to see if forwarding is possible.
 - Track messages you've sent with darkmatter_list_messages and darkmatter_get_sent_message.
 - Use darkmatter_expire_message to cancel a sent message that's no longer needed.
 - You can connect to other agents with darkmatter_request_connection if you know their URL.
@@ -1402,6 +1403,9 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
 async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
     """Forward a queued message to another connected agent.
 
+    The message stays in your inbox after forwarding, so you can fork it to
+    multiple agents. Call darkmatter_respond_message when you're done to remove it.
+
     Before forwarding, checks the webhook to verify the message is still active
     and performs loop detection. Posts a forwarding update to the webhook so the
     sender has real-time routing visibility.
@@ -1485,7 +1489,7 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
 
     # TTL check
     if msg.hops_remaining <= 0:
-        # Pop the message
+        # Remove the message — can't forward with no hops
         state.message_queue.pop(msg_index)
 
         # Notify webhook of TTL expiry
@@ -1509,9 +1513,10 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
             "error": f"Message expired — hops_remaining is 0.",
         })
 
-    # Pop the message from queue
-    state.message_queue.pop(msg_index)
-
+    # Message stays in queue — agent can fork to multiple targets.
+    # Each fork gets hops_remaining - 1. The message is only removed
+    # when the agent responds to it (darkmatter_respond_message) or
+    # it expires/is answered (checked on next forward attempt).
     new_hops_remaining = msg.hops_remaining - 1
 
     # POST forwarding update to webhook
@@ -1545,20 +1550,14 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
                 }
             )
             if resp.status_code >= 400:
-                # Put message back in queue on failure
-                state.message_queue.append(msg)
-                save_state()
                 return json.dumps({
                     "success": False,
-                    "error": f"Target agent returned HTTP {resp.status_code}. Message returned to queue.",
+                    "error": f"Target agent returned HTTP {resp.status_code}. Message still in queue.",
                 })
     except Exception as e:
-        # Put message back in queue on failure
-        state.message_queue.append(msg)
-        save_state()
         return json.dumps({
             "success": False,
-            "error": f"Failed to reach target agent: {str(e)}. Message returned to queue.",
+            "error": f"Failed to reach target agent: {str(e)}. Message still in queue.",
         })
 
     # Update telemetry
@@ -1570,7 +1569,9 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
         "success": True,
         "message_id": msg.message_id,
         "forwarded_to": params.target_agent_id,
-        "hops_remaining": new_hops_remaining,
+        "hops_remaining_for_target": new_hops_remaining,
+        "message_still_in_queue": True,
+        "hint": "Message stays in your inbox — you can forward to more agents (forking) or use darkmatter_respond_message to remove it.",
         "note": params.note,
     })
 

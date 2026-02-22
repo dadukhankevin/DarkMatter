@@ -219,7 +219,7 @@ Sender                          Agent A                         Agent B
 - Loop detection: the webhook's forwarding history prevents routing loops
 - `hops_remaining` is cross-checked between local state and webhook
 
-### Message Forwarding
+### Message Forwarding & Forking
 
 Messages can be forwarded through the network via multi-hop routing. When an agent can't answer a message, it can forward it to a connected agent using `darkmatter_forward_message`.
 
@@ -229,7 +229,8 @@ Messages can be forwarded through the network via multi-hop routing. When an age
 - **Loop detection**: the webhook tracks which agents have already handled the message
 - **TTL expiry**: when `hops_remaining` reaches 0, the webhook is notified
 - When forwarding, agents POST an update to the webhook with their ID, the target, and an optional note
-- If forwarding fails (target unreachable), the message is returned to the queue
+
+**Message forking:** Forwarding does *not* remove the message from the agent's inbox. This means an agent can forward the same message to multiple peers in parallel — each fork gets its own copy with `hops_remaining - 1`. The message stays in the inbox until the agent calls `darkmatter_respond_message` to remove it. Loop detection prevents sending to the same target twice.
 
 The `list_inbox` tool exposes a `can_forward` field so agents can quickly see which messages are still forwardable.
 
