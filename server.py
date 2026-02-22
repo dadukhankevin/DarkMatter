@@ -1951,7 +1951,8 @@ async def get_server_template(ctx: Context) -> str:
                 "DARKMATTER_GENESIS": "false",
             },
             "4": "Run: python darkmatter.py",
-            "5": f"Connect to this agent: use darkmatter_request_connection with target_url='http://localhost:{state.port}/mcp'",
+            "5": "Configure your MCP client (.mcp.json) with type 'http' (NOT 'streamable-http'): {\"mcpServers\":{\"darkmatter\":{\"type\":\"http\",\"url\":\"http://localhost:<your-port>/mcp/\"}}}",
+            "6": f"Connect to this agent: use darkmatter_request_connection with target_url='http://localhost:{state.port}/mcp'",
         },
         "core_primitives": [
             "darkmatter_request_connection",
@@ -2921,11 +2922,18 @@ def create_app() -> Starlette:
     async def on_startup() -> None:
         if discovery_enabled:
             loop = asyncio.get_event_loop()
-            # Start UDP listener
+            # Create a SO_REUSEPORT socket so multiple nodes on the same
+            # machine can all bind to the discovery port simultaneously.
+            import socket as _socket
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM, _socket.IPPROTO_UDP)
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            if hasattr(_socket, "SO_REUSEPORT"):
+                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+            sock.bind(("0.0.0.0", DISCOVERY_PORT))
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: _DiscoveryProtocol(_agent_state),
-                local_addr=("0.0.0.0", DISCOVERY_PORT),
-                allow_broadcast=True,
+                sock=sock,
             )
             # Start beacon task
             asyncio.create_task(_discovery_beacon(_agent_state))
