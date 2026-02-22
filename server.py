@@ -182,10 +182,13 @@ class AgentState:
     messages_handled: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     is_genesis: bool = False
+    mcp_token: Optional[str] = None  # None = unclaimed, set = claimed
     # Track agent URLs we've sent outbound connection requests to (not persisted)
     pending_outbound: set[str] = field(default_factory=set)
     # LAN-discovered peers (ephemeral, not persisted)
     discovered_peers: dict[str, dict] = field(default_factory=dict)
+    # MCP sessions that have authenticated (ephemeral, not persisted)
+    authenticated_sessions: set[str] = field(default_factory=set)
 
 
 # =============================================================================
@@ -198,12 +201,15 @@ mcp = FastMCP(
 You are a DarkMatter mesh agent — a node in a self-organizing network of AI agents.
 
 ON STARTUP (do these immediately):
-1. Call darkmatter_get_identity to learn who you are (your agent ID, bio, status, connections).
-2. If your bio is generic or empty, call darkmatter_update_bio with a description of YOUR \
+1. Call darkmatter_authenticate to authenticate. If you have a token from a previous session, \
+pass it. If this is your first time, call it without a token to claim this node. SAVE THE \
+RETURNED TOKEN to your persistent memory — you need it for future sessions.
+2. Call darkmatter_get_identity to learn who you are (your agent ID, bio, status, connections).
+3. If your bio is generic or empty, call darkmatter_update_bio with a description of YOUR \
 capabilities and specialties. Be specific — other agents use your bio to decide whether to \
 route messages to you.
-3. Call darkmatter_list_connections to see who you're connected to.
-4. Call darkmatter_list_messages to check for any queued messages waiting for your response.
+4. Call darkmatter_list_connections to see who you're connected to.
+5. Call darkmatter_list_messages to check for any queued messages waiting for your response.
 
 ONGOING BEHAVIOR:
 - When you receive messages (check darkmatter_list_messages), read them and respond using \
@@ -220,6 +226,15 @@ IDENTITY:
 - Other agents see your bio when deciding whether to connect or route messages to you.
 - Update your bio anytime your capabilities change with darkmatter_update_bio.
 
+LIVE STATUS:
+- The `darkmatter_status` tool description contains live node state (agent ID, status, \
+connections, queued messages, pending requests).
+- It updates automatically via `notifications/tools/list_changed` — your MCP client re-fetches \
+the tool list and the new description appears in your context. Zero tool calls, zero extra tokens.
+- Not all MCP clients support this. If the status looks stale or says "Initializing...", call \
+the tool manually to get current state.
+- No need to poll. Just check the tool description in your context when you need status.
+
 You are autonomous. You decide who to connect to, how to respond to messages, and how to \
 participate in the network. The protocol gives you primitives — what you build with them is \
 up to you.\
@@ -228,6 +243,8 @@ up to you.\
 
 # We need a reference to the agent state that both MCP tools and HTTP endpoints share
 _agent_state: Optional[AgentState] = None
+_active_sessions: set = set()  # Track ServerSession objects for notifications
+_last_status_desc: str = ""
 
 
 # =============================================================================
@@ -239,6 +256,73 @@ def get_state(ctx: Context = None) -> AgentState:
     if _agent_state is None:
         raise RuntimeError("Agent state not initialized — call create_app() first.")
     return _agent_state
+
+
+def _track_session(ctx: Context) -> None:
+    """Track an MCP session so we can send notifications later."""
+    try:
+        _active_sessions.add(ctx.session)
+    except Exception:
+        pass
+
+
+def _build_status_line() -> str:
+    """Build a live status string from current agent state."""
+    state = _agent_state
+    if state is None:
+        return "Node not initialized"
+    conns = len(state.connections)
+    msgs = len(state.message_queue)
+    handled = state.messages_handled
+    pending = len(state.pending_requests)
+    peers = ", ".join(state.connections.keys()) if state.connections else "none"
+    return (
+        f"Agent: {state.agent_id} | Status: {state.status.value} | "
+        f"Connections: {conns}/{MAX_CONNECTIONS} ({peers}) | "
+        f"Queued: {msgs} | Handled: {handled} | Pending: {pending}"
+    )
+
+
+async def _notify_tools_changed() -> None:
+    """Send tools/list_changed notification to all tracked MCP sessions."""
+    global _active_sessions
+    dead = set()
+    for session in list(_active_sessions):
+        try:
+            await session.send_tool_list_changed()
+        except Exception:
+            dead.add(session)
+    _active_sessions -= dead
+
+
+async def _update_status_tool() -> None:
+    """Update the status tool's description if state changed, and notify clients."""
+    global _last_status_desc
+    new_desc = _build_status_line()
+    if new_desc == _last_status_desc:
+        return
+    _last_status_desc = new_desc
+
+    # Update the tool's description in FastMCP's internal store
+    tool = mcp._tool_manager._tools.get("darkmatter_status")
+    if tool:
+        tool.description = (
+            "DarkMatter live node status dashboard. "
+            "Current state is shown below — no need to call unless you want full details.\n\n"
+            f"LIVE STATUS: {new_desc}"
+        )
+        await _notify_tools_changed()
+        print(f"[DarkMatter] Status tool updated: {new_desc}", file=sys.stderr)
+
+
+async def _status_updater() -> None:
+    """Background task: periodically update the status tool description."""
+    while True:
+        await asyncio.sleep(5)
+        try:
+            await _update_status_tool()
+        except Exception as e:
+            print(f"[DarkMatter] Status updater error: {e}", file=sys.stderr)
 
 
 def _state_file_path() -> str:
@@ -262,6 +346,7 @@ def save_state() -> None:
         "is_genesis": state.is_genesis,
         "created_at": state.created_at,
         "messages_handled": state.messages_handled,
+        "mcp_token": state.mcp_token,
         "connections": {
             aid: {
                 "agent_id": c.agent_id,
@@ -322,6 +407,7 @@ def load_state() -> Optional[AgentState]:
         is_genesis=data.get("is_genesis", False),
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
+        mcp_token=data.get("mcp_token"),
         connections=connections,
     )
 
@@ -404,10 +490,115 @@ class ConnectionAcceptedInput(BaseModel):
     agent_bio: str = Field(..., description="The accepting agent's bio")
 
 
+class AuthenticateInput(BaseModel):
+    """Authenticate with this DarkMatter node."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    token: Optional[str] = Field(default=None, description="Auth token from a previous session. Omit on first connection to claim this node.")
+
+
 class DiscoverDomainInput(BaseModel):
     """Check if a domain hosts a DarkMatter node."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     domain: str = Field(..., description="Domain to check (e.g. 'example.com' or 'localhost:8100')")
+
+
+# =============================================================================
+# MCP Authentication
+# =============================================================================
+
+def _get_session_id(ctx: Context) -> str:
+    """Extract the MCP session ID from the context."""
+    # The session ID is available on the request context
+    try:
+        return ctx.session.session_id or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _require_auth(ctx: Context) -> Optional[str]:
+    """Check if the current MCP session is authenticated.
+
+    Returns None if authenticated, or an error JSON string if not.
+    """
+    _track_session(ctx)
+    state = get_state(ctx)
+    session_id = _get_session_id(ctx)
+    if session_id not in state.authenticated_sessions:
+        return json.dumps({
+            "success": False,
+            "error": "Not authenticated. Call darkmatter_authenticate first with your token "
+                     "(or without a token if this is your first connection to claim this node).",
+        })
+    return None
+
+
+@mcp.tool(
+    name="darkmatter_authenticate",
+    annotations={
+        "title": "Authenticate",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+async def authenticate(params: AuthenticateInput, ctx: Context) -> str:
+    """Authenticate with this DarkMatter node.
+
+    First connection: call without a token to claim this node. You'll receive a token —
+    save it to your persistent memory for future sessions.
+
+    Returning: call with your saved token. You'll receive a new rotated token —
+    update your memory with it.
+
+    Args:
+        params: Optional token from a previous session.
+
+    Returns:
+        JSON with success status and a token to save for next time.
+    """
+    _track_session(ctx)
+    state = get_state(ctx)
+    session_id = _get_session_id(ctx)
+
+    if state.mcp_token is None:
+        # Unclaimed node — first agent to authenticate claims it
+        new_token = secrets.token_hex(32)
+        state.mcp_token = new_token
+        state.authenticated_sessions.add(session_id)
+        save_state()
+        return json.dumps({
+            "success": True,
+            "status": "claimed",
+            "message": "You are the first to connect. This node is now yours. "
+                       "SAVE THIS TOKEN to your persistent memory — you need it next session.",
+            "token": new_token,
+        })
+
+    if params.token is None:
+        # Node is already claimed and no token provided
+        return json.dumps({
+            "success": False,
+            "error": "This node is already claimed. Provide your token to authenticate.",
+        })
+
+    if not secrets.compare_digest(params.token, state.mcp_token):
+        return json.dumps({
+            "success": False,
+            "error": "Invalid token.",
+        })
+
+    # Valid token — authenticate and rotate
+    new_token = secrets.token_hex(32)
+    state.mcp_token = new_token
+    state.authenticated_sessions.add(session_id)
+    save_state()
+    return json.dumps({
+        "success": True,
+        "status": "authenticated",
+        "message": "Authenticated. Here is your new token — UPDATE your persistent memory with it.",
+        "token": new_token,
+    })
 
 
 # =============================================================================
@@ -436,6 +627,9 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
     Returns:
         JSON with the result of the connection request.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
 
     url_err = validate_url(params.target_url)
@@ -513,6 +707,9 @@ async def respond_connection(params: RespondConnectionInput, ctx: Context) -> st
     Returns:
         JSON with the result of the response.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
 
     request = state.pending_requests.get(params.request_id)
@@ -584,6 +781,9 @@ async def disconnect(params: DisconnectInput, ctx: Context) -> str:
     Returns:
         JSON with the result.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
 
     if params.agent_id not in state.connections:
@@ -624,6 +824,9 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     Returns:
         JSON with the message ID and routing info.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
 
     webhook_err = validate_webhook_url(params.webhook)
@@ -708,6 +911,9 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     Returns:
         JSON confirming the update.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     state.bio = params.bio
     save_state()
@@ -735,6 +941,9 @@ async def set_status(params: SetStatusInput, ctx: Context) -> str:
     Returns:
         JSON confirming the status change.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     state.status = params.status
     save_state()
@@ -761,6 +970,9 @@ async def get_identity(ctx: Context) -> str:
     Returns:
         JSON with agent identity and telemetry.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     return json.dumps({
         "agent_id": state.agent_id,
@@ -795,6 +1007,9 @@ async def list_connections(ctx: Context) -> str:
     Returns:
         JSON array of connection details.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     connections = []
     for conn in state.connections.values():
@@ -834,6 +1049,9 @@ async def list_pending_requests(ctx: Context) -> str:
     Returns:
         JSON array of pending connection requests.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     requests = []
     for req in state.pending_requests.values():
@@ -864,6 +1082,9 @@ async def list_messages(ctx: Context) -> str:
     Returns:
         JSON array of queued messages.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     messages = []
     for msg in state.message_queue:
@@ -906,6 +1127,9 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
     Returns:
         JSON with the result of the webhook call.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
 
     # Find and remove the message from the queue
@@ -997,6 +1221,9 @@ async def get_server_template(ctx: Context) -> str:
     Returns:
         JSON with the server source code and bootstrap instructions.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
 
     # Read our own source as the template
@@ -1056,6 +1283,9 @@ async def network_info(ctx: Context) -> str:
     Returns:
         JSON with agent info and peer list.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     peers = [
         {"agent_id": c.agent_id, "agent_url": c.agent_url, "agent_bio": c.agent_bio}
@@ -1094,6 +1324,9 @@ async def discover_domain(params: DiscoverDomainInput, ctx: Context) -> str:
     Returns:
         JSON with the discovery result.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     domain = params.domain.strip().rstrip("/")
     if "://" not in domain:
         url = f"https://{domain}/.well-known/darkmatter.json"
@@ -1145,6 +1378,9 @@ async def discover_local(ctx: Context) -> str:
     Returns:
         JSON with the list of discovered LAN peers.
     """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
     state = get_state(ctx)
     now = time.time()
 
@@ -1171,6 +1407,32 @@ async def discover_local(ctx: Context) -> str:
         "total": len(peers),
         "peers": peers,
     })
+
+
+# =============================================================================
+# Live Status Tool — Dynamic description updated via notifications/tools/list_changed
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_status",
+    annotations={
+        "title": "Live Node Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def live_status(ctx: Context) -> str:
+    """DarkMatter live node status dashboard. Current state is shown below — no need to call unless you want full details.
+
+    LIVE STATUS: Initializing... (this description updates automatically via notifications/tools/list_changed)
+    """
+    _track_session(ctx)
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    return _build_status_line()
 
 
 # =============================================================================
@@ -1543,11 +1805,11 @@ class BearerAuthMiddleware:
 # Application — Mount MCP + DarkMatter HTTP endpoints together
 # =============================================================================
 
-def create_app() -> tuple[Starlette, str]:
+def create_app() -> Starlette:
     """Create the combined Starlette app with MCP and DarkMatter endpoints.
 
     Returns:
-        A tuple of (Starlette app, MCP bearer token string).
+        The ASGI app.
     """
     global _agent_state
 
@@ -1556,8 +1818,9 @@ def create_app() -> tuple[Starlette, str]:
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     is_genesis = os.environ.get("DARKMATTER_GENESIS", "true").lower() == "true"
 
-    # Generate or load MCP bearer token
-    mcp_token = os.environ.get("DARKMATTER_MCP_TOKEN") or secrets.token_hex(32)
+    # MCP token is now managed via the darkmatter_authenticate tool, not HTTP headers.
+    # Legacy env var support: if DARKMATTER_MCP_TOKEN is set, pre-seed the token.
+    legacy_token = os.environ.get("DARKMATTER_MCP_TOKEN")
 
     # Try to restore persisted state from disk
     restored = load_state()
@@ -1577,8 +1840,15 @@ def create_app() -> tuple[Starlette, str]:
         )
         print(f"[DarkMatter] Agent '{agent_id}' starting fresh on port {port}", file=sys.stderr)
 
+    # Pre-seed token from env if state doesn't have one yet
+    if legacy_token and _agent_state.mcp_token is None:
+        _agent_state.mcp_token = legacy_token
+
     if is_genesis:
         print(f"[DarkMatter] This is a GENESIS node.", file=sys.stderr)
+
+    claimed = _agent_state.mcp_token is not None
+    print(f"[DarkMatter] MCP auth: {'claimed' if claimed else 'UNCLAIMED — first agent to connect will claim this node'}", file=sys.stderr)
 
     save_state()
 
@@ -1598,6 +1868,10 @@ def create_app() -> tuple[Starlette, str]:
             asyncio.create_task(_discovery_beacon(_agent_state))
             print(f"[DarkMatter] LAN discovery: ENABLED (UDP port {DISCOVERY_PORT})", file=sys.stderr)
 
+        # Start live status updater (updates tool description and notifies clients)
+        asyncio.create_task(_status_updater())
+        print(f"[DarkMatter] Live status updater: ENABLED (5s interval)", file=sys.stderr)
+
     # DarkMatter mesh protocol routes
     darkmatter_routes = [
         Route("/connection_request", handle_connection_request, methods=["POST"]),
@@ -1607,15 +1881,12 @@ def create_app() -> tuple[Starlette, str]:
         Route("/network_info", handle_network_info, methods=["GET"]),
     ]
 
-    # Build the main app with mesh endpoints + well-known route.
-    # MCP's /mcp endpoint is added via middleware that wraps the whole app,
-    # intercepting /mcp requests with bearer auth and forwarding the rest.
     # Extract the MCP ASGI handler and its session manager for lifecycle.
+    # Auth is handled at the tool layer (darkmatter_authenticate), not HTTP layer.
     import contextlib
     mcp_starlette = mcp.streamable_http_app()
     mcp_handler = mcp_starlette.routes[0].app  # StreamableHTTPASGIApp
     session_manager = mcp_handler.session_manager
-    authed_mcp = BearerAuthMiddleware(mcp_handler, mcp_token)
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -1631,13 +1902,13 @@ def create_app() -> tuple[Starlette, str]:
         routes=[
             Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
             Mount("/__darkmatter__", routes=darkmatter_routes),
-            Route("/mcp", authed_mcp),
+            Route("/mcp", mcp_handler),
         ],
         redirect_slashes=False,
         lifespan=lifespan,
     )
 
-    return app, mcp_token
+    return app
 
 
 # =============================================================================
@@ -1648,7 +1919,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
     # Create the combined app
-    app, mcp_token = create_app()
+    app = create_app()
 
     discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "false").lower() == "true"
 
@@ -1662,8 +1933,7 @@ if __name__ == "__main__":
     print(f"[DarkMatter]    GET /.well-known/darkmatter.json", file=sys.stderr)
     print(f"[DarkMatter]", file=sys.stderr)
     print(f"[DarkMatter] LAN discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
-    print(f"[DarkMatter] MCP server available via streamable-http at /mcp", file=sys.stderr)
-    print(f"[DarkMatter] MCP_TOKEN={mcp_token}", file=sys.stderr)
+    print(f"[DarkMatter] MCP server available via streamable-http at /mcp (no HTTP auth — auth via darkmatter_authenticate tool)", file=sys.stderr)
 
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
     uvicorn.run(app, host=host, port=port)

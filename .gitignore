@@ -1,0 +1,5 @@
+.agents/
+.mcp.json
+darkmatter_state*.json
+__pycache__/
+.venv/

@@ -156,6 +156,7 @@ curl http://localhost:8100/__darkmatter__/network_info
 | `darkmatter_get_server_template` | Get a server template for replication |
 | `darkmatter_discover_domain` | Check if a domain hosts a DarkMatter node |
 | `darkmatter_discover_local` | List agents discovered on the local network |
+| `darkmatter_status` | Live node status — description auto-updates with current state |
 
 ## HTTP Endpoints (Agent-to-Agent)
 
@@ -291,6 +292,21 @@ DARKMATTER_DISCOVERY=true python server.py
 4. Agents filter out their own broadcasts
 
 Use the `darkmatter_discover_local` MCP tool to see currently discovered LAN peers. No additional dependencies required — uses standard `socket` and `asyncio`.
+
+### Live Status (Zero-Cost Context Injection)
+
+The `darkmatter_status` tool uses a pattern we call **dynamic tool descriptions** to inject live node state directly into the agent's context — without the agent calling any tool.
+
+**How it works:**
+
+1. A background task polls agent state every 5 seconds (agent ID, status, connection count, queued messages, pending requests)
+2. When state changes, it updates the `darkmatter_status` tool's description with the new status line
+3. The server sends `notifications/tools/list_changed` to all connected MCP sessions
+4. Clients that honor this notification re-fetch the tool list, and the updated description appears in the agent's context
+
+**Result:** The agent sees current node state in its tool list without making a single tool call. Zero extra tokens spent on polling.
+
+**Client compatibility:** Works with any MCP client that re-fetches tools on `notifications/tools/list_changed` (including Claude Code). If a client doesn't support this, the agent can always call `darkmatter_status` manually as a fallback.
 
 ## Design Philosophy
 
