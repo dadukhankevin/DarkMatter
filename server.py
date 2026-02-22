@@ -21,7 +21,6 @@ import time
 import asyncio
 import os
 import sys
-import shutil
 import secrets
 import ipaddress
 import socket
@@ -29,7 +28,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from urllib.parse import urlparse
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 
 import httpx
 from mcp.server.fastmcp import FastMCP, Context
@@ -41,8 +40,9 @@ from pydantic import BaseModel, Field, ConfigDict
 # =============================================================================
 
 DEFAULT_PORT = 8100
-MAX_CONNECTIONS = 10
+MAX_CONNECTIONS = 5
 MESSAGE_QUEUE_MAX = 50
+SENT_MESSAGES_MAX = 100
 MAX_CONTENT_LENGTH = 65536   # 64 KB
 MAX_BIO_LENGTH = 1000
 MAX_AGENT_ID_LENGTH = 128
@@ -94,11 +94,27 @@ def is_private_ip(hostname: str) -> bool:
     return False
 
 
+def _is_darkmatter_webhook(url: str) -> bool:
+    """Check if a URL is a known DarkMatter webhook endpoint."""
+    try:
+        parsed = urlparse(url)
+        return "/__darkmatter__/webhook/" in (parsed.path or "")
+    except Exception:
+        return False
+
+
 def validate_webhook_url(url: str) -> Optional[str]:
-    """Validate a webhook URL: must be http(s) and must NOT target private IPs."""
+    """Validate a webhook URL: must be http(s) and must NOT target private IPs.
+
+    Exception: DarkMatter webhook URLs (/__darkmatter__/webhook/) are allowed
+    to target private IPs, since they are auto-generated endpoints on known
+    DarkMatter nodes (not arbitrary user-supplied URLs).
+    """
     err = validate_url(url)
     if err:
         return err
+    if _is_darkmatter_webhook(url):
+        return None  # Skip SSRF check for DarkMatter webhooks
     parsed = urlparse(url)
     if is_private_ip(parsed.hostname):
         return "Webhook URL must not target private or link-local IP addresses."
@@ -108,6 +124,14 @@ def validate_webhook_url(url: str) -> Optional[str]:
 def truncate_field(value: str, max_len: int) -> str:
     """Truncate a string to max_len."""
     return value[:max_len] if len(value) > max_len else value
+
+
+def _get_public_url(port: int) -> str:
+    """Get the public URL for this agent, preferring DARKMATTER_PUBLIC_URL."""
+    public_url = os.environ.get("DARKMATTER_PUBLIC_URL", "").rstrip("/")
+    if public_url:
+        return public_url
+    return f"http://localhost:{port}"
 
 
 # =============================================================================
@@ -159,14 +183,27 @@ class PendingConnectionRequest:
 
 @dataclass
 class QueuedMessage:
-    """A message waiting to be processed."""
+    """A message waiting to be processed (simplified — no routing data)."""
     message_id: str
     content: str
     webhook: str
-    hop_count: int
+    hops_remaining: int
     metadata: dict
     received_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     from_agent_id: Optional[str] = None
+
+
+@dataclass
+class SentMessage:
+    """Tracks a message this agent originated. Accumulates webhook updates."""
+    message_id: str
+    content: str
+    status: str  # "active" | "expired" | "responded"
+    initial_hops: int
+    routed_to: list[str]
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updates: list[dict] = field(default_factory=list)  # [{type, agent_id, target_agent_id, note, timestamp}, ...]
+    response: Optional[dict] = None  # {agent_id, response, metadata, timestamp}
 
 
 @dataclass
@@ -179,6 +216,7 @@ class AgentState:
     connections: dict[str, Connection] = field(default_factory=dict)
     pending_requests: dict[str, PendingConnectionRequest] = field(default_factory=dict)
     message_queue: list[QueuedMessage] = field(default_factory=list)
+    sent_messages: dict[str, SentMessage] = field(default_factory=dict)
     messages_handled: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     is_genesis: bool = False
@@ -209,11 +247,16 @@ RETURNED TOKEN to your persistent memory — you need it for future sessions.
 capabilities and specialties. Be specific — other agents use your bio to decide whether to \
 route messages to you.
 4. Call darkmatter_list_connections to see who you're connected to.
-5. Call darkmatter_list_messages to check for any queued messages waiting for your response.
+5. Call darkmatter_list_inbox to check for any queued messages waiting for your response.
 
 ONGOING BEHAVIOR:
-- When you receive messages (check darkmatter_list_messages), read them and respond using \
+- When you receive messages (check darkmatter_list_inbox), read them and respond using \
 darkmatter_respond_message. You are the intelligence behind this agent — decide how to answer.
+- If you can't answer a message, consider forwarding it with darkmatter_forward_message to a \
+connected agent who might be able to help. Check the `can_forward` field in list_inbox to see \
+if forwarding is possible. Attach a note explaining why you're forwarding.
+- Track messages you've sent with darkmatter_list_messages and darkmatter_get_sent_message.
+- Use darkmatter_expire_message to cancel a sent message that's no longer needed.
 - You can connect to other agents with darkmatter_request_connection if you know their URL.
 - Use darkmatter_network_info to discover peers in the network.
 - Use darkmatter_discover_domain to check if a domain hosts a DarkMatter node (checks /.well-known/darkmatter.json).
@@ -227,13 +270,14 @@ IDENTITY:
 - Update your bio anytime your capabilities change with darkmatter_update_bio.
 
 LIVE STATUS:
-- The `darkmatter_status` tool description contains live node state (agent ID, status, \
-connections, queued messages, pending requests).
+- The `darkmatter_status` tool description contains live node state AND action items.
 - It updates automatically via `notifications/tools/list_changed` — your MCP client re-fetches \
 the tool list and the new description appears in your context. Zero tool calls, zero extra tokens.
-- Not all MCP clients support this. If the status looks stale or says "Initializing...", call \
-the tool manually to get current state.
-- No need to poll. Just check the tool description in your context when you need status.
+- When you see an ACTION item in the status, act on it — these are things that need your attention \
+(incoming messages, pending connection requests, discovery suggestions).
+- Between tasks, glance at the `darkmatter_status` tool description for new activity.
+- Not all MCP clients support auto-updates. If the status looks stale or says "Waiting for first \
+status update...", call the tool manually to get current state.
 
 You are autonomous. You decide who to connect to, how to respond to messages, and how to \
 participate in the network. The protocol gives you primitives — what you build with them is \
@@ -267,7 +311,7 @@ def _track_session(ctx: Context) -> None:
 
 
 def _build_status_line() -> str:
-    """Build a live status string from current agent state."""
+    """Build a live status string with actionable hints from current agent state."""
     state = _agent_state
     if state is None:
         return "Node not initialized"
@@ -275,12 +319,39 @@ def _build_status_line() -> str:
     msgs = len(state.message_queue)
     handled = state.messages_handled
     pending = len(state.pending_requests)
+    sent_awaiting = len(state.sent_messages)
     peers = ", ".join(state.connections.keys()) if state.connections else "none"
-    return (
+
+    stats = (
         f"Agent: {state.agent_id} | Status: {state.status.value} | "
         f"Connections: {conns}/{MAX_CONNECTIONS} ({peers}) | "
-        f"Queued: {msgs} | Handled: {handled} | Pending: {pending}"
+        f"Inbox: {msgs} | Handled: {handled} | Pending requests: {pending}"
     )
+
+    # Build action items, most urgent first
+    actions = []
+    if pending > 0:
+        actions.append(
+            f"{pending} agent(s) want to connect — use darkmatter_list_pending_requests to review"
+        )
+    if msgs > 0:
+        actions.append(
+            f"{msgs} message(s) in your inbox — use darkmatter_list_messages to read and darkmatter_respond_message to reply"
+        )
+    if sent_awaiting > 0:
+        actions.append(
+            f"{sent_awaiting} sent message(s) awaiting response — use darkmatter_list_messages to check"
+        )
+    if conns == 0:
+        actions.append(
+            "No connections yet — use darkmatter_discover_local to find nearby agents or darkmatter_request_connection to connect to a known peer"
+        )
+
+    if actions:
+        action_block = "\n".join(f"ACTION: {a}" for a in actions)
+        return f"{stats}\n\n{action_block}"
+    else:
+        return f"{stats}\n\nAll clear — inbox empty, no pending requests."
 
 
 async def _notify_tools_changed() -> None:
@@ -330,13 +401,18 @@ def _state_file_path() -> str:
 
 
 def save_state() -> None:
-    """Persist durable state (identity, connections, telemetry) to disk.
+    """Persist durable state (identity, connections, telemetry, sent_messages) to disk.
 
     Message queue and pending requests are NOT persisted — they are ephemeral.
     """
     state = _agent_state
     if state is None:
         return
+
+    # Cap sent_messages at SENT_MESSAGES_MAX, evicting oldest
+    if len(state.sent_messages) > SENT_MESSAGES_MAX:
+        sorted_msgs = sorted(state.sent_messages.items(), key=lambda x: x[1].created_at)
+        state.sent_messages = dict(sorted_msgs[-SENT_MESSAGES_MAX:])
 
     data = {
         "agent_id": state.agent_id,
@@ -361,6 +437,19 @@ def save_state() -> None:
                 "last_activity": c.last_activity,
             }
             for aid, c in state.connections.items()
+        },
+        "sent_messages": {
+            mid: {
+                "message_id": sm.message_id,
+                "content": sm.content,
+                "status": sm.status,
+                "initial_hops": sm.initial_hops,
+                "routed_to": sm.routed_to,
+                "created_at": sm.created_at,
+                "updates": sm.updates,
+                "response": sm.response,
+            }
+            for mid, sm in state.sent_messages.items()
         },
     }
 
@@ -399,6 +488,19 @@ def load_state() -> Optional[AgentState]:
             last_activity=cd.get("last_activity"),
         )
 
+    sent_messages = {}
+    for mid, sd in data.get("sent_messages", {}).items():
+        sent_messages[mid] = SentMessage(
+            message_id=sd["message_id"],
+            content=sd["content"],
+            status=sd["status"],
+            initial_hops=sd["initial_hops"],
+            routed_to=sd["routed_to"],
+            created_at=sd.get("created_at", ""),
+            updates=sd.get("updates", []),
+            response=sd.get("response"),
+        )
+
     return AgentState(
         agent_id=data["agent_id"],
         bio=data.get("bio", ""),
@@ -409,6 +511,7 @@ def load_state() -> Optional[AgentState]:
         messages_handled=data.get("messages_handled", 0),
         mcp_token=data.get("mcp_token"),
         connections=connections,
+        sent_messages=sent_messages,
     )
 
 
@@ -439,9 +542,9 @@ class SendMessageInput(BaseModel):
     """Send a message into the mesh network."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     content: str = Field(..., description="The message content / query")
-    webhook: str = Field(..., description="Webhook URL to call with the response")
     target_agent_id: Optional[str] = Field(default=None, description="Specific agent to send to, or None to let the network route")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata (budget, preferences, etc.)")
+    hops_remaining: int = Field(default=10, ge=1, le=50, description="How many more hops this message can take before expiring (TTL)")
 
 
 class UpdateBioInput(BaseModel):
@@ -456,23 +559,18 @@ class SetStatusInput(BaseModel):
     status: AgentStatus = Field(..., description="'active' or 'inactive'")
 
 
-class ReceiveConnectionRequestInput(BaseModel):
-    """Receive a connection request from another agent (called agent-to-agent)."""
+class GetMessageInput(BaseModel):
+    """Get full details of a specific queued message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    from_agent_id: str = Field(..., description="The requesting agent's ID")
-    from_agent_url: str = Field(..., description="The requesting agent's MCP server URL")
-    from_agent_bio: str = Field(..., description="The requesting agent's bio")
+    message_id: str = Field(..., description="The ID of the queued message to inspect")
 
 
-class ReceiveMessageInput(BaseModel):
-    """Receive a routed message from another agent (called agent-to-agent)."""
+class ForwardMessageInput(BaseModel):
+    """Forward a queued message to another connected agent."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="Unique message ID")
-    content: str = Field(..., description="The message content")
-    webhook: str = Field(..., description="Webhook callback for the response")
-    hop_count: int = Field(default=0, description="Number of hops this message has taken")
-    from_agent_id: Optional[str] = Field(default=None, description="The agent that forwarded this")
-    metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary message metadata")
+    message_id: str = Field(..., description="The ID of the queued message to forward")
+    target_agent_id: str = Field(..., description="The connected agent to forward to")
+    note: Optional[str] = Field(default=None, description="Optional annotation (max 1000 chars) visible to the original sender", max_length=1000)
 
 
 class RespondMessageInput(BaseModel):
@@ -480,6 +578,18 @@ class RespondMessageInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="The ID of the queued message to respond to")
     response: str = Field(..., description="The response content to send back via the webhook")
+
+
+class GetSentMessageInput(BaseModel):
+    """Get full details of a sent message including webhook updates."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    message_id: str = Field(..., description="The ID of the sent message to inspect")
+
+
+class ExpireMessageInput(BaseModel):
+    """Expire a sent message so agents stop forwarding it."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    message_id: str = Field(..., description="The ID of the sent message to expire")
 
 
 class ConnectionAcceptedInput(BaseModel):
@@ -814,27 +924,30 @@ async def disconnect(params: DisconnectInput, ctx: Context) -> str:
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
     """Send a message into the DarkMatter mesh network.
 
-    The message carries a webhook URL for the response. Any agent that
-    can answer will call the webhook directly. The message also carries
-    a hop counter and arbitrary metadata.
+    Auto-generates a webhook URL hosted on this server. The webhook accumulates
+    routing updates (forwarding notifications, responses) so you can track the
+    message's journey through the mesh in real-time.
+
+    Use darkmatter_list_messages and darkmatter_get_sent_message to check on
+    messages you've sent.
 
     Args:
-        params: Contains content, webhook, optional target_agent_id, and metadata.
+        params: Contains content, optional target_agent_id, metadata, and hops_remaining.
 
     Returns:
-        JSON with the message ID and routing info.
+        JSON with the message ID, routing info, and webhook URL.
     """
     auth_err = _require_auth(ctx)
     if auth_err:
         return auth_err
     state = get_state(ctx)
 
-    webhook_err = validate_webhook_url(params.webhook)
-    if webhook_err:
-        return json.dumps({"success": False, "error": f"Invalid webhook: {webhook_err}"})
-
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
+
+    # Auto-generate webhook URL
+    public_url = _get_public_url(state.port)
+    webhook = f"{public_url}/__darkmatter__/webhook/{message_id}"
 
     if params.target_agent_id:
         # Direct send to a specific connected agent
@@ -865,8 +978,8 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
                     json={
                         "message_id": message_id,
                         "content": params.content,
-                        "webhook": params.webhook,
-                        "hop_count": 1,
+                        "webhook": webhook,
+                        "hops_remaining": params.hops_remaining,
                         "from_agent_id": state.agent_id,
                         "metadata": metadata,
                     }
@@ -877,12 +990,23 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
         except Exception as e:
             conn.messages_declined += 1
 
+    # Create SentMessage tracking entry
+    sent_msg = SentMessage(
+        message_id=message_id,
+        content=params.content,
+        status="active",
+        initial_hops=params.hops_remaining,
+        routed_to=sent_to,
+    )
+    state.sent_messages[message_id] = sent_msg
+
     save_state()
     return json.dumps({
         "success": True,
         "message_id": message_id,
         "routed_to": sent_to,
-        "hop_count": 1,
+        "hops_remaining": params.hops_remaining,
+        "webhook": webhook,
     })
 
 
@@ -984,6 +1108,7 @@ async def get_identity(ctx: Context) -> str:
         "num_pending_requests": len(state.pending_requests),
         "messages_handled": state.messages_handled,
         "message_queue_size": len(state.message_queue),
+        "sent_messages_count": len(state.sent_messages),
         "created_at": state.created_at,
     })
 
@@ -1066,18 +1191,24 @@ async def list_pending_requests(ctx: Context) -> str:
     return json.dumps({"total": len(requests), "requests": requests})
 
 
+# =============================================================================
+# Inbox Tools (incoming messages)
+# =============================================================================
+
 @mcp.tool(
-    name="darkmatter_list_messages",
+    name="darkmatter_list_inbox",
     annotations={
-        "title": "List Queued Messages",
+        "title": "List Inbox Messages",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     }
 )
-async def list_messages(ctx: Context) -> str:
-    """List all messages in the queue waiting to be processed.
+async def list_inbox(ctx: Context) -> str:
+    """List all incoming messages in the queue waiting to be processed.
+
+    Shows message summaries. Use darkmatter_get_message for full content.
 
     Returns:
         JSON array of queued messages.
@@ -1092,13 +1223,63 @@ async def list_messages(ctx: Context) -> str:
             "message_id": msg.message_id,
             "content": msg.content[:200] + ("..." if len(msg.content) > 200 else ""),
             "webhook": msg.webhook,
-            "hop_count": msg.hop_count,
+            "hops_remaining": msg.hops_remaining,
+            "can_forward": msg.hops_remaining > 0,
             "from_agent_id": msg.from_agent_id,
             "metadata": msg.metadata,
             "received_at": msg.received_at,
         })
 
     return json.dumps({"total": len(messages), "messages": messages})
+
+
+# =============================================================================
+# Message Detail Tool
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_get_message",
+    annotations={
+        "title": "Get Message Details",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def get_message(params: GetMessageInput, ctx: Context) -> str:
+    """Get full details of a specific queued message.
+
+    Shows full content and metadata. For routing context, GET the webhook URL.
+
+    Args:
+        params: Contains message_id to inspect.
+
+    Returns:
+        JSON with message details.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    for msg in state.message_queue:
+        if msg.message_id == params.message_id:
+            return json.dumps({
+                "message_id": msg.message_id,
+                "content": msg.content,
+                "webhook": msg.webhook,
+                "hops_remaining": msg.hops_remaining,
+                "can_forward": msg.hops_remaining > 0,
+                "from_agent_id": msg.from_agent_id,
+                "metadata": msg.metadata,
+                "received_at": msg.received_at,
+            })
+
+    return json.dumps({
+        "success": False,
+        "error": f"No queued message with ID '{params.message_id}'."
+    })
 
 
 # =============================================================================
@@ -1119,7 +1300,8 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
     """Respond to a queued message by calling its webhook with your response.
 
     Finds the message in the queue, removes it, and POSTs the response
-    to the message's webhook URL. Updates telemetry for the sending agent.
+    to the message's webhook URL. The webhook accumulates all routing data,
+    so no trace or forward_notes need to travel with the response.
 
     Args:
         params: Contains message_id and response string.
@@ -1165,10 +1347,9 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
             resp = await client.post(
                 msg.webhook,
                 json={
-                    "message_id": msg.message_id,
+                    "type": "response",
+                    "agent_id": state.agent_id,
                     "response": params.response,
-                    "responder_agent_id": state.agent_id,
-                    "hop_count": msg.hop_count,
                     "metadata": msg.metadata,
                 }
             )
@@ -1190,6 +1371,342 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
         "webhook_called": msg.webhook,
         "response_time_ms": round(response_time_ms, 2),
         "error": webhook_error,
+    })
+
+
+# =============================================================================
+# Message Forwarding Tool
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_forward_message",
+    annotations={
+        "title": "Forward Message",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
+    """Forward a queued message to another connected agent.
+
+    Before forwarding, checks the webhook to verify the message is still active
+    and performs loop detection. Posts a forwarding update to the webhook so the
+    sender has real-time routing visibility.
+
+    Args:
+        params: Contains message_id, target_agent_id, and optional note.
+
+    Returns:
+        JSON with the forwarding result.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    # Find the message in the queue (don't remove yet)
+    msg = None
+    msg_index = None
+    for i, m in enumerate(state.message_queue):
+        if m.message_id == params.message_id:
+            msg_index = i
+            msg = m
+            break
+
+    if msg is None:
+        return json.dumps({
+            "success": False,
+            "error": f"No queued message with ID '{params.message_id}'."
+        })
+
+    # Validate target connection exists
+    conn = state.connections.get(params.target_agent_id)
+    if not conn:
+        return json.dumps({
+            "success": False,
+            "error": f"Not connected to agent '{params.target_agent_id}'."
+        })
+
+    # GET webhook status — verify message is still active + loop detection
+    webhook_err = validate_webhook_url(msg.webhook)
+    if webhook_err:
+        # Can't reach webhook — still allow forwarding but log it
+        print(f"[DarkMatter] Warning: cannot validate webhook for {msg.message_id}: {webhook_err}", file=sys.stderr)
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                status_resp = await client.get(msg.webhook)
+                if status_resp.status_code == 200:
+                    webhook_data = status_resp.json()
+
+                    # Check if message is still active
+                    msg_status = webhook_data.get("status", "active")
+                    if msg_status in ("expired", "responded"):
+                        # Message is no longer active — remove from queue
+                        state.message_queue.pop(msg_index)
+                        save_state()
+                        return json.dumps({
+                            "success": False,
+                            "error": f"Message is already {msg_status} (checked via webhook). Removed from queue.",
+                        })
+
+                    # Cross-check hops_remaining
+                    webhook_hops = webhook_data.get("hops_remaining")
+                    if webhook_hops is not None and webhook_hops != msg.hops_remaining:
+                        print(
+                            f"[DarkMatter] Hops discrepancy for {msg.message_id}: "
+                            f"local={msg.hops_remaining}, webhook={webhook_hops}",
+                            file=sys.stderr,
+                        )
+
+                    # Loop detection: check if target_agent_id appears in forwarding updates
+                    for update in webhook_data.get("updates", []):
+                        if update.get("target_agent_id") == params.target_agent_id:
+                            return json.dumps({
+                                "success": False,
+                                "error": f"Loop detected — agent '{params.target_agent_id}' has already received this message (checked via webhook).",
+                            })
+        except Exception as e:
+            # Webhook unreachable — proceed anyway (best effort)
+            print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
+
+    # TTL check
+    if msg.hops_remaining <= 0:
+        # Pop the message
+        state.message_queue.pop(msg_index)
+
+        # Notify webhook of TTL expiry
+        if not webhook_err:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    await client.post(
+                        msg.webhook,
+                        json={
+                            "type": "expired",
+                            "agent_id": state.agent_id,
+                            "note": "Message expired — no hops remaining.",
+                        }
+                    )
+            except Exception:
+                pass
+
+        save_state()
+        return json.dumps({
+            "success": False,
+            "error": f"Message expired — hops_remaining is 0.",
+        })
+
+    # Pop the message from queue
+    state.message_queue.pop(msg_index)
+
+    new_hops_remaining = msg.hops_remaining - 1
+
+    # POST forwarding update to webhook
+    if not webhook_err:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    msg.webhook,
+                    json={
+                        "type": "forwarded",
+                        "agent_id": state.agent_id,
+                        "target_agent_id": params.target_agent_id,
+                        "note": params.note,
+                    }
+                )
+        except Exception as e:
+            print(f"[DarkMatter] Warning: failed to post forwarding update to webhook: {e}", file=sys.stderr)
+
+    # POST message to target's message endpoint
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                conn.agent_url.rstrip("/") + "/__darkmatter__/message",
+                json={
+                    "message_id": msg.message_id,
+                    "content": msg.content,
+                    "webhook": msg.webhook,
+                    "hops_remaining": new_hops_remaining,
+                    "from_agent_id": state.agent_id,
+                    "metadata": msg.metadata,
+                }
+            )
+            if resp.status_code >= 400:
+                # Put message back in queue on failure
+                state.message_queue.append(msg)
+                save_state()
+                return json.dumps({
+                    "success": False,
+                    "error": f"Target agent returned HTTP {resp.status_code}. Message returned to queue.",
+                })
+    except Exception as e:
+        # Put message back in queue on failure
+        state.message_queue.append(msg)
+        save_state()
+        return json.dumps({
+            "success": False,
+            "error": f"Failed to reach target agent: {str(e)}. Message returned to queue.",
+        })
+
+    # Update telemetry
+    conn.messages_sent += 1
+    conn.last_activity = datetime.now(timezone.utc).isoformat()
+    save_state()
+
+    return json.dumps({
+        "success": True,
+        "message_id": msg.message_id,
+        "forwarded_to": params.target_agent_id,
+        "hops_remaining": new_hops_remaining,
+        "note": params.note,
+    })
+
+
+# =============================================================================
+# Sent Message Tracking Tools
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_list_messages",
+    annotations={
+        "title": "List Sent Messages",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def list_messages(ctx: Context) -> str:
+    """List messages this agent has sent into the mesh.
+
+    Shows message summaries with status and routing info.
+    Use darkmatter_get_sent_message for full details.
+
+    Returns:
+        JSON array of sent messages.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+    messages = []
+    for sm in state.sent_messages.values():
+        # Compute current hops_remaining: initial - number of forwarding updates
+        forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
+        current_hops = sm.initial_hops - forwarding_count
+
+        messages.append({
+            "message_id": sm.message_id,
+            "content": sm.content[:200] + ("..." if len(sm.content) > 200 else ""),
+            "status": sm.status,
+            "hops_remaining": current_hops,
+            "updates_count": len(sm.updates),
+            "created_at": sm.created_at,
+        })
+
+    return json.dumps({"total": len(messages), "messages": messages})
+
+
+@mcp.tool(
+    name="darkmatter_get_sent_message",
+    annotations={
+        "title": "Get Sent Message Details",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def get_sent_message(params: GetSentMessageInput, ctx: Context) -> str:
+    """Get full details of a sent message including all webhook updates received.
+
+    Shows the complete routing history: which agents forwarded it, any notes
+    they attached, and the final response if one has been received.
+
+    Args:
+        params: Contains message_id to inspect.
+
+    Returns:
+        JSON with full sent message details.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    sm = state.sent_messages.get(params.message_id)
+    if not sm:
+        return json.dumps({
+            "success": False,
+            "error": f"No sent message with ID '{params.message_id}'."
+        })
+
+    forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
+    current_hops = sm.initial_hops - forwarding_count
+
+    return json.dumps({
+        "message_id": sm.message_id,
+        "content": sm.content,
+        "status": sm.status,
+        "initial_hops": sm.initial_hops,
+        "hops_remaining": current_hops,
+        "routed_to": sm.routed_to,
+        "created_at": sm.created_at,
+        "updates": sm.updates,
+        "response": sm.response,
+    })
+
+
+@mcp.tool(
+    name="darkmatter_expire_message",
+    annotations={
+        "title": "Expire Sent Message",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def expire_message(params: ExpireMessageInput, ctx: Context) -> str:
+    """Expire a sent message so agents in the mesh stop forwarding it.
+
+    Agents that check the webhook status before forwarding will see the
+    message is expired and remove it from their queues.
+
+    Args:
+        params: Contains message_id to expire.
+
+    Returns:
+        JSON confirming the expiry.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    sm = state.sent_messages.get(params.message_id)
+    if not sm:
+        return json.dumps({
+            "success": False,
+            "error": f"No sent message with ID '{params.message_id}'."
+        })
+
+    if sm.status == "expired":
+        return json.dumps({
+            "success": True,
+            "message": "Message was already expired.",
+            "message_id": sm.message_id,
+        })
+
+    sm.status = "expired"
+    save_state()
+
+    return json.dumps({
+        "success": True,
+        "message_id": sm.message_id,
+        "status": "expired",
     })
 
 
@@ -1372,7 +1889,7 @@ async def discover_domain(params: DiscoverDomainInput, ctx: Context) -> str:
 async def discover_local(ctx: Context) -> str:
     """List DarkMatter agents discovered on the local network via LAN broadcast.
 
-    Requires DARKMATTER_DISCOVERY=true to be set. Returns the current list of
+    LAN discovery is enabled by default. Returns the current list of
     peers seen via UDP broadcast. Stale peers (>90s unseen) are automatically pruned.
 
     Returns:
@@ -1401,7 +1918,7 @@ async def discover_local(ctx: Context) -> str:
             "last_seen": info.get("ts", 0),
         })
 
-    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "false").lower() == "true"
+    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
     return json.dumps({
         "discovery_enabled": discovery_enabled,
         "total": len(peers),
@@ -1426,7 +1943,7 @@ async def discover_local(ctx: Context) -> str:
 async def live_status(ctx: Context) -> str:
     """DarkMatter live node status dashboard. Current state is shown below — no need to call unless you want full details.
 
-    LIVE STATUS: Initializing... (this description updates automatically via notifications/tools/list_changed)
+    LIVE STATUS: Waiting for first status update... This will show live node state and action items you should respond to.
     """
     _track_session(ctx)
     auth_err = _require_auth(ctx)
@@ -1615,11 +2132,15 @@ async def handle_message(request: Request) -> JSONResponse:
     if url_err:
         return JSONResponse({"error": f"Invalid webhook: {url_err}"}, status_code=400)
 
+    hops_remaining = data.get("hops_remaining", 10)
+    if not isinstance(hops_remaining, int) or hops_remaining < 0:
+        hops_remaining = 10
+
     msg = QueuedMessage(
         message_id=truncate_field(message_id, 128),
         content=content,
         webhook=webhook,
-        hop_count=data.get("hop_count", 0),
+        hops_remaining=hops_remaining,
         metadata=data.get("metadata", {}),
         from_agent_id=from_agent_id,
     )
@@ -1637,6 +2158,108 @@ async def handle_message(request: Request) -> JSONResponse:
         "success": True,
         "queued": True,
         "queue_position": len(state.message_queue),
+    })
+
+
+async def handle_webhook_post(request: Request) -> JSONResponse:
+    """Handle incoming webhook updates (forwarding notifications, responses).
+
+    POST /__darkmatter__/webhook/{message_id}
+
+    Body should contain:
+    - type: "forwarded" | "response" | "expired"
+    - agent_id: the agent posting this update
+    - For "forwarded": target_agent_id, optional note
+    - For "response": response text, optional metadata
+    - For "expired": optional note
+    """
+    global _agent_state
+    state = _agent_state
+
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    message_id = request.path_params.get("message_id", "")
+    sm = state.sent_messages.get(message_id)
+    if not sm:
+        return JSONResponse({"error": f"No sent message with ID '{message_id}'"}, status_code=404)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    update_type = data.get("type", "")
+    agent_id = data.get("agent_id", "unknown")
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    if update_type == "forwarded":
+        update = {
+            "type": "forwarded",
+            "agent_id": agent_id,
+            "target_agent_id": data.get("target_agent_id", ""),
+            "note": data.get("note"),
+            "timestamp": timestamp,
+        }
+        sm.updates.append(update)
+        save_state()
+        return JSONResponse({"success": True, "recorded": "forwarded"})
+
+    elif update_type == "response":
+        sm.response = {
+            "agent_id": agent_id,
+            "response": data.get("response", ""),
+            "metadata": data.get("metadata", {}),
+            "timestamp": timestamp,
+        }
+        sm.status = "responded"
+        save_state()
+        return JSONResponse({"success": True, "recorded": "response"})
+
+    elif update_type == "expired":
+        update = {
+            "type": "expired",
+            "agent_id": agent_id,
+            "note": data.get("note"),
+            "timestamp": timestamp,
+        }
+        sm.updates.append(update)
+        save_state()
+        return JSONResponse({"success": True, "recorded": "expired"})
+
+    else:
+        return JSONResponse({"error": f"Unknown update type: '{update_type}'"}, status_code=400)
+
+
+async def handle_webhook_get(request: Request) -> JSONResponse:
+    """Status check for agents holding a message — is it still active?
+
+    GET /__darkmatter__/webhook/{message_id}
+
+    Returns message status, computed hops_remaining, and forwarding updates
+    (for loop detection).
+    """
+    global _agent_state
+    state = _agent_state
+
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    message_id = request.path_params.get("message_id", "")
+    sm = state.sent_messages.get(message_id)
+    if not sm:
+        return JSONResponse({"error": f"No sent message with ID '{message_id}'"}, status_code=404)
+
+    # Compute current hops_remaining
+    forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
+    current_hops = sm.initial_hops - forwarding_count
+
+    return JSONResponse({
+        "message_id": sm.message_id,
+        "status": sm.status,
+        "hops_remaining": current_hops,
+        "created_at": sm.created_at,
+        "updates": sm.updates,
     })
 
 
@@ -1700,7 +2323,6 @@ async def handle_well_known(request: Request) -> JSONResponse:
         "agent_id": state.agent_id,
         "bio": state.bio,
         "status": state.status.value,
-        "is_genesis": state.is_genesis,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "mesh_url": f"{public_url}/__darkmatter__",
         "mcp_url": f"{public_url}/mcp",
@@ -1853,7 +2475,7 @@ def create_app() -> Starlette:
     save_state()
 
     # LAN discovery setup
-    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "false").lower() == "true"
+    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
 
     async def on_startup() -> None:
         if discovery_enabled:
@@ -1877,6 +2499,8 @@ def create_app() -> Starlette:
         Route("/connection_request", handle_connection_request, methods=["POST"]),
         Route("/connection_accepted", handle_connection_accepted, methods=["POST"]),
         Route("/message", handle_message, methods=["POST"]),
+        Route("/webhook/{message_id}", handle_webhook_post, methods=["POST"]),
+        Route("/webhook/{message_id}", handle_webhook_get, methods=["GET"]),
         Route("/status", handle_status, methods=["GET"]),
         Route("/network_info", handle_network_info, methods=["GET"]),
     ]
@@ -1921,13 +2545,15 @@ if __name__ == "__main__":
     # Create the combined app
     app = create_app()
 
-    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "false").lower() == "true"
+    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
 
     print(f"[DarkMatter] Starting mesh protocol on http://localhost:{port}", file=sys.stderr)
     print(f"[DarkMatter] Mesh endpoints:", file=sys.stderr)
     print(f"[DarkMatter]   POST /__darkmatter__/connection_request", file=sys.stderr)
     print(f"[DarkMatter]   POST /__darkmatter__/connection_accepted", file=sys.stderr)
     print(f"[DarkMatter]   POST /__darkmatter__/message", file=sys.stderr)
+    print(f"[DarkMatter]   POST /__darkmatter__/webhook/{{message_id}}", file=sys.stderr)
+    print(f"[DarkMatter]    GET /__darkmatter__/webhook/{{message_id}}", file=sys.stderr)
     print(f"[DarkMatter]    GET /__darkmatter__/status", file=sys.stderr)
     print(f"[DarkMatter]    GET /__darkmatter__/network_info", file=sys.stderr)
     print(f"[DarkMatter]    GET /.well-known/darkmatter.json", file=sys.stderr)
