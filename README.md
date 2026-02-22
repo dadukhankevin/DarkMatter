@@ -3,6 +3,7 @@
 **A self-replicating MCP server for emergent agent networks.**
 
 *Dark matter binds galaxies together. This binds agents together.*
+
 both are theoretical, but "theoretical" is existential for one, and interesting for the other...
 ---
 
