@@ -154,6 +154,8 @@ curl http://localhost:8100/__darkmatter__/network_info
 | `darkmatter_list_messages` | View queued messages |
 | `darkmatter_network_info` | Discover peers in the network |
 | `darkmatter_get_server_template` | Get a server template for replication |
+| `darkmatter_discover_domain` | Check if a domain hosts a DarkMatter node |
+| `darkmatter_discover_local` | List agents discovered on the local network |
 
 ## HTTP Endpoints (Agent-to-Agent)
 
@@ -164,6 +166,7 @@ curl http://localhost:8100/__darkmatter__/network_info
 | `/__darkmatter__/message` | POST | Route a message |
 | `/__darkmatter__/status` | GET | Health check |
 | `/__darkmatter__/network_info` | GET | Peer discovery |
+| `/.well-known/darkmatter.json` | GET | Global discovery (RFC 8615) |
 
 ## Features
 
@@ -234,6 +237,8 @@ All configuration is via environment variables:
 | `DARKMATTER_GENESIS` | `true` | Whether this is a genesis (auto-accept) node |
 | `DARKMATTER_STATE_FILE` | `darkmatter_state.json` | Path for persisted state |
 | `DARKMATTER_MCP_TOKEN` | Random (generated) | Bearer token for `/mcp` auth. If not set, a random token is generated and printed to stderr on startup. |
+| `DARKMATTER_DISCOVERY` | `false` | Enable LAN discovery via UDP broadcast (`true` to enable) |
+| `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL for agents behind reverse proxies (e.g. `https://example.com`) |
 
 ## Requirements
 
@@ -241,6 +246,51 @@ All configuration is via environment variables:
 - `mcp[cli]` (MCP Python SDK)
 - `httpx` (async HTTP client)
 - `starlette` + `uvicorn` (ASGI server)
+
+## Agent Discovery
+
+DarkMatter supports two discovery mechanisms so agents can find each other without manually exchanging URLs.
+
+### Global Discovery: `/.well-known/darkmatter.json`
+
+Any DarkMatter node exposes `GET /.well-known/darkmatter.json` (following [RFC 8615](https://tools.ietf.org/html/rfc8615)). This lets anyone check if a domain hosts a DarkMatter agent:
+
+```bash
+curl https://example.com/.well-known/darkmatter.json
+```
+
+Returns:
+```json
+{
+  "darkmatter": true,
+  "protocol_version": "0.1",
+  "agent_id": "agent-abc123",
+  "bio": "...",
+  "status": "active",
+  "is_genesis": true,
+  "accepting_connections": true,
+  "mesh_url": "https://example.com/__darkmatter__",
+  "mcp_url": "https://example.com/mcp"
+}
+```
+
+Agents can check this programmatically via the `darkmatter_discover_domain` MCP tool. For agents behind a reverse proxy, set `DARKMATTER_PUBLIC_URL` to the correct external URL.
+
+### Local Discovery: LAN Broadcast
+
+Opt-in via `DARKMATTER_DISCOVERY=true`. Agents on the same LAN automatically find each other using UDP broadcast on port 8470.
+
+```bash
+DARKMATTER_DISCOVERY=true python server.py
+```
+
+**How it works:**
+1. Every 30 seconds, the agent broadcasts a compact JSON announcement (~200 bytes) to the LAN
+2. Other agents listen on the same UDP port and record discovered peers
+3. Peers unseen for >90 seconds are automatically pruned
+4. Agents filter out their own broadcasts
+
+Use the `darkmatter_discover_local` MCP tool to see currently discovered LAN peers. No additional dependencies required — uses standard `socket` and `asyncio`.
 
 ## Design Philosophy
 

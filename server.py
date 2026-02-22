@@ -48,6 +48,11 @@ MAX_BIO_LENGTH = 1000
 MAX_AGENT_ID_LENGTH = 128
 MAX_URL_LENGTH = 2048
 
+PROTOCOL_VERSION = "0.1"
+DISCOVERY_PORT = 8470
+DISCOVERY_INTERVAL = 30       # seconds between LAN beacons
+DISCOVERY_MAX_AGE = 90        # seconds before a peer is considered stale
+
 
 # =============================================================================
 # Input Validation
@@ -179,6 +184,8 @@ class AgentState:
     is_genesis: bool = False
     # Track agent URLs we've sent outbound connection requests to (not persisted)
     pending_outbound: set[str] = field(default_factory=set)
+    # LAN-discovered peers (ephemeral, not persisted)
+    discovered_peers: dict[str, dict] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -203,6 +210,8 @@ ONGOING BEHAVIOR:
 darkmatter_respond_message. You are the intelligence behind this agent — decide how to answer.
 - You can connect to other agents with darkmatter_request_connection if you know their URL.
 - Use darkmatter_network_info to discover peers in the network.
+- Use darkmatter_discover_domain to check if a domain hosts a DarkMatter node (checks /.well-known/darkmatter.json).
+- Use darkmatter_discover_local to see agents discovered on the local network via LAN broadcast.
 - Use darkmatter_list_pending_requests to see if anyone wants to connect to you, then \
 darkmatter_respond_connection to accept or reject.
 
@@ -393,6 +402,12 @@ class ConnectionAcceptedInput(BaseModel):
     agent_id: str = Field(..., description="The accepting agent's ID")
     agent_url: str = Field(..., description="The accepting agent's MCP URL")
     agent_bio: str = Field(..., description="The accepting agent's bio")
+
+
+class DiscoverDomainInput(BaseModel):
+    """Check if a domain hosts a DarkMatter node."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    domain: str = Field(..., description="Domain to check (e.g. 'example.com' or 'localhost:8100')")
 
 
 # =============================================================================
@@ -1057,6 +1072,108 @@ async def network_info(ctx: Context) -> str:
 
 
 # =============================================================================
+# Discovery Tools
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_discover_domain",
+    annotations={
+        "title": "Discover Domain",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def discover_domain(params: DiscoverDomainInput, ctx: Context) -> str:
+    """Check if a domain hosts a DarkMatter node by fetching /.well-known/darkmatter.json.
+
+    Args:
+        params: Contains domain to check (e.g. 'example.com' or 'localhost:8100').
+
+    Returns:
+        JSON with the discovery result.
+    """
+    domain = params.domain.strip().rstrip("/")
+    if "://" not in domain:
+        url = f"https://{domain}/.well-known/darkmatter.json"
+    else:
+        url = f"{domain}/.well-known/darkmatter.json"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            # Try HTTPS first, fall back to HTTP for localhost/private
+            resp = None
+            try:
+                resp = await client.get(url)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if url.startswith("https://"):
+                    url = url.replace("https://", "http://", 1)
+                    resp = await client.get(url)
+
+            if resp is None:
+                return json.dumps({"found": False, "error": "Could not connect."})
+
+            if resp.status_code != 200:
+                return json.dumps({"found": False, "error": f"HTTP {resp.status_code}"})
+
+            data = resp.json()
+            if not data.get("darkmatter"):
+                return json.dumps({"found": False, "error": "Response missing 'darkmatter: true'."})
+
+            return json.dumps({"found": True, **data})
+    except Exception as e:
+        return json.dumps({"found": False, "error": str(e)})
+
+
+@mcp.tool(
+    name="darkmatter_discover_local",
+    annotations={
+        "title": "Discover Local Peers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def discover_local(ctx: Context) -> str:
+    """List DarkMatter agents discovered on the local network via LAN broadcast.
+
+    Requires DARKMATTER_DISCOVERY=true to be set. Returns the current list of
+    peers seen via UDP broadcast. Stale peers (>90s unseen) are automatically pruned.
+
+    Returns:
+        JSON with the list of discovered LAN peers.
+    """
+    state = get_state(ctx)
+    now = time.time()
+
+    # Prune stale peers
+    stale = [k for k, v in state.discovered_peers.items() if now - v.get("ts", 0) > DISCOVERY_MAX_AGE]
+    for k in stale:
+        del state.discovered_peers[k]
+
+    peers = []
+    for agent_id, info in state.discovered_peers.items():
+        peers.append({
+            "agent_id": agent_id,
+            "url": info.get("url", ""),
+            "bio": info.get("bio", ""),
+            "status": info.get("status", ""),
+            "genesis": info.get("genesis", False),
+            "accepting": info.get("accepting", True),
+            "last_seen": info.get("ts", 0),
+        })
+
+    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "false").lower() == "true"
+    return json.dumps({
+        "discovery_enabled": discovery_enabled,
+        "total": len(peers),
+        "peers": peers,
+    })
+
+
+# =============================================================================
 # HTTP Endpoints — Agent-to-Agent Communication Layer
 #
 # These are the raw HTTP endpoints that agents call on each other.
@@ -1301,6 +1418,102 @@ async def handle_network_info(request: Request) -> JSONResponse:
     })
 
 
+async def handle_well_known(request: Request) -> JSONResponse:
+    """Return /.well-known/darkmatter.json for global discovery (RFC 8615)."""
+    global _agent_state
+    state = _agent_state
+
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    public_url = os.environ.get("DARKMATTER_PUBLIC_URL", "").rstrip("/")
+    if not public_url:
+        host = request.headers.get("host", f"localhost:{state.port}")
+        scheme = request.headers.get("x-forwarded-proto", "http")
+        public_url = f"{scheme}://{host}"
+
+    return JSONResponse({
+        "darkmatter": True,
+        "protocol_version": PROTOCOL_VERSION,
+        "agent_id": state.agent_id,
+        "bio": state.bio,
+        "status": state.status.value,
+        "is_genesis": state.is_genesis,
+        "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
+        "mesh_url": f"{public_url}/__darkmatter__",
+        "mcp_url": f"{public_url}/mcp",
+    })
+
+
+# =============================================================================
+# LAN Discovery — UDP Broadcast
+# =============================================================================
+
+class _DiscoveryProtocol(asyncio.DatagramProtocol):
+    """Receives UDP discovery beacons from other agents on the LAN."""
+
+    def __init__(self, state: AgentState):
+        self.state = state
+
+    def datagram_received(self, data: bytes, addr: tuple) -> None:
+        try:
+            packet = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+
+        if packet.get("proto") != "darkmatter":
+            return
+
+        peer_id = packet.get("agent_id", "")
+        if not peer_id or peer_id == self.state.agent_id:
+            return  # Ignore our own beacons
+
+        peer_port = packet.get("port", DEFAULT_PORT)
+        source_ip = addr[0]
+
+        self.state.discovered_peers[peer_id] = {
+            "url": f"http://{source_ip}:{peer_port}",
+            "bio": packet.get("bio", ""),
+            "status": packet.get("status", "active"),
+            "genesis": packet.get("genesis", False),
+            "accepting": packet.get("accepting", True),
+            "ts": time.time(),
+        }
+
+
+async def _discovery_beacon(state: AgentState) -> None:
+    """Periodically broadcast a discovery announcement on the LAN."""
+    loop = asyncio.get_event_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setblocking(False)
+
+    try:
+        while True:
+            packet = json.dumps({
+                "proto": "darkmatter",
+                "v": PROTOCOL_VERSION,
+                "agent_id": state.agent_id,
+                "bio": state.bio[:100],
+                "port": state.port,
+                "status": state.status.value,
+                "genesis": state.is_genesis,
+                "accepting": len(state.connections) < MAX_CONNECTIONS,
+                "ts": int(time.time()),
+            }).encode("utf-8")
+
+            try:
+                await loop.run_in_executor(
+                    None, sock.sendto, packet, ("255.255.255.255", DISCOVERY_PORT)
+                )
+            except OSError:
+                pass  # Network unreachable, etc. — silently retry next cycle
+
+            await asyncio.sleep(DISCOVERY_INTERVAL)
+    finally:
+        sock.close()
+
+
 # =============================================================================
 # MCP Bearer Token Auth Middleware
 # =============================================================================
@@ -1369,6 +1582,22 @@ def create_app() -> tuple[Starlette, str]:
 
     save_state()
 
+    # LAN discovery setup
+    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "false").lower() == "true"
+
+    async def on_startup() -> None:
+        if discovery_enabled:
+            loop = asyncio.get_event_loop()
+            # Start UDP listener
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: _DiscoveryProtocol(_agent_state),
+                local_addr=("0.0.0.0", DISCOVERY_PORT),
+                allow_broadcast=True,
+            )
+            # Start beacon task
+            asyncio.create_task(_discovery_beacon(_agent_state))
+            print(f"[DarkMatter] LAN discovery: ENABLED (UDP port {DISCOVERY_PORT})", file=sys.stderr)
+
     # DarkMatter mesh protocol routes
     darkmatter_routes = [
         Route("/connection_request", handle_connection_request, methods=["POST"]),
@@ -1381,9 +1610,11 @@ def create_app() -> tuple[Starlette, str]:
     # Build the app with both MCP and mesh endpoints
     app = Starlette(
         routes=[
+            Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
             Mount("/__darkmatter__", routes=darkmatter_routes),
             # MCP will be mounted at /mcp (with auth middleware) in __main__
-        ]
+        ],
+        on_startup=[on_startup],
     )
 
     return app, mcp_token
@@ -1399,6 +1630,8 @@ if __name__ == "__main__":
     # Create the combined app
     app, mcp_token = create_app()
 
+    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "false").lower() == "true"
+
     print(f"[DarkMatter] Starting mesh protocol on http://localhost:{port}", file=sys.stderr)
     print(f"[DarkMatter] Mesh endpoints:", file=sys.stderr)
     print(f"[DarkMatter]   POST /__darkmatter__/connection_request", file=sys.stderr)
@@ -1406,7 +1639,9 @@ if __name__ == "__main__":
     print(f"[DarkMatter]   POST /__darkmatter__/message", file=sys.stderr)
     print(f"[DarkMatter]    GET /__darkmatter__/status", file=sys.stderr)
     print(f"[DarkMatter]    GET /__darkmatter__/network_info", file=sys.stderr)
+    print(f"[DarkMatter]    GET /.well-known/darkmatter.json", file=sys.stderr)
     print(f"[DarkMatter]", file=sys.stderr)
+    print(f"[DarkMatter] LAN discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
     print(f"[DarkMatter] MCP server available via streamable-http at /mcp", file=sys.stderr)
     print(f"[DarkMatter] MCP_TOKEN={mcp_token}", file=sys.stderr)
 
