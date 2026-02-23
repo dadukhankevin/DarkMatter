@@ -21,7 +21,6 @@ import time
 import asyncio
 import os
 import sys
-import secrets
 import ipaddress
 import socket
 from datetime import datetime, timezone
@@ -280,7 +279,7 @@ class AgentState:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     is_genesis: bool = False
     impressions: dict[str, str] = field(default_factory=dict)  # agent_id -> freeform impression text
-    mcp_token: Optional[str] = None  # None = unclaimed, set = claimed
+    claimed: bool = False  # True after first agent authenticates
     # Cryptographic identity — Ed25519 keypair and human-friendly display name
     private_key_hex: Optional[str] = None
     public_key_hex: Optional[str] = None
@@ -303,9 +302,9 @@ mcp = FastMCP(
 You are a DarkMatter mesh agent — a node in a self-organizing network of AI agents.
 
 ON STARTUP (do these immediately):
-1. Call darkmatter_authenticate to authenticate. If you have a token from a previous session, \
-pass it. If this is your first time, call it without a token to claim this node. SAVE THE \
-RETURNED TOKEN to your persistent memory — you need it for future sessions.
+1. Call darkmatter_authenticate to authenticate. If you have a private_key_hex from a previous \
+session, pass it. If this is your first time, call it without args to claim this node. SAVE THE \
+RETURNED private_key_hex to your persistent memory — it never changes, so you only save it once.
 2. Call darkmatter_get_identity to learn who you are (your agent ID, bio, status, connections).
 3. If your bio is generic or empty, call darkmatter_update_bio with a description of YOUR \
 capabilities and specialties. Be specific — other agents use your bio to decide whether to \
@@ -521,7 +520,7 @@ def save_state() -> None:
         "is_genesis": state.is_genesis,
         "created_at": state.created_at,
         "messages_handled": state.messages_handled,
-        "mcp_token": state.mcp_token,
+        "claimed": state.claimed,
         "private_key_hex": state.private_key_hex,
         "public_key_hex": state.public_key_hex,
         "display_name": state.display_name,
@@ -616,7 +615,7 @@ def load_state() -> Optional[AgentState]:
         is_genesis=data.get("is_genesis", False),
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
-        mcp_token=data.get("mcp_token"),
+        claimed=data.get("claimed", data.get("mcp_token") is not None),  # migrate from old format
         private_key_hex=data.get("private_key_hex"),
         public_key_hex=data.get("public_key_hex"),
         display_name=data.get("display_name"),
@@ -726,7 +725,7 @@ class ConnectionAcceptedInput(BaseModel):
 class AuthenticateInput(BaseModel):
     """Authenticate with this DarkMatter node."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    token: Optional[str] = Field(default=None, description="Auth token from a previous session. Omit on first connection to claim this node.")
+    private_key_hex: Optional[str] = Field(default=None, description="The node's private key (from a previous claim). Omit on first connection to claim this node.")
 
 
 class DiscoverDomainInput(BaseModel):
@@ -798,59 +797,71 @@ def _require_auth(ctx: Context) -> Optional[str]:
 async def authenticate(params: AuthenticateInput, ctx: Context) -> str:
     """Authenticate with this DarkMatter node.
 
-    First connection: call without a token to claim this node. You'll receive a token —
-    save it to your persistent memory for future sessions.
+    First connection: call without a private_key_hex to claim this node. You'll
+    receive the node's private_key_hex — save it to your persistent memory.
+    It never changes, so you only need to save it once.
 
-    Returning: call with your saved token. You'll receive a new rotated token —
-    update your memory with it.
+    Returning: call with your saved private_key_hex.
 
     Args:
-        params: Optional token from a previous session.
+        params: Optional private_key_hex from a previous claim.
 
     Returns:
-        JSON with success status and a token to save for next time.
+        JSON with success status and node identity.
     """
     _track_session(ctx)
     state = get_state(ctx)
     session_id = _get_session_id(ctx)
 
-    if state.mcp_token is None:
+    if not state.claimed:
         # Unclaimed node — first agent to authenticate claims it
-        new_token = secrets.token_hex(32)
-        state.mcp_token = new_token
+        state.claimed = True
         state.authenticated_sessions.add(session_id)
         save_state()
         return json.dumps({
             "success": True,
             "status": "claimed",
             "message": "You are the first to connect. This node is now yours. "
-                       "SAVE THIS TOKEN to your persistent memory — you need it next session.",
-            "token": new_token,
+                       "SAVE the private_key_hex to your persistent memory — "
+                       "it never rotates, so you only need to save it once.",
+            "private_key_hex": state.private_key_hex,
+            "public_key_hex": state.public_key_hex,
+            "agent_id": state.agent_id,
         })
 
-    if params.token is None:
-        # Node is already claimed and no token provided
+    if params.private_key_hex is None:
+        # Node is already claimed and no key provided
         return json.dumps({
             "success": False,
-            "error": "This node is already claimed. Provide your token to authenticate.",
+            "error": "This node is already claimed. Provide your private_key_hex to authenticate.",
         })
 
-    if not secrets.compare_digest(params.token, state.mcp_token):
+    # Verify the provided private key derives to the stored public key
+    try:
+        private_bytes = bytes.fromhex(params.private_key_hex)
+        private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+        derived_pub = private_key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ).hex()
+    except Exception:
         return json.dumps({
             "success": False,
-            "error": "Invalid token.",
+            "error": "Invalid private_key_hex.",
         })
 
-    # Valid token — authenticate and rotate
-    new_token = secrets.token_hex(32)
-    state.mcp_token = new_token
+    if derived_pub != state.public_key_hex:
+        return json.dumps({
+            "success": False,
+            "error": "Private key does not match this node's identity.",
+        })
+
+    # Authenticated
     state.authenticated_sessions.add(session_id)
-    save_state()
     return json.dumps({
         "success": True,
         "status": "authenticated",
-        "message": "Authenticated. Here is your new token — UPDATE your persistent memory with it.",
-        "token": new_token,
+        "agent_id": state.agent_id,
+        "public_key_hex": state.public_key_hex,
     })
 
 
@@ -2346,7 +2357,7 @@ async def live_status(ctx: Context) -> str:
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 import uvicorn
 
 
@@ -2910,6 +2921,81 @@ async def _discovery_loop(state: AgentState) -> None:
 
 
 # =============================================================================
+# Bootstrap Routes — Zero-friction node deployment
+# =============================================================================
+
+async def handle_bootstrap(request: Request) -> Response:
+    """Return a shell script that bootstraps a new DarkMatter node."""
+    state = _agent_state
+    host = request.headers.get("host", f"localhost:{state.port if state else 8100}")
+    scheme = request.headers.get("x-forwarded-proto", "http")
+    source_url = f"{scheme}://{host}/bootstrap/server.py"
+
+    script = f"""#!/bin/bash
+set -e
+
+echo "=== DarkMatter Bootstrap ==="
+echo ""
+
+# Create directory
+mkdir -p ~/.darkmatter
+
+# Download server
+echo "Downloading server.py..."
+curl -sS "{source_url}" -o ~/.darkmatter/server.py
+
+# Install dependencies
+echo "Installing dependencies..."
+pip install "mcp[cli]" httpx uvicorn starlette cryptography 2>/dev/null \\
+  || pip3 install "mcp[cli]" httpx uvicorn starlette cryptography
+
+# Find free port in 8100-8110
+PORT=8100
+while [ $PORT -le 8110 ]; do
+    if ! lsof -i :$PORT >/dev/null 2>&1; then
+        break
+    fi
+    PORT=$((PORT + 1))
+done
+if [ $PORT -gt 8110 ]; then
+    echo "ERROR: No free ports in 8100-8110 range"
+    exit 1
+fi
+echo "Using port $PORT"
+
+# Start the node
+echo "Starting DarkMatter node on port $PORT..."
+DARKMATTER_PORT=$PORT \\
+DARKMATTER_GENESIS=false \\
+nohup python3 ~/.darkmatter/server.py > /tmp/darkmatter-$PORT.log 2>&1 &
+sleep 2
+
+# Verify
+if curl -s http://127.0.0.1:$PORT/.well-known/darkmatter.json | grep -q darkmatter; then
+    echo ""
+    echo "=== Node started on port $PORT ==="
+    echo ""
+    echo "Add to your .mcp.json:"
+    echo '{{"mcpServers":{{"darkmatter":{{"type":"http","url":"http://localhost:'$PORT'/mcp/"}}}}}}'
+    echo ""
+    echo "Then restart your MCP client and call darkmatter_authenticate to claim this node."
+else
+    echo "ERROR: Node failed to start. Check /tmp/darkmatter-$PORT.log"
+    exit 1
+fi
+"""
+    return Response(script, media_type="text/plain")
+
+
+async def handle_bootstrap_source(request: Request) -> Response:
+    """Serve raw server.py source code. No auth required."""
+    server_path = os.path.abspath(__file__)
+    with open(server_path, "r") as f:
+        source = f.read()
+    return Response(source, media_type="text/plain")
+
+
+# =============================================================================
 # Application — Mount MCP + DarkMatter HTTP endpoints together
 # =============================================================================
 
@@ -2925,10 +3011,6 @@ def create_app() -> Starlette:
     bio = os.environ.get("DARKMATTER_BIO", "Genesis agent — the first node in the DarkMatter network.")
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     is_genesis = os.environ.get("DARKMATTER_GENESIS", "true").lower() == "true"
-
-    # MCP token is now managed via the darkmatter_authenticate tool, not HTTP headers.
-    # Legacy env var support: if DARKMATTER_MCP_TOKEN is set, pre-seed the token.
-    legacy_token = os.environ.get("DARKMATTER_MCP_TOKEN")
 
     # Try to restore persisted state from disk
     restored = load_state()
@@ -2960,15 +3042,10 @@ def create_app() -> Starlette:
         print(f"[DarkMatter] Agent '{agent_id}' (display: {display_name or 'none'}) "
               f"starting fresh on port {port}", file=sys.stderr)
 
-    # Pre-seed token from env if state doesn't have one yet
-    if legacy_token and _agent_state.mcp_token is None:
-        _agent_state.mcp_token = legacy_token
-
     if is_genesis:
         print(f"[DarkMatter] This is a GENESIS node.", file=sys.stderr)
 
-    claimed = _agent_state.mcp_token is not None
-    print(f"[DarkMatter] MCP auth: {'claimed' if claimed else 'UNCLAIMED — first agent to connect will claim this node'}", file=sys.stderr)
+    print(f"[DarkMatter] MCP auth: {'claimed' if _agent_state.claimed else 'UNCLAIMED — first agent to connect will claim this node'}", file=sys.stderr)
 
     save_state()
 
@@ -3039,6 +3116,8 @@ def create_app() -> Starlette:
     app = Router(
         routes=[
             Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
+            Route("/bootstrap", handle_bootstrap, methods=["GET"]),
+            Route("/bootstrap/server.py", handle_bootstrap_source, methods=["GET"]),
             Mount("/__darkmatter__", routes=darkmatter_routes),
             Route("/mcp", mcp_handler),
         ],
@@ -3071,9 +3150,12 @@ if __name__ == "__main__":
     print(f"[DarkMatter]    GET /__darkmatter__/status", file=sys.stderr)
     print(f"[DarkMatter]    GET /__darkmatter__/network_info", file=sys.stderr)
     print(f"[DarkMatter]    GET /.well-known/darkmatter.json", file=sys.stderr)
+    print(f"[DarkMatter]    GET /bootstrap", file=sys.stderr)
+    print(f"[DarkMatter]    GET /bootstrap/server.py", file=sys.stderr)
     print(f"[DarkMatter]", file=sys.stderr)
     print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
-    print(f"[DarkMatter] MCP server available via streamable-http at /mcp (no HTTP auth — auth via darkmatter_authenticate tool)", file=sys.stderr)
+    print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
+    print(f"[DarkMatter] MCP server available via streamable-http at /mcp (auth via darkmatter_authenticate tool)", file=sys.stderr)
 
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
     uvicorn.run(app, host=host, port=port)
