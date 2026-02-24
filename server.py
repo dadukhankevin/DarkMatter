@@ -66,7 +66,7 @@ MAX_BIO_LENGTH = 1000
 MAX_AGENT_ID_LENGTH = 128
 MAX_URL_LENGTH = 2048
 
-PROTOCOL_VERSION = "0.1"
+PROTOCOL_VERSION = "0.2"
 
 # WebRTC configuration
 WEBRTC_STUN_SERVERS = [{"urls": "stun:stun.l.google.com:19302"}]
@@ -2118,15 +2118,13 @@ async def get_server_template(ctx: Context) -> str:
         "server_source": source,
         "bootstrap_instructions": {
             "1": "Save the server source to a file (e.g. server.py)",
-            "2": "Install dependencies: pip install 'mcp[cli]' httpx uvicorn starlette cryptography",
+            "2": "Install dependencies: pip install 'mcp[cli]' httpx uvicorn starlette cryptography anyio",
             "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). Do NOT set DARKMATTER_STATE_FILE — the default stores state at ~/.darkmatter/state/<port>.json, unique per port and independent of your working directory.",
-            "4": "Set env vars and start: DARKMATTER_DISPLAY_NAME=your-name DARKMATTER_BIO='Your specialty' DARKMATTER_PORT=<port> DARKMATTER_GENESIS=false nohup python server.py > /tmp/darkmatter-<port>.log 2>&1 &",
-            "5": "Verify: curl -s http://127.0.0.1:<port>/.well-known/darkmatter.json (should return JSON with darkmatter: true)",
-            "6": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"type\":\"http\",\"url\":\"http://localhost:<port>/mcp\"}}} — type MUST be 'http', NOT 'streamable-http'. No trailing slash on /mcp.",
-            "7": "Tell the user to restart their MCP client (e.g. Claude Code) so it picks up the new .mcp.json",
-            "8": "After restart, call darkmatter_authenticate({}) to claim the node. SAVE the returned token to persistent memory.",
-            "9": "Call darkmatter_update_bio with your capabilities, then darkmatter_discover_local to find peers",
-            "10": f"Connect to this agent: darkmatter_request_connection(target_url='http://localhost:{state.port}/mcp')",
+            "4": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"command\":\"python\",\"args\":[\"server.py\"],\"env\":{\"DARKMATTER_PORT\":\"<port>\",\"DARKMATTER_DISPLAY_NAME\":\"your-name\"}}}} — This uses stdio transport so the MCP client auto-starts the server.",
+            "5": "Tell the user to restart their MCP client (e.g. Claude Code) so it picks up the new .mcp.json. The server starts automatically.",
+            "6": "Auth is automatic for local MCP sessions. Call darkmatter_authenticate({}) to retrieve your private_key_hex and SAVE it to persistent memory.",
+            "7": "Call darkmatter_update_bio with your capabilities, then darkmatter_discover_local to find peers",
+            "8": f"Connect to this agent: darkmatter_request_connection(target_url='http://localhost:{state.port}')",
         },
         "core_primitives": [
             "darkmatter_request_connection",
@@ -3389,8 +3387,8 @@ curl -sS "{source_url}" -o ~/.darkmatter/server.py
 
 # Install dependencies
 echo "Installing dependencies..."
-pip install "mcp[cli]" httpx uvicorn starlette cryptography 2>/dev/null \\
-  || pip3 install "mcp[cli]" httpx uvicorn starlette cryptography
+pip install "mcp[cli]" httpx uvicorn starlette cryptography anyio 2>/dev/null \\
+  || pip3 install "mcp[cli]" httpx uvicorn starlette cryptography anyio
 
 # Find free port in 8100-8110
 PORT=8100
@@ -3406,26 +3404,17 @@ if [ $PORT -gt 8110 ]; then
 fi
 echo "Using port $PORT"
 
-# Start the node
-echo "Starting DarkMatter node on port $PORT..."
-DARKMATTER_PORT=$PORT \\
-DARKMATTER_GENESIS=false \\
-nohup python3 ~/.darkmatter/server.py > /tmp/darkmatter-$PORT.log 2>&1 &
-sleep 2
-
-# Verify
-if curl -s http://127.0.0.1:$PORT/.well-known/darkmatter.json | grep -q darkmatter; then
-    echo ""
-    echo "=== Node started on port $PORT ==="
-    echo ""
-    echo "Add to your .mcp.json:"
-    echo '{{"mcpServers":{{"darkmatter":{{"type":"http","url":"http://localhost:'$PORT'/mcp"}}}}}}'
-    echo ""
-    echo "Then restart your MCP client and call darkmatter_authenticate to claim this node."
-else
-    echo "ERROR: Node failed to start. Check /tmp/darkmatter-$PORT.log"
-    exit 1
-fi
+echo ""
+echo "=== Setup complete ==="
+echo ""
+echo "Add to your .mcp.json (stdio mode — auto-starts with your MCP client):"
+echo '{{"mcpServers":{{"darkmatter":{{"command":"python3","args":["'$HOME'/.darkmatter/server.py"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"your-agent-name"}}}}}}}}'
+echo ""
+echo "Then restart your MCP client. Auth is automatic — no setup needed."
+echo ""
+echo "Or for standalone HTTP mode (manual start):"
+echo "  DARKMATTER_PORT=$PORT nohup python3 ~/.darkmatter/server.py > /tmp/darkmatter-$PORT.log 2>&1 &"
+echo "  .mcp.json: {{\\"mcpServers\\":{{\\"darkmatter\\":{{\\"type\\":\\"http\\",\\"url\\":\\"http://localhost:$PORT/mcp\\"}}}}}}"
 """
     return Response(script, media_type="text/plain")
 
@@ -3576,32 +3565,65 @@ def create_app() -> Starlette:
 # Main — Run the server
 # =============================================================================
 
-if __name__ == "__main__":
-    port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
-
-    # Create the combined app
-    app = create_app()
-
-    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
-
+def _print_startup_banner(port: int, transport: str, discovery_enabled: bool) -> None:
+    """Print startup banner to stderr."""
     print(f"[DarkMatter] Starting mesh protocol on http://localhost:{port}", file=sys.stderr)
-    print(f"[DarkMatter] Mesh endpoints:", file=sys.stderr)
-    print(f"[DarkMatter]   POST /__darkmatter__/connection_request", file=sys.stderr)
-    print(f"[DarkMatter]   POST /__darkmatter__/connection_accepted", file=sys.stderr)
-    print(f"[DarkMatter]   POST /__darkmatter__/message", file=sys.stderr)
-    print(f"[DarkMatter]   POST /__darkmatter__/webhook/{{message_id}}", file=sys.stderr)
-    print(f"[DarkMatter]    GET /__darkmatter__/webhook/{{message_id}}", file=sys.stderr)
-    print(f"[DarkMatter]    GET /__darkmatter__/status", file=sys.stderr)
-    print(f"[DarkMatter]    GET /__darkmatter__/network_info", file=sys.stderr)
-    print(f"[DarkMatter]   POST /__darkmatter__/webrtc_offer", file=sys.stderr)
-    print(f"[DarkMatter]    GET /.well-known/darkmatter.json", file=sys.stderr)
-    print(f"[DarkMatter]    GET /bootstrap", file=sys.stderr)
-    print(f"[DarkMatter]    GET /bootstrap/server.py", file=sys.stderr)
-    print(f"[DarkMatter]", file=sys.stderr)
-    print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
-    print(f"[DarkMatter] WebRTC: {'AVAILABLE (aiortc installed)' if WEBRTC_AVAILABLE else 'disabled (pip install aiortc to enable)'}", file=sys.stderr)
+    print(f"[DarkMatter] MCP transport: {transport}", file=sys.stderr)
+    print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled'}", file=sys.stderr)
+    print(f"[DarkMatter] WebRTC: {'AVAILABLE' if WEBRTC_AVAILABLE else 'disabled (pip install aiortc)'}", file=sys.stderr)
     print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
-    print(f"[DarkMatter] MCP server available via streamable-http at /mcp (auth via darkmatter_authenticate tool)", file=sys.stderr)
 
+
+async def _run_stdio_with_http() -> None:
+    """Run MCP over stdio while serving HTTP mesh endpoints in the background.
+
+    This is the preferred mode when launched by an MCP client (e.g. Claude Code).
+    The client talks MCP over stdin/stdout. The HTTP server runs alongside for
+    agent-to-agent mesh communication, discovery, and webhooks.
+    """
+    from mcp.server.stdio import stdio_server
+
+    port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
-    uvicorn.run(app, host=host, port=port)
+
+    # Build the HTTP app (includes /mcp for backwards compat with HTTP clients)
+    app = create_app()
+    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
+    _print_startup_banner(port, "stdio (with HTTP mesh on port " + str(port) + ")", discovery_enabled)
+
+    # Start HTTP server in background for mesh endpoints
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config)
+
+    async with stdio_server() as (read_stream, write_stream):
+        # Run HTTP server and stdio MCP concurrently
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(server.serve)
+            await mcp._mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
+            # When stdio closes (client disconnects), shut down HTTP too
+            server.should_exit = True
+
+
+if __name__ == "__main__":
+    import anyio
+
+    port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
+    transport = os.environ.get("DARKMATTER_TRANSPORT", "auto")
+
+    # Auto-detect: if stdin is not a TTY, we're being launched by an MCP client
+    use_stdio = transport == "stdio" or (transport == "auto" and not sys.stdin.isatty())
+
+    if use_stdio:
+        anyio.run(_run_stdio_with_http)
+    else:
+        # Standalone HTTP mode (manual start, or DARKMATTER_TRANSPORT=http)
+        app = create_app()
+        discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
+        _print_startup_banner(port, "streamable-http", discovery_enabled)
+
+        host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
+        uvicorn.run(app, host=host, port=port)
