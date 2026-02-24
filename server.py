@@ -1205,10 +1205,12 @@ async def _status_updater() -> None:
 def _state_file_path() -> str:
     if "DARKMATTER_STATE_FILE" in os.environ:
         return os.environ["DARKMATTER_STATE_FILE"]
-    # Default: ~/.darkmatter/state/<port>.json — absolute path, per-port,
-    # no cwd dependency, no collisions between projects/terminals.
     state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
     os.makedirs(state_dir, exist_ok=True)
+    display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", "").strip()
+    if display_name:
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in display_name)
+        return os.path.join(state_dir, f"{safe_name}.json")
     port = os.environ.get("DARKMATTER_PORT", "8100")
     return os.path.join(state_dir, f"{port}.json")
 
@@ -1287,7 +1289,18 @@ def load_state() -> Optional[AgentState]:
     """Load persisted state from disk, if it exists. Returns None if no file."""
     path = _state_file_path()
     if not os.path.exists(path):
-        return None
+        # Migration: if using name-keyed path, check for legacy port-keyed file
+        display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", "").strip()
+        if display_name:
+            port = os.environ.get("DARKMATTER_PORT", "8100")
+            state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
+            legacy_path = os.path.join(state_dir, f"{port}.json")
+            if os.path.exists(legacy_path):
+                import shutil
+                shutil.copy2(legacy_path, path)
+                print(f"[DarkMatter] Migrated state: {legacy_path} → {path}", file=sys.stderr)
+        if not os.path.exists(path):
+            return None
 
     try:
         with open(path, "r") as f:
