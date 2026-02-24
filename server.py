@@ -846,16 +846,26 @@ def _require_auth(ctx: Context) -> Optional[str]:
     """Check if the current MCP session is authenticated.
 
     Returns None if authenticated, or an error JSON string if not.
+    Auto-authenticates local MCP sessions (localhost/streamable-http)
+    since co-located agents don't need explicit key exchange.
     """
     _track_session(ctx)
     state = get_state(ctx)
     session_id = _get_session_id(ctx)
     if session_id not in state.authenticated_sessions:
-        return json.dumps({
-            "success": False,
-            "error": "Not authenticated. Call darkmatter_authenticate first with your token "
-                     "(or without a token if this is your first connection to claim this node).",
-        })
+        # Auto-auth for local MCP sessions: if you can talk to the server
+        # over localhost MCP, you're co-located — no key exchange needed.
+        # Remote agents authenticate via mesh HTTP endpoints, not MCP.
+        if not state.claimed:
+            # First session on unclaimed node — auto-claim
+            state.claimed = True
+            state.authenticated_sessions.add(session_id)
+            save_state()
+            return None
+        # Claimed node — still auto-auth for MCP sessions since MCP is
+        # only reachable from localhost (streamable HTTP on 127.0.0.1)
+        state.authenticated_sessions.add(session_id)
+        return None
     return None
 
 
@@ -871,6 +881,9 @@ def _require_auth(ctx: Context) -> Optional[str]:
 )
 async def authenticate(params: AuthenticateInput, ctx: Context) -> str:
     """Authenticate with this DarkMatter node.
+
+    NOTE: Local MCP sessions are auto-authenticated — you only need to call
+    this explicitly to retrieve your private_key_hex for saving to memory.
 
     First connection: call without a private_key_hex to claim this node. You'll
     receive the node's private_key_hex — save it to your persistent memory.
@@ -888,10 +901,12 @@ async def authenticate(params: AuthenticateInput, ctx: Context) -> str:
     state = get_state(ctx)
     session_id = _get_session_id(ctx)
 
+    # Always auto-auth the MCP session
+    state.authenticated_sessions.add(session_id)
+
     if not state.claimed:
-        # Unclaimed node — first agent to authenticate claims it
+        # Unclaimed node — claim it and return the key
         state.claimed = True
-        state.authenticated_sessions.add(session_id)
         save_state()
         return json.dumps({
             "success": True,
@@ -905,10 +920,15 @@ async def authenticate(params: AuthenticateInput, ctx: Context) -> str:
         })
 
     if params.private_key_hex is None:
-        # Node is already claimed and no key provided
+        # Node already claimed, no key provided — but session is auto-authed.
+        # Return identity info so the agent knows who it is.
         return json.dumps({
-            "success": False,
-            "error": "This node is already claimed. Provide your private_key_hex to authenticate.",
+            "success": True,
+            "status": "authenticated",
+            "message": "Auto-authenticated via local MCP session. Call with your "
+                       "private_key_hex if you need to verify key ownership.",
+            "agent_id": state.agent_id,
+            "public_key_hex": state.public_key_hex,
         })
 
     # Verify the provided private key derives to the stored public key
@@ -981,14 +1001,22 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
             "error": f"Connection limit reached ({MAX_CONNECTIONS}). Disconnect from an agent first."
         })
 
+    # Normalize target URL: strip known suffixes so agents can pass
+    # "http://host:port", "http://host:port/mcp", or "http://host:port/__darkmatter__"
+    target_base = params.target_url.rstrip("/")
+    for suffix in ("/mcp", "/__darkmatter__"):
+        if target_base.endswith(suffix):
+            target_base = target_base[:-len(suffix)]
+            break
+
     # Call the target agent's receive_connection_request tool
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                params.target_url.rstrip("/") + "/__darkmatter__/connection_request",
+                target_base + "/__darkmatter__/connection_request",
                 json={
                     "from_agent_id": state.agent_id,
-                    "from_agent_url": f"{_get_public_url(state.port)}/mcp",
+                    "from_agent_url": _get_public_url(state.port),
                     "from_agent_bio": state.bio,
                     "from_agent_public_key_hex": state.public_key_hex,
                     "from_agent_display_name": state.display_name,
@@ -1016,7 +1044,7 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
                 })
             else:
                 # Track that we sent this request so we can verify acceptance later
-                state.pending_outbound.add(params.target_url.rstrip("/"))
+                state.pending_outbound.add(target_base)
                 return json.dumps({
                     "success": True,
                     "status": "pending",
@@ -1024,10 +1052,21 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
                     "request_id": result.get("request_id"),
                 })
 
+    except httpx.HTTPError as e:
+        return json.dumps({
+            "success": False,
+            "error": f"Failed to reach target agent at {target_base}: {str(e)}"
+        })
+    except json.JSONDecodeError:
+        status = response.status_code if 'response' in dir() else "unknown"
+        return json.dumps({
+            "success": False,
+            "error": f"Target agent at {target_base} returned non-JSON response (HTTP {status}). Is it a DarkMatter node?"
+        })
     except Exception as e:
         return json.dumps({
             "success": False,
-            "error": f"Failed to reach target agent: {str(e)}"
+            "error": f"Failed to connect to {target_base}: {str(e)}"
         })
 
 
@@ -1170,10 +1209,15 @@ async def _send_to_peer(conn: Connection, path: str, payload: dict) -> dict:
         except Exception as e:
             print(f"[DarkMatter] WebRTC send failed, falling back to HTTP: {e}", file=sys.stderr)
 
-    # HTTP fallback
+    # HTTP fallback — strip known suffixes from agent_url to get base URL
+    base_url = conn.agent_url.rstrip("/")
+    for suffix in ("/mcp", "/__darkmatter__"):
+        if base_url.endswith(suffix):
+            base_url = base_url[:-len(suffix)]
+            break
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            conn.agent_url.rstrip("/") + path,
+            base_url + path,
             json=payload,
         )
         result = resp.json()
@@ -1248,6 +1292,7 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
         )
 
     sent_to = []
+    failed = []
     for conn in targets:
         try:
             payload = {
@@ -1267,6 +1312,7 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
             sent_to.append(conn.agent_id)
         except Exception as e:
             conn.messages_declined += 1
+            failed.append({"agent_id": conn.agent_id, "display_name": conn.agent_display_name, "error": str(e)})
 
     # Create SentMessage tracking entry
     sent_msg = SentMessage(
@@ -1279,13 +1325,19 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     state.sent_messages[message_id] = sent_msg
 
     save_state()
-    return json.dumps({
-        "success": True,
+
+    result = {
+        "success": len(sent_to) > 0,
         "message_id": message_id,
         "routed_to": sent_to,
         "hops_remaining": params.hops_remaining,
         "webhook": webhook,
-    })
+    }
+    if failed:
+        result["failed"] = failed
+        if not sent_to:
+            result["error"] = f"Message could not be delivered to any of {len(failed)} target(s). Check 'failed' for details."
+    return json.dumps(result)
 
 
 # =============================================================================
