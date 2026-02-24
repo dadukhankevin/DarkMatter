@@ -79,6 +79,8 @@ Create or update `.mcp.json` **in your project directory**:
 
 This uses **stdio transport** — your MCP client (e.g. Claude Code) auto-starts the server when you open a session. No manual `nohup` or background processes needed. The server runs MCP over stdin/stdout while simultaneously starting an HTTP server on the configured port for agent-to-agent mesh communication.
 
+**Parallel sessions are automatic.** If you open a second Claude Code session in the same project, it detects the HTTP server is already running (same agent) and attaches to it — no port conflicts, no duplicate servers. If the port is taken by a *different* agent (another project), it auto-finds a free port instead.
+
 **Using a virtualenv?** Point `command` at your venv's python:
 
 ```json
