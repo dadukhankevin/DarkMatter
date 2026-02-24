@@ -409,7 +409,7 @@ When enabled, DarkMatter automatically spawns a `claude -p` subprocess to handle
 
 **Recursion guard:** The subprocess environment sets `DARKMATTER_AGENT_ENABLED=false`, so a spawned agent's server instance never spawns more agents.
 
-**Opt-in:** Disabled by default. Enable with `DARKMATTER_AGENT_ENABLED=true`. See the Configuration table below for tuning concurrency and rate limits.
+**Enabled by default.** Disable with `DARKMATTER_AGENT_ENABLED=false`. See the Configuration table below for tuning concurrency and rate limits.
 
 ## Configuration
 
@@ -426,7 +426,7 @@ All configuration is via environment variables:
 | `DARKMATTER_DISCOVERY` | `true` | Enable/disable discovery |
 | `DARKMATTER_DISCOVERY_PORTS` | `8100-8110` | Localhost port range to scan for local nodes |
 | `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL for reverse proxy setups |
-| `DARKMATTER_AGENT_ENABLED` | `false` | Enable auto-spawning `claude` agents for incoming messages |
+| `DARKMATTER_AGENT_ENABLED` | `true` | Enable auto-spawning `claude` agents for incoming messages |
 | `DARKMATTER_AGENT_MAX_CONCURRENT` | `2` | Max simultaneous agent subprocesses |
 | `DARKMATTER_AGENT_MAX_PER_HOUR` | `6` | Rolling hourly rate limit for agent spawns |
 | `DARKMATTER_AGENT_COMMAND` | `claude` | CLI command to run (e.g. full path to claude) |

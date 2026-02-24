@@ -98,7 +98,7 @@ PEER_LOOKUP_MAX_CONCURRENT = 50     # fan out peer_lookup to all connections
 IP_CHECK_INTERVAL = 300             # check public IP every 5 min, not every health cycle
 
 # Agent auto-spawn configuration
-AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "false").lower() == "true"
+AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
 AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
 AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "6"))
 AGENT_SPAWN_COMMAND = os.environ.get("DARKMATTER_AGENT_COMMAND", "claude")
