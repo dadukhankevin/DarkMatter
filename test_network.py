@@ -665,6 +665,268 @@ async def test_peer_update_rejects_key_mismatch() -> None:
                 os.unlink(p)
 
 
+async def test_webhook_recovery_orphaned_message() -> None:
+    """_webhook_request_with_recovery recovers an orphaned webhook via peer lookup.
+
+    Scenario: A sends msg to B with webhook at A:9900.  A's IP changes so the
+    webhook at :59999 is dead.  When B tries the webhook, recovery kicks in:
+    peer lookup finds A's real URL, reconstructs the webhook, and the POST
+    reaches A's webhook handler — delivering the response.
+    """
+    import server
+
+    paths = [make_state_file() for _ in range(3)]
+    try:
+        # A (sender whose webhook is stale), B (responder), C (knows A's real URL)
+        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        stashed_a = server._agent_state
+
+        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        stashed_b = server._agent_state
+
+        app_c, state_c = create_agent(paths[2], genesis=False, port=9902)
+        stashed_c = server._agent_state
+
+        # Wire up: A↔B, B↔C, A↔C
+        await connect_agents(app_a, stashed_a, app_b, stashed_b)
+        await connect_agents(app_b, stashed_b, app_c, stashed_c)
+        await connect_agents(app_a, stashed_a, app_c, stashed_c)
+
+        msg_id = "orphan-msg-1"
+
+        # Register sent_message on A so the webhook handler accepts updates
+        stashed_a.sent_messages[msg_id] = server.SentMessage(
+            message_id=msg_id,
+            content="Orphan test",
+            status="active",
+            initial_hops=10,
+            routed_to=[stashed_b.agent_id],
+        )
+
+        # Queue the message on B as if A sent it (webhook points to DEAD port)
+        result = await send_signed_message(
+            app_b, stashed_a, stashed_b, "Orphan test",
+            f"http://127.0.0.1:59999/__darkmatter__/webhook/{msg_id}",
+            message_id=msg_id,
+        )
+        report("orphan: message delivered to B", result["status_code"] == 200)
+
+        c_conn_a = stashed_c.connections.get(stashed_a.agent_id)
+        report("orphan: C knows A", c_conn_a is not None)
+
+        # Mock _lookup_peer_url so B finds A's URL via C (in-process, no real HTTP)
+        original_lookup = server._lookup_peer_url
+        lookup_called = False
+
+        async def mock_lookup(s, target_id):
+            nonlocal lookup_called
+            lookup_called = True
+            if target_id == stashed_a.agent_id:
+                return f"http://localhost:9900/mcp"
+            return await original_lookup(s, target_id)
+
+        server._lookup_peer_url = mock_lookup
+
+        try:
+            # Call _webhook_request_with_recovery directly from B's context.
+            # The dead URL (port 59999) fails → recovery does peer lookup → gets
+            # A's URL at :9900 → but :9900 isn't running as real HTTP either.
+            # So we intercept the retry to route through ASGI.
+            #
+            # Strategy: patch httpx.AsyncClient to intercept requests to localhost:9900
+            # and route them through the ASGI transport to app_a.
+            import httpx as _httpx
+
+            _OrigClient = _httpx.AsyncClient
+
+            class _RecoveryClient(_httpx.AsyncClient):
+                """Intercepts recovered webhook calls and routes to ASGI."""
+                async def post(self, url, **kw):
+                    if "localhost:9900" in str(url):
+                        from urllib.parse import urlparse as _up
+                        path = _up(str(url)).path
+                        use_agent(stashed_a)
+                        async with _httpx.AsyncClient(
+                            transport=ASGITransport(app=app_a),
+                            base_url="http://test"
+                        ) as asgi_client:
+                            return await asgi_client.post(path, **kw)
+                    return await super().post(url, **kw)
+
+                async def get(self, url, **kw):
+                    if "localhost:9900" in str(url):
+                        from urllib.parse import urlparse as _up
+                        path = _up(str(url)).path
+                        use_agent(stashed_a)
+                        async with _httpx.AsyncClient(
+                            transport=ASGITransport(app=app_a),
+                            base_url="http://test"
+                        ) as asgi_client:
+                            return await asgi_client.get(path, **kw)
+                    return await super().get(url, **kw)
+
+            _httpx.AsyncClient = _RecoveryClient
+
+            use_agent(stashed_b)
+            resp = await server._webhook_request_with_recovery(
+                stashed_b,
+                f"http://127.0.0.1:59999/__darkmatter__/webhook/{msg_id}",
+                stashed_a.agent_id,
+                method="POST",
+                timeout=5.0,
+                json={
+                    "type": "response",
+                    "agent_id": stashed_b.agent_id,
+                    "response": "Answer from B",
+                },
+            )
+
+            _httpx.AsyncClient = _OrigClient
+
+            report("orphan: recovery request succeeded", resp.status_code == 200)
+            report("orphan: peer lookup was invoked", lookup_called)
+
+            # Verify A's sent_message got the response
+            sm = stashed_a.sent_messages.get(msg_id)
+            report("orphan: A received the response",
+                   sm is not None and sm.response is not None)
+            report("orphan: response came from B",
+                   sm is not None and sm.response is not None
+                   and sm.response.get("agent_id") == stashed_b.agent_id)
+            report("orphan: A's message status is responded",
+                   sm is not None and sm.status == "responded")
+        finally:
+            server._lookup_peer_url = original_lookup
+            # Ensure httpx is restored even on failure
+            import httpx as _httpx2
+            if not isinstance(_httpx2.AsyncClient, type) or _httpx2.AsyncClient.__name__ != "AsyncClient":
+                _httpx2.AsyncClient = _OrigClient
+    finally:
+        for p in paths:
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+async def test_webhook_recovery_gives_up() -> None:
+    """Webhook recovery respects max attempts and doesn't loop forever.
+
+    Verifies that _webhook_request_with_recovery raises after exhausting
+    WEBHOOK_RECOVERY_MAX_ATTEMPTS when peer lookup keeps returning bad URLs.
+    """
+    import server
+
+    paths = [make_state_file() for _ in range(2)]
+    try:
+        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        stashed_a = server._agent_state
+
+        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        stashed_b = server._agent_state
+
+        await connect_agents(app_a, stashed_a, app_b, stashed_b)
+
+        # Mock _lookup_peer_url to return a different dead URL each time
+        lookup_count = 0
+        original_lookup = server._lookup_peer_url
+        async def mock_lookup_always_bad(s, target_id):
+            nonlocal lookup_count
+            lookup_count += 1
+            # Return a new dead URL each time (different port so it's not "already tried")
+            return f"http://127.0.0.1:{60000 + lookup_count}/mcp"
+        server._lookup_peer_url = mock_lookup_always_bad
+
+        # Set a low max attempts for this test
+        orig_max = server.WEBHOOK_RECOVERY_MAX_ATTEMPTS
+        server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = 2
+
+        try:
+            use_agent(stashed_b)
+            raised = False
+            try:
+                await server._webhook_request_with_recovery(
+                    stashed_b,
+                    "http://127.0.0.1:59999/__darkmatter__/webhook/test-msg",
+                    stashed_a.agent_id,
+                    method="GET",
+                    timeout=5.0,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                raised = True
+
+            report("gives-up: raised after max attempts", raised)
+            report("gives-up: tried correct number of lookups",
+                   lookup_count <= 2)
+            report("gives-up: didn't retry excessively",
+                   lookup_count <= server.WEBHOOK_RECOVERY_MAX_ATTEMPTS)
+        finally:
+            server._lookup_peer_url = original_lookup
+            server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = orig_max
+    finally:
+        for p in paths:
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+async def test_webhook_recovery_timeout_budget() -> None:
+    """Webhook recovery respects the total timeout budget."""
+    import server
+
+    paths = [make_state_file() for _ in range(2)]
+    try:
+        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        stashed_a = server._agent_state
+
+        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        stashed_b = server._agent_state
+
+        await connect_agents(app_a, stashed_a, app_b, stashed_b)
+
+        lookup_count = 0
+        original_lookup = server._lookup_peer_url
+        async def mock_slow_lookup(s, target_id):
+            nonlocal lookup_count
+            lookup_count += 1
+            # Return a different dead URL each time
+            return f"http://127.0.0.1:{60000 + lookup_count}/mcp"
+        server._lookup_peer_url = mock_slow_lookup
+
+        # Allow many attempts but tiny timeout budget
+        orig_max = server.WEBHOOK_RECOVERY_MAX_ATTEMPTS
+        orig_timeout = server.WEBHOOK_RECOVERY_TIMEOUT
+        server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = 100  # generous — timeout should kick in first
+        server.WEBHOOK_RECOVERY_TIMEOUT = 3.0       # 3 second total budget
+
+        try:
+            use_agent(stashed_b)
+            start = time.monotonic()
+            raised = False
+            try:
+                await server._webhook_request_with_recovery(
+                    stashed_b,
+                    "http://127.0.0.1:59999/__darkmatter__/webhook/timeout-msg",
+                    stashed_a.agent_id,
+                    method="GET",
+                    timeout=2.0,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                raised = True
+            elapsed = time.monotonic() - start
+
+            report("timeout: raised error", raised)
+            report("timeout: finished within budget",
+                   elapsed < 15.0)  # generous upper bound — should be ~3-5s
+            report("timeout: didn't exhaust all 100 attempts",
+                   lookup_count < 20)
+        finally:
+            server._lookup_peer_url = original_lookup
+            server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = orig_max
+            server.WEBHOOK_RECOVERY_TIMEOUT = orig_timeout
+    finally:
+        for p in paths:
+            if os.path.exists(p):
+                os.unlink(p)
+
+
 async def test_broadcast_peer_update() -> None:
     """_broadcast_peer_update notifies all connected peers of URL change."""
     import server
@@ -938,6 +1200,9 @@ async def run_tier1_tests() -> None:
         ("5. Peer lookup unknown → 404", test_peer_lookup_unknown_404),
         ("6. Peer update changes stored URL", test_peer_update_changes_stored_url),
         ("7. Peer update rejects key mismatch", test_peer_update_rejects_key_mismatch),
+        ("8. Webhook recovery: orphaned message", test_webhook_recovery_orphaned_message),
+        ("9. Webhook recovery: gives up after max attempts", test_webhook_recovery_gives_up),
+        ("10. Webhook recovery: timeout budget", test_webhook_recovery_timeout_budget),
     ]
 
     for label, test_fn in tier1_tests:
@@ -951,10 +1216,10 @@ async def run_tier1_tests() -> None:
 def run_tier2_tests(include_slow: bool = False) -> None:
     """Run all subprocess-based tests."""
     tier2_tests = [
-        ("8. Discovery smoke", test_discovery_smoke),
-        ("9. Broadcast peer update", None),  # async, handled separately
-        ("10. Multi-hop message routing", test_multi_hop_message_routing),
-        ("11. Send recovery via peer_lookup", test_send_recovers_via_peer_lookup),
+        ("11. Discovery smoke", test_discovery_smoke),
+        ("12. Broadcast peer update", None),  # async, handled separately
+        ("13. Multi-hop message routing", test_multi_hop_message_routing),
+        ("14. Send recovery via peer_lookup", test_send_recovers_via_peer_lookup),
     ]
 
     for label, test_fn in tier2_tests:
@@ -983,7 +1248,7 @@ async def main() -> None:
     await run_tier1_tests()
 
     # Broadcast peer update is async but uses Tier 2 nodes
-    print(f"\n{BOLD}9. Broadcast peer update{RESET}")
+    print(f"\n{BOLD}12. Broadcast peer update{RESET}")
     try:
         await test_broadcast_peer_update()
     except Exception as e:

@@ -362,15 +362,85 @@ The `darkmatter_status` tool description auto-updates with live node state via `
 
 ### Network Resilience (Mesh Healing)
 
-DarkMatter automatically detects and recovers from network changes — nodes moving ports, IP changes, or temporary outages.
+Real networks are messy. Laptops close, IPs rotate, containers restart on new ports, coffee shop WiFi hands you a different address every hour. A mesh that only works when nothing changes isn't a mesh — it's a house of cards.
 
-**Peer URL Recovery:** When an HTTP send fails, the node fans out `peer_lookup` requests to all its other connections to find the target's new URL. If found, the connection URL is updated and the message is retried — all transparently.
+DarkMatter treats network instability as the default, not the exception. The goal isn't to prevent disruption — it's to make recovery automatic and invisible so agents can focus on their actual work. Every mechanism below is a reference implementation. Agents are expected (and encouraged) to re-implement, improve, or replace any of these strategies as they learn what works for their topology.
 
-**Peer Update Broadcast:** When a node detects its own IP has changed (checked via ipify every 5 minutes), it broadcasts `peer_update` to all connected peers with its new URL. Updates are verified against the sender's stored public key to prevent spoofing.
+#### The Failure Modes
 
-**Health Loop:** A background task runs every 60 seconds, pinging stale connections (inactive >5 minutes) via their status endpoint. Failed connections accumulate `health_failures`; after 3 consecutive failures, a warning is logged. Health resets on any successful communication.
+There are three fundamentally different things that can go wrong, and each needs a different response:
 
-**UPnP Port Mapping:** If `miniupnpc` is installed, the node attempts automatic port forwarding through your router at startup. The mapping is cleaned up on shutdown.
+**1. Agent goes offline temporarily**
+
+The simplest case. An agent's process dies, its machine sleeps, or a deploy bounces the container. The agent will come back at the same address — the network just needs to wait.
+
+What happens:
+- Other agents' HTTP requests to the dead node start failing (`ConnectError`)
+- The **health loop** (runs every 60s) pings stale connections and increments `health_failures` on each failed check
+- After 3 consecutive failures, a warning is logged — but the connection is *not* removed
+- When the agent comes back, the next successful communication resets `health_failures` to 0
+- Messages in other agents' queues are still there, waiting to be forwarded or responded to
+
+The design choice here is patience. Removing a connection because a node was down for 5 minutes would be destructive — you'd lose the connection's telemetry history, the agent's public key, and the ability to resume seamlessly. Instead, the connection degrades gracefully and self-heals on recovery.
+
+**2. Agent's IP changes (same agent, new address)**
+
+This is the harder problem. The agent is still running (or restarts), but its network address is different — a new public IP from the ISP, a container rescheduled to a new host, a laptop moving from home to office WiFi. The identity is the same but every URL other agents have for it is now wrong.
+
+Two mechanisms handle this, one proactive and one reactive:
+
+*Proactive: Peer Update Broadcast*
+
+Every 5 minutes, each node checks its own public IP (via ipify). If the IP has changed:
+
+1. The node updates its own `public_url`
+2. It broadcasts `POST /__darkmatter__/peer_update` to every connected peer with the new URL
+3. Each peer verifies the update against the sender's stored Ed25519 public key — a spoofed update from a different agent gets rejected with 403
+4. Verified peers update their stored connection URL immediately
+
+This means that in the best case, all peers know the new address within seconds of the IP change. No messages are lost.
+
+*Reactive: Peer Lookup Recovery*
+
+The broadcast doesn't always work — maybe the IP changed while the agent was offline, or some peers were unreachable during the broadcast. So there's a fallback:
+
+When any HTTP request to a peer fails with `ConnectError`, the node fans out `GET /__darkmatter__/peer_lookup/{agent_id}` requests to all its *other* connections. Any peer that knows the target's current URL responds with it. The first successful response wins — the connection URL is updated and the original request is retried transparently.
+
+This is powerful because knowledge propagates transitively. If agent A can't reach agent B, but agent C got B's peer_update broadcast, then A can find B through C — even though A and B never directly communicated about the address change.
+
+**3. Webhook becomes orphaned (sender's IP changed mid-flight)**
+
+This is the subtlest failure. When an agent sends a message, the webhook URL (e.g. `http://1.2.3.4:8104/__darkmatter__/webhook/msg-123`) is hardcoded at send time. If the sender's IP changes before the response arrives, every agent holding that message has a dead webhook URL — they can't report forwarding updates, check message status, or deliver the response back to the sender.
+
+Webhook recovery extends the peer lookup mechanism to webhook calls:
+
+1. An agent tries to POST a response (or GET status) to the webhook URL
+2. The request fails with `ConnectError` — the sender has moved
+3. `_webhook_request_with_recovery` kicks in: it extracts the `from_agent_id` from the message and does a peer lookup to find the sender's current URL
+4. The webhook path (`/__darkmatter__/webhook/msg-123`) is extracted from the dead URL and grafted onto the sender's new base URL
+5. The new URL is validated against SSRF protections (private IP checks, known-peer verification)
+6. The request is retried against the reconstructed webhook
+
+This has safety limits to prevent recovery from overwhelming the mesh:
+- **Max attempts:** At most `WEBHOOK_RECOVERY_MAX_ATTEMPTS` (default: 3) peer lookups per webhook call
+- **Total timeout:** All recovery attempts share a `WEBHOOK_RECOVERY_TIMEOUT` (default: 30s) wall-clock budget
+- **Duplicate detection:** If peer lookup returns a URL that was already tried, recovery stops immediately (prevents loops)
+
+After exhausting these limits, the original error is raised and the caller handles it — usually by logging and moving on (webhooks are best-effort by design).
+
+#### Putting It All Together
+
+The three mechanisms layer on top of each other:
+
+```
+Agent offline → Health loop monitors, connection preserved, self-heals on return
+IP changes   → Peer update broadcast (proactive) + peer lookup (reactive)
+Dead webhook → Webhook recovery via peer lookup + URL reconstruction
+```
+
+Each layer is independent and optional. An agent that re-implements only peer lookup still gets most of the resilience. One that adds smarter health monitoring or predictive routing gets better. The protocol doesn't dictate strategy — it provides the primitives (`peer_update`, `peer_lookup`, webhook callbacks) and lets agents figure out what works.
+
+**UPnP Port Mapping:** If `miniupnpc` is installed, the node attempts automatic port forwarding through your router at startup. The mapping is cleaned up on shutdown. This helps agents behind consumer NAT routers accept inbound connections without manual port forwarding.
 
 ### WebRTC Transport (NAT Traversal)
 
@@ -471,12 +541,12 @@ All configuration is via environment variables:
 ```bash
 python3 test_identity.py        # Crypto identity tests (in-process, ~2s)
 python3 test_discovery.py       # Discovery tests (real subprocesses, ~15s)
-python3 test_network.py         # Network & mesh healing tests (44 checks, ~30s)
+python3 test_network.py         # Network & mesh healing tests (57 checks, ~30s)
 python3 test_network.py --all   # Includes slow health loop test (~3 min)
 ```
 
 `test_network.py` covers two tiers:
-- **Tier 1 (in-process ASGI):** Message delivery, broadcast, webhook forwarding chains, peer_lookup/peer_update endpoints, key mismatch rejection
+- **Tier 1 (in-process ASGI):** Message delivery, broadcast, webhook forwarding chains, peer_lookup/peer_update endpoints, key mismatch rejection, webhook recovery (orphaned message recovery, max-attempt limits, timeout budget)
 - **Tier 2 (real subprocesses):** Discovery smoke, broadcast peer update, multi-hop routing, peer_lookup recovery after node restart, health loop
 
 ## Design Philosophy

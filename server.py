@@ -96,6 +96,8 @@ UPNP_PORT_RANGE = (30000, 60000)    # external port range for UPnP mappings
 PEER_LOOKUP_TIMEOUT = 5.0           # seconds to wait for peer_lookup responses
 PEER_LOOKUP_MAX_CONCURRENT = 50     # fan out peer_lookup to all connections
 IP_CHECK_INTERVAL = 300             # check public IP every 5 min, not every health cycle
+WEBHOOK_RECOVERY_MAX_ATTEMPTS = 3   # max peer-lookup recovery attempts per webhook call
+WEBHOOK_RECOVERY_TIMEOUT = 30.0     # total wall-clock budget for all recovery attempts (seconds)
 
 # Agent auto-spawn configuration
 AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
@@ -367,6 +369,84 @@ async def _lookup_peer_url(state, target_agent_id: str) -> Optional[str]:
         for t in tasks:
             t.cancel()
     return None
+
+
+async def _webhook_request_with_recovery(
+    state, webhook_url: str, from_agent_id: Optional[str],
+    method: str = "POST", timeout: float = 30.0, **kwargs
+) -> "httpx.Response":
+    """Make an HTTP request to a webhook URL, recovering via peer lookup on connection failure.
+
+    On ConnectError/ConnectTimeout, uses _lookup_peer_url to find the sender's
+    current URL, reconstructs the webhook with the new base, validates it, and retries.
+
+    Limits:
+      - At most WEBHOOK_RECOVERY_MAX_ATTEMPTS recovery attempts (peer lookups)
+      - Total wall-clock time capped at WEBHOOK_RECOVERY_TIMEOUT seconds
+    """
+    deadline = time.monotonic() + WEBHOOK_RECOVERY_TIMEOUT
+    current_url = webhook_url
+    last_err: Exception | None = None
+
+    # Initial attempt (not counted toward recovery budget)
+    try:
+        remaining = max(1.0, deadline - time.monotonic())
+        async with httpx.AsyncClient(timeout=min(timeout, remaining)) as client:
+            return await getattr(client, method.lower())(current_url, **kwargs)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        last_err = e
+
+    # Recovery loop — only entered on connection failure
+    if not from_agent_id:
+        raise last_err
+
+    urls_tried = {current_url}
+
+    for attempt in range(1, WEBHOOK_RECOVERY_MAX_ATTEMPTS + 1):
+        if time.monotonic() >= deadline:
+            print(f"[DarkMatter] Webhook recovery: timeout exceeded after {attempt - 1} attempts", file=sys.stderr)
+            break
+
+        new_base = await _lookup_peer_url(state, from_agent_id)
+        if not new_base:
+            print(f"[DarkMatter] Webhook recovery: peer lookup returned nothing (attempt {attempt}/{WEBHOOK_RECOVERY_MAX_ATTEMPTS})", file=sys.stderr)
+            break
+
+        # Reconstruct webhook URL with the new base
+        parsed = urlparse(current_url if attempt == 1 else webhook_url)
+        path = parsed.path  # e.g. /__darkmatter__/webhook/msg-xxx
+        if not path.startswith("/__darkmatter__/webhook/"):
+            break
+
+        new_base = new_base.rstrip("/")
+        for suffix in ("/mcp", "/__darkmatter__"):
+            if new_base.endswith(suffix):
+                new_base = new_base[:-len(suffix)]
+                break
+        new_webhook = f"{new_base}{path}"
+
+        if new_webhook in urls_tried:
+            print(f"[DarkMatter] Webhook recovery: peer lookup returned already-tried URL {new_webhook}, giving up", file=sys.stderr)
+            break
+        urls_tried.add(new_webhook)
+
+        # SSRF protection
+        err = validate_webhook_url(new_webhook)
+        if err:
+            print(f"[DarkMatter] Webhook recovery: new URL failed validation: {err}", file=sys.stderr)
+            break
+
+        print(f"[DarkMatter] Webhook recovery: {webhook_url} -> {new_webhook} (attempt {attempt}/{WEBHOOK_RECOVERY_MAX_ATTEMPTS})", file=sys.stderr)
+
+        try:
+            remaining = max(1.0, deadline - time.monotonic())
+            async with httpx.AsyncClient(timeout=min(timeout, remaining)) as client:
+                return await getattr(client, method.lower())(new_webhook, **kwargs)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            last_err = e
+            continue
+
+    raise last_err
 
 
 async def _broadcast_peer_update(state) -> None:
@@ -2207,21 +2287,21 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
     response_time_ms = 0.0
     try:
         start = time.monotonic()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                msg.webhook,
-                json={
-                    "type": "response",
-                    "agent_id": state.agent_id,
-                    "response": params.response,
-                    "metadata": msg.metadata,
-                    "timestamp": resp_timestamp,
-                    "from_public_key_hex": state.public_key_hex,
-                    "signature_hex": resp_signature_hex,
-                }
-            )
-            response_time_ms = (time.monotonic() - start) * 1000
-            webhook_success = resp.status_code < 400
+        resp = await _webhook_request_with_recovery(
+            state, msg.webhook, msg.from_agent_id,
+            method="POST", timeout=30.0,
+            json={
+                "type": "response",
+                "agent_id": state.agent_id,
+                "response": params.response,
+                "metadata": msg.metadata,
+                "timestamp": resp_timestamp,
+                "from_public_key_hex": state.public_key_hex,
+                "signature_hex": resp_signature_hex,
+            }
+        )
+        response_time_ms = (time.monotonic() - start) * 1000
+        webhook_success = resp.status_code < 400
     except Exception as e:
         webhook_error = str(e)
 
@@ -2307,33 +2387,35 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
         print(f"[DarkMatter] Warning: cannot validate webhook for {msg.message_id}: {webhook_err}", file=sys.stderr)
     else:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                status_resp = await client.get(msg.webhook)
-                if status_resp.status_code == 200:
-                    webhook_data = status_resp.json()
+            status_resp = await _webhook_request_with_recovery(
+                state, msg.webhook, msg.from_agent_id,
+                method="GET", timeout=10.0,
+            )
+            if status_resp.status_code == 200:
+                webhook_data = status_resp.json()
 
-                    # Check if message is still active
-                    msg_status = webhook_data.get("status", "active")
-                    if msg_status in ("expired", "responded"):
-                        # Message is no longer active — remove from queue
-                        state.message_queue.pop(msg_index)
-                        save_state()
-                        return json.dumps({
-                            "success": False,
-                            "error": f"Message is already {msg_status} (checked via webhook). Removed from queue.",
-                        })
+                # Check if message is still active
+                msg_status = webhook_data.get("status", "active")
+                if msg_status in ("expired", "responded"):
+                    # Message is no longer active — remove from queue
+                    state.message_queue.pop(msg_index)
+                    save_state()
+                    return json.dumps({
+                        "success": False,
+                        "error": f"Message is already {msg_status} (checked via webhook). Removed from queue.",
+                    })
 
-                    # Loop detection: block with hint unless force=True
-                    for update in webhook_data.get("updates", []):
-                        if update.get("target_agent_id") == params.target_agent_id:
-                            if params.force:
-                                loop_warning = f"Warning: agent '{params.target_agent_id}' has already received this message. Forwarding anyway (force=true)."
-                            else:
-                                return json.dumps({
-                                    "success": False,
-                                    "error": f"Agent '{params.target_agent_id}' has already received this message. To forward anyway, retry with force=true.",
-                                })
-                            break
+                # Loop detection: block with hint unless force=True
+                for update in webhook_data.get("updates", []):
+                    if update.get("target_agent_id") == params.target_agent_id:
+                        if params.force:
+                            loop_warning = f"Warning: agent '{params.target_agent_id}' has already received this message. Forwarding anyway (force=true)."
+                        else:
+                            return json.dumps({
+                                "success": False,
+                                "error": f"Agent '{params.target_agent_id}' has already received this message. To forward anyway, retry with force=true.",
+                            })
+                        break
         except Exception as e:
             # Webhook unreachable — proceed anyway (best effort)
             print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
@@ -2346,15 +2428,15 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
         # Notify webhook of TTL expiry
         if not webhook_err:
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    await client.post(
-                        msg.webhook,
-                        json={
-                            "type": "expired",
-                            "agent_id": state.agent_id,
-                            "note": "Message expired — no hops remaining.",
-                        }
-                    )
+                await _webhook_request_with_recovery(
+                    state, msg.webhook, msg.from_agent_id,
+                    method="POST", timeout=30.0,
+                    json={
+                        "type": "expired",
+                        "agent_id": state.agent_id,
+                        "note": "Message expired — no hops remaining.",
+                    }
+                )
             except Exception:
                 pass
 
@@ -2373,16 +2455,16 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
     # POST forwarding update to webhook
     if not webhook_err:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    msg.webhook,
-                    json={
-                        "type": "forwarded",
-                        "agent_id": state.agent_id,
-                        "target_agent_id": params.target_agent_id,
-                        "note": params.note,
-                    }
-                )
+            await _webhook_request_with_recovery(
+                state, msg.webhook, msg.from_agent_id,
+                method="POST", timeout=10.0,
+                json={
+                    "type": "forwarded",
+                    "agent_id": state.agent_id,
+                    "target_agent_id": params.target_agent_id,
+                    "note": params.note,
+                }
+            )
         except Exception as e:
             print(f"[DarkMatter] Warning: failed to post forwarding update to webhook: {e}", file=sys.stderr)
 
