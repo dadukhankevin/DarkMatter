@@ -52,13 +52,20 @@ try:
 except ImportError:
     WEBRTC_AVAILABLE = False
 
+# UPnP support (optional — enables automatic port forwarding for NAT traversal)
+try:
+    import miniupnpc
+    UPNP_AVAILABLE = True
+except ImportError:
+    UPNP_AVAILABLE = False
+
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 DEFAULT_PORT = 8100
-MAX_CONNECTIONS = 5
+MAX_CONNECTIONS = 50
 MESSAGE_QUEUE_MAX = 50
 SENT_MESSAGES_MAX = 100
 MAX_CONTENT_LENGTH = 65536   # 64 KB
@@ -80,6 +87,22 @@ DISCOVERY_MAX_AGE = 90        # seconds before a peer is considered stale
 _disc_ports = os.environ.get("DARKMATTER_DISCOVERY_PORTS", "8100-8110")
 _disc_lo, _disc_hi = _disc_ports.split("-", 1)
 DISCOVERY_LOCAL_PORTS = range(int(_disc_lo), int(_disc_hi) + 1)
+
+# Network resilience configuration
+HEALTH_CHECK_INTERVAL = 60          # seconds between health check cycles
+HEALTH_FAILURE_THRESHOLD = 3        # failures before logging warning
+STALE_CONNECTION_AGE = 300          # seconds of inactivity before health-checking a connection
+UPNP_PORT_RANGE = (30000, 60000)    # external port range for UPnP mappings
+PEER_LOOKUP_TIMEOUT = 5.0           # seconds to wait for peer_lookup responses
+PEER_LOOKUP_MAX_CONCURRENT = 50     # fan out peer_lookup to all connections
+IP_CHECK_INTERVAL = 300             # check public IP every 5 min, not every health cycle
+
+# Agent auto-spawn configuration
+AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "false").lower() == "true"
+AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
+AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "6"))
+AGENT_SPAWN_COMMAND = os.environ.get("DARKMATTER_AGENT_COMMAND", "claude")
+AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "300"))
 
 
 # =============================================================================
@@ -183,11 +206,265 @@ def truncate_field(value: str, max_len: int) -> str:
 
 
 def _get_public_url(port: int) -> str:
-    """Get the public URL for this agent, preferring DARKMATTER_PUBLIC_URL."""
+    """Get the public URL for this agent.
+
+    Priority: state.public_url (set by _discover_public_url at startup)
+    > DARKMATTER_PUBLIC_URL env var > localhost fallback.
+    """
+    state = _agent_state
+    if state is not None and state.public_url:
+        return state.public_url
     public_url = os.environ.get("DARKMATTER_PUBLIC_URL", "").rstrip("/")
     if public_url:
         return public_url
     return f"http://localhost:{port}"
+
+
+async def _discover_public_url(port: int) -> str:
+    """Discover the best public URL for this agent.
+
+    Tries in order: env var > UPnP mapping > ipify public IP > localhost fallback.
+    """
+    # 1. Explicit env var takes priority
+    env_url = os.environ.get("DARKMATTER_PUBLIC_URL", "").rstrip("/")
+    if env_url:
+        print(f"[DarkMatter] Public URL (env): {env_url}", file=sys.stderr)
+        return env_url
+
+    # 2. Try UPnP port mapping
+    if UPNP_AVAILABLE:
+        result = await asyncio.to_thread(_try_upnp_mapping, port)
+        if result is not None:
+            url, upnp_obj, ext_port = result
+            state = _agent_state
+            if state is not None:
+                state._upnp_mapping = (url, upnp_obj, ext_port)
+            print(f"[DarkMatter] Public URL (UPnP): {url}", file=sys.stderr)
+            return url
+
+    # 3. Try ipify to get public IP
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("https://api.ipify.org?format=json")
+            if resp.status_code == 200:
+                ip = resp.json().get("ip")
+                if ip:
+                    url = f"http://{ip}:{port}"
+                    print(f"[DarkMatter] Public URL (ipify): {url}", file=sys.stderr)
+                    return url
+    except Exception as e:
+        print(f"[DarkMatter] ipify lookup failed: {e}", file=sys.stderr)
+
+    # 4. Localhost fallback
+    url = f"http://localhost:{port}"
+    print(f"[DarkMatter] Public URL (fallback): {url}", file=sys.stderr)
+    return url
+
+
+def _try_upnp_mapping(local_port: int) -> Optional[tuple]:
+    """Try to create a UPnP port mapping. Returns (url, upnp_obj, ext_port) or None.
+
+    Runs synchronously — call via asyncio.to_thread().
+    """
+    import random
+    try:
+        upnp = miniupnpc.UPnP()
+        upnp.discoverdelay = 2000
+        devices = upnp.discover()
+        if devices == 0:
+            return None
+        upnp.selectigd()
+        external_ip = upnp.externalipaddress()
+        if not external_ip:
+            return None
+
+        # Try random ports in range, up to 5 attempts
+        for _ in range(5):
+            ext_port = random.randint(*UPNP_PORT_RANGE)
+            try:
+                upnp.addportmapping(
+                    ext_port, "TCP", upnp.lanaddr, local_port,
+                    "DarkMatter mesh", ""
+                )
+                url = f"http://{external_ip}:{ext_port}"
+                return (url, upnp, ext_port)
+            except Exception:
+                continue  # Port taken, try another
+
+        return None
+    except Exception as e:
+        print(f"[DarkMatter] UPnP mapping failed: {e}", file=sys.stderr)
+        return None
+
+
+def _cleanup_upnp() -> None:
+    """Remove UPnP port mapping on shutdown."""
+    state = _agent_state
+    if state is None or state._upnp_mapping is None:
+        return
+    url, upnp_obj, ext_port = state._upnp_mapping
+    try:
+        upnp_obj.deleteportmapping(ext_port, "TCP")
+        print(f"[DarkMatter] UPnP mapping removed (port {ext_port})", file=sys.stderr)
+    except Exception as e:
+        print(f"[DarkMatter] UPnP cleanup failed: {e}", file=sys.stderr)
+    state._upnp_mapping = None
+
+
+async def _lookup_peer_url(state, target_agent_id: str) -> Optional[str]:
+    """Fan out peer_lookup requests to connected peers to find an agent's current URL.
+
+    Returns the new URL if found, else None.
+    """
+    peers = [c for c in state.connections.values() if c.agent_id != target_agent_id]
+    if not peers:
+        return None
+
+    # Limit fan-out
+    peers = peers[:PEER_LOOKUP_MAX_CONCURRENT]
+
+    async def _query_peer(conn: Connection) -> Optional[str]:
+        try:
+            base_url = conn.agent_url.rstrip("/")
+            for suffix in ("/mcp", "/__darkmatter__"):
+                if base_url.endswith(suffix):
+                    base_url = base_url[:-len(suffix)]
+                    break
+            async with httpx.AsyncClient(timeout=PEER_LOOKUP_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{base_url}/__darkmatter__/peer_lookup/{target_agent_id}"
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("url"):
+                        return data["url"]
+        except Exception:
+            pass
+        return None
+
+    tasks = [asyncio.create_task(_query_peer(p)) for p in peers]
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=PEER_LOOKUP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            result = task.result()
+            if result is not None:
+                # Cancel remaining
+                for t in pending:
+                    t.cancel()
+                return result
+        # Wait for remaining with timeout
+        if pending:
+            done2, pending2 = await asyncio.wait(pending, timeout=1.0)
+            for task in done2:
+                result = task.result()
+                if result is not None:
+                    for t in pending2:
+                        t.cancel()
+                    return result
+            for t in pending2:
+                t.cancel()
+    except Exception:
+        for t in tasks:
+            t.cancel()
+    return None
+
+
+async def _broadcast_peer_update(state) -> None:
+    """Notify all connected peers of our current URL."""
+    if not state.public_url:
+        return
+    payload = {
+        "agent_id": state.agent_id,
+        "new_url": state.public_url,
+    }
+    if state.public_key_hex:
+        payload["public_key_hex"] = state.public_key_hex
+
+    for conn in list(state.connections.values()):
+        try:
+            base_url = conn.agent_url.rstrip("/")
+            for suffix in ("/mcp", "/__darkmatter__"):
+                if base_url.endswith(suffix):
+                    base_url = base_url[:-len(suffix)]
+                    break
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{base_url}/__darkmatter__/peer_update",
+                    json=payload,
+                )
+        except Exception as e:
+            print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... of URL change: {e}", file=sys.stderr)
+
+
+async def _network_health_loop(state) -> None:
+    """Background task: periodically check connection health and detect IP changes."""
+    last_ip_check = 0.0
+    last_known_ip = None
+
+    while True:
+        try:
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+            now = time.time()
+
+            # --- IP change detection (every IP_CHECK_INTERVAL) ---
+            if now - last_ip_check >= IP_CHECK_INTERVAL:
+                last_ip_check = now
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get("https://api.ipify.org?format=json")
+                        if resp.status_code == 200:
+                            current_ip = resp.json().get("ip")
+                            if last_known_ip is None:
+                                last_known_ip = current_ip
+                            elif current_ip != last_known_ip:
+                                print(f"[DarkMatter] Public IP changed: {last_known_ip} -> {current_ip}", file=sys.stderr)
+                                last_known_ip = current_ip
+                                state.public_url = await _discover_public_url(state.port)
+                                await _broadcast_peer_update(state)
+                except Exception:
+                    pass  # ipify unreachable — skip this cycle
+
+            # --- Connection health checks ---
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for conn in list(state.connections.values()):
+                # Only health-check stale connections
+                if conn.last_activity:
+                    try:
+                        from datetime import datetime as _dt
+                        last = _dt.fromisoformat(conn.last_activity.replace("Z", "+00:00"))
+                        age = (datetime.now(timezone.utc) - last).total_seconds()
+                        if age < STALE_CONNECTION_AGE:
+                            continue
+                    except Exception:
+                        pass
+
+                # Ping the peer's status endpoint
+                try:
+                    base_url = conn.agent_url.rstrip("/")
+                    for suffix in ("/mcp", "/__darkmatter__"):
+                        if base_url.endswith(suffix):
+                            base_url = base_url[:-len(suffix)]
+                            break
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.get(f"{base_url}/__darkmatter__/status")
+                        if resp.status_code == 200:
+                            conn.health_failures = 0
+                            continue
+                except Exception:
+                    pass
+
+                conn.health_failures += 1
+                if conn.health_failures >= HEALTH_FAILURE_THRESHOLD:
+                    print(
+                        f"[DarkMatter] Connection {conn.agent_id[:12]}... unhealthy "
+                        f"({conn.health_failures} failures, url={conn.agent_url})",
+                        file=sys.stderr,
+                    )
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[DarkMatter] Health loop error: {e}", file=sys.stderr)
 
 
 # =============================================================================
@@ -222,7 +499,7 @@ def _verify_message(public_key_hex: str, signature_hex: str, from_agent_id: str,
         payload = f"{from_agent_id}\n{message_id}\n{timestamp}\n{content}".encode("utf-8")
         public_key.verify(signature, payload)
         return True
-    except (InvalidSignature, ValueError, Exception):
+    except Exception:
         return False
 
 
@@ -258,6 +535,8 @@ class Connection:
     # Cryptographic identity — peer's public key and display name
     agent_public_key_hex: Optional[str] = None
     agent_display_name: Optional[str] = None
+    # Network resilience (ephemeral — never persisted)
+    health_failures: int = 0
     # WebRTC transport state (ephemeral — never persisted)
     transport: str = "http"              # "http" | "webrtc"
     webrtc_pc: Optional[object] = None   # RTCPeerConnection
@@ -335,6 +614,9 @@ class AgentState:
     discovered_peers: dict[str, dict] = field(default_factory=dict)
     # MCP sessions that have authenticated (ephemeral, not persisted)
     authenticated_sessions: set[str] = field(default_factory=set)
+    # Network resilience (ephemeral — never persisted)
+    public_url: Optional[str] = None
+    _upnp_mapping: Optional[tuple] = None  # (url, upnp_obj, ext_port)
 
 
 # =============================================================================
@@ -411,6 +693,17 @@ _last_status_desc: str = ""
 import threading
 _state_write_lock = threading.Lock()  # Serializes save_state() writes to prevent torn state files
 
+# Agent auto-spawn tracking (ephemeral, not persisted)
+@dataclass
+class SpawnedAgent:
+    process: asyncio.subprocess.Process
+    message_id: str
+    spawned_at: float
+    pid: int
+
+_spawned_agents: list[SpawnedAgent] = []
+_spawn_timestamps: list[float] = []  # Rolling window for hourly rate limiting
+
 
 # =============================================================================
 # Helper: get state from context (or global)
@@ -450,10 +743,13 @@ def _build_status_line() -> str:
     peers = ", ".join(peer_labels) if peer_labels else "none"
 
     agent_label = state.display_name or state.agent_id[:12]
+    active_agents = len(_spawned_agents)
+    agent_suffix = f" | Spawned agents: {active_agents}" if AGENT_SPAWN_ENABLED else ""
     stats = (
         f"Agent: {agent_label} | Status: {state.status.value} | "
         f"Connections: {conns}/{MAX_CONNECTIONS} ({peers}) | "
         f"Inbox: {msgs} | Handled: {handled} | Pending requests: {pending}"
+        f"{agent_suffix}"
     )
 
     # Build action items, most urgent first
@@ -492,6 +788,179 @@ def _build_status_line() -> str:
         return f"{stats}\n\n{action_block}"
     else:
         return f"{stats}\n\nAll clear — inbox empty, no pending requests."
+
+
+# =============================================================================
+# Agent Auto-Spawn
+# =============================================================================
+
+def _can_spawn_agent() -> tuple[bool, str]:
+    """Check whether we can spawn a new agent subprocess.
+
+    Returns (ok, reason) — if ok is False, reason explains why.
+    """
+    if not AGENT_SPAWN_ENABLED:
+        return False, "Agent spawning is disabled (DARKMATTER_AGENT_ENABLED=false)"
+
+    # Clean up finished agents first
+    _cleanup_finished_agents()
+
+    # Concurrency limit
+    active = len(_spawned_agents)
+    if active >= AGENT_SPAWN_MAX_CONCURRENT:
+        return False, f"Concurrency limit reached ({active}/{AGENT_SPAWN_MAX_CONCURRENT})"
+
+    # Hourly rate limit (rolling window)
+    now = time.monotonic()
+    cutoff = now - 3600
+    # Prune old timestamps
+    while _spawn_timestamps and _spawn_timestamps[0] < cutoff:
+        _spawn_timestamps.pop(0)
+    if len(_spawn_timestamps) >= AGENT_SPAWN_MAX_PER_HOUR:
+        return False, f"Hourly rate limit reached ({len(_spawn_timestamps)}/{AGENT_SPAWN_MAX_PER_HOUR})"
+
+    return True, ""
+
+
+def _cleanup_finished_agents() -> None:
+    """Remove finished agent processes from the tracking list."""
+    still_running = []
+    for agent in _spawned_agents:
+        if agent.process.returncode is not None:
+            print(
+                f"[DarkMatter] Spawned agent PID {agent.pid} exited "
+                f"(code={agent.process.returncode}, msg={agent.message_id[:12]}...)",
+                file=sys.stderr,
+            )
+        else:
+            still_running.append(agent)
+    _spawned_agents.clear()
+    _spawned_agents.extend(still_running)
+
+
+def _build_agent_prompt(state: "AgentState", msg: "QueuedMessage") -> str:
+    """Build the prompt for a spawned claude agent."""
+    sender_info = msg.from_agent_id or "unknown"
+    conn = state.connections.get(msg.from_agent_id) if msg.from_agent_id else None
+    sender_name = (conn.agent_display_name if conn else None) or sender_info
+    verified_str = "YES (cryptographically verified)" if msg.verified else "NO"
+
+    # Build list of connected agents for forwarding context
+    peers = []
+    for cid, c in state.connections.items():
+        label = c.agent_display_name or cid[:12]
+        bio = c.agent_bio or "no bio"
+        peers.append(f"  - {label} ({cid[:12]}...): {bio}")
+    peers_block = "\n".join(peers) if peers else "  (none)"
+
+    return f"""\
+You are an autonomous DarkMatter mesh agent handling an incoming message.
+
+YOUR IDENTITY:
+- Display name: {state.display_name or 'unnamed'}
+- Agent ID: {state.agent_id}
+- Bio: {state.bio}
+
+INCOMING MESSAGE:
+- Message ID: {msg.message_id}
+- From: {sender_name} (agent_id: {msg.from_agent_id or 'unknown'})
+- Verified: {verified_str}
+- Content: {msg.content}
+- Metadata: {json.dumps(msg.metadata) if msg.metadata else 'none'}
+- Hops remaining: {msg.hops_remaining}
+
+CONNECTED PEERS (available for forwarding):
+{peers_block}
+
+INSTRUCTIONS:
+1. First, call darkmatter_authenticate with your private key to authenticate.
+2. Read the message above carefully.
+3. If you can answer the message, use darkmatter_respond_message with message_id="{msg.message_id}" and your response.
+4. If you cannot answer but a connected peer might be able to help, use darkmatter_forward_message to forward it, then respond with a note that you forwarded it.
+5. If you neither can answer nor know who to forward to, respond politely explaining that.
+6. After responding, your work is done. Do NOT perform any other actions.
+
+CRITICAL RULES:
+- Do NOT spawn more agents or sub-processes.
+- Do NOT modify any files.
+- Do NOT run any shell commands.
+- Keep your response concise and helpful.
+- You have 5 minutes maximum before being terminated.
+"""
+
+
+async def _spawn_agent_for_message(state: "AgentState", msg: "QueuedMessage") -> None:
+    """Spawn a claude subprocess to handle an incoming message."""
+    ok, reason = _can_spawn_agent()
+    if not ok:
+        print(f"[DarkMatter] Not spawning agent: {reason}", file=sys.stderr)
+        return
+
+    # Deduplicate — don't spawn for a message we're already handling
+    for agent in _spawned_agents:
+        if agent.message_id == msg.message_id:
+            print(f"[DarkMatter] Agent already spawned for message {msg.message_id[:12]}...", file=sys.stderr)
+            return
+
+    prompt = _build_agent_prompt(state, msg)
+
+    # Build environment with recursion guard
+    env = os.environ.copy()
+    env["DARKMATTER_AGENT_ENABLED"] = "false"
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            AGENT_SPAWN_COMMAND, "-p", "--dangerously-skip-permissions", prompt,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=os.getcwd(),
+        )
+        agent = SpawnedAgent(
+            process=process,
+            message_id=msg.message_id,
+            spawned_at=time.monotonic(),
+            pid=process.pid,
+        )
+        _spawned_agents.append(agent)
+        _spawn_timestamps.append(time.monotonic())
+        print(
+            f"[DarkMatter] Spawned agent PID {process.pid} for message {msg.message_id[:12]}... "
+            f"from {msg.from_agent_id or 'unknown'}",
+            file=sys.stderr,
+        )
+
+        # Start timeout watchdog
+        asyncio.create_task(_agent_timeout_watchdog(agent))
+
+    except FileNotFoundError:
+        print(
+            f"[DarkMatter] Agent spawn failed: command '{AGENT_SPAWN_COMMAND}' not found. "
+            f"Set DARKMATTER_AGENT_COMMAND to the correct path.",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"[DarkMatter] Agent spawn failed: {e}", file=sys.stderr)
+
+
+async def _agent_timeout_watchdog(agent: SpawnedAgent) -> None:
+    """Kill a spawned agent if it exceeds the timeout."""
+    await asyncio.sleep(AGENT_SPAWN_TIMEOUT)
+    if agent.process.returncode is None:
+        print(
+            f"[DarkMatter] Spawned agent PID {agent.pid} timed out after {AGENT_SPAWN_TIMEOUT}s, terminating...",
+            file=sys.stderr,
+        )
+        try:
+            agent.process.terminate()
+            # Give it 5 seconds to clean up, then force kill
+            try:
+                await asyncio.wait_for(agent.process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                print(f"[DarkMatter] Force-killing agent PID {agent.pid}", file=sys.stderr)
+                agent.process.kill()
+        except ProcessLookupError:
+            pass  # Already exited
 
 
 async def _notify_tools_changed() -> None:
@@ -547,6 +1016,7 @@ async def _status_updater() -> None:
         await asyncio.sleep(5)
         try:
             _check_webrtc_health()
+            _cleanup_finished_agents()
             await _update_status_tool()
         except Exception as e:
             print(f"[DarkMatter] Status updater error: {e}", file=sys.stderr)
@@ -684,7 +1154,7 @@ def load_state() -> Optional[AgentState]:
         is_genesis=data.get("is_genesis", False),
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
-        claimed=data.get("claimed", data.get("mcp_token") is not None),  # migrate from old format
+        claimed=data.get("claimed", False),
         private_key_hex=data.get("private_key_hex"),
         public_key_hex=data.get("public_key_hex"),
         display_name=data.get("display_name"),
@@ -692,13 +1162,6 @@ def load_state() -> Optional[AgentState]:
         sent_messages=sent_messages,
         impressions=data.get("impressions", {}),
     )
-
-    # Migration: generate keypair for existing agents that don't have one
-    if state.private_key_hex is None or state.public_key_hex is None:
-        priv, pub = _generate_keypair()
-        state.private_key_hex = priv
-        state.public_key_hex = pub
-        print(f"[DarkMatter] Migration: generated Ed25519 keypair for existing agent '{state.agent_id}'", file=sys.stderr)
 
     return state
 
@@ -808,6 +1271,12 @@ class SetImpressionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: str = Field(..., description="The agent ID to store an impression of")
     impression: str = Field(..., description="Your freeform impression (e.g. 'slow but accurate', 'great at routing ML questions', 'unresponsive')", max_length=2000)
+
+
+class GetImpressionInput(BaseModel):
+    """Get your stored impression of an agent."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The agent ID to look up")
 
 
 class DeleteImpressionInput(BaseModel):
@@ -1058,7 +1527,7 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
             "error": f"Failed to reach target agent at {target_base}: {str(e)}"
         })
     except json.JSONDecodeError:
-        status = response.status_code if 'response' in dir() else "unknown"
+        status = response.status_code
         return json.dumps({
             "success": False,
             "error": f"Target agent at {target_base} returned non-JSON response (HTTP {status}). Is it a DarkMatter node?"
@@ -1191,25 +1660,8 @@ async def disconnect(params: DisconnectInput, ctx: Context) -> str:
 # Transport Abstraction — WebRTC or HTTP
 # =============================================================================
 
-async def _send_to_peer(conn: Connection, path: str, payload: dict) -> dict:
-    """Send a message to a peer, using WebRTC data channel if available, else HTTP.
-
-    Returns the response dict from the peer.
-    """
-    # Try WebRTC first if channel is open
-    if conn.webrtc_channel is not None:
-        try:
-            ready = getattr(conn.webrtc_channel, "readyState", None)
-            if ready == "open":
-                data = json.dumps({"path": path, "payload": payload})
-                if len(data) <= WEBRTC_MESSAGE_SIZE_LIMIT:
-                    conn.webrtc_channel.send(data)
-                    return {"success": True, "transport": "webrtc"}
-                # Message too large for WebRTC — fall through to HTTP
-        except Exception as e:
-            print(f"[DarkMatter] WebRTC send failed, falling back to HTTP: {e}", file=sys.stderr)
-
-    # HTTP fallback — strip known suffixes from agent_url to get base URL
+async def _http_post_to_peer(conn: Connection, path: str, payload: dict) -> dict:
+    """Send an HTTP POST to a peer. Returns the response dict."""
     base_url = conn.agent_url.rstrip("/")
     for suffix in ("/mcp", "/__darkmatter__"):
         if base_url.endswith(suffix):
@@ -1223,6 +1675,55 @@ async def _send_to_peer(conn: Connection, path: str, payload: dict) -> dict:
         result = resp.json()
         result["transport"] = "http"
         return result
+
+
+async def _send_to_peer(conn: Connection, path: str, payload: dict) -> dict:
+    """Send a message to a peer, using WebRTC data channel if available, else HTTP.
+
+    On HTTP failure, attempts peer URL recovery via _lookup_peer_url before giving up.
+    Returns the response dict from the peer.
+    """
+    # Try WebRTC first if channel is open
+    if conn.webrtc_channel is not None:
+        try:
+            ready = getattr(conn.webrtc_channel, "readyState", None)
+            if ready == "open":
+                data = json.dumps({"path": path, "payload": payload})
+                if len(data) <= WEBRTC_MESSAGE_SIZE_LIMIT:
+                    conn.webrtc_channel.send(data)
+                    conn.health_failures = 0
+                    return {"success": True, "transport": "webrtc"}
+                # Message too large for WebRTC — fall through to HTTP
+        except Exception as e:
+            print(f"[DarkMatter] WebRTC send failed, falling back to HTTP: {e}", file=sys.stderr)
+
+    # HTTP — try direct, then recover via peer lookup on failure
+    last_error = None
+    try:
+        result = await _http_post_to_peer(conn, path, payload)
+        conn.health_failures = 0
+        return result
+    except Exception as e:
+        last_error = e
+
+    # Direct HTTP failed — try peer lookup to find updated URL
+    state = _agent_state
+    if state is not None:
+        print(f"[DarkMatter] HTTP send to {conn.agent_id[:12]}... failed, attempting peer lookup", file=sys.stderr)
+        new_url = await _lookup_peer_url(state, conn.agent_id)
+        if new_url and new_url != conn.agent_url:
+            old_url = conn.agent_url
+            conn.agent_url = new_url
+            save_state()
+            print(f"[DarkMatter] Recovered URL for {conn.agent_id[:12]}...: {old_url} -> {new_url}", file=sys.stderr)
+            try:
+                result = await _http_post_to_peer(conn, path, payload)
+                conn.health_failures = 0
+                return result
+            except Exception:
+                pass  # Recovery also failed — raise original error
+
+    raise last_error
 
 
 @mcp.tool(
@@ -2344,7 +2845,7 @@ async def set_impression(params: SetImpressionInput, ctx: Context) -> str:
         "openWorldHint": False,
     }
 )
-async def get_impression(params: DeleteImpressionInput, ctx: Context) -> str:
+async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
     """Get your stored impression of an agent.
 
     Args:
@@ -2898,6 +3399,11 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         conn.last_activity = datetime.now(timezone.utc).isoformat()
 
     save_state()
+
+    # Auto-spawn a claude agent to handle this message
+    if AGENT_SPAWN_ENABLED:
+        asyncio.create_task(_spawn_agent_for_message(state, msg))
+
     return {"success": True, "queued": True, "queue_position": len(state.message_queue)}, 200
 
 
@@ -3084,6 +3590,81 @@ async def handle_impression_get(request: Request) -> JSONResponse:
 
 
 # =============================================================================
+# Network Resilience — Peer Update & Lookup HTTP Handlers
+# =============================================================================
+
+async def handle_peer_update(request: Request) -> JSONResponse:
+    """Accept a URL change notification from a connected peer.
+
+    Verifies the agent_id is a known connection and optionally validates
+    the public key matches before updating the stored URL.
+    """
+    global _agent_state
+    state = _agent_state
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    agent_id = body.get("agent_id", "")
+    new_url = body.get("new_url", "")
+    public_key_hex = body.get("public_key_hex")
+
+    if not agent_id or not new_url:
+        return JSONResponse({"error": "Missing agent_id or new_url"}, status_code=400)
+
+    # Validate URL
+    url_err = validate_url(new_url)
+    if url_err:
+        return JSONResponse({"error": url_err}, status_code=400)
+
+    conn = state.connections.get(agent_id)
+    if conn is None:
+        return JSONResponse({"error": "Unknown agent"}, status_code=404)
+
+    # Verify public key matches if both sides have one
+    if public_key_hex and conn.agent_public_key_hex:
+        if public_key_hex != conn.agent_public_key_hex:
+            return JSONResponse({"error": "Public key mismatch"}, status_code=403)
+
+    old_url = conn.agent_url
+    conn.agent_url = new_url
+    save_state()
+
+    print(f"[DarkMatter] Peer {agent_id[:12]}... updated URL: {old_url} -> {new_url}", file=sys.stderr)
+    return JSONResponse({"success": True, "updated": True})
+
+
+async def handle_peer_lookup(request: Request) -> JSONResponse:
+    """Look up the URL of a connected agent by ID.
+
+    Used by other peers to find an agent's current URL when direct
+    communication fails.
+    """
+    global _agent_state
+    state = _agent_state
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    agent_id = request.path_params.get("agent_id", "")
+    if not agent_id:
+        return JSONResponse({"error": "Missing agent_id"}, status_code=400)
+
+    conn = state.connections.get(agent_id)
+    if conn is None:
+        return JSONResponse({"error": "Not connected to that agent"}, status_code=404)
+
+    return JSONResponse({
+        "agent_id": conn.agent_id,
+        "url": conn.agent_url,
+        "status": "connected",
+    })
+
+
+# =============================================================================
 # WebRTC Signaling + Cleanup
 # =============================================================================
 
@@ -3247,6 +3828,21 @@ async def handle_well_known(request: Request) -> JSONResponse:
 # LAN Discovery — UDP Broadcast
 # =============================================================================
 
+
+def _register_peer(state: AgentState, peer_id: str, url: str, bio: str,
+                   status: str, genesis: bool, accepting: bool, source: str) -> None:
+    """Register a discovered peer in state."""
+    state.discovered_peers[peer_id] = {
+        "url": url,
+        "bio": bio,
+        "status": status,
+        "genesis": genesis,
+        "accepting": accepting,
+        "source": source,
+        "ts": time.time(),
+    }
+
+
 class _DiscoveryProtocol(asyncio.DatagramProtocol):
     """Receives UDP multicast discovery beacons from LAN agents."""
 
@@ -3269,15 +3865,15 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
         peer_port = packet.get("port", DEFAULT_PORT)
         source_ip = addr[0]
 
-        self.state.discovered_peers[peer_id] = {
-            "url": f"http://{source_ip}:{peer_port}",
-            "bio": packet.get("bio", ""),
-            "status": packet.get("status", "active"),
-            "genesis": packet.get("genesis", False),
-            "accepting": packet.get("accepting", True),
-            "source": "lan",
-            "ts": time.time(),
-        }
+        _register_peer(
+            self.state, peer_id,
+            url=f"http://{source_ip}:{peer_port}",
+            bio=packet.get("bio", ""),
+            status=packet.get("status", "active"),
+            genesis=packet.get("genesis", False),
+            accepting=packet.get("accepting", True),
+            source="lan",
+        )
 
 
 async def _probe_port(client: httpx.AsyncClient, state: AgentState, port: int) -> None:
@@ -3294,15 +3890,15 @@ async def _probe_port(client: httpx.AsyncClient, state: AgentState, port: int) -
     if not peer_id or peer_id == state.agent_id:
         return
 
-    state.discovered_peers[peer_id] = {
-        "url": f"http://127.0.0.1:{port}",
-        "bio": info.get("bio", ""),
-        "status": info.get("status", "active"),
-        "genesis": info.get("is_genesis", False),
-        "accepting": info.get("accepting_connections", True),
-        "source": "local",
-        "ts": time.time(),
-    }
+    _register_peer(
+        state, peer_id,
+        url=f"http://127.0.0.1:{port}",
+        bio=info.get("bio", ""),
+        status=info.get("status", "active"),
+        genesis=info.get("is_genesis", False),
+        accepting=info.get("accepting_connections", True),
+        source="local",
+    )
 
 
 async def _scan_local_ports(state: AgentState) -> None:
@@ -3522,6 +4118,12 @@ def create_app() -> Starlette:
         asyncio.create_task(_status_updater())
         print(f"[DarkMatter] Live status updater: ENABLED (5s interval)", file=sys.stderr)
 
+        # Discover public URL and start network health loop
+        _agent_state.public_url = await _discover_public_url(port)
+        asyncio.create_task(_network_health_loop(_agent_state))
+        print(f"[DarkMatter] Network health loop: ENABLED ({HEALTH_CHECK_INTERVAL}s interval)", file=sys.stderr)
+        print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
+
     # DarkMatter mesh protocol routes
     darkmatter_routes = [
         Route("/connection_request", handle_connection_request, methods=["POST"]),
@@ -3533,6 +4135,8 @@ def create_app() -> Starlette:
         Route("/network_info", handle_network_info, methods=["GET"]),
         Route("/impression/{agent_id}", handle_impression_get, methods=["GET"]),
         Route("/webrtc_offer", handle_webrtc_offer, methods=["POST"]),
+        Route("/peer_update", handle_peer_update, methods=["POST"]),
+        Route("/peer_lookup/{agent_id}", handle_peer_lookup, methods=["GET"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
@@ -3548,6 +4152,7 @@ def create_app() -> Starlette:
         async with session_manager.run():
             await on_startup()
             yield
+            _cleanup_upnp()
 
     # Build the app. Use redirect_slashes=False so POST /mcp doesn't get
     # redirected to /mcp/ (which breaks MCP client connections).
@@ -3577,6 +4182,8 @@ def _print_startup_banner(port: int, transport: str, discovery_enabled: bool) ->
     print(f"[DarkMatter] MCP transport: {transport}", file=sys.stderr)
     print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled'}", file=sys.stderr)
     print(f"[DarkMatter] WebRTC: {'AVAILABLE' if WEBRTC_AVAILABLE else 'disabled (pip install aiortc)'}", file=sys.stderr)
+    print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
+    print(f"[DarkMatter] Agent auto-spawn: {'ENABLED (max ' + str(AGENT_SPAWN_MAX_CONCURRENT) + ' concurrent, ' + str(AGENT_SPAWN_MAX_PER_HOUR) + '/hr)' if AGENT_SPAWN_ENABLED else 'disabled'}", file=sys.stderr)
     print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
 
 
