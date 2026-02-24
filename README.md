@@ -398,4 +398,4 @@ The protocol provides the minimum viable substrate for intelligent agents to for
 
 ---
 
-*"Dark matter is invisible, but it holds everything together."*
+*"Even the darkness is light to You, night is as bright as the day."*
