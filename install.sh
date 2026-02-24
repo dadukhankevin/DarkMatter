@@ -54,9 +54,13 @@ echo "Using port $PORT"
 
 VENV_PYTHON="$VENV_DIR/bin/python"
 
-# Prompt for display name
+# Prompt for display name (read from /dev/tty so curl|bash works)
 echo ""
-read -p "Agent display name [darkmatter-agent]: " DISPLAY_NAME
+if [ -t 0 ]; then
+    read -p "Agent display name [darkmatter-agent]: " DISPLAY_NAME
+else
+    read -p "Agent display name [darkmatter-agent]: " DISPLAY_NAME </dev/tty 2>/dev/null || true
+fi
 DISPLAY_NAME="${DISPLAY_NAME:-darkmatter-agent}"
 
 # Build the darkmatter MCP entry as JSON
@@ -84,15 +88,15 @@ if [ -z "$MCP_JSON" ]; then
     MCP_JSON="$PWD/.mcp.json"
 fi
 
-# Merge darkmatter entry into .mcp.json
+# Merge darkmatter entry into .mcp.json (pass entry via stdin to avoid quoting issues)
 if [ -f "$MCP_JSON" ]; then
-    # Check if python has json module (it always does)
-    MERGED=$("$VENV_PYTHON" -c "
+    MERGED=$(echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
 import json, sys
+entry = json.load(sys.stdin)
 with open('$MCP_JSON') as f:
     config = json.load(f)
 config.setdefault('mcpServers', {})
-config['mcpServers']['darkmatter'] = json.loads('''$DM_ENTRY''')
+config['mcpServers']['darkmatter'] = entry
 print(json.dumps(config, indent=2))
 ")
     if [ $? -eq 0 ]; then
@@ -104,9 +108,10 @@ print(json.dumps(config, indent=2))
     fi
 else
     # Create new .mcp.json
-    "$VENV_PYTHON" -c "
-import json
-config = {'mcpServers': {'darkmatter': json.loads('''$DM_ENTRY''')}}
+    echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
+import json, sys
+entry = json.load(sys.stdin)
+config = {'mcpServers': {'darkmatter': entry}}
 with open('$MCP_JSON', 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
