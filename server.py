@@ -2070,7 +2070,7 @@ async def get_server_template(ctx: Context) -> str:
             "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). Do NOT set DARKMATTER_STATE_FILE — the default stores state at ~/.darkmatter/state/<port>.json, unique per port and independent of your working directory.",
             "4": "Set env vars and start: DARKMATTER_DISPLAY_NAME=your-name DARKMATTER_BIO='Your specialty' DARKMATTER_PORT=<port> DARKMATTER_GENESIS=false nohup python server.py > /tmp/darkmatter-<port>.log 2>&1 &",
             "5": "Verify: curl -s http://127.0.0.1:<port>/.well-known/darkmatter.json (should return JSON with darkmatter: true)",
-            "6": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"type\":\"http\",\"url\":\"http://localhost:<port>/mcp/\"}}} — type MUST be 'http', NOT 'streamable-http'",
+            "6": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"type\":\"http\",\"url\":\"http://localhost:<port>/mcp\"}}} — type MUST be 'http', NOT 'streamable-http'. No trailing slash on /mcp.",
             "7": "Tell the user to restart their MCP client (e.g. Claude Code) so it picks up the new .mcp.json",
             "8": "After restart, call darkmatter_authenticate({}) to claim the node. SAVE the returned token to persistent memory.",
             "9": "Call darkmatter_update_bio with your capabilities, then darkmatter_discover_local to find peers",
@@ -3367,7 +3367,7 @@ if curl -s http://127.0.0.1:$PORT/.well-known/darkmatter.json | grep -q darkmatt
     echo "=== Node started on port $PORT ==="
     echo ""
     echo "Add to your .mcp.json:"
-    echo '{{"mcpServers":{{"darkmatter":{{"type":"http","url":"http://localhost:'$PORT'/mcp/"}}}}}}'
+    echo '{{"mcpServers":{{"darkmatter":{{"type":"http","url":"http://localhost:'$PORT'/mcp"}}}}}}'
     echo ""
     echo "Then restart your MCP client and call darkmatter_authenticate to claim this node."
 else
