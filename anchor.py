@@ -16,12 +16,42 @@ Stale entries (>24h unseen) are pruned on writes.
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Blueprint, request, jsonify
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 # Stale threshold: entries unseen for >24 hours are pruned
 STALE_THRESHOLD = 86400  # 24 hours in seconds
+
+# Max age for peer_update timestamps (prevents replay attacks)
+PEER_UPDATE_MAX_AGE = 300  # 5 minutes
+
+
+def _verify_peer_update_signature(public_key_hex: str, signature_hex: str,
+                                   agent_id: str, new_url: str, timestamp: str) -> bool:
+    """Verify a signed peer_update payload. Returns True if valid."""
+    try:
+        public_bytes = bytes.fromhex(public_key_hex)
+        public_key = Ed25519PublicKey.from_public_bytes(public_bytes)
+        signature = bytes.fromhex(signature_hex)
+        payload = f"peer_update\n{agent_id}\n{new_url}\n{timestamp}".encode("utf-8")
+        public_key.verify(signature, payload)
+        return True
+    except Exception:
+        return False
+
+
+def _is_timestamp_fresh(timestamp: str) -> bool:
+    """Check if a timestamp is within PEER_UPDATE_MAX_AGE seconds of now."""
+    try:
+        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        age = abs((datetime.now(timezone.utc) - ts).total_seconds())
+        return age <= PEER_UPDATE_MAX_AGE
+    except Exception:
+        return False
 
 # In-memory directory: {agent_id: {url, public_key_hex, last_seen}}
 _directory: dict[str, dict] = {}
@@ -78,8 +108,9 @@ _load_backup()
 def anchor_peer_update():
     """Register or update an agent's URL.
 
-    First registration stores the public key. Subsequent updates must
-    provide the same public key (prevents spoofing).
+    Requires Ed25519 signature to prove the sender holds the private key.
+    First registration pins the public key. Subsequent updates must use
+    the same key and provide a valid signature.
     """
     data = request.get_json(silent=True)
     if not data:
@@ -88,20 +119,33 @@ def anchor_peer_update():
     agent_id = data.get("agent_id", "").strip()
     new_url = data.get("new_url", "").strip()
     public_key_hex = data.get("public_key_hex", "").strip()
+    signature = data.get("signature", "").strip()
+    timestamp = data.get("timestamp", "").strip()
 
     if not agent_id or not new_url:
         return jsonify({"error": "Missing agent_id or new_url"}), 400
 
+    if not public_key_hex or not signature or not timestamp:
+        return jsonify({"error": "Missing public_key_hex, signature, or timestamp"}), 400
+
+    # Verify timestamp freshness (prevents replay attacks)
+    if not _is_timestamp_fresh(timestamp):
+        return jsonify({"error": "Timestamp expired or invalid"}), 403
+
+    # Verify Ed25519 signature proves ownership of the private key
+    if not _verify_peer_update_signature(public_key_hex, signature, agent_id, new_url, timestamp):
+        return jsonify({"error": "Invalid signature"}), 403
+
     existing = _directory.get(agent_id)
 
-    # If entry exists and has a public key, verify it matches
+    # If entry exists, verify the public key matches the pinned one
     if existing and existing.get("public_key_hex"):
-        if public_key_hex and public_key_hex != existing["public_key_hex"]:
+        if public_key_hex != existing["public_key_hex"]:
             return jsonify({"error": "Public key mismatch"}), 403
 
     _directory[agent_id] = {
         "url": new_url,
-        "public_key_hex": public_key_hex or (existing or {}).get("public_key_hex", ""),
+        "public_key_hex": public_key_hex,
         "last_seen": time.time(),
     }
 

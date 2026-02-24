@@ -1208,12 +1208,21 @@ async def test_anchor_priority() -> None:
         anchor_app = _Flask(__name__)
         anchor_app.register_blueprint(anchor_bp)
 
-        # Register agent B's URL in the anchor
+        # Register agent B's URL in the anchor (signed)
+        import server as _srv
+        from datetime import datetime as _dt, timezone as _tz
+        ts = _dt.now(_tz.utc).isoformat()
+        sig = _srv._sign_peer_update(
+            state_b.private_key_hex, state_b.agent_id,
+            f"http://localhost:{state_b.port}", ts
+        )
         with anchor_app.test_client() as anchor_client:
             resp = anchor_client.post("/__darkmatter__/peer_update", json={
                 "agent_id": state_b.agent_id,
                 "new_url": f"http://localhost:{state_b.port}",
                 "public_key_hex": state_b.public_key_hex,
+                "signature": sig,
+                "timestamp": ts,
             })
             report("anchor: peer_update accepted", resp.status_code == 200)
 

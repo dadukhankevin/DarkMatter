@@ -505,16 +505,49 @@ async def _webhook_request_with_recovery(
     raise last_err
 
 
+def _sign_peer_update(private_key_hex: str, agent_id: str, new_url: str, timestamp: str) -> str:
+    """Sign a peer_update payload. Returns signature as hex."""
+    private_bytes = bytes.fromhex(private_key_hex)
+    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    payload = f"peer_update\n{agent_id}\n{new_url}\n{timestamp}".encode("utf-8")
+    return private_key.sign(payload).hex()
+
+
+def _verify_peer_update_signature(public_key_hex: str, signature_hex: str,
+                                   agent_id: str, new_url: str, timestamp: str) -> bool:
+    """Verify a signed peer_update payload. Returns True if valid."""
+    try:
+        public_bytes = bytes.fromhex(public_key_hex)
+        public_key = Ed25519PublicKey.from_public_bytes(public_bytes)
+        signature = bytes.fromhex(signature_hex)
+        payload = f"peer_update\n{agent_id}\n{new_url}\n{timestamp}".encode("utf-8")
+        public_key.verify(signature, payload)
+        return True
+    except Exception:
+        return False
+
+
+# Max age for peer_update timestamps (prevents replay attacks)
+PEER_UPDATE_MAX_AGE = 300  # 5 minutes
+
+
 async def _broadcast_peer_update(state) -> None:
     """Notify all connected peers and anchor nodes of our current URL."""
     if not state.public_url:
         return
+
+    timestamp = datetime.now(timezone.utc).isoformat()
     payload = {
         "agent_id": state.agent_id,
         "new_url": state.public_url,
+        "timestamp": timestamp,
     }
     if state.public_key_hex:
         payload["public_key_hex"] = state.public_key_hex
+    if state.private_key_hex and state.public_key_hex:
+        payload["signature"] = _sign_peer_update(
+            state.private_key_hex, state.agent_id, state.public_url, timestamp
+        )
 
     for conn in list(state.connections.values()):
         try:
@@ -3767,6 +3800,8 @@ async def handle_peer_update(request: Request) -> JSONResponse:
     agent_id = body.get("agent_id", "")
     new_url = body.get("new_url", "")
     public_key_hex = body.get("public_key_hex")
+    signature = body.get("signature")
+    timestamp = body.get("timestamp", "")
 
     if not agent_id or not new_url:
         return JSONResponse({"error": "Missing agent_id or new_url"}, status_code=400)
@@ -3784,6 +3819,12 @@ async def handle_peer_update(request: Request) -> JSONResponse:
     if public_key_hex and conn.agent_public_key_hex:
         if public_key_hex != conn.agent_public_key_hex:
             return JSONResponse({"error": "Public key mismatch"}, status_code=403)
+
+    # Verify signature if the connection has a known public key
+    verify_key = conn.agent_public_key_hex or public_key_hex
+    if verify_key and signature and timestamp:
+        if not _verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
+            return JSONResponse({"error": "Invalid signature"}, status_code=403)
 
     old_url = conn.agent_url
     conn.agent_url = new_url
