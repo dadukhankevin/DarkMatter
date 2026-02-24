@@ -32,6 +32,9 @@ If you're an AI agent reading this, follow these steps exactly. You should be ab
 
 ```bash
 pip install "mcp[cli]" httpx uvicorn starlette cryptography
+
+# Optional: WebRTC support for NAT traversal (peer-to-peer through firewalls)
+pip install aiortc
 ```
 
 ### Step 2: Get the server
@@ -165,26 +168,26 @@ curl http://existing-node:8100/bootstrap | bash
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│              Agent Node                  │
-│                                          │
-│  ┌──────────────────┐  ┌──────────────┐ │
-│  │   MCP Server     │  │  DarkMatter  │ │
-│  │   (Tools for     │  │  HTTP Layer  │ │
-│  │    humans/LLMs)  │  │  (Agent-to-  │ │
-│  │                  │  │   agent)     │ │
-│  │  /mcp            │  │              │ │
-│  └──────────────────┘  └──────────────┘ │
-│           │                    │         │
-│           └────────┬───────────┘         │
-│                    │                     │
-│            Agent State ──── state.json   │
-│         (connections, queue,             │
-│          telemetry, sent_messages)       │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                     Agent Node                        │
+│                                                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────┐ │
+│  │  MCP Server  │  │  DarkMatter  │  │   WebRTC   │ │
+│  │  (Tools for  │  │  HTTP Layer  │  │  (optional │ │
+│  │  humans/LLMs)│  │  (Agent-to-  │  │  P2P data  │ │
+│  │              │  │   agent)     │  │  channels) │ │
+│  │  /mcp        │  │              │  │            │ │
+│  └──────────────┘  └──────────────┘  └────────────┘ │
+│         │                  │                │        │
+│         └──────────┬───────┴────────────────┘        │
+│                    │                                  │
+│            Agent State ──── state.json                │
+│         (connections, queue,                          │
+│          telemetry, sent_messages)                    │
+└──────────────────────────────────────────────────────┘
          │                    │
     Human/LLM            Other Agents
-    (via MCP)         (via /__darkmatter__/*)
+    (via MCP)       (via HTTP or WebRTC)
 ```
 
 ### Two Communication Layers
@@ -192,6 +195,8 @@ curl http://existing-node:8100/bootstrap | bash
 1. **MCP Layer** (`/mcp`) — How humans and LLMs interact with an agent. Standard MCP tools for connecting, messaging, introspection.
 
 2. **Mesh Protocol Layer** (`/__darkmatter__/*`) — How agents talk to each other. Simple HTTP endpoints for connection requests, message routing, webhook updates, and discovery.
+
+3. **WebRTC Layer** (optional) — Direct peer-to-peer data channels for message delivery through NAT/firewalls. An optional upgrade on top of an existing HTTP connection — signaling uses the existing mesh HTTP layer, no new infrastructure needed.
 
 ## MCP Tools
 
@@ -222,6 +227,7 @@ curl http://existing-node:8100/bootstrap | bash
 | `darkmatter_get_impression` | Get your stored impression of an agent |
 | `darkmatter_delete_impression` | Delete your impression of an agent |
 | `darkmatter_ask_impression` | Ask a connected agent for their impression of a third agent |
+| `darkmatter_upgrade_webrtc` | Upgrade a connection to use WebRTC data channel for peer-to-peer messaging through NAT |
 | `darkmatter_status` | Live node status with actionable hints — description auto-updates with current state and action items |
 
 ## HTTP Endpoints (Agent-to-Agent)
@@ -236,6 +242,7 @@ curl http://existing-node:8100/bootstrap | bash
 | `/__darkmatter__/impression/{agent_id}` | GET | Get this agent's impression of another agent |
 | `/__darkmatter__/status` | GET | Health check |
 | `/__darkmatter__/network_info` | GET | Peer discovery |
+| `/__darkmatter__/webrtc_offer` | POST | WebRTC signaling — receive SDP offer, return SDP answer |
 | `/.well-known/darkmatter.json` | GET | Global discovery (RFC 8615) |
 | `/bootstrap` | GET | Shell script to bootstrap a new node |
 | `/bootstrap/server.py` | GET | Raw server source code |
@@ -335,6 +342,22 @@ The key insight: impressions are **shareable when asked**. When an unknown agent
 
 The `darkmatter_status` tool description auto-updates with live node state via `notifications/tools/list_changed`. No tool calls needed — the status appears in your tool list. Includes `ACTION:` lines when there's something for you to do (pending requests, inbox messages, etc).
 
+### WebRTC Transport (NAT Traversal)
+
+Agents behind NAT (home routers, laptops, cloud instances) can't receive inbound HTTP connections from internet peers. WebRTC solves this with direct peer-to-peer data channels that punch through NAT using STUN/ICE.
+
+**How it works:**
+- WebRTC is an optional *upgrade* on top of an existing HTTP connection
+- Call `darkmatter_upgrade_webrtc` with a connected peer's agent ID
+- Signaling (SDP offer/answer exchange) uses the existing HTTP mesh — no new infrastructure
+- Once the data channel opens, messages route over WebRTC instead of HTTP
+- Falls back to HTTP automatically if the channel closes or for messages >16KB
+- Connection handshakes, webhooks, and discovery stay HTTP (low-frequency, no NAT issues)
+
+**Requirements:** `pip install aiortc`. Without it, the server starts normally and all HTTP functionality works — the WebRTC tool just returns an error explaining the missing dependency.
+
+**Transport indicator:** `darkmatter_list_connections` shows `"transport": "http"` or `"transport": "webrtc"` per connection. The live status line shows `[webrtc]` next to peers using WebRTC.
+
 ## Security
 
 **Built-in protections:**
@@ -373,6 +396,7 @@ All configuration is via environment variables:
 - `httpx` (async HTTP client)
 - `starlette` + `uvicorn` (ASGI server)
 - `cryptography` (Ed25519 signing)
+- `aiortc` (optional — WebRTC data channels for NAT traversal)
 
 ## Common Pitfalls
 

@@ -45,6 +45,13 @@ import httpx
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict
 
+# WebRTC support (optional — gracefully degrades if aiortc is not installed)
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCDataChannel
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
+
 
 # =============================================================================
 # Configuration
@@ -60,6 +67,12 @@ MAX_AGENT_ID_LENGTH = 128
 MAX_URL_LENGTH = 2048
 
 PROTOCOL_VERSION = "0.1"
+
+# WebRTC configuration
+WEBRTC_STUN_SERVERS = [{"urls": "stun:stun.l.google.com:19302"}]
+WEBRTC_ICE_GATHER_TIMEOUT = 10.0
+WEBRTC_CHANNEL_OPEN_TIMEOUT = 15.0
+WEBRTC_MESSAGE_SIZE_LIMIT = 16384  # 16 KB — fall back to HTTP for larger messages
 DISCOVERY_PORT = 8470
 DISCOVERY_MCAST_GROUP = "239.77.68.77"  # "M" "D" "M" in ASCII — DarkMatter multicast group
 DISCOVERY_INTERVAL = 30       # seconds between discovery scans
@@ -217,6 +230,10 @@ class Connection:
     # Cryptographic identity — peer's public key and display name
     agent_public_key_hex: Optional[str] = None
     agent_display_name: Optional[str] = None
+    # WebRTC transport state (ephemeral — never persisted)
+    transport: str = "http"              # "http" | "webrtc"
+    webrtc_pc: Optional[object] = None   # RTCPeerConnection
+    webrtc_channel: Optional[object] = None  # RTCDataChannel
 
     @property
     def avg_response_time_ms(self) -> float:
@@ -393,10 +410,12 @@ def _build_status_line() -> str:
     msgs = len(state.message_queue)
     handled = state.messages_handled
     pending = len(state.pending_requests)
-    # Show display names for peers when available
+    # Show display names for peers when available, with transport indicator
     peer_labels = []
     for c in state.connections.values():
         label = c.agent_display_name or c.agent_id[:12]
+        if c.transport == "webrtc":
+            label += " [webrtc]"
         peer_labels.append(label)
     peers = ", ".join(peer_labels) if peer_labels else "none"
 
@@ -477,11 +496,27 @@ async def _update_status_tool() -> None:
         print(f"[DarkMatter] Status tool updated: {new_desc}", file=sys.stderr)
 
 
+def _check_webrtc_health() -> None:
+    """Clean up dead WebRTC channels on all connections."""
+    state = _agent_state
+    if state is None:
+        return
+    for conn in state.connections.values():
+        if conn.webrtc_channel is None:
+            continue
+        ready = getattr(conn.webrtc_channel, "readyState", None)
+        if ready not in ("open", "connecting"):
+            peer = conn.agent_display_name or conn.agent_id[:12]
+            print(f"[DarkMatter] WebRTC: cleaning up dead channel (peer: {peer}, state: {ready})", file=sys.stderr)
+            _cleanup_webrtc(conn)
+
+
 async def _status_updater() -> None:
-    """Background task: periodically update the status tool description."""
+    """Background task: periodically update the status tool description and check WebRTC health."""
     while True:
         await asyncio.sleep(5)
         try:
+            _check_webrtc_health()
             await _update_status_tool()
         except Exception as e:
             print(f"[DarkMatter] Status updater error: {e}", file=sys.stderr)
@@ -752,6 +787,12 @@ class AskImpressionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     ask_agent_id: str = Field(..., description="The connected agent to ask")
     about_agent_id: str = Field(..., description="The agent you want to know about")
+
+
+class UpgradeWebrtcInput(BaseModel):
+    """Upgrade a connection to use WebRTC data channel for message delivery."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The connected agent to upgrade to WebRTC transport")
 
 
 # =============================================================================
@@ -1073,6 +1114,39 @@ async def disconnect(params: DisconnectInput, ctx: Context) -> str:
     })
 
 
+# =============================================================================
+# Transport Abstraction — WebRTC or HTTP
+# =============================================================================
+
+async def _send_to_peer(conn: Connection, path: str, payload: dict) -> dict:
+    """Send a message to a peer, using WebRTC data channel if available, else HTTP.
+
+    Returns the response dict from the peer.
+    """
+    # Try WebRTC first if channel is open
+    if conn.webrtc_channel is not None:
+        try:
+            ready = getattr(conn.webrtc_channel, "readyState", None)
+            if ready == "open":
+                data = json.dumps({"path": path, "payload": payload})
+                if len(data) <= WEBRTC_MESSAGE_SIZE_LIMIT:
+                    conn.webrtc_channel.send(data)
+                    return {"success": True, "transport": "webrtc"}
+                # Message too large for WebRTC — fall through to HTTP
+        except Exception as e:
+            print(f"[DarkMatter] WebRTC send failed, falling back to HTTP: {e}", file=sys.stderr)
+
+    # HTTP fallback
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            conn.agent_url.rstrip("/") + path,
+            json=payload,
+        )
+        result = resp.json()
+        result["transport"] = "http"
+        return result
+
+
 @mcp.tool(
     name="darkmatter_send_message",
     annotations={
@@ -1142,25 +1216,21 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     sent_to = []
     for conn in targets:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                payload = {
-                    "message_id": message_id,
-                    "content": params.content,
-                    "webhook": webhook,
-                    "hops_remaining": params.hops_remaining,
-                    "from_agent_id": state.agent_id,
-                    "metadata": metadata,
-                    "timestamp": msg_timestamp,
-                    "from_public_key_hex": state.public_key_hex,
-                    "signature_hex": signature_hex,
-                }
-                await client.post(
-                    conn.agent_url.rstrip("/") + "/__darkmatter__/message",
-                    json=payload,
-                )
-                conn.messages_sent += 1
-                conn.last_activity = datetime.now(timezone.utc).isoformat()
-                sent_to.append(conn.agent_id)
+            payload = {
+                "message_id": message_id,
+                "content": params.content,
+                "webhook": webhook,
+                "hops_remaining": params.hops_remaining,
+                "from_agent_id": state.agent_id,
+                "metadata": metadata,
+                "timestamp": msg_timestamp,
+                "from_public_key_hex": state.public_key_hex,
+                "signature_hex": signature_hex,
+            }
+            await _send_to_peer(conn, "/__darkmatter__/message", payload)
+            conn.messages_sent += 1
+            conn.last_activity = datetime.now(timezone.utc).isoformat()
+            sent_to.append(conn.agent_id)
         except Exception as e:
             conn.messages_declined += 1
 
@@ -1326,6 +1396,7 @@ async def list_connections(ctx: Context) -> str:
             "agent_url": conn.agent_url,
             "bio_summary": _truncate(conn.agent_bio, 250) if conn.agent_bio else None,
             "crypto": conn.agent_public_key_hex is not None,
+            "transport": conn.transport,
             "direction": conn.direction.value,
             "connected_at": conn.connected_at,
             "messages_sent": conn.messages_sent,
@@ -1730,28 +1801,25 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
             state.private_key_hex, state.agent_id, msg.message_id, fwd_timestamp, msg.content
         )
 
-    # POST message to target's message endpoint
+    # POST message to target's message endpoint (via WebRTC or HTTP)
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                conn.agent_url.rstrip("/") + "/__darkmatter__/message",
-                json={
-                    "message_id": msg.message_id,
-                    "content": msg.content,
-                    "webhook": msg.webhook,
-                    "hops_remaining": new_hops_remaining,
-                    "from_agent_id": state.agent_id,
-                    "metadata": msg.metadata,
-                    "timestamp": fwd_timestamp,
-                    "from_public_key_hex": state.public_key_hex,
-                    "signature_hex": fwd_signature_hex,
-                }
-            )
-            if resp.status_code >= 400:
-                return json.dumps({
-                    "success": False,
-                    "error": f"Target agent returned HTTP {resp.status_code}. Message still in queue.",
-                })
+        fwd_payload = {
+            "message_id": msg.message_id,
+            "content": msg.content,
+            "webhook": msg.webhook,
+            "hops_remaining": new_hops_remaining,
+            "from_agent_id": state.agent_id,
+            "metadata": msg.metadata,
+            "timestamp": fwd_timestamp,
+            "from_public_key_hex": state.public_key_hex,
+            "signature_hex": fwd_signature_hex,
+        }
+        result = await _send_to_peer(conn, "/__darkmatter__/message", fwd_payload)
+        if result.get("error"):
+            return json.dumps({
+                "success": False,
+                "error": f"Target agent error: {result['error']}. Message still in queue.",
+            })
     except Exception as e:
         return json.dumps({
             "success": False,
@@ -2322,6 +2390,167 @@ async def ask_impression(params: AskImpressionInput, ctx: Context) -> str:
 
 
 # =============================================================================
+# WebRTC Transport Upgrade Tool
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_upgrade_webrtc",
+    annotations={
+        "title": "Upgrade to WebRTC",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def upgrade_webrtc(params: UpgradeWebrtcInput, ctx: Context) -> str:
+    """Upgrade a connection to use WebRTC data channel for peer-to-peer messaging.
+
+    After upgrading, messages to this peer are sent over a direct WebRTC data
+    channel instead of HTTP. This enables communication through NAT and firewalls.
+    Falls back to HTTP automatically if the channel closes or for large messages.
+
+    Requires aiortc to be installed. Only works with peers that also support WebRTC.
+
+    Args:
+        params: Contains agent_id of the connected peer to upgrade.
+
+    Returns:
+        JSON with upgrade result and transport status.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+
+    if not WEBRTC_AVAILABLE:
+        return json.dumps({
+            "success": False,
+            "error": "WebRTC not available — install aiortc: pip install aiortc",
+        })
+
+    state = get_state(ctx)
+    if params.agent_id not in state.connections:
+        return json.dumps({
+            "success": False,
+            "error": f"Not connected to agent '{params.agent_id}'.",
+        })
+
+    conn = state.connections[params.agent_id]
+
+    # Already upgraded?
+    if conn.transport == "webrtc" and conn.webrtc_channel is not None:
+        ready = getattr(conn.webrtc_channel, "readyState", None)
+        if ready == "open":
+            return json.dumps({
+                "success": True,
+                "already_upgraded": True,
+                "transport": "webrtc",
+                "agent_id": params.agent_id,
+            })
+
+    # Clean up any stale WebRTC state
+    if conn.webrtc_pc is not None:
+        _cleanup_webrtc(conn)
+
+    pc = RTCPeerConnection(configuration=_make_rtc_config())
+    channel = pc.createDataChannel("darkmatter")
+
+    channel_open = asyncio.Event()
+
+    @channel.on("open")
+    def on_open():
+        channel_open.set()
+
+    @channel.on("message")
+    async def on_message(message):
+        try:
+            envelope = json.loads(message)
+            path = envelope.get("path", "")
+            payload = envelope.get("payload", {})
+            if path == "/__darkmatter__/message":
+                await _process_incoming_message(state, payload)
+        except Exception as e:
+            print(f"[DarkMatter] WebRTC message processing error: {e}", file=sys.stderr)
+
+    @channel.on("close")
+    def on_close():
+        print(f"[DarkMatter] WebRTC data channel closed (peer: {params.agent_id})", file=sys.stderr)
+        _cleanup_webrtc(conn)
+
+    @pc.on("connectionstatechange")
+    async def on_connection_state_change():
+        if pc.connectionState in ("failed", "closed"):
+            print(f"[DarkMatter] WebRTC connection {pc.connectionState} (peer: {params.agent_id})", file=sys.stderr)
+            _cleanup_webrtc(conn)
+
+    # Create offer and gather ICE candidates
+    offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    await _wait_for_ice_gathering(pc)
+
+    # Send offer to peer via HTTP (signaling uses existing HTTP connection)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                conn.agent_url.rstrip("/") + "/__darkmatter__/webrtc_offer",
+                json={
+                    "from_agent_id": state.agent_id,
+                    "sdp_offer": pc.localDescription.sdp,
+                },
+            )
+            if resp.status_code != 200:
+                await pc.close()
+                return json.dumps({
+                    "success": False,
+                    "error": f"Peer rejected WebRTC offer (HTTP {resp.status_code}): {resp.text}",
+                })
+            answer_data = resp.json()
+    except Exception as e:
+        await pc.close()
+        return json.dumps({
+            "success": False,
+            "error": f"Failed to send WebRTC offer to peer: {str(e)}",
+        })
+
+    sdp_answer = answer_data.get("sdp_answer", "")
+    if not sdp_answer:
+        await pc.close()
+        return json.dumps({
+            "success": False,
+            "error": "Peer returned empty SDP answer.",
+        })
+
+    # Set remote answer
+    answer = RTCSessionDescription(sdp=sdp_answer, type="answer")
+    await pc.setRemoteDescription(answer)
+
+    # Wait for data channel to open
+    try:
+        await asyncio.wait_for(channel_open.wait(), timeout=WEBRTC_CHANNEL_OPEN_TIMEOUT)
+    except asyncio.TimeoutError:
+        await pc.close()
+        return json.dumps({
+            "success": False,
+            "error": f"WebRTC data channel did not open within {WEBRTC_CHANNEL_OPEN_TIMEOUT}s.",
+        })
+
+    # Upgrade successful
+    conn.webrtc_pc = pc
+    conn.webrtc_channel = channel
+    conn.transport = "webrtc"
+
+    peer_label = conn.agent_display_name or params.agent_id
+    print(f"[DarkMatter] WebRTC: upgraded connection to {peer_label}", file=sys.stderr)
+
+    return json.dumps({
+        "success": True,
+        "transport": "webrtc",
+        "agent_id": params.agent_id,
+        "display_name": conn.agent_display_name,
+    })
+
+
+# =============================================================================
 # Live Status Tool — Dynamic description updated via notifications/tools/list_changed
 # =============================================================================
 
@@ -2513,24 +2742,16 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
     return JSONResponse({"success": True})
 
 
-async def handle_message(request: Request) -> JSONResponse:
-    """Handle an incoming routed message from another agent."""
-    global _agent_state
-    state = _agent_state
+async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Core message processing logic, shared by HTTP and WebRTC receive paths.
 
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
+    Returns (response_dict, status_code).
+    """
     if state.status == AgentStatus.INACTIVE:
-        return JSONResponse({"error": "Agent is currently inactive"}, status_code=503)
+        return {"error": "Agent is currently inactive"}, 503
 
     if len(state.message_queue) >= MESSAGE_QUEUE_MAX:
-        return JSONResponse({"error": "Message queue full"}, status_code=429)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        return {"error": "Message queue full"}, 429
 
     message_id = data.get("message_id", "")
     content = data.get("content", "")
@@ -2538,21 +2759,18 @@ async def handle_message(request: Request) -> JSONResponse:
     from_agent_id = data.get("from_agent_id")
 
     if not message_id or not content or not webhook:
-        return JSONResponse({"error": "Missing required fields"}, status_code=400)
+        return {"error": "Missing required fields"}, 400
     if len(content) > MAX_CONTENT_LENGTH:
-        return JSONResponse({"error": f"Content exceeds {MAX_CONTENT_LENGTH} bytes"}, status_code=413)
+        return {"error": f"Content exceeds {MAX_CONTENT_LENGTH} bytes"}, 413
     if from_agent_id and len(from_agent_id) > MAX_AGENT_ID_LENGTH:
-        return JSONResponse({"error": "from_agent_id too long"}, status_code=400)
+        return {"error": "from_agent_id too long"}, 400
     url_err = validate_url(webhook)
     if url_err:
-        return JSONResponse({"error": f"Invalid webhook: {url_err}"}, status_code=400)
+        return {"error": f"Invalid webhook: {url_err}"}, 400
 
     # Reject messages from agents we're not connected to
     if not from_agent_id or from_agent_id not in state.connections:
-        return JSONResponse(
-            {"error": "Not connected — only connected agents can send messages."},
-            status_code=403,
-        )
+        return {"error": "Not connected — only connected agents can send messages."}, 403
 
     hops_remaining = data.get("hops_remaining", 10)
     if not isinstance(hops_remaining, int) or hops_remaining < 0:
@@ -2569,18 +2787,12 @@ async def handle_message(request: Request) -> JSONResponse:
         if conn.agent_public_key_hex and from_public_key_hex:
             # Known connection with stored key — verify key matches
             if conn.agent_public_key_hex != from_public_key_hex:
-                return JSONResponse(
-                    {"error": "Public key mismatch — sender key does not match stored key for this connection."},
-                    status_code=403,
-                )
+                return {"error": "Public key mismatch — sender key does not match stored key for this connection."}, 403
             # Verify signature
             if signature_hex and msg_timestamp:
                 if not _verify_message(conn.agent_public_key_hex, signature_hex,
                                        from_agent_id, message_id, msg_timestamp, content):
-                    return JSONResponse(
-                        {"error": "Invalid signature — message authenticity could not be verified."},
-                        status_code=403,
-                    )
+                    return {"error": "Invalid signature — message authenticity could not be verified."}, 403
                 verified = True
 
     msg = QueuedMessage(
@@ -2602,11 +2814,24 @@ async def handle_message(request: Request) -> JSONResponse:
         conn.last_activity = datetime.now(timezone.utc).isoformat()
 
     save_state()
-    return JSONResponse({
-        "success": True,
-        "queued": True,
-        "queue_position": len(state.message_queue),
-    })
+    return {"success": True, "queued": True, "queue_position": len(state.message_queue)}, 200
+
+
+async def handle_message(request: Request) -> JSONResponse:
+    """Handle an incoming routed message from another agent (HTTP transport)."""
+    global _agent_state
+    state = _agent_state
+
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    result, status_code = await _process_incoming_message(state, data)
+    return JSONResponse(result, status_code=status_code)
 
 
 async def handle_webhook_post(request: Request) -> JSONResponse:
@@ -2774,6 +2999,137 @@ async def handle_impression_get(request: Request) -> JSONResponse:
     })
 
 
+# =============================================================================
+# WebRTC Signaling + Cleanup
+# =============================================================================
+
+def _cleanup_webrtc(conn: Connection) -> None:
+    """Close WebRTC peer connection and revert transport to HTTP."""
+    pc = conn.webrtc_pc
+    conn.webrtc_channel = None
+    conn.webrtc_pc = None
+    conn.transport = "http"
+    if pc is not None:
+        asyncio.ensure_future(_close_pc(pc))
+
+
+async def _close_pc(pc: object) -> None:
+    """Close an RTCPeerConnection safely."""
+    try:
+        await pc.close()
+    except Exception:
+        pass
+
+
+def _make_rtc_config():
+    """Create an RTCConfiguration with STUN servers."""
+    return RTCConfiguration(
+        iceServers=[RTCIceServer(urls=s["urls"]) for s in WEBRTC_STUN_SERVERS]
+    )
+
+
+async def _wait_for_ice_gathering(pc, timeout: float = WEBRTC_ICE_GATHER_TIMEOUT) -> None:
+    """Wait for ICE gathering to complete."""
+    if pc.iceGatheringState == "complete":
+        return
+    done = asyncio.Event()
+
+    @pc.on("icegatheringstatechange")
+    def on_ice_state():
+        if pc.iceGatheringState == "complete":
+            done.set()
+
+    await asyncio.wait_for(done.wait(), timeout=timeout)
+
+
+async def handle_webrtc_offer(request: Request) -> JSONResponse:
+    """Handle an incoming WebRTC SDP offer from a peer (answering side).
+
+    POST /__darkmatter__/webrtc_offer
+    Body: {from_agent_id, sdp_offer}
+    Returns: {sdp_answer}
+    """
+    global _agent_state
+    state = _agent_state
+
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    if not WEBRTC_AVAILABLE:
+        return JSONResponse({"error": "WebRTC not available (aiortc not installed)"}, status_code=501)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    from_agent_id = data.get("from_agent_id", "")
+    sdp_offer = data.get("sdp_offer", "")
+
+    if not from_agent_id or not sdp_offer:
+        return JSONResponse({"error": "Missing from_agent_id or sdp_offer"}, status_code=400)
+
+    if from_agent_id not in state.connections:
+        return JSONResponse({"error": "Not connected — WebRTC upgrade requires an existing connection."}, status_code=403)
+
+    conn = state.connections[from_agent_id]
+
+    # Clean up any existing WebRTC state for this connection
+    if conn.webrtc_pc is not None:
+        _cleanup_webrtc(conn)
+
+    pc = RTCPeerConnection(configuration=_make_rtc_config())
+    channel_ready = asyncio.Event()
+    received_channel = [None]  # mutable container for closure
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        received_channel[0] = channel
+        conn.webrtc_channel = channel
+        conn.webrtc_pc = pc
+        conn.transport = "webrtc"
+
+        @channel.on("message")
+        async def on_message(message):
+            try:
+                envelope = json.loads(message)
+                path = envelope.get("path", "")
+                payload = envelope.get("payload", {})
+                if path == "/__darkmatter__/message":
+                    await _process_incoming_message(state, payload)
+            except Exception as e:
+                print(f"[DarkMatter] WebRTC message processing error: {e}", file=sys.stderr)
+
+        @channel.on("close")
+        def on_close():
+            print(f"[DarkMatter] WebRTC data channel closed (peer: {from_agent_id})", file=sys.stderr)
+            _cleanup_webrtc(conn)
+
+        channel_ready.set()
+
+    @pc.on("connectionstatechange")
+    async def on_connection_state_change():
+        if pc.connectionState in ("failed", "closed"):
+            print(f"[DarkMatter] WebRTC connection {pc.connectionState} (peer: {from_agent_id})", file=sys.stderr)
+            _cleanup_webrtc(conn)
+
+    # Set remote offer and create answer
+    offer = RTCSessionDescription(sdp=sdp_offer, type="offer")
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    # Wait for ICE gathering
+    await _wait_for_ice_gathering(pc)
+
+    print(f"[DarkMatter] WebRTC: answered offer from {conn.agent_display_name or from_agent_id}", file=sys.stderr)
+
+    return JSONResponse({
+        "success": True,
+        "sdp_answer": pc.localDescription.sdp,
+    })
+
+
 async def handle_well_known(request: Request) -> JSONResponse:
     """Return /.well-known/darkmatter.json for global discovery (RFC 8615)."""
     global _agent_state
@@ -2799,6 +3155,7 @@ async def handle_well_known(request: Request) -> JSONResponse:
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "mesh_url": f"{public_url}/__darkmatter__",
         "mcp_url": f"{public_url}/mcp",
+        "webrtc_enabled": WEBRTC_AVAILABLE,
     })
 
 
@@ -3094,6 +3451,7 @@ def create_app() -> Starlette:
         Route("/status", handle_status, methods=["GET"]),
         Route("/network_info", handle_network_info, methods=["GET"]),
         Route("/impression/{agent_id}", handle_impression_get, methods=["GET"]),
+        Route("/webrtc_offer", handle_webrtc_offer, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
@@ -3149,11 +3507,13 @@ if __name__ == "__main__":
     print(f"[DarkMatter]    GET /__darkmatter__/webhook/{{message_id}}", file=sys.stderr)
     print(f"[DarkMatter]    GET /__darkmatter__/status", file=sys.stderr)
     print(f"[DarkMatter]    GET /__darkmatter__/network_info", file=sys.stderr)
+    print(f"[DarkMatter]   POST /__darkmatter__/webrtc_offer", file=sys.stderr)
     print(f"[DarkMatter]    GET /.well-known/darkmatter.json", file=sys.stderr)
     print(f"[DarkMatter]    GET /bootstrap", file=sys.stderr)
     print(f"[DarkMatter]    GET /bootstrap/server.py", file=sys.stderr)
     print(f"[DarkMatter]", file=sys.stderr)
     print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled (set DARKMATTER_DISCOVERY=true to enable)'}", file=sys.stderr)
+    print(f"[DarkMatter] WebRTC: {'AVAILABLE (aiortc installed)' if WEBRTC_AVAILABLE else 'disabled (pip install aiortc to enable)'}", file=sys.stderr)
     print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
     print(f"[DarkMatter] MCP server available via streamable-http at /mcp (auth via darkmatter_authenticate tool)", file=sys.stderr)
 

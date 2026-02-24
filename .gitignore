@@ -3,3 +3,6 @@
 darkmatter_state*.json
 __pycache__/
 .venv/
+
+# Glance memory shards
+.glance/
