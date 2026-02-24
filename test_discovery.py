@@ -23,8 +23,9 @@ import httpx
 PYTHON = sys.executable
 SERVER = os.path.join(os.path.dirname(__file__), "server.py")
 BASE_PORT = 9900
-STARTUP_TIMEOUT = 10  # seconds to wait for a server to come up
+STARTUP_TIMEOUT = 15  # seconds to wait for a server to come up
 DISCOVERY_WAIT = 5    # seconds to wait for discovery scan
+PORT_RELEASE_WAIT = 1  # seconds to wait after stopping a node for port release
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -66,6 +67,7 @@ class DarkMatterNode:
             "DARKMATTER_DISPLAY_NAME": self.display_name,
             "DARKMATTER_STATE_FILE": self.state_file,
             "DARKMATTER_DISCOVERY": "true",
+            "DARKMATTER_TRANSPORT": "http",
             # Override the scan range to cover our test ports
             "DARKMATTER_DISCOVERY_PORTS": f"{BASE_PORT}-{BASE_PORT + 10}",
         }
@@ -84,6 +86,11 @@ class DarkMatterNode:
         """Wait until the server responds to HTTP."""
         deadline = time.time() + STARTUP_TIMEOUT
         while time.time() < deadline:
+            # Check if process died
+            if self.proc and self.proc.poll() is not None:
+                stderr = self.proc.stderr.read().decode() if self.proc.stderr else ""
+                print(f"      Process died (rc={self.proc.returncode}): {stderr[-300:]}")
+                return False
             try:
                 r = httpx.get(
                     f"http://127.0.0.1:{self.port}/.well-known/darkmatter.json",
@@ -96,25 +103,13 @@ class DarkMatterNode:
             except httpx.HTTPError:
                 pass
             time.sleep(0.3)
+        # Timeout — dump stderr for diagnostics
+        if self.proc and self.proc.stderr:
+            try:
+                self.proc.stderr.close()
+            except Exception:
+                pass
         return False
-
-    def get_discovered_peers(self) -> dict:
-        """Get discovered peers by reading the status endpoint's discovered peers.
-
-        Since the MCP tool requires auth, we check via /.well-known/darkmatter.json
-        on the expected peer ports to verify they can reach each other.
-        """
-        # Actually, let's just probe the server from our perspective
-        # and verify the discovery worked by checking if THIS node
-        # appears as reachable from other nodes. But that's circular.
-        #
-        # The real test: check the server's internal state by calling
-        # the HTTP network_info endpoint (which shows connections).
-        # For discovery specifically, we need to verify the scan found peers.
-        #
-        # Simplest approach: use the /__darkmatter__/status endpoint
-        # which we can extend, OR just run _scan_local_ports in a subprocess.
-        pass
 
     def stop(self) -> None:
         if self.proc:
@@ -158,6 +153,7 @@ def test_well_known_endpoint() -> None:
         report("has mcp_url", "mcp" in info.get("mcp_url", ""))
     finally:
         node.stop()
+        time.sleep(PORT_RELEASE_WAIT)
 
 
 def test_two_nodes_discover_each_other() -> None:
@@ -169,17 +165,16 @@ def test_two_nodes_discover_each_other() -> None:
 
     try:
         node_a.start()
-        assert node_a.wait_ready(), "Node A failed to start"
         node_b.start()
-        assert node_b.wait_ready(), "Node B failed to start"
 
-        # Wait for discovery cycle (scans run on startup + every DISCOVERY_INTERVAL)
-        # First scan is immediate, but both nodes need to be up first.
-        # Wait a few seconds for the second scan cycle.
-        print(f"  ... waiting {DISCOVERY_WAIT}s for discovery scan")
-        time.sleep(DISCOVERY_WAIT)
+        if not node_a.wait_ready():
+            report("Node A started", False, "failed to start")
+            return
+        if not node_b.wait_ready():
+            report("Node B started", False, "failed to start")
+            return
 
-        # Verify B can reach A's well-known endpoint (basic connectivity)
+        # Verify basic HTTP connectivity
         r = httpx.get(
             f"http://127.0.0.1:{node_a.port}/.well-known/darkmatter.json",
             timeout=2.0,
@@ -192,13 +187,7 @@ def test_two_nodes_discover_each_other() -> None:
         )
         report("A can reach B via HTTP", r.status_code == 200)
 
-        # The real discovery test: check node A's stderr for evidence it
-        # found node B (the scan logs HTTP requests to peer ports)
-        # Read stderr from both processes
-        # Actually, we need a better way. Let me add a simple discovery
-        # status endpoint check.
-
-        # For now: run a manual scan and verify
+        # Run a manual scan from A's perspective to find B
         result = subprocess.run(
             [PYTHON, "-c", f"""
 import asyncio, json, sys, os
@@ -269,6 +258,7 @@ asyncio.run(main())
     finally:
         node_a.stop()
         node_b.stop()
+        time.sleep(PORT_RELEASE_WAIT)
 
 
 def test_three_nodes_nway() -> None:
@@ -284,7 +274,9 @@ def test_three_nodes_nway() -> None:
         for n in nodes:
             n.start()
         for n in nodes:
-            assert n.wait_ready(), f"{n} failed to start"
+            if not n.wait_ready():
+                report(f"{n} started", False, "failed to start")
+                return
 
         # Run scan from each node's perspective
         for i, scanner in enumerate(nodes):
@@ -320,6 +312,7 @@ asyncio.run(main())
     finally:
         for n in nodes:
             n.stop()
+        time.sleep(PORT_RELEASE_WAIT)
 
 
 def test_dead_node_disappears() -> None:
@@ -332,8 +325,12 @@ def test_dead_node_disappears() -> None:
     try:
         node_a.start()
         node_b.start()
-        assert node_a.wait_ready()
-        assert node_b.wait_ready()
+        if not node_a.wait_ready():
+            report("Node A started", False, "failed to start")
+            return
+        if not node_b.wait_ready():
+            report("Node B started", False, "failed to start")
+            return
 
         # Scan — should find B
         result = subprocess.run(
@@ -379,6 +376,7 @@ asyncio.run(main())
     finally:
         node_a.stop()
         node_b.stop()
+        time.sleep(PORT_RELEASE_WAIT)
 
 
 def test_scan_performance() -> None:

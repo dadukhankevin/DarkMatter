@@ -1146,6 +1146,12 @@ def load_state() -> Optional[AgentState]:
             response=sd.get("response"),
         )
 
+    # Migrate legacy state: generate keypair if missing
+    priv = data.get("private_key_hex")
+    pub = data.get("public_key_hex")
+    if not priv or not pub:
+        priv, pub = _generate_keypair()
+
     state = AgentState(
         agent_id=data["agent_id"],
         bio=data.get("bio", ""),
@@ -1155,8 +1161,8 @@ def load_state() -> Optional[AgentState]:
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
         claimed=data.get("claimed", False),
-        private_key_hex=data.get("private_key_hex"),
-        public_key_hex=data.get("public_key_hex"),
+        private_key_hex=priv,
+        public_key_hex=pub,
         display_name=data.get("display_name"),
         connections=connections,
         sent_messages=sent_messages,
