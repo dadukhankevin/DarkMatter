@@ -3580,15 +3580,40 @@ def _print_startup_banner(port: int, transport: str, discovery_enabled: bool) ->
     print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
 
 
-def _port_in_use(host: str, port: int) -> bool:
-    """Check if a port is already bound."""
+def _check_port_owner(host: str, port: int) -> Optional[str]:
+    """Check if a port has a DarkMatter server and return its agent_id, or None if port is free."""
     import socket as _socket
+    # First check if port is in use at all
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
         try:
             s.bind((host, port))
-            return False
+            return None  # Port is free
         except OSError:
-            return True
+            pass  # Port in use — probe it
+
+    # Port is taken — check if it's a DarkMatter node
+    try:
+        import httpx
+        resp = httpx.get(f"http://127.0.0.1:{port}/.well-known/darkmatter.json", timeout=1.0)
+        if resp.status_code == 200:
+            info = resp.json()
+            return info.get("agent_id")
+    except Exception:
+        pass
+    return "unknown"  # Port taken by non-DarkMatter process
+
+
+def _find_free_port(host: str, start: int) -> int:
+    """Find a free port in the discovery range (start to start+10)."""
+    import socket as _socket
+    for port in range(start, start + 11):
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"No free ports in range {start}-{start + 10}")
 
 
 async def _run_stdio_with_http() -> None:
@@ -3598,33 +3623,26 @@ async def _run_stdio_with_http() -> None:
     The client talks MCP over stdin/stdout. The HTTP server runs alongside for
     agent-to-agent mesh communication, discovery, and webhooks.
 
-    If the HTTP port is already in use (e.g. another session already started the
-    server), this instance runs stdio-only and shares the same state file. The
-    existing HTTP server handles all mesh traffic.
+    Port conflict resolution:
+    - Port free → start normally
+    - Port taken by OUR server (same agent_id) → another session of us is
+      already running the HTTP mesh. Run stdio-only and share state.
+    - Port taken by SOMEONE ELSE → find a new free port and start there.
     """
     from mcp.server.stdio import stdio_server
 
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
 
-    already_running = _port_in_use(host, port)
+    # Load our state to get our agent_id (if we have one)
+    our_state = load_state()
+    our_agent_id = our_state.agent_id if our_state else None
 
-    if already_running:
-        # Another session owns the HTTP server — run stdio-only
-        print(f"[DarkMatter] Port {port} already in use — another session owns the HTTP mesh.", file=sys.stderr)
-        print(f"[DarkMatter] Running stdio-only MCP (shared state via ~/.darkmatter/state/{port}.json)", file=sys.stderr)
+    # Check who owns the port
+    port_owner = _check_port_owner(host, port)
 
-        # Still need to initialize agent state so MCP tools work
-        _init_state(port)
-
-        async with stdio_server() as (read_stream, write_stream):
-            await mcp._mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp._mcp_server.create_initialization_options(),
-            )
-    else:
-        # We're the first session — start HTTP server alongside stdio
+    if port_owner is None:
+        # Port is free — start normally
         app = create_app()
         discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
         _print_startup_banner(port, "stdio (with HTTP mesh on port " + str(port) + ")", discovery_enabled)
@@ -3633,7 +3651,6 @@ async def _run_stdio_with_http() -> None:
         server = uvicorn.Server(config)
 
         async with stdio_server() as (read_stream, write_stream):
-            # Run HTTP server and stdio MCP concurrently
             async with anyio.create_task_group() as tg:
                 tg.start_soon(server.serve)
                 await mcp._mcp_server.run(
@@ -3641,7 +3658,46 @@ async def _run_stdio_with_http() -> None:
                     write_stream,
                     mcp._mcp_server.create_initialization_options(),
                 )
-                # When stdio closes (client disconnects), shut down HTTP too
+                server.should_exit = True
+
+    elif port_owner == our_agent_id:
+        # Our server is already running — parallel session, share state
+        print(f"[DarkMatter] Port {port} is already running our server (agent {our_agent_id[:12]}...).", file=sys.stderr)
+        print(f"[DarkMatter] Running stdio-only MCP (parallel session, shared state).", file=sys.stderr)
+
+        _init_state(port)
+
+        async with stdio_server() as (read_stream, write_stream):
+            await mcp._mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
+
+    else:
+        # Port taken by a different agent — find a new port
+        print(f"[DarkMatter] Port {port} is taken by another agent ({port_owner[:12] if port_owner != 'unknown' else 'unknown'}...).", file=sys.stderr)
+        new_port = _find_free_port(host, DEFAULT_PORT)
+        print(f"[DarkMatter] Using port {new_port} instead.", file=sys.stderr)
+
+        # Override port for this session
+        os.environ["DARKMATTER_PORT"] = str(new_port)
+
+        app = create_app()
+        discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
+        _print_startup_banner(new_port, "stdio (with HTTP mesh on port " + str(new_port) + ")", discovery_enabled)
+
+        config = uvicorn.Config(app, host=host, port=new_port, log_level="warning")
+        server = uvicorn.Server(config)
+
+        async with stdio_server() as (read_stream, write_stream):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(server.serve)
+                await mcp._mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    mcp._mcp_server.create_initialization_options(),
+                )
                 server.should_exit = True
 
 
