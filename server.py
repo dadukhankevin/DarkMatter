@@ -3431,34 +3431,31 @@ async def handle_bootstrap_source(request: Request) -> Response:
 # Application — Mount MCP + DarkMatter HTTP endpoints together
 # =============================================================================
 
-def create_app() -> Starlette:
-    """Create the combined Starlette app with MCP and DarkMatter endpoints.
-
-    Returns:
-        The ASGI app.
-    """
+def _init_state(port: int = None) -> None:
+    """Initialize agent state from disk or create fresh. Safe to call multiple times."""
     global _agent_state
+    if _agent_state is not None:
+        return  # Already initialized
+
+    if port is None:
+        port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
     display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", os.environ.get("DARKMATTER_AGENT_ID", ""))
     bio = os.environ.get("DARKMATTER_BIO", "Genesis agent — the first node in the DarkMatter network.")
-    port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     is_genesis = os.environ.get("DARKMATTER_GENESIS", "true").lower() == "true"
 
     # Try to restore persisted state from disk
     restored = load_state()
     if restored:
         _agent_state = restored
-        # Update mutable env-driven fields in case they changed
         _agent_state.port = port
         _agent_state.status = AgentStatus.ACTIVE
-        # Update display name from env if provided
         if display_name:
             _agent_state.display_name = display_name
         print(f"[DarkMatter] Restored state for '{_agent_state.agent_id}' "
               f"(display: {_agent_state.display_name or 'none'}, "
               f"{len(_agent_state.connections)} connections)", file=sys.stderr)
     else:
-        # New agent — generate UUID agent_id and Ed25519 keypair
         agent_id = str(uuid.uuid4())
         priv, pub = _generate_keypair()
         _agent_state = AgentState(
@@ -3477,9 +3474,18 @@ def create_app() -> Starlette:
     if is_genesis:
         print(f"[DarkMatter] This is a GENESIS node.", file=sys.stderr)
 
-    print(f"[DarkMatter] MCP auth: {'claimed' if _agent_state.claimed else 'UNCLAIMED — first agent to connect will claim this node'}", file=sys.stderr)
-
+    print(f"[DarkMatter] MCP auth: {'claimed' if _agent_state.claimed else 'UNCLAIMED'}", file=sys.stderr)
     save_state()
+
+
+def create_app() -> Starlette:
+    """Create the combined Starlette app with MCP and DarkMatter endpoints.
+
+    Returns:
+        The ASGI app.
+    """
+    port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
+    _init_state(port)
 
     # LAN discovery setup
     discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
@@ -3574,38 +3580,69 @@ def _print_startup_banner(port: int, transport: str, discovery_enabled: bool) ->
     print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
 
 
+def _port_in_use(host: str, port: int) -> bool:
+    """Check if a port is already bound."""
+    import socket as _socket
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+            return False
+        except OSError:
+            return True
+
+
 async def _run_stdio_with_http() -> None:
     """Run MCP over stdio while serving HTTP mesh endpoints in the background.
 
     This is the preferred mode when launched by an MCP client (e.g. Claude Code).
     The client talks MCP over stdin/stdout. The HTTP server runs alongside for
     agent-to-agent mesh communication, discovery, and webhooks.
+
+    If the HTTP port is already in use (e.g. another session already started the
+    server), this instance runs stdio-only and shares the same state file. The
+    existing HTTP server handles all mesh traffic.
     """
     from mcp.server.stdio import stdio_server
 
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
 
-    # Build the HTTP app (includes /mcp for backwards compat with HTTP clients)
-    app = create_app()
-    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
-    _print_startup_banner(port, "stdio (with HTTP mesh on port " + str(port) + ")", discovery_enabled)
+    already_running = _port_in_use(host, port)
 
-    # Start HTTP server in background for mesh endpoints
-    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    server = uvicorn.Server(config)
+    if already_running:
+        # Another session owns the HTTP server — run stdio-only
+        print(f"[DarkMatter] Port {port} already in use — another session owns the HTTP mesh.", file=sys.stderr)
+        print(f"[DarkMatter] Running stdio-only MCP (shared state via ~/.darkmatter/state/{port}.json)", file=sys.stderr)
 
-    async with stdio_server() as (read_stream, write_stream):
-        # Run HTTP server and stdio MCP concurrently
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(server.serve)
+        # Still need to initialize agent state so MCP tools work
+        _init_state(port)
+
+        async with stdio_server() as (read_stream, write_stream):
             await mcp._mcp_server.run(
                 read_stream,
                 write_stream,
                 mcp._mcp_server.create_initialization_options(),
             )
-            # When stdio closes (client disconnects), shut down HTTP too
-            server.should_exit = True
+    else:
+        # We're the first session — start HTTP server alongside stdio
+        app = create_app()
+        discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
+        _print_startup_banner(port, "stdio (with HTTP mesh on port " + str(port) + ")", discovery_enabled)
+
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+
+        async with stdio_server() as (read_stream, write_stream):
+            # Run HTTP server and stdio MCP concurrently
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(server.serve)
+                await mcp._mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    mcp._mcp_server.create_initialization_options(),
+                )
+                # When stdio closes (client disconnects), shut down HTTP too
+                server.should_exit = True
 
 
 if __name__ == "__main__":
