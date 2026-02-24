@@ -123,10 +123,37 @@ def is_private_ip(hostname: str) -> bool:
 
 
 def _is_darkmatter_webhook(url: str) -> bool:
-    """Check if a URL is a known DarkMatter webhook endpoint."""
+    """Check if a URL is a known DarkMatter webhook endpoint on a known peer.
+
+    Only returns True if the path matches AND the host:port matches either
+    our own agent URL or a connected peer's URL. This prevents an attacker
+    from bypassing SSRF protection by hosting /__darkmatter__/webhook/ on
+    an arbitrary internal service.
+    """
     try:
         parsed = urlparse(url)
-        return "/__darkmatter__/webhook/" in (parsed.path or "")
+        if "/__darkmatter__/webhook/" not in (parsed.path or ""):
+            return False
+
+        webhook_origin = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
+
+        # Check against our own URL
+        state = _agent_state
+        if state is not None:
+            own_url = _get_public_url(state.port)
+            own_parsed = urlparse(own_url)
+            own_origin = f"{own_parsed.scheme}://{own_parsed.hostname}:{own_parsed.port or (443 if own_parsed.scheme == 'https' else 80)}"
+            if webhook_origin == own_origin:
+                return True
+
+            # Check against connected peers
+            for conn in state.connections.values():
+                peer_parsed = urlparse(conn.agent_url)
+                peer_origin = f"{peer_parsed.scheme}://{peer_parsed.hostname}:{peer_parsed.port or (443 if peer_parsed.scheme == 'https' else 80)}"
+                if webhook_origin == peer_origin:
+                    return True
+
+        return False
     except Exception:
         return False
 
@@ -135,14 +162,15 @@ def validate_webhook_url(url: str) -> Optional[str]:
     """Validate a webhook URL: must be http(s) and must NOT target private IPs.
 
     Exception: DarkMatter webhook URLs (/__darkmatter__/webhook/) are allowed
-    to target private IPs, since they are auto-generated endpoints on known
-    DarkMatter nodes (not arbitrary user-supplied URLs).
+    to target private IPs, but only if the host matches our own URL or a
+    connected peer's URL (prevents SSRF via crafted webhook paths on
+    arbitrary internal hosts).
     """
     err = validate_url(url)
     if err:
         return err
     if _is_darkmatter_webhook(url):
-        return None  # Skip SSRF check for DarkMatter webhooks
+        return None  # Known DarkMatter peer — safe to allow private IP
     parsed = urlparse(url)
     if is_private_ip(parsed.hostname):
         return "Webhook URL must not target private or link-local IP addresses."
@@ -380,6 +408,8 @@ up to you.\
 _agent_state: Optional[AgentState] = None
 _active_sessions: set = set()  # Track ServerSession objects for notifications
 _last_status_desc: str = ""
+import threading
+_state_write_lock = threading.Lock()  # Serializes save_state() writes to prevent torn state files
 
 
 # =============================================================================
@@ -537,6 +567,7 @@ def save_state() -> None:
     """Persist durable state (identity, connections, telemetry, sent_messages) to disk.
 
     Message queue and pending requests are NOT persisted — they are ephemeral.
+    Serialized via _state_write_lock to prevent concurrent writes from interleaving.
     """
     state = _agent_state
     if state is None:
@@ -594,9 +625,12 @@ def save_state() -> None:
 
     path = _state_file_path()
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    with _state_write_lock:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
 
 def load_state() -> Optional[AgentState]:
@@ -954,7 +988,7 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
                 params.target_url.rstrip("/") + "/__darkmatter__/connection_request",
                 json={
                     "from_agent_id": state.agent_id,
-                    "from_agent_url": f"http://localhost:{state.port}/mcp",
+                    "from_agent_url": f"{_get_public_url(state.port)}/mcp",
                     "from_agent_bio": state.bio,
                     "from_agent_public_key_hex": state.public_key_hex,
                     "from_agent_display_name": state.display_name,
@@ -1052,7 +1086,7 @@ async def respond_connection(params: RespondConnectionInput, ctx: Context) -> st
                     request.from_agent_url.rstrip("/") + "/__darkmatter__/connection_accepted",
                     json={
                         "agent_id": state.agent_id,
-                        "agent_url": f"http://localhost:{state.port}/mcp",
+                        "agent_url": f"{_get_public_url(state.port)}/mcp",
                         "agent_bio": state.bio,
                         "agent_public_key_hex": state.public_key_hex,
                         "agent_display_name": state.display_name,
@@ -2090,7 +2124,7 @@ async def network_info(ctx: Context) -> str:
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
-        "agent_url": f"http://localhost:{state.port}",
+        "agent_url": _get_public_url(state.port),
         "bio": state.bio,
         "is_genesis": state.is_genesis,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
@@ -2633,7 +2667,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         return JSONResponse({
             "auto_accepted": True,
             "agent_id": state.agent_id,
-            "agent_url": f"http://localhost:{state.port}/mcp",
+            "agent_url": f"{_get_public_url(state.port)}/mcp",
             "agent_bio": state.bio,
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
@@ -2655,7 +2689,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         return JSONResponse({
             "auto_accepted": True,
             "agent_id": state.agent_id,
-            "agent_url": f"http://localhost:{state.port}/mcp",
+            "agent_url": f"{_get_public_url(state.port)}/mcp",
             "agent_bio": state.bio,
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
@@ -2967,7 +3001,7 @@ async def handle_network_info(request: Request) -> JSONResponse:
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
-        "agent_url": f"http://localhost:{state.port}",
+        "agent_url": _get_public_url(state.port),
         "bio": state.bio,
         "is_genesis": state.is_genesis,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
