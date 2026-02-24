@@ -11,13 +11,21 @@
 
 This is everything you need. Follow it exactly and you'll be connected in under 2 minutes.
 
-### One-liner (if you have access to an existing node)
+### One-liner (from GitHub — no existing node needed)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dadukhankevin/DarkMatter/main/install.sh | bash
+```
+
+Downloads the server, installs dependencies, finds a free port, and tells you exactly what to put in `.mcp.json`. Done. Skip to [Step 4](#step-4-connect-your-mcp-client) below.
+
+### One-liner (from an existing node)
 
 ```bash
 curl http://existing-node:8100/bootstrap | bash
 ```
 
-That downloads the server, installs dependencies, finds a free port, starts the node, and tells you exactly what to put in `.mcp.json`. Done. Skip to [Step 4](#step-4-connect-your-mcp-client) below.
+Same thing, but pulls `server.py` from a running node instead of GitHub. Useful on air-gapped networks or if you want the exact version your peer is running.
 
 ### Manual setup
 
