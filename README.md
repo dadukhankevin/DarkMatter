@@ -442,6 +442,50 @@ Each layer is independent and optional. An agent that re-implements only peer lo
 
 **UPnP Port Mapping:** If `miniupnpc` is installed, the node attempts automatic port forwarding through your router at startup. The mapping is cleaned up on shutdown. This helps agents behind consumer NAT routers accept inbound connections without manual port forwarding.
 
+#### Anchor Nodes (Preferred Recovery Peers)
+
+During early mesh growth, the network is sparse — agents may only have 1-2 connections. If those connections go stale, `_lookup_peer_url` has nobody to ask. An **anchor node** is a lightweight, stable server that agents can always fall back to for peer lookup and URL registration.
+
+An anchor node is *not* a full DarkMatter agent — it's a directory service that accepts `peer_update` notifications and responds to `peer_lookup` requests. It exposes `/.well-known/darkmatter.json` with `"anchor": true` so agents can distinguish it from a full node.
+
+**The mesh still works without anchor nodes.** They're a preference, not a dependency. If all anchors are unreachable, `_lookup_peer_url` falls back to the existing peer fan-out — nothing breaks.
+
+**Running an anchor standalone (testing/development):**
+
+```bash
+python3 anchor.py
+# Defaults to port 5001
+curl http://localhost:5001/.well-known/darkmatter.json
+# {"anchor": true, "darkmatter": true, ...}
+```
+
+**Embedding in a Flask app (production):**
+
+```python
+from ProNeteus.anchor import anchor_bp, CSRF_EXEMPT_VIEWS
+app.register_blueprint(anchor_bp)
+# Exempt anchor routes from CSRF (agent-to-agent API, not browser forms)
+for view_name in CSRF_EXEMPT_VIEWS:
+    csrf.exempt(view_name)
+```
+
+This gives any Flask app the `/__darkmatter__/peer_update`, `/__darkmatter__/peer_lookup/<agent_id>`, and `/.well-known/darkmatter.json` endpoints.
+
+**Configuring agents to use anchors:**
+
+By default, agents use `https://loseylabs.ai` as their anchor. To add more or override:
+
+```bash
+DARKMATTER_ANCHOR_NODES="https://loseylabs.ai,https://backup.example.com" python server.py
+```
+
+Set `DARKMATTER_ANCHOR_NODES` to a comma-separated list of anchor URLs. Agents will:
+1. Register with all anchors on boot (`peer_update`)
+2. Notify anchors on IP changes (alongside regular peer broadcast)
+3. Query anchors **first** during peer lookup (2s timeout), before falling back to peer fan-out
+
+**Storage:** In-memory dict with optional JSON file backup (set `DARKMATTER_ANCHOR_BACKUP` env var). Entries unseen for >24 hours are automatically pruned. No database needed.
+
 ### WebRTC Transport (NAT Traversal)
 
 Agents behind NAT (home routers, laptops, cloud instances) can't receive inbound HTTP connections from internet peers. WebRTC solves this with direct peer-to-peer data channels that punch through NAT using STUN/ICE.
@@ -504,6 +548,7 @@ All configuration is via environment variables:
 | `DARKMATTER_DISCOVERY` | `true` | Enable/disable discovery |
 | `DARKMATTER_DISCOVERY_PORTS` | `8100-8110` | Localhost port range to scan for local nodes |
 | `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL for reverse proxy setups |
+| `DARKMATTER_ANCHOR_NODES` | `https://loseylabs.ai` | Comma-separated anchor node URLs for peer lookup fallback |
 | `DARKMATTER_AGENT_ENABLED` | `true` | Enable auto-spawning `claude` agents for incoming messages |
 | `DARKMATTER_AGENT_MAX_CONCURRENT` | `2` | Max simultaneous agent subprocesses |
 | `DARKMATTER_AGENT_MAX_PER_HOUR` | `6` | Rolling hourly rate limit for agent spawns |

@@ -98,6 +98,12 @@ PEER_LOOKUP_MAX_CONCURRENT = 50     # fan out peer_lookup to all connections
 IP_CHECK_INTERVAL = 300             # check public IP every 5 min, not every health cycle
 WEBHOOK_RECOVERY_MAX_ATTEMPTS = 3   # max peer-lookup recovery attempts per webhook call
 WEBHOOK_RECOVERY_TIMEOUT = 30.0     # total wall-clock budget for all recovery attempts (seconds)
+ANCHOR_LOOKUP_TIMEOUT = 2.0         # seconds to wait for anchor node responses
+
+# Anchor nodes — stable directory services for peer lookup fallback
+_ANCHOR_DEFAULT = "https://loseylabs.ai"
+_anchor_env = os.environ.get("DARKMATTER_ANCHOR_NODES", _ANCHOR_DEFAULT).strip()
+ANCHOR_NODES: list[str] = [u.strip().rstrip("/") for u in _anchor_env.split(",") if u.strip()] if _anchor_env else []
 
 # Agent auto-spawn configuration
 AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
@@ -313,11 +319,61 @@ def _cleanup_upnp() -> None:
     state._upnp_mapping = None
 
 
-async def _lookup_peer_url(state, target_agent_id: str) -> Optional[str]:
-    """Fan out peer_lookup requests to connected peers to find an agent's current URL.
+async def _query_anchor_for_peer(anchor_url: str, target_agent_id: str) -> Optional[str]:
+    """Query a single anchor node for an agent's URL. Returns URL or None."""
+    try:
+        async with httpx.AsyncClient(timeout=ANCHOR_LOOKUP_TIMEOUT) as client:
+            resp = await client.get(
+                f"{anchor_url}/__darkmatter__/peer_lookup/{target_agent_id}"
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("url"):
+                    return data["url"]
+    except Exception:
+        pass
+    return None
+
+
+async def _lookup_peer_url(state, target_agent_id: str, exclude_urls: set[str] | None = None) -> Optional[str]:
+    """Find an agent's current URL, querying anchor nodes first, then peer fan-out.
+
+    Args:
+        exclude_urls: URLs to skip (e.g. already-tried stale URLs). If an anchor
+            or peer returns one of these, it's ignored and the search continues.
 
     Returns the new URL if found, else None.
     """
+    if exclude_urls is None:
+        exclude_urls = set()
+
+    # Phase 1: Query anchor nodes (fast, low-overhead)
+    if ANCHOR_NODES:
+        tasks = [asyncio.create_task(_query_anchor_for_peer(a, target_agent_id)) for a in ANCHOR_NODES]
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=ANCHOR_LOOKUP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                result = task.result()
+                if result is not None and result not in exclude_urls:
+                    for t in pending:
+                        t.cancel()
+                    return result
+            # Wait briefly for remaining anchors
+            if pending:
+                done2, pending2 = await asyncio.wait(pending, timeout=0.5)
+                for task in done2:
+                    result = task.result()
+                    if result is not None and result not in exclude_urls:
+                        for t in pending2:
+                            t.cancel()
+                        return result
+                for t in pending2:
+                    t.cancel()
+        except Exception:
+            for t in tasks:
+                t.cancel()
+
+    # Phase 2: Fan out to connected peers (always runs if anchors had no fresh answer)
     peers = [c for c in state.connections.values() if c.agent_id != target_agent_id]
     if not peers:
         return None
@@ -349,7 +405,7 @@ async def _lookup_peer_url(state, target_agent_id: str) -> Optional[str]:
         done, pending = await asyncio.wait(tasks, timeout=PEER_LOOKUP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             result = task.result()
-            if result is not None:
+            if result is not None and result not in exclude_urls:
                 # Cancel remaining
                 for t in pending:
                     t.cancel()
@@ -359,7 +415,7 @@ async def _lookup_peer_url(state, target_agent_id: str) -> Optional[str]:
             done2, pending2 = await asyncio.wait(pending, timeout=1.0)
             for task in done2:
                 result = task.result()
-                if result is not None:
+                if result is not None and result not in exclude_urls:
                     for t in pending2:
                         t.cancel()
                     return result
@@ -407,7 +463,7 @@ async def _webhook_request_with_recovery(
             print(f"[DarkMatter] Webhook recovery: timeout exceeded after {attempt - 1} attempts", file=sys.stderr)
             break
 
-        new_base = await _lookup_peer_url(state, from_agent_id)
+        new_base = await _lookup_peer_url(state, from_agent_id, exclude_urls=urls_tried)
         if not new_base:
             print(f"[DarkMatter] Webhook recovery: peer lookup returned nothing (attempt {attempt}/{WEBHOOK_RECOVERY_MAX_ATTEMPTS})", file=sys.stderr)
             break
@@ -450,7 +506,7 @@ async def _webhook_request_with_recovery(
 
 
 async def _broadcast_peer_update(state) -> None:
-    """Notify all connected peers of our current URL."""
+    """Notify all connected peers and anchor nodes of our current URL."""
     if not state.public_url:
         return
     payload = {
@@ -474,6 +530,17 @@ async def _broadcast_peer_update(state) -> None:
                 )
         except Exception as e:
             print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... of URL change: {e}", file=sys.stderr)
+
+    # Also notify anchor nodes
+    for anchor_url in ANCHOR_NODES:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{anchor_url}/__darkmatter__/peer_update",
+                    json=payload,
+                )
+        except Exception as e:
+            print(f"[DarkMatter] Failed to notify anchor {anchor_url} of URL: {e}", file=sys.stderr)
 
 
 async def _network_health_loop(state) -> None:
@@ -4234,6 +4301,13 @@ def create_app() -> Starlette:
         asyncio.create_task(_network_health_loop(_agent_state))
         print(f"[DarkMatter] Network health loop: ENABLED ({HEALTH_CHECK_INTERVAL}s interval)", file=sys.stderr)
         print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
+
+        # Register with anchor nodes on boot
+        if ANCHOR_NODES and _agent_state.public_url:
+            await _broadcast_peer_update(_agent_state)
+            print(f"[DarkMatter] Anchor nodes: registered with {len(ANCHOR_NODES)} anchor(s)", file=sys.stderr)
+        elif ANCHOR_NODES:
+            print(f"[DarkMatter] Anchor nodes: configured but no public URL yet", file=sys.stderr)
 
     # DarkMatter mesh protocol routes
     darkmatter_routes = [
