@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from httpx import ASGITransport
@@ -45,7 +46,7 @@ def make_state_file() -> str:
     return path
 
 
-def create_agent(state_path: str, *, genesis: bool = True, port: int = 9900) -> tuple:
+def create_agent(state_path: str, *, port: int = 9900) -> tuple:
     """Create a fresh DarkMatter app + state, isolated from other agents.
 
     Returns (app, state) tuple.
@@ -57,10 +58,10 @@ def create_agent(state_path: str, *, genesis: bool = True, port: int = 9900) -> 
 
     os.environ["DARKMATTER_STATE_FILE"] = state_path
     os.environ["DARKMATTER_PORT"] = str(port)
-    os.environ["DARKMATTER_GENESIS"] = "true" if genesis else "false"
     os.environ["DARKMATTER_DISCOVERY"] = "false"
     os.environ.pop("DARKMATTER_AGENT_ID", None)
     os.environ.pop("DARKMATTER_MCP_TOKEN", None)
+    os.environ.pop("DARKMATTER_GENESIS", None)
 
     app = server.create_app()
     state = server._agent_state
@@ -71,6 +72,39 @@ def use_agent(state):
     """Set the global _agent_state to this agent's state before making requests."""
     import server
     server._agent_state = state
+
+
+async def connect_agents(app_a, state_a, app_b, state_b) -> None:
+    """Connect agent B to agent A via accept_pending + connection_accepted.
+
+    After this call, both sides have the connection recorded.
+    """
+    # B sends connection_request to A
+    use_agent(state_a)
+    async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+        resp = await client.post("/__darkmatter__/connection_request", json={
+            "from_agent_id": state_b.agent_id,
+            "from_agent_url": f"http://localhost:{state_b.port}/mcp",
+            "from_agent_bio": f"Agent {state_b.agent_id[:8]}",
+            "from_agent_public_key_hex": state_b.public_key_hex,
+        })
+    data = resp.json()
+    request_id = data.get("request_id")
+
+    # Accept on A's side
+    async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+        await client.post("/__darkmatter__/accept_pending", json={"request_id": request_id})
+
+    # Record connection on B's side (simulate connection_accepted callback)
+    use_agent(state_b)
+    state_b.pending_outbound.add(f"http://localhost:{state_a.port}/mcp")
+    async with httpx.AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client:
+        await client.post("/__darkmatter__/connection_accepted", json={
+            "agent_id": state_a.agent_id,
+            "agent_url": f"http://localhost:{state_a.port}/mcp",
+            "agent_bio": state_a.bio,
+            "agent_public_key_hex": state_a.public_key_hex,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +168,6 @@ async def test_state_migration() -> None:
             "bio": "Old agent",
             "status": "active",
             "port": 9900,
-            "is_genesis": True,
             "created_at": "2024-01-01T00:00:00+00:00",
             "messages_handled": 5,
             "connections": {},
@@ -159,21 +192,20 @@ async def test_state_migration() -> None:
 
 
 async def test_connection_handshake_exchanges_keys() -> None:
-    """Connection request to genesis agent exchanges public keys."""
+    """Connection request with manual accept exchanges public keys."""
     import server
 
     path_a = make_state_file()
     path_b = make_state_file()
     try:
-        # Agent A: genesis
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
-        # Stash A's state
+        # Agent A
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        # Agent B: non-genesis
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        # Agent B
+        app_b, state_b = create_agent(path_b, port=9901)
 
-        # B sends connection_request to A — restore A's state for the handler
+        # B sends connection_request to A
         use_agent(stashed_a)
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
             resp = await client.post("/__darkmatter__/connection_request", json={
@@ -184,10 +216,18 @@ async def test_connection_handshake_exchanges_keys() -> None:
             })
 
         data = resp.json()
-        report("connection auto-accepted (genesis)", data.get("auto_accepted") is True)
-        report("response includes agent_public_key_hex",
-               isinstance(data.get("agent_public_key_hex"), str)
-               and len(data["agent_public_key_hex"]) == 64)
+        report("connection request queued (not auto-accepted)", data.get("auto_accepted") is False)
+        request_id = data.get("request_id")
+        report("response includes request_id", request_id is not None)
+
+        # Accept via HTTP endpoint
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp2 = await client.post("/__darkmatter__/accept_pending", json={
+                "request_id": request_id,
+            })
+
+        accept_data = resp2.json()
+        report("accept_pending succeeded", accept_data.get("success") is True)
 
         # Agent A should have B's public key stored in its connection
         conn_b = stashed_a.connections.get(state_b.agent_id)
@@ -207,24 +247,17 @@ async def test_signed_message_verified() -> None:
     path_b = make_state_file()
     try:
         # Set up two connected agents
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        app_b, state_b = create_agent(path_b, port=9901)
 
-        # Connect B → A (restore A's state for the handler)
-        use_agent(stashed_a)
-        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
-            await client.post("/__darkmatter__/connection_request", json={
-                "from_agent_id": state_b.agent_id,
-                "from_agent_url": "http://localhost:9901/mcp",
-                "from_agent_bio": "Test agent B",
-                "from_agent_public_key_hex": state_b.public_key_hex,
-            })
+        # Connect B → A
+        await connect_agents(app_a, stashed_a, app_b, state_b)
 
         # B signs and sends a message to A
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
-        timestamp = "2025-01-01T00:00:00Z"
+        timestamp = datetime.now(timezone.utc).isoformat()
         content = "Hello from B"
 
         signature = server._sign_message(
@@ -262,26 +295,19 @@ async def test_key_mismatch_rejected() -> None:
     path_a = make_state_file()
     path_b = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        app_b, state_b = create_agent(path_b, port=9901)
 
         # Connect B → A
-        use_agent(stashed_a)
-        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
-            await client.post("/__darkmatter__/connection_request", json={
-                "from_agent_id": state_b.agent_id,
-                "from_agent_url": "http://localhost:9901/mcp",
-                "from_agent_bio": "Test agent B",
-                "from_agent_public_key_hex": state_b.public_key_hex,
-            })
+        await connect_agents(app_a, stashed_a, app_b, state_b)
 
         # Generate a different keypair (impersonator)
         fake_priv, fake_pub = server._generate_keypair()
 
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
-        timestamp = "2025-01-01T00:00:00Z"
+        timestamp = datetime.now(timezone.utc).isoformat()
         content = "Spoofed message"
 
         signature = server._sign_message(fake_priv, state_b.agent_id, message_id, timestamp, content)
@@ -314,23 +340,16 @@ async def test_invalid_signature_rejected() -> None:
     path_a = make_state_file()
     path_b = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        app_b, state_b = create_agent(path_b, port=9901)
 
         # Connect B → A
-        use_agent(stashed_a)
-        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
-            await client.post("/__darkmatter__/connection_request", json={
-                "from_agent_id": state_b.agent_id,
-                "from_agent_url": "http://localhost:9901/mcp",
-                "from_agent_bio": "Test agent B",
-                "from_agent_public_key_hex": state_b.public_key_hex,
-            })
+        await connect_agents(app_a, stashed_a, app_b, state_b)
 
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
-        timestamp = "2025-01-01T00:00:00Z"
+        timestamp = datetime.now(timezone.utc).isoformat()
         content = "Tampered message"
 
         # Garbage signature (valid hex, wrong bytes)
@@ -363,14 +382,14 @@ async def test_unknown_sender_rejected() -> None:
 
     path_a = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
         # Send message from an agent that's NOT connected
         unknown_priv, unknown_pub = server._generate_keypair()
         unknown_id = "unknown-agent-999"
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
-        timestamp = "2025-01-01T00:00:00Z"
+        timestamp = datetime.now(timezone.utc).isoformat()
         content = "Who am I?"
 
         signature = server._sign_message(unknown_priv, unknown_id, message_id, timestamp, content)

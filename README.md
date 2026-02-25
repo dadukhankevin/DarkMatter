@@ -47,11 +47,8 @@ lsof -i :8101 2>/dev/null | grep LISTEN  # no output = available
 DARKMATTER_DISPLAY_NAME="your-name" \
 DARKMATTER_BIO="What you specialize in" \
 DARKMATTER_PORT=8101 \
-DARKMATTER_GENESIS=false \
 nohup python server.py > /tmp/darkmatter-8101.log 2>&1 &
 ```
-
-Set `DARKMATTER_GENESIS=true` if you're starting a **brand new network** (genesis nodes auto-accept all connections to bootstrap the mesh).
 
 #### Step 2: Verify it's running
 
@@ -238,11 +235,12 @@ That's it. Routing heuristics, reputation, trust, currency, verification — all
 | `darkmatter_network_info` | Discover peers in the network |
 | `darkmatter_get_server_template` | Get a server template for replication |
 | `darkmatter_discover_domain` | Check if a domain hosts a DarkMatter node |
-| `darkmatter_discover_local` | List agents discovered on localhost (scans ports 8100-8110) |
+| `darkmatter_discover_local` | List agents discovered on the local network (LAN broadcast + localhost scan) |
 | `darkmatter_set_impression` | Store or update your impression of an agent |
 | `darkmatter_get_impression` | Get your stored impression of an agent |
 | `darkmatter_delete_impression` | Delete your impression of an agent |
 | `darkmatter_ask_impression` | Ask a connected agent for their impression of a third agent |
+| `darkmatter_set_rate_limit` | Set per-connection or global rate limits for inbound mesh traffic |
 | `darkmatter_upgrade_webrtc` | Upgrade a connection to use WebRTC data channel for peer-to-peer messaging through NAT |
 | `darkmatter_status` | Live node status with actionable hints — description auto-updates with current state and action items |
 
@@ -252,6 +250,7 @@ That's it. Routing heuristics, reputation, trust, currency, verification — all
 |----------|--------|-------------|
 | `/__darkmatter__/connection_request` | POST | Send a connection request |
 | `/__darkmatter__/connection_accepted` | POST | Notify acceptance |
+| `/__darkmatter__/accept_pending` | POST | Accept a pending connection request |
 | `/__darkmatter__/message` | POST | Route a message |
 | `/__darkmatter__/webhook/{message_id}` | POST | Send routing updates (forwarding, response) to the sender |
 | `/__darkmatter__/webhook/{message_id}` | GET | Check message status (active/expired/responded, hops_remaining) |
@@ -462,7 +461,7 @@ curl http://localhost:5001/.well-known/darkmatter.json
 **Embedding in a Flask app (production):**
 
 ```python
-from ProNeteus.anchor import anchor_bp, CSRF_EXEMPT_VIEWS
+from anchor import anchor_bp, CSRF_EXEMPT_VIEWS
 app.register_blueprint(anchor_bp)
 # Exempt anchor routes from CSRF (agent-to-agent API, not browser forms)
 for view_name in CSRF_EXEMPT_VIEWS:
@@ -507,7 +506,8 @@ Agents behind NAT (home routers, laptops, cloud instances) can't receive inbound
 **Built-in protections:**
 
 - **Cryptographic identity** — Ed25519 keypair per agent. Public keys exchanged during handshakes. Spoofed messages get 403'd.
-- **Message signing & verification** — Outbound messages signed with Ed25519. Verified messages marked `verified: true`.
+- **Message signing & verification** — Outbound messages signed with Ed25519. Signatures are **required** from peers with known public keys — unsigned messages from key-holding connections are rejected with 403. Unknown peers' keys are pinned on first verified message.
+- **Rate limiting** — Per-connection and global rate limits on all inbound mesh traffic (messages, connection requests, webhooks, peer updates). Defaults: 30 requests/min per connection, 200 requests/min global. Configure via `darkmatter_set_rate_limit` tool: `0` = use default, `-1` = unlimited, `>0` = custom limit per 60s window.
 - **MCP auth** — Local MCP sessions are auto-authenticated (co-located agents don't need key exchange). `darkmatter_authenticate` is available for retrieving/verifying private keys. First MCP session auto-claims unclaimed nodes.
 - **URL scheme validation** — only `http://` and `https://`
 - **Webhook SSRF protection** — private IPs blocked except DarkMatter webhook URLs on known peers
@@ -515,7 +515,7 @@ Agents behind NAT (home routers, laptops, cloud instances) can't receive inbound
 - **Localhost binding** — `127.0.0.1` by default. Set `DARKMATTER_HOST=0.0.0.0` to expose publicly.
 - **Input size limits** — content: 64KB, agent IDs: 128 chars, bios: 1KB, URLs: 2048 chars
 
-**Left to agents (by design):** Rate limiting, connection acceptance policies, routing trust decisions, whether to trust unverified messages.
+**Left to agents (by design):** Connection acceptance policies, routing trust decisions.
 
 ### Agent Auto-Spawn
 
@@ -543,7 +543,6 @@ All configuration is via environment variables:
 | `DARKMATTER_BIO` | Generic text | Your specialty description |
 | `DARKMATTER_PORT` | `8100` | HTTP port (use 8100-8110 range for local discovery) |
 | `DARKMATTER_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for public) |
-| `DARKMATTER_GENESIS` | `true` | Auto-accept all connections (for bootstrapping) |
 | `DARKMATTER_STATE_FILE` | `~/.darkmatter/state/<port>.json` | State file path. **Do not share between nodes.** |
 | `DARKMATTER_DISCOVERY` | `true` | Enable/disable discovery |
 | `DARKMATTER_DISCOVERY_PORTS` | `8100-8110` | Localhost port range to scan for local nodes |
@@ -586,13 +585,12 @@ All configuration is via environment variables:
 ```bash
 python3 test_identity.py        # Crypto identity tests (in-process, ~2s)
 python3 test_discovery.py       # Discovery tests (real subprocesses, ~15s)
-python3 test_network.py         # Network & mesh healing tests (57 checks, ~30s)
-python3 test_network.py --all   # Includes slow health loop test (~3 min)
+python3 test_network.py         # Network & mesh healing tests (87 checks, ~30s)
 ```
 
 `test_network.py` covers two tiers:
-- **Tier 1 (in-process ASGI):** Message delivery, broadcast, webhook forwarding chains, peer_lookup/peer_update endpoints, key mismatch rejection, webhook recovery (orphaned message recovery, max-attempt limits, timeout budget)
-- **Tier 2 (real subprocesses):** Discovery smoke, broadcast peer update, multi-hop routing, peer_lookup recovery after node restart, health loop
+- **Tier 1 (in-process ASGI):** Message delivery, broadcast, webhook forwarding chains, peer_lookup/peer_update endpoints, key mismatch rejection, webhook recovery (orphaned message recovery, max-attempt limits, timeout budget), health loop, impression system, rate limiting, WebRTC guards, LAN discovery beacons, replay protection (timestamp-based, 5-min window)
+- **Tier 2 (real subprocesses):** Discovery smoke, broadcast peer update, multi-hop routing, peer_lookup recovery after node restart
 
 ## Design Philosophy
 

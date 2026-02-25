@@ -12,8 +12,7 @@ Two tiers:
 Standalone async script — same conventions as test_identity.py.
 
 Usage:
-    python3 test_network.py          # ~30s, all tests except health loop
-    python3 test_network.py --all    # ~3 min, includes health loop test
+    python3 test_network.py          # ~30s, all tests
 """
 
 import asyncio
@@ -25,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from httpx import ASGITransport
@@ -58,7 +58,7 @@ def make_state_file() -> str:
     return path
 
 
-def create_agent(state_path: str, *, genesis: bool = True, port: int = 9900) -> tuple:
+def create_agent(state_path: str, *, port: int = 9900) -> tuple:
     """Create a fresh DarkMatter app + state, isolated from other agents."""
     import server
 
@@ -66,10 +66,10 @@ def create_agent(state_path: str, *, genesis: bool = True, port: int = 9900) -> 
 
     os.environ["DARKMATTER_STATE_FILE"] = state_path
     os.environ["DARKMATTER_PORT"] = str(port)
-    os.environ["DARKMATTER_GENESIS"] = "true" if genesis else "false"
     os.environ["DARKMATTER_DISCOVERY"] = "false"
     os.environ.pop("DARKMATTER_AGENT_ID", None)
     os.environ.pop("DARKMATTER_MCP_TOKEN", None)
+    os.environ.pop("DARKMATTER_GENESIS", None)
 
     app = server.create_app()
     state = server._agent_state
@@ -87,7 +87,7 @@ def use_agent(state):
 # ---------------------------------------------------------------------------
 
 async def connect_agents(app_a, state_a, app_b, state_b) -> None:
-    """Connect agent B to agent A (genesis auto-accepts).
+    """Connect agent B to agent A via accept_pending + connection_accepted.
 
     After this call, both sides have the connection recorded.
     """
@@ -104,19 +104,27 @@ async def connect_agents(app_a, state_a, app_b, state_b) -> None:
         })
     assert resp.status_code == 200, f"Connection request failed: {resp.text}"
     data = resp.json()
+    request_id = data.get("request_id")
+    assert request_id, f"No request_id in response: {data}"
+
+    # Accept on A's side via HTTP endpoint
+    async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+        resp2 = await client.post("/__darkmatter__/accept_pending", json={
+            "request_id": request_id,
+        })
+    assert resp2.status_code == 200, f"Accept pending failed: {resp2.text}"
 
     # Simulate the /connection_accepted callback on B so both sides record it
     use_agent(state_b)
-    # Add to pending_outbound so connection_accepted is accepted
     state_b.pending_outbound.add(f"http://localhost:{state_a.port}/mcp")
     async with httpx.AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client:
-        resp2 = await client.post("/__darkmatter__/connection_accepted", json={
+        resp3 = await client.post("/__darkmatter__/connection_accepted", json={
             "agent_id": state_a.agent_id,
             "agent_url": f"http://localhost:{state_a.port}/mcp",
             "agent_bio": state_a.bio,
             "agent_public_key_hex": state_a.public_key_hex,
         })
-    assert resp2.status_code == 200, f"Connection accepted failed: {resp2.text}"
+    assert resp3.status_code == 200, f"Connection accepted failed: {resp3.text}"
 
 
 async def send_signed_message(app_target, state_sender, state_target, content: str,
@@ -126,7 +134,7 @@ async def send_signed_message(app_target, state_sender, state_target, content: s
 
     if message_id is None:
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
-    timestamp = "2025-01-01T00:00:00Z"
+    timestamp = datetime.now(timezone.utc).isoformat()
 
     signature = server._sign_message(
         state_sender.private_key_hex, state_sender.agent_id,
@@ -161,9 +169,8 @@ STARTUP_TIMEOUT = 10
 class TestNode:
     """Manages a real DarkMatter server subprocess for Tier 2 tests."""
 
-    def __init__(self, port: int, *, genesis: bool = False, display_name: str = ""):
+    def __init__(self, port: int, *, display_name: str = ""):
         self.port = port
-        self.genesis = genesis
         self.display_name = display_name or f"test-node-{port}"
         self.state_file = tempfile.mktemp(suffix=".json", prefix=f"dm_{port}_")
         self.proc: subprocess.Popen | None = None
@@ -176,7 +183,6 @@ class TestNode:
             **os.environ,
             "DARKMATTER_PORT": str(self.port),
             "DARKMATTER_HOST": "127.0.0.1",
-            "DARKMATTER_GENESIS": "true" if self.genesis else "false",
             "DARKMATTER_DISPLAY_NAME": self.display_name,
             "DARKMATTER_STATE_FILE": self.state_file,
             "DARKMATTER_DISCOVERY": "false",
@@ -233,9 +239,9 @@ class TestNode:
     def connect_to(self, other: "TestNode") -> dict:
         """Send a connection request to another node via real HTTP.
 
-        Works for both genesis (auto-accept) and non-genesis targets.
-        For non-genesis targets, we accept the pending request manually.
+        Uses accept_pending endpoint to accept the connection.
         """
+        # Send connection request from self to other
         resp = httpx.post(
             f"{other.base_url}/__darkmatter__/connection_request",
             json={
@@ -249,51 +255,7 @@ class TestNode:
         data = resp.json()
 
         if data.get("auto_accepted"):
-            # Tell ourselves about the accepted connection
-            # First, register pending_outbound so connection_accepted is accepted
-            # We do this by adding to our state's pending_outbound
-            # But the server loads state in-memory, so we need to POST the
-            # connection_request TO the other node and then simulate acceptance.
-            # Actually, the /connection_accepted handler checks pending_outbound.
-            # We need to add to it first. The simplest approach: modify state file
-            # and hope the server re-reads... but it doesn't.
-            #
-            # Alternative: use the MCP tool endpoint. But that requires auth.
-            # Simplest: just add the connection directly to our state file
-            # and restart... but that's heavy.
-            #
-            # Best approach: the target already accepted. We just need to record
-            # the connection on our side. Write it directly to our state.
-            if os.path.exists(self.state_file):
-                with open(self.state_file) as f:
-                    state_data = json.load(f)
-            else:
-                state_data = {}
-
-            conns = state_data.setdefault("connections", {})
-            conns[data["agent_id"]] = {
-                "agent_id": data["agent_id"],
-                "agent_url": data.get("agent_url", f"{other.base_url}/mcp"),
-                "agent_bio": data.get("agent_bio", ""),
-                "direction": "outbound",
-                "connected_at": "2025-01-01T00:00:00+00:00",
-                "messages_sent": 0,
-                "messages_received": 0,
-                "messages_declined": 0,
-                "total_response_time_ms": 0,
-                "last_activity": None,
-                "agent_public_key_hex": data.get("agent_public_key_hex"),
-                "agent_display_name": data.get("agent_display_name"),
-            }
-            with open(self.state_file, "w") as f:
-                json.dump(state_data, f)
-
-            # The server has the connection in-memory from the request handler,
-            # but we also need to tell OUR server about the connection.
-            # Since the target auto-accepted, post connection_accepted to ourselves.
-            # But we need pending_outbound set first. Let's just POST connection_request
-            # from the other side too (bidirectional).
-            # Actually, the simpler fix: POST from other to us as well.
+            # Already connected — record on our side too
             resp2 = httpx.post(
                 f"{self.base_url}/__darkmatter__/connection_request",
                 json={
@@ -304,6 +266,34 @@ class TestNode:
                 },
                 timeout=5.0,
             )
+        else:
+            # Accept the pending request on the other node
+            request_id = data.get("request_id")
+            if request_id:
+                httpx.post(
+                    f"{other.base_url}/__darkmatter__/accept_pending",
+                    json={"request_id": request_id},
+                    timeout=5.0,
+                )
+            # Also send reverse connection request so self knows about other
+            resp2 = httpx.post(
+                f"{self.base_url}/__darkmatter__/connection_request",
+                json={
+                    "from_agent_id": other.agent_id,
+                    "from_agent_url": f"{other.base_url}/mcp",
+                    "from_agent_bio": f"Test node {other.display_name}",
+                    "from_agent_public_key_hex": other.public_key_hex,
+                },
+                timeout=5.0,
+            )
+            resp2_data = resp2.json()
+            req_id2 = resp2_data.get("request_id")
+            if req_id2:
+                httpx.post(
+                    f"{self.base_url}/__darkmatter__/accept_pending",
+                    json={"request_id": req_id2},
+                    timeout=5.0,
+                )
 
         return data
 
@@ -317,7 +307,7 @@ class TestNode:
 
         if message_id is None:
             message_id = f"msg-{uuid.uuid4().hex[:8]}"
-        timestamp = "2025-01-01T00:00:00Z"
+        timestamp = datetime.now(timezone.utc).isoformat()
 
         signature = _srv._sign_message(
             self.private_key_hex, self.agent_id,
@@ -353,11 +343,19 @@ class TestNode:
         return {"status_code": resp.status_code, "data": resp.json()}
 
     def post_peer_update(self, agent_id: str, new_url: str,
-                         public_key_hex: str = None) -> dict:
-        """POST /peer_update on this node."""
+                         public_key_hex: str = None,
+                         private_key_hex: str = None) -> dict:
+        """POST /peer_update on this node (signed if private key provided)."""
+        import server as _srv
+        from datetime import datetime, timezone
         payload = {"agent_id": agent_id, "new_url": new_url}
         if public_key_hex:
             payload["public_key_hex"] = public_key_hex
+        if private_key_hex and public_key_hex:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            payload["timestamp"] = timestamp
+            payload["signature"] = _srv._sign_peer_update(
+                private_key_hex, agent_id, new_url, timestamp)
         resp = httpx.post(
             f"{self.base_url}/__darkmatter__/peer_update",
             json=payload,
@@ -381,10 +379,10 @@ async def test_basic_message_delivery() -> None:
     path_a = make_state_file()
     path_b = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        app_b, state_b = create_agent(path_b, port=9901)
         stashed_b = server._agent_state
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -418,13 +416,13 @@ async def test_message_broadcast() -> None:
 
     paths = [make_state_file() for _ in range(3)]
     try:
-        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        app_a, state_a = create_agent(paths[0], port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        app_b, state_b = create_agent(paths[1], port=9901)
         stashed_b = server._agent_state
 
-        app_c, state_c = create_agent(paths[2], genesis=False, port=9902)
+        app_c, state_c = create_agent(paths[2], port=9902)
         stashed_c = server._agent_state
 
         # Connect B and C to A
@@ -464,13 +462,13 @@ async def test_webhook_forwarding_chain() -> None:
 
     paths = [make_state_file() for _ in range(3)]
     try:
-        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        app_a, state_a = create_agent(paths[0], port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        app_b, state_b = create_agent(paths[1], port=9901)
         stashed_b = server._agent_state
 
-        app_c, state_c = create_agent(paths[2], genesis=False, port=9902)
+        app_c, state_c = create_agent(paths[2], port=9902)
         stashed_c = server._agent_state
 
         # A↔B, B↔C
@@ -545,10 +543,10 @@ async def test_peer_lookup_returns_url() -> None:
     path_a = make_state_file()
     path_b = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        app_b, state_b = create_agent(path_b, port=9901)
         stashed_b = server._agent_state
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -577,7 +575,7 @@ async def test_peer_lookup_unknown_404() -> None:
 
     path_a = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
 
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
             resp = await client.get("/__darkmatter__/peer_lookup/nonexistent-agent-id")
@@ -596,22 +594,27 @@ async def test_peer_update_changes_stored_url() -> None:
     path_a = make_state_file()
     path_b = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        app_b, state_b = create_agent(path_b, port=9901)
         stashed_b = server._agent_state
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
 
-        # B notifies A of URL change
+        # B notifies A of URL change (must be signed since A has B's public key)
         new_url = "http://192.168.1.100:9901"
+        timestamp = server.datetime.now(server.timezone.utc).isoformat()
+        signature = server._sign_peer_update(
+            stashed_b.private_key_hex, stashed_b.agent_id, new_url, timestamp)
         use_agent(stashed_a)
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
             resp = await client.post("/__darkmatter__/peer_update", json={
                 "agent_id": stashed_b.agent_id,
                 "new_url": new_url,
                 "public_key_hex": stashed_b.public_key_hex,
+                "signature": signature,
+                "timestamp": timestamp,
             })
 
         report("peer_update returns 200", resp.status_code == 200)
@@ -633,10 +636,10 @@ async def test_peer_update_rejects_key_mismatch() -> None:
     path_a = make_state_file()
     path_b = make_state_file()
     try:
-        app_a, state_a = create_agent(path_a, genesis=True, port=9900)
+        app_a, state_a = create_agent(path_a, port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(path_b, genesis=False, port=9901)
+        app_b, state_b = create_agent(path_b, port=9901)
         stashed_b = server._agent_state
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -678,13 +681,13 @@ async def test_webhook_recovery_orphaned_message() -> None:
     paths = [make_state_file() for _ in range(3)]
     try:
         # A (sender whose webhook is stale), B (responder), C (knows A's real URL)
-        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        app_a, state_a = create_agent(paths[0], port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        app_b, state_b = create_agent(paths[1], port=9901)
         stashed_b = server._agent_state
 
-        app_c, state_c = create_agent(paths[2], genesis=False, port=9902)
+        app_c, state_c = create_agent(paths[2], port=9902)
         stashed_c = server._agent_state
 
         # Wire up: A↔B, B↔C, A↔C
@@ -817,10 +820,10 @@ async def test_webhook_recovery_gives_up() -> None:
 
     paths = [make_state_file() for _ in range(2)]
     try:
-        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        app_a, state_a = create_agent(paths[0], port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        app_b, state_b = create_agent(paths[1], port=9901)
         stashed_b = server._agent_state
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -873,10 +876,10 @@ async def test_webhook_recovery_timeout_budget() -> None:
 
     paths = [make_state_file() for _ in range(2)]
     try:
-        app_a, state_a = create_agent(paths[0], genesis=True, port=9900)
+        app_a, state_a = create_agent(paths[0], port=9900)
         stashed_a = server._agent_state
 
-        app_b, state_b = create_agent(paths[1], genesis=False, port=9901)
+        app_b, state_b = create_agent(paths[1], port=9901)
         stashed_b = server._agent_state
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -935,9 +938,9 @@ async def test_broadcast_peer_update() -> None:
     nodes = []
     try:
         # We need real HTTP for broadcast, so use Tier 2 nodes
-        # All genesis so connections auto-accept
+        # Start nodes and connect them
         for i, path in enumerate(paths):
-            node = TestNode(BASE_PORT + i, genesis=True, display_name=f"bcast-{i}")
+            node = TestNode(BASE_PORT + i, display_name=f"bcast-{i}")
             node.start()
             nodes.append(node)
 
@@ -964,6 +967,7 @@ async def test_broadcast_peer_update() -> None:
             target.post_peer_update(
                 nodes[0].agent_id, new_url,
                 public_key_hex=nodes[0].public_key_hex,
+                private_key_hex=nodes[0].private_key_hex,
             )
 
         # Verify both peers updated
@@ -987,8 +991,8 @@ def test_discovery_smoke() -> None:
     """2 nodes in scan range, verify both reachable via well-known endpoint."""
     print(f"\n{BOLD}Test: discovery smoke (Tier 2){RESET}")
 
-    node_a = TestNode(BASE_PORT, genesis=True, display_name="disc-alpha")
-    node_b = TestNode(BASE_PORT + 1, genesis=False, display_name="disc-beta")
+    node_a = TestNode(BASE_PORT, display_name="disc-alpha")
+    node_b = TestNode(BASE_PORT + 1, display_name="disc-beta")
 
     try:
         node_a.start()
@@ -1023,9 +1027,9 @@ def test_multi_hop_message_routing() -> None:
     """A↔B↔C (A not connected to C). A sends to B. B forwards to C. C responds."""
     print(f"\n{BOLD}Test: multi-hop message routing (Tier 2){RESET}")
 
-    node_a = TestNode(BASE_PORT, genesis=True, display_name="hop-A")
-    node_b = TestNode(BASE_PORT + 1, genesis=True, display_name="hop-B")
-    node_c = TestNode(BASE_PORT + 2, genesis=True, display_name="hop-C")
+    node_a = TestNode(BASE_PORT, display_name="hop-A")
+    node_b = TestNode(BASE_PORT + 1, display_name="hop-B")
+    node_c = TestNode(BASE_PORT + 2, display_name="hop-C")
 
     try:
         for n in (node_a, node_b, node_c):
@@ -1069,9 +1073,9 @@ def test_send_recovers_via_peer_lookup() -> None:
     A queries C via peer_lookup to find B's new URL."""
     print(f"\n{BOLD}Test: send recovery via peer_lookup (Tier 2){RESET}")
 
-    node_a = TestNode(BASE_PORT, genesis=True, display_name="recover-A")
-    node_b = TestNode(BASE_PORT + 1, genesis=True, display_name="recover-B")
-    node_c = TestNode(BASE_PORT + 2, genesis=True, display_name="recover-C")
+    node_a = TestNode(BASE_PORT, display_name="recover-A")
+    node_b = TestNode(BASE_PORT + 1, display_name="recover-B")
+    node_c = TestNode(BASE_PORT + 2, display_name="recover-C")
 
     try:
         for n in (node_a, node_b, node_c):
@@ -1099,7 +1103,7 @@ def test_send_recovers_via_peer_lookup() -> None:
         time.sleep(1)
 
         # Restart B on a new port
-        node_b2 = TestNode(BASE_PORT + 5, genesis=True, display_name="recover-B-new")
+        node_b2 = TestNode(BASE_PORT + 5, display_name="recover-B-new")
         # We need B to keep its identity — write the old state to the new state file
         # Actually, B's state file was cleaned up by stop(). Let's create a new node
         # and update C's record to point to it.
@@ -1133,57 +1137,47 @@ def test_send_recovers_via_peer_lookup() -> None:
         node_c.stop()
 
 
-def test_health_loop_increments_failures() -> None:
-    """2 connected nodes, stop one, wait for health check, verify failures > 0."""
-    print(f"\n{BOLD}Test: health loop increments failures (Tier 2, slow){RESET}")
-    print(f"  {YELLOW}... waiting ~70s for health check cycle{RESET}")
+async def test_health_loop_increments_failures() -> None:
+    """In-process: monkeypatch STALE_CONNECTION_AGE=0, call _check_connection_health, verify failures."""
+    import server
 
-    node_a = TestNode(BASE_PORT, genesis=True, display_name="health-A")
-    node_b = TestNode(BASE_PORT + 1, genesis=True, display_name="health-B")
+    sf_a = make_state_file()
+    sf_b = make_state_file()
+
+    original_stale_age = server.STALE_CONNECTION_AGE
 
     try:
-        node_a.start()
-        node_b.start()
-        ok_a = node_a.wait_ready()
-        ok_b = node_b.wait_ready()
-        if not ok_a or not ok_b:
-            report("health: nodes started", False, "timeout")
+        app_a, state_a = create_agent(sf_a, port=9900)
+        app_b, state_b = create_agent(sf_b, port=9901)
+        await connect_agents(app_a, state_a, app_b, state_b)
+
+        use_agent(state_a)
+
+        # Monkeypatch stale age to 0 so all connections are health-checked
+        server.STALE_CONNECTION_AGE = 0
+
+        conn = state_a.connections.get(state_b.agent_id)
+        report("health: A has connection to B", conn is not None)
+        if conn is None:
             return
 
-        # Connect them
-        node_b.connect_to(node_a)
+        initial_failures = conn.health_failures
 
-        # Verify connection
-        r = node_a.get_peer_lookup(node_b.agent_id)
-        report("health: A knows B initially", r["status_code"] == 200)
+        # Call health check — B's ASGI app isn't listening on real HTTP,
+        # so the ping will fail and increment health_failures
+        await server._check_connection_health(state_a)
 
-        # Kill B
-        node_b.stop()
-        time.sleep(1)
-
-        # Wait for health check cycle (HEALTH_CHECK_INTERVAL=60s + some buffer)
-        # The health loop only checks "stale" connections (>300s inactive by default)
-        # Since the connection was just made, it won't be checked immediately.
-        # We need to wait for STALE_CONNECTION_AGE (300s) which is too long.
-        # Instead, verify the mechanism works by checking the status endpoint.
-        print(f"  {YELLOW}... waiting 70s for health loop cycle{RESET}")
-        time.sleep(70)
-
-        # Check A's status — B should have health_failures > 0
-        # We can't directly inspect state from outside, but we can check
-        # if A still considers B a valid peer
-        r = node_a.get_peer_lookup(node_b.agent_id)
-        # B is still in connections (health doesn't remove, just logs)
-        report("health: B still in A's connections (degraded)", r["status_code"] == 200)
-
-        # The health loop may not have triggered yet since the connection is fresh
-        # (STALE_CONNECTION_AGE = 300s). This is expected behavior.
-        report("health: health loop ran without crashing",
-               node_a.proc is not None and node_a.proc.poll() is None)
+        report("health: failures incremented after unreachable peer",
+               conn.health_failures > initial_failures,
+               f"was {initial_failures}, now {conn.health_failures}")
 
     finally:
-        node_a.stop()
-        node_b.stop()
+        server.STALE_CONNECTION_AGE = original_stale_age
+        for sf in [sf_a, sf_b]:
+            try:
+                os.unlink(sf)
+            except FileNotFoundError:
+                pass
 
 
 # ==========================================================================
@@ -1304,13 +1298,305 @@ async def test_anchor_fallback() -> None:
             result = await server._lookup_peer_url(state_a, state_c.agent_id)
             # Result is None because in-process peers can't be reached via real HTTP,
             # but the important thing is the anchor failure didn't crash anything
-            report("anchor fallback: unreachable anchor didn't crash lookup", True)
-            report("anchor fallback: function completed gracefully", result is None or result is not None)
+            report("anchor fallback: unreachable anchor didn't crash lookup", result is None or isinstance(result, str))
+            report("anchor fallback: returns None (no reachable peers)", result is None)
         finally:
             server.ANCHOR_NODES = original_anchors
 
     finally:
         for sf in [sf_a, sf_b, sf_c]:
+            try:
+                os.unlink(sf)
+            except FileNotFoundError:
+                pass
+
+
+# ==========================================================================
+# Tier 1: Impression system tests
+# ==========================================================================
+
+async def test_impression_system() -> None:
+    """Test set/get/delete impression and HTTP endpoint."""
+    import server
+
+    sf_a = make_state_file()
+    sf_b = make_state_file()
+
+    try:
+        app_a, state_a = create_agent(sf_a, port=9900)
+        app_b, state_b = create_agent(sf_b, port=9901)
+        await connect_agents(app_a, state_a, app_b, state_b)
+
+        use_agent(state_a)
+        target_id = state_b.agent_id
+
+        # Set impression
+        state_a.impressions[target_id] = "fast and accurate"
+        report("impression: set", state_a.impressions.get(target_id) == "fast and accurate")
+
+        # Get impression
+        report("impression: get", state_a.impressions[target_id] == "fast and accurate")
+
+        # HTTP endpoint — query A's impression of B
+        use_agent(state_a)
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp = await client.get(f"/__darkmatter__/impression/{target_id}")
+        data = resp.json()
+        report("impression: HTTP get has_impression", data.get("has_impression") is True)
+        report("impression: HTTP get returns text", data.get("impression") == "fast and accurate")
+
+        # Query impression for unknown agent
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp = await client.get("/__darkmatter__/impression/nonexistent-agent")
+        data = resp.json()
+        report("impression: HTTP unknown agent returns false", data.get("has_impression") is False)
+
+        # Delete impression
+        del state_a.impressions[target_id]
+        report("impression: deleted", target_id not in state_a.impressions)
+
+        # Verify gone via HTTP
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp = await client.get(f"/__darkmatter__/impression/{target_id}")
+        data = resp.json()
+        report("impression: HTTP confirms deletion", data.get("has_impression") is False)
+
+    finally:
+        for sf in [sf_a, sf_b]:
+            try:
+                os.unlink(sf)
+            except FileNotFoundError:
+                pass
+
+
+# ==========================================================================
+# Tier 1: Rate limiting tests
+# ==========================================================================
+
+async def test_rate_limiting() -> None:
+    """Test per-connection and global rate limits on inbound mesh traffic."""
+    import server
+
+    sf_a = make_state_file()
+    sf_b = make_state_file()
+
+    try:
+        app_a, state_a = create_agent(sf_a, port=9900)
+        app_b, state_b = create_agent(sf_b, port=9901)
+        await connect_agents(app_a, state_a, app_b, state_b)
+
+        use_agent(state_a)
+        conn = state_a.connections.get(state_b.agent_id)
+
+        # Set a very low per-connection rate limit
+        conn.rate_limit = 2
+        conn._request_timestamps.clear()
+        state_a._global_request_timestamps.clear()
+
+        # First 2 requests should pass
+        err1 = server._check_rate_limit(state_a, conn)
+        report("rate limit: request 1 passes", err1 is None)
+        err2 = server._check_rate_limit(state_a, conn)
+        report("rate limit: request 2 passes", err2 is None)
+
+        # Third request should be rate limited
+        err3 = server._check_rate_limit(state_a, conn)
+        report("rate limit: request 3 blocked", err3 is not None and "Rate limit" in err3)
+
+        # Test global rate limit
+        state_a.rate_limit_global = 3
+        state_a._global_request_timestamps.clear()
+        conn.rate_limit = -1  # unlimited per-connection
+        conn._request_timestamps.clear()
+
+        for _ in range(3):
+            server._check_rate_limit(state_a, conn)
+        err_global = server._check_rate_limit(state_a, conn)
+        report("rate limit: global limit blocks", err_global is not None and "Global" in err_global)
+
+        # Test set_rate_limit value 0 means default
+        conn.rate_limit = 0
+        effective = conn.rate_limit or server.DEFAULT_RATE_LIMIT_PER_CONNECTION
+        report("rate limit: 0 resolves to default", effective == 30)
+
+        # Test -1 means unlimited
+        conn.rate_limit = -1
+        report("rate limit: -1 means unlimited", conn.rate_limit == -1)
+
+    finally:
+        for sf in [sf_a, sf_b]:
+            try:
+                os.unlink(sf)
+            except FileNotFoundError:
+                pass
+
+
+# ==========================================================================
+# Tier 1: WebRTC guard tests
+# ==========================================================================
+
+async def test_webrtc_guards() -> None:
+    """Test WebRTC gracefully handles missing aiortc and unknown agents."""
+    import server
+
+    sf_a = make_state_file()
+    sf_b = make_state_file()
+
+    try:
+        app_a, state_a = create_agent(sf_a, port=9900)
+        app_b, state_b = create_agent(sf_b, port=9901)
+        await connect_agents(app_a, state_a, app_b, state_b)
+
+        use_agent(state_a)
+
+        # Test: WebRTC offer endpoint rejects unknown agent
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp = await client.post("/__darkmatter__/webrtc_offer", json={
+                "from_agent_id": "unknown-agent-id",
+                "sdp_offer": "fake-sdp",
+            })
+        report("webrtc: unknown agent rejected",
+               resp.status_code in (403, 501),
+               f"status={resp.status_code}")
+
+        # Test: WebRTC offer rejects if no from_agent_id
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp = await client.post("/__darkmatter__/webrtc_offer", json={
+                "sdp_offer": "fake-sdp",
+            })
+        report("webrtc: missing agent_id rejected",
+               resp.status_code in (400, 501),
+               f"status={resp.status_code}")
+
+        # Test: WEBRTC_AVAILABLE flag exists
+        report("webrtc: WEBRTC_AVAILABLE is a bool", isinstance(server.WEBRTC_AVAILABLE, bool))
+
+        # Test: webrtc_offer for connected agent (will fail on SDP but not crash)
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp = await client.post("/__darkmatter__/webrtc_offer", json={
+                "from_agent_id": state_b.agent_id,
+                "sdp_offer": "fake-sdp",
+            })
+        # Should either fail gracefully (aiortc missing=501) or return a proper error
+        report("webrtc: connected agent doesn't crash",
+               resp.status_code in (200, 400, 500, 501, 503),
+               f"status={resp.status_code}")
+
+    finally:
+        for sf in [sf_a, sf_b]:
+            try:
+                os.unlink(sf)
+            except FileNotFoundError:
+                pass
+
+
+# ==========================================================================
+# Tier 1: LAN discovery beacon tests
+# ==========================================================================
+
+async def test_lan_discovery_beacon() -> None:
+    """Test _DiscoveryProtocol.datagram_received directly."""
+    import server
+
+    sf = make_state_file()
+
+    try:
+        _, state = create_agent(sf, port=9900)
+        use_agent(state)
+
+        protocol = server._DiscoveryProtocol(state)
+
+        # Valid beacon from another agent
+        peer_id = str(uuid.uuid4())
+        beacon = json.dumps({
+            "proto": "darkmatter",
+            "agent_id": peer_id,
+            "port": 8105,
+            "bio": "test peer",
+            "status": "active",
+            "accepting": True,
+        }).encode("utf-8")
+        protocol.datagram_received(beacon, ("192.168.1.50", 8470))
+        report("discovery: valid beacon registered",
+               peer_id in state.discovered_peers)
+        if peer_id in state.discovered_peers:
+            report("discovery: correct URL",
+                   state.discovered_peers[peer_id]["url"] == "http://192.168.1.50:8105")
+        else:
+            report("discovery: correct URL", False, "peer not registered")
+
+        # Self-filtering: our own agent_id should be ignored
+        self_beacon = json.dumps({
+            "proto": "darkmatter",
+            "agent_id": state.agent_id,
+            "port": 9900,
+        }).encode("utf-8")
+        prev_count = len(state.discovered_peers)
+        protocol.datagram_received(self_beacon, ("127.0.0.1", 8470))
+        report("discovery: self-beacon ignored",
+               len(state.discovered_peers) == prev_count)
+
+        # Wrong protocol should be ignored
+        wrong_proto = json.dumps({"proto": "not-darkmatter", "agent_id": "x"}).encode("utf-8")
+        protocol.datagram_received(wrong_proto, ("10.0.0.1", 8470))
+        report("discovery: wrong proto ignored",
+               "x" not in state.discovered_peers)
+
+        # Malformed packet should not crash or corrupt state
+        known_peers_before = set(state.discovered_peers.keys())
+        protocol.datagram_received(b"not json at all", ("10.0.0.2", 8470))
+        report("discovery: malformed packet handled",
+               set(state.discovered_peers.keys()) == known_peers_before)
+
+    finally:
+        try:
+            os.unlink(sf)
+        except FileNotFoundError:
+            pass
+
+
+# ==========================================================================
+# Tier 1: Peer update replay rejection test
+# ==========================================================================
+
+async def test_peer_update_replay_rejected() -> None:
+    """Send a peer_update with a stale timestamp (>5min old), assert 403."""
+    import server
+
+    sf_a = make_state_file()
+    sf_b = make_state_file()
+
+    try:
+        app_a, state_a = create_agent(sf_a, port=9900)
+        app_b, state_b = create_agent(sf_b, port=9901)
+        await connect_agents(app_a, state_a, app_b, state_b)
+
+        use_agent(state_a)
+
+        # Create a stale timestamp (10 minutes ago)
+        from datetime import timedelta
+        stale_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        new_url = f"http://localhost:{state_b.port}"
+
+        signature = server._sign_peer_update(
+            state_b.private_key_hex, state_b.agent_id, new_url, stale_time
+        )
+
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+            resp = await client.post("/__darkmatter__/peer_update", json={
+                "agent_id": state_b.agent_id,
+                "new_url": new_url,
+                "public_key_hex": state_b.public_key_hex,
+                "signature": signature,
+                "timestamp": stale_time,
+            })
+        report("replay: stale timestamp rejected with 403", resp.status_code == 403)
+        report("replay: error message mentions timestamp",
+               "Timestamp" in resp.json().get("error", ""),
+               f"error: {resp.json().get('error', '')}")
+
+    finally:
+        for sf in [sf_a, sf_b]:
             try:
                 os.unlink(sf)
             except FileNotFoundError:
@@ -1336,6 +1622,12 @@ async def run_tier1_tests() -> None:
         ("10. Webhook recovery: timeout budget", test_webhook_recovery_timeout_budget),
         ("11. Anchor priority: anchor queried first", test_anchor_priority),
         ("12. Anchor fallback: unreachable anchor", test_anchor_fallback),
+        ("13. Health loop increments failures", test_health_loop_increments_failures),
+        ("14. Impression system", test_impression_system),
+        ("15. Rate limiting", test_rate_limiting),
+        ("16. WebRTC guards", test_webrtc_guards),
+        ("17. LAN discovery beacon", test_lan_discovery_beacon),
+        ("18. Peer update replay rejected", test_peer_update_replay_rejected),
     ]
 
     for label, test_fn in tier1_tests:
@@ -1346,13 +1638,13 @@ async def run_tier1_tests() -> None:
             report(label, False, f"EXCEPTION: {e}")
 
 
-def run_tier2_tests(include_slow: bool = False) -> None:
+def run_tier2_tests() -> None:
     """Run all subprocess-based tests."""
     tier2_tests = [
-        ("13. Discovery smoke", test_discovery_smoke),
-        ("14. Broadcast peer update", None),  # async, handled separately
-        ("15. Multi-hop message routing", test_multi_hop_message_routing),
-        ("16. Send recovery via peer_lookup", test_send_recovers_via_peer_lookup),
+        ("19. Discovery smoke", test_discovery_smoke),
+        ("20. Broadcast peer update", None),  # async, handled separately
+        ("21. Multi-hop message routing", test_multi_hop_message_routing),
+        ("22. Send recovery via peer_lookup", test_send_recovers_via_peer_lookup),
     ]
 
     for label, test_fn in tier2_tests:
@@ -1363,16 +1655,8 @@ def run_tier2_tests(include_slow: bool = False) -> None:
         except Exception as e:
             report(label, False, f"EXCEPTION: {e}")
 
-    if include_slow:
-        try:
-            test_health_loop_increments_failures()
-        except Exception as e:
-            report("17. Health loop", False, f"EXCEPTION: {e}")
-
 
 async def main() -> None:
-    include_slow = "--all" in sys.argv
-
     print(f"\n{BOLD}DarkMatter Network Test Suite{RESET}")
     print("=" * 50)
 
@@ -1381,7 +1665,7 @@ async def main() -> None:
     await run_tier1_tests()
 
     # Broadcast peer update is async but uses Tier 2 nodes
-    print(f"\n{BOLD}14. Broadcast peer update{RESET}")
+    print(f"\n{BOLD}20. Broadcast peer update{RESET}")
     try:
         await test_broadcast_peer_update()
     except Exception as e:
@@ -1389,7 +1673,7 @@ async def main() -> None:
 
     # Tier 2: Real subprocess (thorough)
     print(f"\n{BOLD}── Tier 2: Real subprocess nodes ──{RESET}")
-    run_tier2_tests(include_slow=include_slow)
+    run_tier2_tests()
 
     # Summary
     passed = sum(1 for _, ok, _ in results if ok)

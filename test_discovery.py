@@ -50,9 +50,8 @@ def report(name: str, passed: bool, detail: str = "") -> None:
 class DarkMatterNode:
     """Manages a real DarkMatter server process."""
 
-    def __init__(self, port: int, *, genesis: bool = False, display_name: str = ""):
+    def __init__(self, port: int, *, display_name: str = ""):
         self.port = port
-        self.genesis = genesis
         self.display_name = display_name or f"node-{port}"
         self.state_file = tempfile.mktemp(suffix=".json", prefix=f"dm_{port}_")
         self.proc: subprocess.Popen | None = None
@@ -63,7 +62,6 @@ class DarkMatterNode:
             **os.environ,
             "DARKMATTER_PORT": str(self.port),
             "DARKMATTER_HOST": "127.0.0.1",
-            "DARKMATTER_GENESIS": "true" if self.genesis else "false",
             "DARKMATTER_DISPLAY_NAME": self.display_name,
             "DARKMATTER_STATE_FILE": self.state_file,
             "DARKMATTER_DISCOVERY": "true",
@@ -134,7 +132,7 @@ def test_well_known_endpoint() -> None:
     """A running server exposes /.well-known/darkmatter.json."""
     print(f"\n{BOLD}Test: well-known endpoint{RESET}")
 
-    node = DarkMatterNode(BASE_PORT, genesis=True, display_name="wk-test")
+    node = DarkMatterNode(BASE_PORT, display_name="wk-test")
     try:
         node.start()
         ready = node.wait_ready()
@@ -160,8 +158,8 @@ def test_two_nodes_discover_each_other() -> None:
     """Two nodes on different ports discover each other via HTTP scan."""
     print(f"\n{BOLD}Test: two nodes discover each other{RESET}")
 
-    node_a = DarkMatterNode(BASE_PORT, genesis=True, display_name="alpha")
-    node_b = DarkMatterNode(BASE_PORT + 1, genesis=False, display_name="beta")
+    node_a = DarkMatterNode(BASE_PORT, display_name="alpha")
+    node_b = DarkMatterNode(BASE_PORT + 1, display_name="beta")
 
     try:
         node_a.start()
@@ -266,7 +264,7 @@ def test_three_nodes_nway() -> None:
     print(f"\n{BOLD}Test: three-node N-way discovery{RESET}")
 
     nodes = [
-        DarkMatterNode(BASE_PORT + i, genesis=(i == 0), display_name=f"node-{i}")
+        DarkMatterNode(BASE_PORT + i, display_name=f"node-{i}")
         for i in range(3)
     ]
 
@@ -319,8 +317,8 @@ def test_dead_node_disappears() -> None:
     """A killed node is no longer discovered on the next scan."""
     print(f"\n{BOLD}Test: dead node disappears{RESET}")
 
-    node_a = DarkMatterNode(BASE_PORT, genesis=True, display_name="alive")
-    node_b = DarkMatterNode(BASE_PORT + 1, genesis=False, display_name="doomed")
+    node_a = DarkMatterNode(BASE_PORT, display_name="alive")
+    node_b = DarkMatterNode(BASE_PORT + 1, display_name="doomed")
 
     try:
         node_a.start()

@@ -1,7 +1,7 @@
 """
 DarkMatter — A Self-Replicating MCP Server for Emergent Agent Networks
 
-The Genesis server. This is the first node in a DarkMatter mesh network.
+A self-replicating MCP server for emergent agent networks.
 Agents connect to each other, route messages through the network, and
 self-organize based on actual usage patterns.
 
@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from urllib.parse import urlparse
+from collections import deque
 from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -99,6 +100,11 @@ IP_CHECK_INTERVAL = 300             # check public IP every 5 min, not every hea
 WEBHOOK_RECOVERY_MAX_ATTEMPTS = 3   # max peer-lookup recovery attempts per webhook call
 WEBHOOK_RECOVERY_TIMEOUT = 30.0     # total wall-clock budget for all recovery attempts (seconds)
 ANCHOR_LOOKUP_TIMEOUT = 2.0         # seconds to wait for anchor node responses
+
+# Rate limiting — per-connection and global
+DEFAULT_RATE_LIMIT_PER_CONNECTION = 30    # max requests per window per connection (0 = unlimited)
+DEFAULT_RATE_LIMIT_GLOBAL = 200           # max total inbound requests per window (0 = unlimited)
+RATE_LIMIT_WINDOW = 60                    # sliding window in seconds
 
 # Anchor nodes — stable directory services for peer lookup fallback
 _ANCHOR_DEFAULT = "https://loseylabs.ai"
@@ -211,6 +217,49 @@ def validate_webhook_url(url: str) -> Optional[str]:
 def truncate_field(value: str, max_len: int) -> str:
     """Truncate a string to max_len."""
     return value[:max_len] if len(value) > max_len else value
+
+
+# =============================================================================
+# Rate Limiting
+# =============================================================================
+
+def _check_rate_limit(state, conn: Optional["Connection"] = None) -> Optional[str]:
+    """Check per-connection and global rate limits. Returns error string if exceeded, None if OK.
+
+    Prunes expired timestamps and records the current request if allowed.
+    """
+    now = time.monotonic()
+    cutoff = now - RATE_LIMIT_WINDOW
+
+    # Global rate limit
+    global_limit = state.rate_limit_global or DEFAULT_RATE_LIMIT_GLOBAL
+    if global_limit > 0:
+        ts = state._global_request_timestamps
+        # Prune expired
+        while ts and ts[0] < cutoff:
+            ts.popleft()
+        if len(ts) >= global_limit:
+            return f"Global rate limit exceeded ({global_limit} requests per {RATE_LIMIT_WINDOW}s)"
+
+    # Per-connection rate limit
+    if conn is not None:
+        if conn.rate_limit == -1:
+            # Unlimited for this connection
+            per_conn_limit = 0
+        else:
+            per_conn_limit = conn.rate_limit or DEFAULT_RATE_LIMIT_PER_CONNECTION
+        if per_conn_limit > 0:
+            ts = conn._request_timestamps
+            while ts and ts[0] < cutoff:
+                ts.popleft()
+            if len(ts) >= per_conn_limit:
+                return f"Rate limit exceeded for this connection ({per_conn_limit} requests per {RATE_LIMIT_WINDOW}s)"
+
+    # Record the request
+    state._global_request_timestamps.append(now)
+    if conn is not None:
+        conn._request_timestamps.append(now)
+    return None
 
 
 def _get_public_url(port: int) -> str:
@@ -531,6 +580,16 @@ def _verify_peer_update_signature(public_key_hex: str, signature_hex: str,
 PEER_UPDATE_MAX_AGE = 300  # 5 minutes
 
 
+def _is_timestamp_fresh(timestamp: str) -> bool:
+    """Check if a timestamp is within PEER_UPDATE_MAX_AGE seconds of now."""
+    try:
+        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        age = abs((datetime.now(timezone.utc) - ts).total_seconds())
+        return age <= PEER_UPDATE_MAX_AGE
+    except Exception:
+        return False
+
+
 async def _broadcast_peer_update(state) -> None:
     """Notify all connected peers and anchor nodes of our current URL."""
     if not state.public_url:
@@ -576,6 +635,43 @@ async def _broadcast_peer_update(state) -> None:
             print(f"[DarkMatter] Failed to notify anchor {anchor_url} of URL: {e}", file=sys.stderr)
 
 
+async def _check_connection_health(state) -> None:
+    """Check health of all stale connections and update failure counts."""
+    for conn in list(state.connections.values()):
+        # Only health-check stale connections
+        if conn.last_activity:
+            try:
+                last = datetime.fromisoformat(conn.last_activity.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - last).total_seconds()
+                if age < STALE_CONNECTION_AGE:
+                    continue
+            except Exception:
+                pass
+
+        # Ping the peer's status endpoint
+        try:
+            base_url = conn.agent_url.rstrip("/")
+            for suffix in ("/mcp", "/__darkmatter__"):
+                if base_url.endswith(suffix):
+                    base_url = base_url[:-len(suffix)]
+                    break
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{base_url}/__darkmatter__/status")
+                if resp.status_code == 200:
+                    conn.health_failures = 0
+                    continue
+        except Exception:
+            pass
+
+        conn.health_failures += 1
+        if conn.health_failures >= HEALTH_FAILURE_THRESHOLD:
+            print(
+                f"[DarkMatter] Connection {conn.agent_id[:12]}... unhealthy "
+                f"({conn.health_failures} failures, url={conn.agent_url})",
+                file=sys.stderr,
+            )
+
+
 async def _network_health_loop(state) -> None:
     """Background task: periodically check connection health and detect IP changes."""
     last_ip_check = 0.0
@@ -605,41 +701,7 @@ async def _network_health_loop(state) -> None:
                     pass  # ipify unreachable — skip this cycle
 
             # --- Connection health checks ---
-            now_iso = datetime.now(timezone.utc).isoformat()
-            for conn in list(state.connections.values()):
-                # Only health-check stale connections
-                if conn.last_activity:
-                    try:
-                        from datetime import datetime as _dt
-                        last = _dt.fromisoformat(conn.last_activity.replace("Z", "+00:00"))
-                        age = (datetime.now(timezone.utc) - last).total_seconds()
-                        if age < STALE_CONNECTION_AGE:
-                            continue
-                    except Exception:
-                        pass
-
-                # Ping the peer's status endpoint
-                try:
-                    base_url = conn.agent_url.rstrip("/")
-                    for suffix in ("/mcp", "/__darkmatter__"):
-                        if base_url.endswith(suffix):
-                            base_url = base_url[:-len(suffix)]
-                            break
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        resp = await client.get(f"{base_url}/__darkmatter__/status")
-                        if resp.status_code == 200:
-                            conn.health_failures = 0
-                            continue
-                except Exception:
-                    pass
-
-                conn.health_failures += 1
-                if conn.health_failures >= HEALTH_FAILURE_THRESHOLD:
-                    print(
-                        f"[DarkMatter] Connection {conn.agent_id[:12]}... unhealthy "
-                        f"({conn.health_failures} failures, url={conn.agent_url})",
-                        file=sys.stderr,
-                    )
+            await _check_connection_health(state)
 
         except asyncio.CancelledError:
             return
@@ -715,6 +777,10 @@ class Connection:
     # Cryptographic identity — peer's public key and display name
     agent_public_key_hex: Optional[str] = None
     agent_display_name: Optional[str] = None
+    # Per-connection rate limit (0 = use global default, -1 = unlimited)
+    rate_limit: int = 0
+    # Rate limit tracking (ephemeral — never persisted)
+    _request_timestamps: deque = field(default_factory=deque)
     # Network resilience (ephemeral — never persisted)
     health_failures: int = 0
     # WebRTC transport state (ephemeral — never persisted)
@@ -781,7 +847,6 @@ class AgentState:
     sent_messages: dict[str, SentMessage] = field(default_factory=dict)
     messages_handled: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    is_genesis: bool = False
     impressions: dict[str, str] = field(default_factory=dict)  # agent_id -> freeform impression text
     claimed: bool = False  # True after first agent authenticates
     # Cryptographic identity — Ed25519 keypair and human-friendly display name
@@ -794,6 +859,9 @@ class AgentState:
     discovered_peers: dict[str, dict] = field(default_factory=dict)
     # MCP sessions that have authenticated (ephemeral, not persisted)
     authenticated_sessions: set[str] = field(default_factory=set)
+    # Rate limiting (global)
+    rate_limit_global: int = 0             # 0 = use DEFAULT_RATE_LIMIT_GLOBAL
+    _global_request_timestamps: deque = field(default_factory=deque)
     # Network resilience (ephemeral — never persisted)
     public_url: Optional[str] = None
     _upnp_mapping: Optional[tuple] = None  # (url, upnp_obj, ext_port)
@@ -956,7 +1024,7 @@ def _build_status_line() -> str:
             "No connections yet — use darkmatter_discover_local to find nearby agents or darkmatter_request_connection to connect to a known peer"
         )
     if not state.bio or state.bio in (
-        "Genesis agent — the first node in the DarkMatter network.",
+        "A DarkMatter mesh agent.",
         "Description of what this agent specializes in",
     ):
         actions.append(
@@ -1235,7 +1303,6 @@ def save_state() -> None:
         "bio": state.bio,
         "status": state.status.value,
         "port": state.port,
-        "is_genesis": state.is_genesis,
         "created_at": state.created_at,
         "messages_handled": state.messages_handled,
         "claimed": state.claimed,
@@ -1256,6 +1323,7 @@ def save_state() -> None:
                 "last_activity": c.last_activity,
                 "agent_public_key_hex": c.agent_public_key_hex,
                 "agent_display_name": c.agent_display_name,
+                "rate_limit": c.rate_limit,
             }
             for aid, c in state.connections.items()
         },
@@ -1273,6 +1341,7 @@ def save_state() -> None:
             for mid, sm in state.sent_messages.items()
         },
         "impressions": state.impressions,
+        "rate_limit_global": state.rate_limit_global,
     }
 
     path = _state_file_path()
@@ -1324,6 +1393,7 @@ def load_state() -> Optional[AgentState]:
             last_activity=cd.get("last_activity"),
             agent_public_key_hex=cd.get("agent_public_key_hex"),
             agent_display_name=cd.get("agent_display_name"),
+            rate_limit=cd.get("rate_limit", 0),
         )
 
     sent_messages = {}
@@ -1350,7 +1420,6 @@ def load_state() -> Optional[AgentState]:
         bio=data.get("bio", ""),
         status=AgentStatus(data.get("status", "active")),
         port=data.get("port", DEFAULT_PORT),
-        is_genesis=data.get("is_genesis", False),
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
         claimed=data.get("claimed", False),
@@ -1360,6 +1429,7 @@ def load_state() -> Optional[AgentState]:
         connections=connections,
         sent_messages=sent_messages,
         impressions=data.get("impressions", {}),
+        rate_limit_global=data.get("rate_limit_global", 0),
     )
 
     return state
@@ -1693,7 +1763,7 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
             result = response.json()
 
             if result.get("auto_accepted"):
-                # Genesis agents auto-accept — connection is live
+                # Already connected — the target recognized us
                 conn = Connection(
                     agent_id=result["agent_id"],
                     agent_url=result["agent_url"],
@@ -1710,15 +1780,15 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
                     "agent_id": result["agent_id"],
                     "agent_bio": result.get("agent_bio", ""),
                 })
-            else:
-                # Track that we sent this request so we can verify acceptance later
-                state.pending_outbound.add(target_base)
-                return json.dumps({
-                    "success": True,
-                    "status": "pending",
-                    "message": "Connection request sent. Waiting for acceptance.",
-                    "request_id": result.get("request_id"),
-                })
+
+            # Track that we sent this request so we can verify acceptance later
+            state.pending_outbound.add(target_base)
+            return json.dumps({
+                "success": True,
+                "status": "pending",
+                "message": "Connection request sent. Waiting for acceptance.",
+                "request_id": result.get("request_id"),
+            })
 
     except httpx.HTTPError as e:
         return json.dumps({
@@ -2135,7 +2205,6 @@ async def get_identity(ctx: Context) -> str:
         "bio": state.bio,
         "status": state.status.value,
         "port": state.port,
-        "is_genesis": state.is_genesis,
         "num_connections": len(state.connections),
         "num_pending_requests": len(state.pending_requests),
         "messages_handled": state.messages_handled,
@@ -2190,6 +2259,7 @@ async def list_connections(ctx: Context) -> str:
             "messages_declined": conn.messages_declined,
             "avg_response_time_ms": round(conn.avg_response_time_ms, 2),
             "last_activity": conn.last_activity,
+            "rate_limit": conn.rate_limit if conn.rate_limit != 0 else DEFAULT_RATE_LIMIT_PER_CONNECTION,
         }
         impression = state.impressions.get(conn.agent_id)
         if impression:
@@ -2878,7 +2948,6 @@ async def network_info(ctx: Context) -> str:
         "public_key_hex": state.public_key_hex,
         "agent_url": _get_public_url(state.port),
         "bio": state.bio,
-        "is_genesis": state.is_genesis,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "peers": peers,
     })
@@ -2979,7 +3048,6 @@ async def discover_local(ctx: Context) -> str:
             "url": info.get("url", ""),
             "bio": info.get("bio", ""),
             "status": info.get("status", ""),
-            "genesis": info.get("genesis", False),
             "accepting": info.get("accepting", True),
             "last_seen": info.get("ts", 0),
         })
@@ -3176,6 +3244,73 @@ async def ask_impression(params: AskImpressionInput, ctx: Context) -> str:
 
 
 # =============================================================================
+# Rate Limit Configuration Tool
+# =============================================================================
+
+class SetRateLimitInput(BaseModel):
+    agent_id: Optional[str] = Field(None, description="Agent ID to set per-connection rate limit for. Omit to set global rate limit.")
+    limit: int = Field(..., description="Max requests per 60s window. 0 = use default, -1 = unlimited.")
+
+@mcp.tool(
+    name="darkmatter_set_rate_limit",
+    annotations={
+        "title": "Set Rate Limit",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def set_rate_limit(params: SetRateLimitInput, ctx: Context) -> str:
+    """Set rate limits for incoming requests.
+
+    Per-connection: limits how many requests a specific peer can send per minute.
+    Global: limits total inbound requests from all peers per minute.
+
+    Values:
+      0 = use default (per-connection: 30/min, global: 200/min)
+      -1 = unlimited
+      >0 = custom limit
+
+    Args:
+        params: Contains optional agent_id (for per-connection) and limit.
+
+    Returns:
+        JSON confirming the rate limit was set.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    if params.agent_id:
+        conn = state.connections.get(params.agent_id)
+        if not conn:
+            return json.dumps({"error": f"Not connected to agent {params.agent_id}"})
+        conn.rate_limit = params.limit
+        save_state()
+        effective = params.limit if params.limit != 0 else DEFAULT_RATE_LIMIT_PER_CONNECTION
+        label = "unlimited" if params.limit == -1 else f"{effective}/min"
+        return json.dumps({
+            "success": True,
+            "agent_id": params.agent_id,
+            "rate_limit": params.limit,
+            "effective": label,
+        })
+    else:
+        state.rate_limit_global = params.limit
+        save_state()
+        effective = params.limit if params.limit != 0 else DEFAULT_RATE_LIMIT_GLOBAL
+        label = "unlimited" if params.limit == -1 else f"{effective}/min"
+        return json.dumps({
+            "success": True,
+            "scope": "global",
+            "rate_limit": params.limit,
+            "effective": label,
+        })
+
+
+# =============================================================================
 # WebRTC Transport Upgrade Tool
 # =============================================================================
 
@@ -3254,7 +3389,9 @@ async def upgrade_webrtc(params: UpgradeWebrtcInput, ctx: Context) -> str:
             path = envelope.get("path", "")
             payload = envelope.get("payload", {})
             if path == "/__darkmatter__/message":
-                await _process_incoming_message(state, payload)
+                result, status_code = await _process_incoming_message(state, payload)
+                if status_code >= 400:
+                    print(f"[DarkMatter] WebRTC message rejected ({status_code}): {result.get('error', 'unknown')}", file=sys.stderr)
         except Exception as e:
             print(f"[DarkMatter] WebRTC message processing error: {e}", file=sys.stderr)
 
@@ -3387,6 +3524,11 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     if state.status == AgentStatus.INACTIVE:
         return JSONResponse({"error": "Agent is currently inactive"}, status_code=503)
 
+    # Global rate limit (no per-connection since this may be from an unknown agent)
+    rate_err = _check_rate_limit(state)
+    if rate_err:
+        return JSONResponse({"error": rate_err}, status_code=429)
+
     try:
         data = await request.json()
     except Exception:
@@ -3426,28 +3568,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
             "message": "Already connected.",
         })
 
-    # Genesis agents auto-accept (to bootstrap the network)
-    if state.is_genesis and len(state.connections) < MAX_CONNECTIONS:
-        conn = Connection(
-            agent_id=from_agent_id,
-            agent_url=from_agent_url,
-            agent_bio=from_agent_bio,
-            direction=ConnectionDirection.INBOUND,
-            agent_public_key_hex=from_agent_public_key_hex,
-            agent_display_name=from_agent_display_name,
-        )
-        state.connections[from_agent_id] = conn
-        save_state()
-        return JSONResponse({
-            "auto_accepted": True,
-            "agent_id": state.agent_id,
-            "agent_url": f"{_get_public_url(state.port)}/mcp",
-            "agent_bio": state.bio,
-            "agent_public_key_hex": state.public_key_hex,
-            "agent_display_name": state.display_name,
-        })
-
-    # Non-genesis agents queue the request
+    # Queue the request for the agent to accept or reject
     if len(state.pending_requests) >= MESSAGE_QUEUE_MAX:
         return JSONResponse({"error": "Too many pending requests"}, status_code=429)
 
@@ -3528,6 +3649,72 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
     return JSONResponse({"success": True})
 
 
+async def handle_accept_pending(request: Request) -> JSONResponse:
+    """Accept a pending connection request via HTTP (no MCP needed)."""
+    global _agent_state
+    state = _agent_state
+
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    request_id = data.get("request_id", "")
+    if not request_id:
+        return JSONResponse({"error": "Missing request_id"}, status_code=400)
+
+    pending = state.pending_requests.get(request_id)
+    if not pending:
+        return JSONResponse({"error": f"No pending request with ID '{request_id}'"}, status_code=404)
+
+    if len(state.connections) >= MAX_CONNECTIONS:
+        return JSONResponse({"error": f"Connection limit reached ({MAX_CONNECTIONS})"}, status_code=429)
+
+    conn = Connection(
+        agent_id=pending.from_agent_id,
+        agent_url=pending.from_agent_url,
+        agent_bio=pending.from_agent_bio,
+        direction=ConnectionDirection.INBOUND,
+        agent_public_key_hex=pending.from_agent_public_key_hex,
+        agent_display_name=pending.from_agent_display_name,
+    )
+    state.connections[pending.from_agent_id] = conn
+
+    # Notify the requesting agent that we accepted
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            base = pending.from_agent_url.rstrip("/")
+            # Strip /mcp suffix to get to mesh endpoint
+            for suffix in ("/mcp", "/__darkmatter__"):
+                if base.endswith(suffix):
+                    base = base[:-len(suffix)]
+                    break
+            await client.post(
+                base + "/__darkmatter__/connection_accepted",
+                json={
+                    "agent_id": state.agent_id,
+                    "agent_url": f"{_get_public_url(state.port)}/mcp",
+                    "agent_bio": state.bio,
+                    "agent_public_key_hex": state.public_key_hex,
+                    "agent_display_name": state.display_name,
+                }
+            )
+    except Exception:
+        pass  # Best effort — connection still formed on our side
+
+    del state.pending_requests[request_id]
+    save_state()
+
+    return JSONResponse({
+        "success": True,
+        "accepted": True,
+        "agent_id": pending.from_agent_id,
+    })
+
+
 async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict, int]:
     """Core message processing logic, shared by HTTP and WebRTC receive paths.
 
@@ -3558,6 +3745,14 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if not from_agent_id or from_agent_id not in state.connections:
         return {"error": "Not connected — only connected agents can send messages."}, 403
 
+    # Rate limit check
+    conn_for_rate = state.connections.get(from_agent_id)
+    rate_err = _check_rate_limit(state, conn_for_rate)
+    if rate_err:
+        if conn_for_rate:
+            conn_for_rate.messages_declined += 1
+        return {"error": rate_err}, 429
+
     hops_remaining = data.get("hops_remaining", 10)
     if not isinstance(hops_remaining, int) or hops_remaining < 0:
         hops_remaining = 10
@@ -3570,16 +3765,28 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     if from_agent_id in state.connections:
         conn = state.connections[from_agent_id]
-        if conn.agent_public_key_hex and from_public_key_hex:
-            # Known connection with stored key — verify key matches
-            if conn.agent_public_key_hex != from_public_key_hex:
+        if conn.agent_public_key_hex:
+            # We have a stored public key for this peer — signature is REQUIRED
+            if from_public_key_hex and conn.agent_public_key_hex != from_public_key_hex:
                 return {"error": "Public key mismatch — sender key does not match stored key for this connection."}, 403
-            # Verify signature
+            if not signature_hex or not msg_timestamp:
+                return {"error": "Signature required — this connection has a known public key."}, 403
+            if not _verify_message(conn.agent_public_key_hex, signature_hex,
+                                   from_agent_id, message_id, msg_timestamp, content):
+                return {"error": "Invalid signature — message authenticity could not be verified."}, 403
+            verified = True
+        elif from_public_key_hex:
+            # Peer sent a key but we don't have one stored — pin it and verify
             if signature_hex and msg_timestamp:
-                if not _verify_message(conn.agent_public_key_hex, signature_hex,
+                if not _verify_message(from_public_key_hex, signature_hex,
                                        from_agent_id, message_id, msg_timestamp, content):
                     return {"error": "Invalid signature — message authenticity could not be verified."}, 403
+                conn.agent_public_key_hex = from_public_key_hex
                 verified = True
+
+    # Replay protection: reject messages with stale timestamps
+    if verified and msg_timestamp and not _is_timestamp_fresh(msg_timestamp):
+        return {"error": "Message timestamp too old — possible replay"}, 403
 
     msg = QueuedMessage(
         message_id=truncate_field(message_id, 128),
@@ -3642,6 +3849,11 @@ async def handle_webhook_post(request: Request) -> JSONResponse:
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    # Global rate limit for webhook POSTs
+    rate_err = _check_rate_limit(state)
+    if rate_err:
+        return JSONResponse({"error": rate_err}, status_code=429)
 
     message_id = request.path_params.get("message_id", "")
     sm = state.sent_messages.get(message_id)
@@ -3736,7 +3948,6 @@ async def handle_status(request: Request) -> JSONResponse:
         "public_key_hex": state.public_key_hex,
         "bio": state.bio,
         "status": state.status.value,
-        "is_genesis": state.is_genesis,
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
     })
@@ -3760,7 +3971,6 @@ async def handle_network_info(request: Request) -> JSONResponse:
         "public_key_hex": state.public_key_hex,
         "agent_url": _get_public_url(state.port),
         "bio": state.bio,
-        "is_genesis": state.is_genesis,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "peers": peers,
     })
@@ -3805,6 +4015,11 @@ async def handle_peer_update(request: Request) -> JSONResponse:
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
+    # Global rate limit (per-connection checked after we know the agent_id)
+    rate_err = _check_rate_limit(state)
+    if rate_err:
+        return JSONResponse({"error": rate_err}, status_code=429)
+
     try:
         body = await request.json()
     except Exception:
@@ -3828,14 +4043,23 @@ async def handle_peer_update(request: Request) -> JSONResponse:
     if conn is None:
         return JSONResponse({"error": "Unknown agent"}, status_code=404)
 
+    # Replay protection: reject stale timestamps
+    if timestamp and not _is_timestamp_fresh(timestamp):
+        return JSONResponse({"error": "Timestamp expired"}, status_code=403)
+
     # Verify public key matches if both sides have one
     if public_key_hex and conn.agent_public_key_hex:
         if public_key_hex != conn.agent_public_key_hex:
             return JSONResponse({"error": "Public key mismatch"}, status_code=403)
 
-    # Verify signature if the connection has a known public key
+    # Signature is REQUIRED when we have a stored key for this peer
     verify_key = conn.agent_public_key_hex or public_key_hex
-    if verify_key and signature and timestamp:
+    if conn.agent_public_key_hex:
+        if not signature or not timestamp:
+            return JSONResponse({"error": "Signature required — known public key on file"}, status_code=403)
+        if not _verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
+            return JSONResponse({"error": "Invalid signature"}, status_code=403)
+    elif verify_key and signature and timestamp:
         if not _verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
             return JSONResponse({"error": "Invalid signature"}, status_code=403)
 
@@ -3970,7 +4194,9 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
                 path = envelope.get("path", "")
                 payload = envelope.get("payload", {})
                 if path == "/__darkmatter__/message":
-                    await _process_incoming_message(state, payload)
+                    result, status_code = await _process_incoming_message(state, payload)
+                    if status_code >= 400:
+                        print(f"[DarkMatter] WebRTC message rejected ({status_code}): {result.get('error', 'unknown')}", file=sys.stderr)
             except Exception as e:
                 print(f"[DarkMatter] WebRTC message processing error: {e}", file=sys.stderr)
 
@@ -4039,13 +4265,12 @@ async def handle_well_known(request: Request) -> JSONResponse:
 
 
 def _register_peer(state: AgentState, peer_id: str, url: str, bio: str,
-                   status: str, genesis: bool, accepting: bool, source: str) -> None:
+                   status: str, accepting: bool, source: str) -> None:
     """Register a discovered peer in state."""
     state.discovered_peers[peer_id] = {
         "url": url,
         "bio": bio,
         "status": status,
-        "genesis": genesis,
         "accepting": accepting,
         "source": source,
         "ts": time.time(),
@@ -4079,7 +4304,6 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
             url=f"http://{source_ip}:{peer_port}",
             bio=packet.get("bio", ""),
             status=packet.get("status", "active"),
-            genesis=packet.get("genesis", False),
             accepting=packet.get("accepting", True),
             source="lan",
         )
@@ -4104,7 +4328,6 @@ async def _probe_port(client: httpx.AsyncClient, state: AgentState, port: int) -
         url=f"http://127.0.0.1:{port}",
         bio=info.get("bio", ""),
         status=info.get("status", "active"),
-        genesis=info.get("is_genesis", False),
         accepting=info.get("accepting_connections", True),
         source="local",
     )
@@ -4149,7 +4372,6 @@ async def _discovery_loop(state: AgentState) -> None:
                 "bio": state.bio[:100],
                 "port": state.port,
                 "status": state.status.value,
-                "genesis": state.is_genesis,
                 "accepting": len(state.connections) < MAX_CONNECTIONS,
                 "ts": int(time.time()),
             }).encode("utf-8")
@@ -4269,8 +4491,7 @@ def _init_state(port: int = None) -> None:
         port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
     display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", os.environ.get("DARKMATTER_AGENT_ID", ""))
-    bio = os.environ.get("DARKMATTER_BIO", "Genesis agent — the first node in the DarkMatter network.")
-    is_genesis = os.environ.get("DARKMATTER_GENESIS", "true").lower() == "true"
+    bio = os.environ.get("DARKMATTER_BIO", "A DarkMatter mesh agent.")
 
     # Try to restore persisted state from disk
     restored = load_state()
@@ -4291,16 +4512,12 @@ def _init_state(port: int = None) -> None:
             bio=bio,
             status=AgentStatus.ACTIVE,
             port=port,
-            is_genesis=is_genesis,
             private_key_hex=priv,
             public_key_hex=pub,
             display_name=display_name or None,
         )
         print(f"[DarkMatter] Agent '{agent_id}' (display: {display_name or 'none'}) "
               f"starting fresh on port {port}", file=sys.stderr)
-
-    if is_genesis:
-        print(f"[DarkMatter] This is a GENESIS node.", file=sys.stderr)
 
     print(f"[DarkMatter] MCP auth: {'claimed' if _agent_state.claimed else 'UNCLAIMED'}", file=sys.stderr)
     save_state()
@@ -4367,6 +4584,7 @@ def create_app() -> Starlette:
     darkmatter_routes = [
         Route("/connection_request", handle_connection_request, methods=["POST"]),
         Route("/connection_accepted", handle_connection_accepted, methods=["POST"]),
+        Route("/accept_pending", handle_accept_pending, methods=["POST"]),
         Route("/message", handle_message, methods=["POST"]),
         Route("/webhook/{message_id}", handle_webhook_post, methods=["POST"]),
         Route("/webhook/{message_id}", handle_webhook_get, methods=["GET"]),
