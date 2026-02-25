@@ -1,0 +1,62 @@
+networks:
+  left:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+  right:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+
+services:
+  node-a:
+    build: .
+    container_name: dm-node-a
+    networks:
+      - left
+    ports:
+      - "9800:8100"
+    environment:
+      DARKMATTER_PORT: "8100"
+      DARKMATTER_GENESIS: "true"
+      DARKMATTER_DISPLAY_NAME: "node-a"
+      DARKMATTER_HOST: "0.0.0.0"
+      DARKMATTER_TRANSPORT: "http"
+      DARKMATTER_DISCOVERY: "false"
+      DARKMATTER_ANCHOR_NODES: ""
+
+  node-b:
+    build: .
+    container_name: dm-node-b
+    networks:
+      - left
+      - right
+    ports:
+      - "9801:8100"
+    environment:
+      DARKMATTER_PORT: "8100"
+      DARKMATTER_GENESIS: "true"
+      DARKMATTER_DISPLAY_NAME: "node-b"
+      DARKMATTER_HOST: "0.0.0.0"
+      DARKMATTER_TRANSPORT: "http"
+      DARKMATTER_DISCOVERY: "false"
+      DARKMATTER_ANCHOR_NODES: ""
+      DARKMATTER_PUBLIC_URL: "http://node-b:8100"
+
+  node-c:
+    build: .
+    container_name: dm-node-c
+    networks:
+      - right
+    ports:
+      - "9802:8100"
+    environment:
+      DARKMATTER_PORT: "8100"
+      DARKMATTER_GENESIS: "true"
+      DARKMATTER_DISPLAY_NAME: "node-c"
+      DARKMATTER_HOST: "0.0.0.0"
+      DARKMATTER_TRANSPORT: "http"
+      DARKMATTER_DISCOVERY: "false"
+      DARKMATTER_ANCHOR_NODES: ""
