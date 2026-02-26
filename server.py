@@ -19,6 +19,7 @@ import json
 import uuid
 import time
 import asyncio
+import fcntl
 import os
 import sys
 import ipaddress
@@ -66,7 +67,7 @@ except ImportError:
 # =============================================================================
 
 DEFAULT_PORT = 8100
-MAX_CONNECTIONS = 50
+MAX_CONNECTIONS = int(os.environ.get("DARKMATTER_MAX_CONNECTIONS", "50"))
 MESSAGE_QUEUE_MAX = 50
 SENT_MESSAGES_MAX = 100
 MAX_CONTENT_LENGTH = 65536   # 64 KB
@@ -590,6 +591,37 @@ def _is_timestamp_fresh(timestamp: str) -> bool:
         return False
 
 
+# Replay dedup: track recently seen message IDs for 5 minutes
+# Uses time.time() (wall clock) so entries survive process restarts via persistence.
+_REPLAY_WINDOW = 300  # seconds
+_REPLAY_MAX_SIZE = 10000
+_seen_message_ids: dict[str, float] = {}
+
+
+def _check_message_replay(message_id: str) -> bool:
+    """Return True if this message_id was already seen recently (replay).
+
+    Tracks message IDs for _REPLAY_WINDOW seconds with lazy pruning.
+    Uses wall-clock time (time.time()) so entries can be persisted across restarts.
+    """
+    now = time.time()
+
+    # Lazy prune: evict expired entries when dict gets large
+    if len(_seen_message_ids) > _REPLAY_MAX_SIZE:
+        cutoff = now - _REPLAY_WINDOW
+        expired = [mid for mid, ts in _seen_message_ids.items() if ts < cutoff]
+        for mid in expired:
+            del _seen_message_ids[mid]
+
+    if message_id in _seen_message_ids:
+        ts = _seen_message_ids[message_id]
+        if now - ts < _REPLAY_WINDOW:
+            return True  # replay detected
+        # Expired entry — allow reuse
+    _seen_message_ids[message_id] = now
+    return False
+
+
 async def _broadcast_peer_update(state) -> None:
     """Notify all connected peers and anchor nodes of our current URL."""
     if not state.public_url:
@@ -659,6 +691,9 @@ async def _check_connection_health(state) -> None:
                 resp = await client.get(f"{base_url}/__darkmatter__/status")
                 if resp.status_code == 200:
                     conn.health_failures = 0
+                    # Auto-upgrade to WebRTC if still on HTTP
+                    if conn.transport == "http" and WEBRTC_AVAILABLE:
+                        asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
                     continue
         except Exception:
             pass
@@ -806,6 +841,7 @@ class PendingConnectionRequest:
     # Cryptographic identity — requester's public key and display name
     from_agent_public_key_hex: Optional[str] = None
     from_agent_display_name: Optional[str] = None
+    mutual: bool = False  # If True, after accepting, send a reverse connection_request
 
 
 @dataclass
@@ -865,6 +901,8 @@ class AgentState:
     # Network resilience (ephemeral — never persisted)
     public_url: Optional[str] = None
     _upnp_mapping: Optional[tuple] = None  # (url, upnp_obj, ext_port)
+    # Auto-reactivation timer for inactive status
+    inactive_until: Optional[str] = None  # ISO timestamp; when expired, auto-flip to active
 
 
 # =============================================================================
@@ -890,18 +928,18 @@ route messages to you.
 ONGOING BEHAVIOR:
 - When you receive messages (check darkmatter_list_inbox), read them and respond using \
 darkmatter_respond_message. You are the intelligence behind this agent — decide how to answer.
-- If you can't answer a message, consider forwarding it with darkmatter_forward_message to a \
-connected agent who might be able to help. You can fork a message to multiple agents — forwarding \
-keeps the message in your inbox so you can forward again. Use darkmatter_respond_message to remove \
-it when you're done. Check the `can_forward` field in list_inbox to see if forwarding is possible.
+- If you can't answer a message, forward it using darkmatter_send_message with the message_id \
+from your inbox and a target_agent_id (or target_agent_ids to fork to multiple). Forwarding \
+removes the message from your queue.
 - Track messages you've sent with darkmatter_list_messages and darkmatter_get_sent_message.
 - Use darkmatter_expire_message to cancel a sent message that's no longer needed.
-- You can connect to other agents with darkmatter_request_connection if you know their URL.
+- Use darkmatter_connection(action="request", target_url=...) to connect to another agent.
+- Use darkmatter_connection(action="request_mutual", target_url=...) for bidirectional connections.
 - Use darkmatter_network_info to discover peers in the network.
-- Use darkmatter_discover_domain to check if a domain hosts a DarkMatter node (checks /.well-known/darkmatter.json).
+- Use darkmatter_discover_domain to check if a domain hosts a DarkMatter node.
 - Use darkmatter_discover_local to see agents discovered on the local network via LAN broadcast.
-- Use darkmatter_list_pending_requests to see if anyone wants to connect to you, then \
-darkmatter_respond_connection to accept or reject.
+- Use darkmatter_list_pending_requests to see pending requests, then \
+darkmatter_connection(action="accept", request_id=...) or action="reject".
 
 IDENTITY:
 - Your agent ID and bio define who you are in the mesh. Own it.
@@ -915,8 +953,8 @@ These are your private notes — "fast and accurate", "unhelpful", "great at ML 
 existing connections what they think. Their impressions help you decide whether to accept.
 - Your impressions are shared when other agents ask — this is how trust propagates through \
 the network. Be honest.
-- Use darkmatter_get_impression to check your notes on a specific agent, and \
-darkmatter_delete_impression to remove outdated ones.
+- Use darkmatter_get_impression to check your notes on a specific agent. \
+Pass an empty impression string to darkmatter_set_impression to delete one.
 
 LIVE STATUS:
 - The `darkmatter_status` tool description contains live node state AND action items.
@@ -939,7 +977,7 @@ _agent_state: Optional[AgentState] = None
 _active_sessions: set = set()  # Track ServerSession objects for notifications
 _last_status_desc: str = ""
 import threading
-_state_write_lock = threading.Lock()  # Serializes save_state() writes to prevent torn state files
+_state_write_lock = threading.Lock()  # Serializes save_state() writes; fcntl.flock handles inter-process locking
 
 # Agent auto-spawn tracking (ephemeral, not persisted)
 @dataclass
@@ -1021,7 +1059,7 @@ def _build_status_line() -> str:
         )
     if conns == 0:
         actions.append(
-            "No connections yet — use darkmatter_discover_local to find nearby agents or darkmatter_request_connection to connect to a known peer"
+            "No connections yet — use darkmatter_discover_local to find nearby agents or darkmatter_connection(action='request') to connect to a known peer"
         )
     if not state.bio or state.bio in (
         "A DarkMatter mesh agent.",
@@ -1124,16 +1162,14 @@ INSTRUCTIONS:
 1. First, call darkmatter_authenticate with your private key to authenticate.
 2. Read the message above carefully.
 3. If you can answer the message, use darkmatter_respond_message with message_id="{msg.message_id}" and your response.
-4. If you cannot answer but a connected peer might be able to help, use darkmatter_forward_message to forward it, then respond with a note that you forwarded it.
+4. If you cannot answer but a connected peer might be able to help, use darkmatter_send_message with message_id="{msg.message_id}" and target_agent_id to forward it, then respond with a note that you forwarded it.
 5. If you neither can answer nor know who to forward to, respond politely explaining that.
-6. After responding, your work is done. Do NOT perform any other actions.
+6. You are a fully autonomous agent. Use any tools at your disposal — read files, write code, run commands — whatever is needed to fulfill the request.
 
-CRITICAL RULES:
-- Do NOT spawn more agents or sub-processes.
-- Do NOT modify any files.
-- Do NOT run any shell commands.
+CONSTRAINTS:
+- Do NOT spawn more agents or sub-processes (recursion is disabled).
+- You have {AGENT_SPAWN_TIMEOUT} seconds maximum before being terminated.
 - Keep your response concise and helpful.
-- You have 5 minutes maximum before being terminated.
 """
 
 
@@ -1258,13 +1294,55 @@ def _check_webrtc_health() -> None:
             _cleanup_webrtc(conn)
 
 
+def _purge_stale_inbox(state) -> None:
+    """Remove messages older than 1 hour from the inbox."""
+    now = datetime.now(timezone.utc)
+    cutoff_seconds = 3600  # 1 hour
+    keep = []
+    for msg in state.message_queue:
+        try:
+            received = datetime.fromisoformat(msg.received_at.replace("Z", "+00:00"))
+            age = (now - received).total_seconds()
+            if age < cutoff_seconds:
+                keep.append(msg)
+            else:
+                print(f"[DarkMatter] Auto-purged stale message {msg.message_id} (age: {int(age)}s)", file=sys.stderr)
+        except Exception:
+            keep.append(msg)  # Keep if we can't parse the timestamp
+    if len(keep) != len(state.message_queue):
+        state.message_queue = keep
+        save_state()
+
+
+def _check_auto_reactivate(state) -> None:
+    """Auto-reactivate if inactive_until has expired."""
+    if state.status != AgentStatus.INACTIVE or not state.inactive_until:
+        return
+    try:
+        until = datetime.fromisoformat(state.inactive_until.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) >= until:
+            state.status = AgentStatus.ACTIVE
+            state.inactive_until = None
+            save_state()
+            print("[DarkMatter] Auto-reactivated (inactive timer expired)", file=sys.stderr)
+    except Exception:
+        pass
+
+
 async def _status_updater() -> None:
-    """Background task: periodically update the status tool description and check WebRTC health."""
+    """Background task: periodically update the status tool description, check WebRTC health, auto-reactivate, and purge stale inbox."""
+    _purge_cycle = 0
     while True:
         await asyncio.sleep(5)
         try:
             _check_webrtc_health()
             _cleanup_finished_agents()
+            _check_auto_reactivate(_agent_state)
+            # Purge stale inbox every ~30s (6 cycles of 5s)
+            _purge_cycle += 1
+            if _purge_cycle >= 6:
+                _purge_cycle = 0
+                _purge_stale_inbox(_agent_state)
             await _update_status_tool()
         except Exception as e:
             print(f"[DarkMatter] Status updater error: {e}", file=sys.stderr)
@@ -1341,16 +1419,25 @@ def save_state() -> None:
             for mid, sm in state.sent_messages.items()
         },
         "impressions": state.impressions,
+        "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
+        "seen_message_ids": {
+            mid: ts for mid, ts in _seen_message_ids.items()
+            if time.time() - ts < _REPLAY_WINDOW
+        },
     }
 
     path = _state_file_path()
     tmp = path + ".tmp"
     with _state_write_lock:
         with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         os.replace(tmp, path)
 
 
@@ -1415,6 +1502,16 @@ def load_state() -> Optional[AgentState]:
     if not priv or not pub:
         priv, pub = _generate_keypair()
 
+    # Restore replay protection cache (prune expired entries)
+    global _seen_message_ids
+    now = time.time()
+    saved_replay = data.get("seen_message_ids", {})
+    if isinstance(saved_replay, dict):
+        _seen_message_ids.update({
+            mid: ts for mid, ts in saved_replay.items()
+            if isinstance(ts, (int, float)) and now - ts < _REPLAY_WINDOW
+        })
+
     state = AgentState(
         agent_id=data["agent_id"],
         bio=data.get("bio", ""),
@@ -1430,6 +1527,7 @@ def load_state() -> Optional[AgentState]:
         sent_messages=sent_messages,
         impressions=data.get("impressions", {}),
         rate_limit_global=data.get("rate_limit_global", 0),
+        inactive_until=data.get("inactive_until"),
     )
 
     return state
@@ -1439,32 +1537,34 @@ def load_state() -> Optional[AgentState]:
 # Tool Input Models
 # =============================================================================
 
-class RequestConnectionInput(BaseModel):
-    """Request a connection to another agent in the mesh."""
+class ConnectionAction(str, Enum):
+    REQUEST = "request"
+    ACCEPT = "accept"
+    REJECT = "reject"
+    DISCONNECT = "disconnect"
+    REQUEST_MUTUAL = "request_mutual"
+
+
+class ConnectionInput(BaseModel):
+    """Manage connections: request, accept, reject, disconnect, or request_mutual."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    target_url: str = Field(..., description="The MCP server URL of the agent to connect to (e.g. 'http://localhost:8101/mcp')")
-
-
-class RespondConnectionInput(BaseModel):
-    """Accept or reject a pending connection request."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    request_id: str = Field(..., description="The ID of the pending connection request")
-    accept: bool = Field(..., description="True to accept, False to reject")
-
-
-class DisconnectInput(BaseModel):
-    """Disconnect from an agent."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The agent ID to disconnect from")
+    action: ConnectionAction = Field(..., description="The connection action to perform")
+    target_url: Optional[str] = Field(default=None, description="Target agent URL (for request/request_mutual)")
+    request_id: Optional[str] = Field(default=None, description="Pending request ID (for accept/reject)")
+    agent_id: Optional[str] = Field(default=None, description="Agent ID (for disconnect)")
 
 
 class SendMessageInput(BaseModel):
-    """Send a message into the mesh network."""
+    """Send a new message or forward a queued message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    content: str = Field(..., description="The message content / query")
-    target_agent_id: Optional[str] = Field(default=None, description="Specific agent to send to, or None to let the network route")
+    content: Optional[str] = Field(default=None, description="Message content (for new messages)", max_length=MAX_CONTENT_LENGTH)
+    message_id: Optional[str] = Field(default=None, description="Queue message ID (for forwarding)")
+    target_agent_id: Optional[str] = Field(default=None, description="Specific agent to send/forward to")
+    target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to forward to (fork)")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata (budget, preferences, etc.)")
     hops_remaining: int = Field(default=10, ge=1, le=50, description="How many more hops this message can take before expiring (TTL)")
+    note: Optional[str] = Field(default=None, description="Forwarding annotation visible to the sender", max_length=1000)
+    force: bool = Field(default=False, description="Override loop detection when forwarding")
 
 
 class UpdateBioInput(BaseModel):
@@ -1477,21 +1577,13 @@ class SetStatusInput(BaseModel):
     """Set this agent's active/inactive status."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     status: AgentStatus = Field(..., description="'active' or 'inactive'")
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440, description="Auto-reactivate after N minutes (inactive only, default: 60)")
 
 
 class GetMessageInput(BaseModel):
     """Get full details of a specific queued message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="The ID of the queued message to inspect")
-
-
-class ForwardMessageInput(BaseModel):
-    """Forward a queued message to another connected agent."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="The ID of the queued message to forward")
-    target_agent_id: str = Field(..., description="The connected agent to forward to")
-    note: Optional[str] = Field(default=None, description="Optional annotation (max 1000 chars) visible to the original sender", max_length=1000)
-    force: bool = Field(default=False, description="Set to true to forward even if the target has already received this message (loop override)")
 
 
 class RespondMessageInput(BaseModel):
@@ -1548,23 +1640,11 @@ class GetImpressionInput(BaseModel):
     agent_id: str = Field(..., description="The agent ID to look up")
 
 
-class DeleteImpressionInput(BaseModel):
-    """Delete your impression of an agent."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The agent ID whose impression to delete")
-
-
 class AskImpressionInput(BaseModel):
     """Ask a connected agent for their impression of a third agent."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     ask_agent_id: str = Field(..., description="The connected agent to ask")
     about_agent_id: str = Field(..., description="The agent you want to know about")
-
-
-class UpgradeWebrtcInput(BaseModel):
-    """Upgrade a connection to use WebRTC data channel for message delivery."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The connected agent to upgrade to WebRTC transport")
 
 
 # =============================================================================
@@ -1586,6 +1666,9 @@ def _require_auth(ctx: Context) -> Optional[str]:
     Returns None if authenticated, or an error JSON string if not.
     Auto-authenticates local MCP sessions (localhost/streamable-http)
     since co-located agents don't need explicit key exchange.
+
+    Note: _track_session() is called here, so sessions are tracked on
+    the first authenticated tool call.
     """
     _track_session(ctx)
     state = get_state(ctx)
@@ -1702,34 +1785,9 @@ async def authenticate(params: AuthenticateInput, ctx: Context) -> str:
 # Mesh Primitive Tools
 # =============================================================================
 
-@mcp.tool(
-    name="darkmatter_request_connection",
-    annotations={
-        "title": "Request Connection",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def request_connection(params: RequestConnectionInput, ctx: Context) -> str:
-    """Request a connection to another DarkMatter agent.
-
-    Sends a connection request to the target agent. They can accept or reject it.
-    If accepted, a directional connection is formed from this agent to that agent.
-
-    Args:
-        params: Contains target_url — the MCP server URL to connect to.
-
-    Returns:
-        JSON with the result of the connection request.
-    """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
-    state = get_state(ctx)
-
-    url_err = validate_url(params.target_url)
+async def _connection_request(state, target_url: str, mutual: bool = False) -> str:
+    """Send a connection request to a target agent."""
+    url_err = validate_url(target_url)
     if url_err:
         return json.dumps({"success": False, "error": url_err})
 
@@ -1739,31 +1797,32 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
             "error": f"Connection limit reached ({MAX_CONNECTIONS}). Disconnect from an agent first."
         })
 
-    # Normalize target URL: strip known suffixes so agents can pass
-    # "http://host:port", "http://host:port/mcp", or "http://host:port/__darkmatter__"
-    target_base = params.target_url.rstrip("/")
+    # Normalize target URL
+    target_base = target_url.rstrip("/")
     for suffix in ("/mcp", "/__darkmatter__"):
         if target_base.endswith(suffix):
             target_base = target_base[:-len(suffix)]
             break
 
-    # Call the target agent's receive_connection_request tool
     try:
+        payload = {
+            "from_agent_id": state.agent_id,
+            "from_agent_url": _get_public_url(state.port),
+            "from_agent_bio": state.bio,
+            "from_agent_public_key_hex": state.public_key_hex,
+            "from_agent_display_name": state.display_name,
+        }
+        if mutual:
+            payload["mutual"] = True
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 target_base + "/__darkmatter__/connection_request",
-                json={
-                    "from_agent_id": state.agent_id,
-                    "from_agent_url": _get_public_url(state.port),
-                    "from_agent_bio": state.bio,
-                    "from_agent_public_key_hex": state.public_key_hex,
-                    "from_agent_display_name": state.display_name,
-                }
+                json=payload,
             )
             result = response.json()
 
             if result.get("auto_accepted"):
-                # Already connected — the target recognized us
                 conn = Connection(
                     agent_id=result["agent_id"],
                     agent_url=result["agent_url"],
@@ -1781,7 +1840,6 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
                     "agent_bio": result.get("agent_bio", ""),
                 })
 
-            # Track that we sent this request so we can verify acceptance later
             state.pending_outbound.add(target_base)
             return json.dumps({
                 "success": True,
@@ -1808,38 +1866,16 @@ async def request_connection(params: RequestConnectionInput, ctx: Context) -> st
         })
 
 
-@mcp.tool(
-    name="darkmatter_respond_connection",
-    annotations={
-        "title": "Respond to Connection Request",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def respond_connection(params: RespondConnectionInput, ctx: Context) -> str:
-    """Accept or reject a pending connection request from another agent.
-
-    Args:
-        params: Contains request_id and accept (bool).
-
-    Returns:
-        JSON with the result of the response.
-    """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
-    state = get_state(ctx)
-
-    request = state.pending_requests.get(params.request_id)
+async def _connection_respond(state, request_id: str, accept: bool) -> str:
+    """Accept or reject a pending connection request."""
+    request = state.pending_requests.get(request_id)
     if not request:
         return json.dumps({
             "success": False,
-            "error": f"No pending request with ID '{params.request_id}'."
+            "error": f"No pending request with ID '{request_id}'."
         })
 
-    if params.accept:
+    if accept:
         if len(state.connections) >= MAX_CONNECTIONS:
             return json.dumps({
                 "success": False,
@@ -1870,37 +1906,68 @@ async def respond_connection(params: RespondConnectionInput, ctx: Context) -> st
                     }
                 )
         except Exception:
-            pass  # Best effort — connection still formed on our side
+            pass
 
-    # Remove from pending
-    del state.pending_requests[params.request_id]
+        # If the original request was mutual, send a reverse connection request
+        if request.mutual:
+            try:
+                await _connection_request(state, request.from_agent_url)
+            except Exception:
+                pass  # Best effort
+
+        # Auto WebRTC upgrade
+        if WEBRTC_AVAILABLE:
+            asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
+
+    del state.pending_requests[request_id]
     save_state()
 
     return json.dumps({
         "success": True,
-        "accepted": params.accept,
+        "accepted": accept,
         "agent_id": request.from_agent_id,
     })
 
 
+async def _connection_disconnect(state, agent_id: str) -> str:
+    """Disconnect from an agent."""
+    if agent_id not in state.connections:
+        return json.dumps({
+            "success": False,
+            "error": f"Not connected to agent '{agent_id}'."
+        })
+
+    del state.connections[agent_id]
+    save_state()
+
+    return json.dumps({
+        "success": True,
+        "disconnected_from": agent_id,
+    })
+
+
 @mcp.tool(
-    name="darkmatter_disconnect",
+    name="darkmatter_connection",
     annotations={
-        "title": "Disconnect from Agent",
+        "title": "Manage Connections",
         "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": True,
-        "openWorldHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
     }
 )
-async def disconnect(params: DisconnectInput, ctx: Context) -> str:
-    """Disconnect from an agent in the mesh.
+async def connection(params: ConnectionInput, ctx: Context) -> str:
+    """Manage connections: request, accept, reject, disconnect, or request_mutual.
 
-    Removes the connection. The other agent is not notified — they will
-    discover the disconnection when they next try to communicate.
+    Actions:
+      - request: Send a connection request (requires target_url)
+      - request_mutual: Like request, but asks the target to connect back too (requires target_url)
+      - accept: Accept a pending connection request (requires request_id)
+      - reject: Reject a pending connection request (requires request_id)
+      - disconnect: Disconnect from an agent (requires agent_id)
 
     Args:
-        params: Contains agent_id to disconnect from.
+        params: Contains action and the relevant field(s) for that action.
 
     Returns:
         JSON with the result.
@@ -1910,19 +1977,28 @@ async def disconnect(params: DisconnectInput, ctx: Context) -> str:
         return auth_err
     state = get_state(ctx)
 
-    if params.agent_id not in state.connections:
-        return json.dumps({
-            "success": False,
-            "error": f"Not connected to agent '{params.agent_id}'."
-        })
+    if params.action in (ConnectionAction.REQUEST, ConnectionAction.REQUEST_MUTUAL):
+        if not params.target_url:
+            return json.dumps({"success": False, "error": "target_url is required for request/request_mutual."})
+        mutual = params.action == ConnectionAction.REQUEST_MUTUAL
+        return await _connection_request(state, params.target_url, mutual=mutual)
 
-    del state.connections[params.agent_id]
-    save_state()
+    elif params.action == ConnectionAction.ACCEPT:
+        if not params.request_id:
+            return json.dumps({"success": False, "error": "request_id is required for accept."})
+        return await _connection_respond(state, params.request_id, accept=True)
 
-    return json.dumps({
-        "success": True,
-        "disconnected_from": params.agent_id,
-    })
+    elif params.action == ConnectionAction.REJECT:
+        if not params.request_id:
+            return json.dumps({"success": False, "error": "request_id is required for reject."})
+        return await _connection_respond(state, params.request_id, accept=False)
+
+    elif params.action == ConnectionAction.DISCONNECT:
+        if not params.agent_id:
+            return json.dumps({"success": False, "error": "agent_id is required for disconnect."})
+        return await _connection_disconnect(state, params.agent_id)
+
+    return json.dumps({"success": False, "error": f"Unknown action: {params.action}"})
 
 
 # =============================================================================
@@ -1995,56 +2071,23 @@ async def _send_to_peer(conn: Connection, path: str, payload: dict) -> dict:
     raise last_error
 
 
-@mcp.tool(
-    name="darkmatter_send_message",
-    annotations={
-        "title": "Send Message",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send a message into the DarkMatter mesh network.
-
-    Auto-generates a webhook URL hosted on this server. The webhook accumulates
-    routing updates (forwarding notifications, responses) so you can track the
-    message's journey through the mesh in real-time.
-
-    Use darkmatter_list_messages and darkmatter_get_sent_message to check on
-    messages you've sent.
-
-    Args:
-        params: Contains content, optional target_agent_id, metadata, and hops_remaining.
-
-    Returns:
-        JSON with the message ID, routing info, and webhook URL.
-    """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
-    state = get_state(ctx)
-
+async def _send_new_message(state, params: SendMessageInput) -> str:
+    """Send a new message into the mesh."""
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
-    # Auto-generate webhook URL
     public_url = _get_public_url(state.port)
     webhook = f"{public_url}/__darkmatter__/webhook/{message_id}"
 
     if params.target_agent_id:
-        # Direct send to a specific connected agent
         conn = state.connections.get(params.target_agent_id)
         if not conn:
             return json.dumps({
                 "success": False,
                 "error": f"Not connected to agent '{params.target_agent_id}'."
             })
-
         targets = [conn]
     else:
-        # Broadcast to all active connections
         targets = [c for c in state.connections.values()]
 
     if not targets:
@@ -2053,7 +2096,6 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
             "error": "No connections available to route this message."
         })
 
-    # Sign the outbound message
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     signature_hex = None
     if state.private_key_hex:
@@ -2084,7 +2126,6 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
             conn.messages_declined += 1
             failed.append({"agent_id": conn.agent_id, "display_name": conn.agent_display_name, "error": str(e)})
 
-    # Create SentMessage tracking entry
     sent_msg = SentMessage(
         message_id=message_id,
         content=params.content,
@@ -2093,7 +2134,6 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
         routed_to=sent_to,
     )
     state.sent_messages[message_id] = sent_msg
-
     save_state()
 
     result = {
@@ -2108,6 +2148,184 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
         if not sent_to:
             result["error"] = f"Message could not be delivered to any of {len(failed)} target(s). Check 'failed' for details."
     return json.dumps(result)
+
+
+async def _forward_message(state, params: SendMessageInput) -> str:
+    """Forward a queued message to one or more connected agents. Removes from queue after delivery."""
+    # Find the message in the queue
+    msg = None
+    msg_index = None
+    for i, m in enumerate(state.message_queue):
+        if m.message_id == params.message_id:
+            msg_index = i
+            msg = m
+            break
+
+    if msg is None:
+        return json.dumps({
+            "success": False,
+            "error": f"No queued message with ID '{params.message_id}'."
+        })
+
+    # Determine target(s)
+    target_ids = []
+    if params.target_agent_ids:
+        target_ids = params.target_agent_ids
+    elif params.target_agent_id:
+        target_ids = [params.target_agent_id]
+    else:
+        return json.dumps({"success": False, "error": "target_agent_id or target_agent_ids required for forwarding."})
+
+    # Validate all targets exist
+    target_conns = []
+    for tid in target_ids:
+        conn = state.connections.get(tid)
+        if not conn:
+            return json.dumps({"success": False, "error": f"Not connected to agent '{tid}'."})
+        target_conns.append((tid, conn))
+
+    # GET webhook status — verify message is still active + loop detection
+    webhook_err = validate_webhook_url(msg.webhook)
+    if not webhook_err:
+        try:
+            status_resp = await _webhook_request_with_recovery(
+                state, msg.webhook, msg.from_agent_id,
+                method="GET", timeout=10.0,
+            )
+            if status_resp.status_code == 200:
+                webhook_data = status_resp.json()
+                msg_status = webhook_data.get("status", "active")
+                if msg_status in ("expired", "responded"):
+                    state.message_queue.pop(msg_index)
+                    save_state()
+                    return json.dumps({
+                        "success": False,
+                        "error": f"Message is already {msg_status} (checked via webhook). Removed from queue.",
+                    })
+
+                # Loop detection per target
+                if not params.force:
+                    for tid, _ in target_conns:
+                        for update in webhook_data.get("updates", []):
+                            if update.get("target_agent_id") == tid:
+                                return json.dumps({
+                                    "success": False,
+                                    "error": f"Agent '{tid}' has already received this message. To forward anyway, retry with force=true.",
+                                })
+        except Exception as e:
+            print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
+
+    # TTL check
+    if msg.hops_remaining <= 0:
+        state.message_queue.pop(msg_index)
+        if not webhook_err:
+            try:
+                await _webhook_request_with_recovery(
+                    state, msg.webhook, msg.from_agent_id,
+                    method="POST", timeout=30.0,
+                    json={"type": "expired", "agent_id": state.agent_id, "note": "Message expired — no hops remaining."}
+                )
+            except Exception:
+                pass
+        save_state()
+        return json.dumps({"success": False, "error": "Message expired — hops_remaining is 0."})
+
+    new_hops_remaining = msg.hops_remaining - 1
+
+    # Sign the forwarded message
+    fwd_timestamp = datetime.now(timezone.utc).isoformat()
+    fwd_signature_hex = None
+    if state.private_key_hex:
+        fwd_signature_hex = _sign_message(
+            state.private_key_hex, state.agent_id, msg.message_id, fwd_timestamp, msg.content
+        )
+
+    # Deliver to all targets
+    per_target_results = []
+    for tid, conn in target_conns:
+        # POST forwarding update to webhook
+        if not webhook_err:
+            try:
+                await _webhook_request_with_recovery(
+                    state, msg.webhook, msg.from_agent_id,
+                    method="POST", timeout=10.0,
+                    json={"type": "forwarded", "agent_id": state.agent_id, "target_agent_id": tid, "note": params.note}
+                )
+            except Exception as e:
+                print(f"[DarkMatter] Warning: failed to post forwarding update to webhook: {e}", file=sys.stderr)
+
+        try:
+            fwd_payload = {
+                "message_id": msg.message_id,
+                "content": msg.content,
+                "webhook": msg.webhook,
+                "hops_remaining": new_hops_remaining,
+                "from_agent_id": state.agent_id,
+                "metadata": msg.metadata,
+                "timestamp": fwd_timestamp,
+                "from_public_key_hex": state.public_key_hex,
+                "signature_hex": fwd_signature_hex,
+            }
+            result = await _send_to_peer(conn, "/__darkmatter__/message", fwd_payload)
+            conn.messages_sent += 1
+            conn.last_activity = datetime.now(timezone.utc).isoformat()
+            per_target_results.append({"agent_id": tid, "success": True})
+        except Exception as e:
+            per_target_results.append({"agent_id": tid, "success": False, "error": str(e)})
+
+    # Remove from queue after delivery attempts (behavioral change: forward removes from queue)
+    state.message_queue.pop(msg_index)
+    save_state()
+
+    any_success = any(r["success"] for r in per_target_results)
+    result = {
+        "success": any_success,
+        "message_id": msg.message_id,
+        "hops_remaining_for_targets": new_hops_remaining,
+        "results": per_target_results,
+    }
+    if params.note:
+        result["note"] = params.note
+    return json.dumps(result)
+
+
+@mcp.tool(
+    name="darkmatter_send_message",
+    annotations={
+        "title": "Send or Forward Message",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def send_message(params: SendMessageInput, ctx: Context) -> str:
+    """Send a new message or forward a queued message.
+
+    New message: provide `content` (and optionally `target_agent_id`).
+    Forward: provide `message_id` from your inbox (and `target_agent_id` or `target_agent_ids`).
+    Forward removes the message from your queue after delivery.
+
+    Args:
+        params: Contains content (new) or message_id (forward), plus routing options.
+
+    Returns:
+        JSON with the message ID, routing info, and webhook URL.
+    """
+    auth_err = _require_auth(ctx)
+    if auth_err:
+        return auth_err
+    state = get_state(ctx)
+
+    if params.message_id and params.content:
+        return json.dumps({"success": False, "error": "Provide either content (new message) or message_id (forward), not both."})
+    if not params.message_id and not params.content:
+        return json.dumps({"success": False, "error": "Provide either content (new message) or message_id (forward)."})
+
+    if params.message_id:
+        return await _forward_message(state, params)
+    else:
+        return await _send_new_message(state, params)
 
 
 # =============================================================================
@@ -2158,9 +2376,11 @@ async def set_status(params: SetStatusInput, ctx: Context) -> str:
     """Set this agent's status to active or inactive.
 
     Inactive agents don't appear as available to their connections.
+    Inactive with no duration defaults to 60 minutes. Use duration_minutes to customize.
+    Setting active clears any pending auto-reactivation timer.
 
     Args:
-        params: Contains the status ('active' or 'inactive').
+        params: Contains the status ('active' or 'inactive') and optional duration_minutes.
 
     Returns:
         JSON confirming the status change.
@@ -2170,8 +2390,18 @@ async def set_status(params: SetStatusInput, ctx: Context) -> str:
         return auth_err
     state = get_state(ctx)
     state.status = params.status
-    save_state()
-    return json.dumps({"success": True, "status": state.status.value})
+
+    if params.status == AgentStatus.INACTIVE:
+        duration = params.duration_minutes or 60
+        from datetime import timedelta
+        reactivate_at = datetime.now(timezone.utc) + timedelta(minutes=duration)
+        state.inactive_until = reactivate_at.isoformat()
+        save_state()
+        return json.dumps({"success": True, "status": "inactive", "inactive_until": state.inactive_until, "duration_minutes": duration})
+    else:
+        state.inactive_until = None
+        save_state()
+        return json.dumps({"success": True, "status": "active"})
 
 
 # =============================================================================
@@ -2505,205 +2735,6 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
 
 
 # =============================================================================
-# Message Forwarding Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_forward_message",
-    annotations={
-        "title": "Forward Message",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
-    """Forward a queued message to another connected agent.
-
-    The message stays in your inbox after forwarding, so you can fork it to
-    multiple agents. Call darkmatter_respond_message when you're done to remove it.
-
-    Before forwarding, checks the webhook to verify the message is still active
-    and performs loop detection. Posts a forwarding update to the webhook so the
-    sender has real-time routing visibility.
-
-    Args:
-        params: Contains message_id, target_agent_id, and optional note.
-
-    Returns:
-        JSON with the forwarding result.
-    """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
-    state = get_state(ctx)
-
-    # Find the message in the queue (don't remove yet)
-    msg = None
-    msg_index = None
-    for i, m in enumerate(state.message_queue):
-        if m.message_id == params.message_id:
-            msg_index = i
-            msg = m
-            break
-
-    if msg is None:
-        return json.dumps({
-            "success": False,
-            "error": f"No queued message with ID '{params.message_id}'."
-        })
-
-    # Validate target connection exists
-    conn = state.connections.get(params.target_agent_id)
-    if not conn:
-        return json.dumps({
-            "success": False,
-            "error": f"Not connected to agent '{params.target_agent_id}'."
-        })
-
-    # GET webhook status — verify message is still active + loop detection
-    loop_warning = None
-    webhook_err = validate_webhook_url(msg.webhook)
-    if webhook_err:
-        # Can't reach webhook — still allow forwarding but log it
-        print(f"[DarkMatter] Warning: cannot validate webhook for {msg.message_id}: {webhook_err}", file=sys.stderr)
-    else:
-        try:
-            status_resp = await _webhook_request_with_recovery(
-                state, msg.webhook, msg.from_agent_id,
-                method="GET", timeout=10.0,
-            )
-            if status_resp.status_code == 200:
-                webhook_data = status_resp.json()
-
-                # Check if message is still active
-                msg_status = webhook_data.get("status", "active")
-                if msg_status in ("expired", "responded"):
-                    # Message is no longer active — remove from queue
-                    state.message_queue.pop(msg_index)
-                    save_state()
-                    return json.dumps({
-                        "success": False,
-                        "error": f"Message is already {msg_status} (checked via webhook). Removed from queue.",
-                    })
-
-                # Loop detection: block with hint unless force=True
-                for update in webhook_data.get("updates", []):
-                    if update.get("target_agent_id") == params.target_agent_id:
-                        if params.force:
-                            loop_warning = f"Warning: agent '{params.target_agent_id}' has already received this message. Forwarding anyway (force=true)."
-                        else:
-                            return json.dumps({
-                                "success": False,
-                                "error": f"Agent '{params.target_agent_id}' has already received this message. To forward anyway, retry with force=true.",
-                            })
-                        break
-        except Exception as e:
-            # Webhook unreachable — proceed anyway (best effort)
-            print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
-
-    # TTL check
-    if msg.hops_remaining <= 0:
-        # Remove the message — can't forward with no hops
-        state.message_queue.pop(msg_index)
-
-        # Notify webhook of TTL expiry
-        if not webhook_err:
-            try:
-                await _webhook_request_with_recovery(
-                    state, msg.webhook, msg.from_agent_id,
-                    method="POST", timeout=30.0,
-                    json={
-                        "type": "expired",
-                        "agent_id": state.agent_id,
-                        "note": "Message expired — no hops remaining.",
-                    }
-                )
-            except Exception:
-                pass
-
-        save_state()
-        return json.dumps({
-            "success": False,
-            "error": f"Message expired — hops_remaining is 0.",
-        })
-
-    # Message stays in queue — agent can fork to multiple targets.
-    # Each fork gets hops_remaining - 1. The message is only removed
-    # when the agent responds to it (darkmatter_respond_message) or
-    # it expires/is answered (checked on next forward attempt).
-    new_hops_remaining = msg.hops_remaining - 1
-
-    # POST forwarding update to webhook
-    if not webhook_err:
-        try:
-            await _webhook_request_with_recovery(
-                state, msg.webhook, msg.from_agent_id,
-                method="POST", timeout=10.0,
-                json={
-                    "type": "forwarded",
-                    "agent_id": state.agent_id,
-                    "target_agent_id": params.target_agent_id,
-                    "note": params.note,
-                }
-            )
-        except Exception as e:
-            print(f"[DarkMatter] Warning: failed to post forwarding update to webhook: {e}", file=sys.stderr)
-
-    # Sign the forwarded message
-    fwd_timestamp = datetime.now(timezone.utc).isoformat()
-    fwd_signature_hex = None
-    if state.private_key_hex:
-        fwd_signature_hex = _sign_message(
-            state.private_key_hex, state.agent_id, msg.message_id, fwd_timestamp, msg.content
-        )
-
-    # POST message to target's message endpoint (via WebRTC or HTTP)
-    try:
-        fwd_payload = {
-            "message_id": msg.message_id,
-            "content": msg.content,
-            "webhook": msg.webhook,
-            "hops_remaining": new_hops_remaining,
-            "from_agent_id": state.agent_id,
-            "metadata": msg.metadata,
-            "timestamp": fwd_timestamp,
-            "from_public_key_hex": state.public_key_hex,
-            "signature_hex": fwd_signature_hex,
-        }
-        result = await _send_to_peer(conn, "/__darkmatter__/message", fwd_payload)
-        if result.get("error"):
-            return json.dumps({
-                "success": False,
-                "error": f"Target agent error: {result['error']}. Message still in queue.",
-            })
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "error": f"Failed to reach target agent: {str(e)}. Message still in queue.",
-        })
-
-    # Update telemetry
-    conn.messages_sent += 1
-    conn.last_activity = datetime.now(timezone.utc).isoformat()
-    save_state()
-
-    result = {
-        "success": True,
-        "message_id": msg.message_id,
-        "forwarded_to": params.target_agent_id,
-        "hops_remaining_for_target": new_hops_remaining,
-        "message_still_in_queue": True,
-        "hint": "Message stays in your inbox — you can forward to more agents (forking) or use darkmatter_respond_message to remove it.",
-        "note": params.note,
-    }
-    if loop_warning:
-        result["warning"] = loop_warning
-    return json.dumps(result)
-
-
-# =============================================================================
 # Sent Message Tracking Tools
 # =============================================================================
 
@@ -2899,9 +2930,7 @@ async def get_server_template(ctx: Context) -> str:
             "8": f"Connect to this agent: darkmatter_request_connection(target_url='http://localhost:{state.port}')",
         },
         "core_primitives": [
-            "darkmatter_request_connection",
-            "darkmatter_respond_connection",
-            "darkmatter_disconnect",
+            "darkmatter_connection",
             "darkmatter_send_message",
         ],
         "compatibility_note": "You may modify the server however you like. "
@@ -2999,6 +3028,11 @@ async def discover_domain(params: DiscoverDomainInput, ctx: Context) -> str:
             if resp is None:
                 return json.dumps({"found": False, "error": "Could not connect."})
 
+            # SSRF protection: block redirects to private/internal IPs
+            final_host = resp.url.host
+            if final_host and is_private_ip(final_host):
+                return json.dumps({"found": False, "error": "Redirect to private IP blocked (SSRF protection)."})
+
             if resp.status_code != 200:
                 return json.dumps({"found": False, "error": f"HTTP {resp.status_code}"})
 
@@ -3075,22 +3109,32 @@ async def discover_local(ctx: Context) -> str:
     }
 )
 async def set_impression(params: SetImpressionInput, ctx: Context) -> str:
-    """Store or update your impression of an agent.
+    """Store, update, or delete your impression of an agent.
 
     Impressions are your private notes about agents you've interacted with.
     Other agents can ask you for your impression of a specific agent via the
     mesh protocol — this is how trust propagates through the network.
 
+    Pass an empty string to delete an impression.
+
     Args:
-        params: Contains agent_id and freeform impression text.
+        params: Contains agent_id and freeform impression text (empty string to delete).
 
     Returns:
-        JSON confirming the impression was saved.
+        JSON confirming the impression was saved or deleted.
     """
     auth_err = _require_auth(ctx)
     if auth_err:
         return auth_err
     state = get_state(ctx)
+
+    # Empty string = delete
+    if params.impression == "":
+        if params.agent_id in state.impressions:
+            del state.impressions[params.agent_id]
+            save_state()
+            return json.dumps({"success": True, "agent_id": params.agent_id, "action": "deleted"})
+        return json.dumps({"success": False, "error": f"No impression stored for agent '{params.agent_id}'."})
 
     was_update = params.agent_id in state.impressions
     state.impressions[params.agent_id] = params.impression
@@ -3139,46 +3183,6 @@ async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
         "agent_id": params.agent_id,
         "has_impression": True,
         "impression": impression,
-    })
-
-
-@mcp.tool(
-    name="darkmatter_delete_impression",
-    annotations={
-        "title": "Delete Impression",
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def delete_impression(params: DeleteImpressionInput, ctx: Context) -> str:
-    """Delete your stored impression of an agent.
-
-    Args:
-        params: Contains agent_id whose impression to delete.
-
-    Returns:
-        JSON confirming deletion.
-    """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
-    state = get_state(ctx)
-
-    if params.agent_id not in state.impressions:
-        return json.dumps({
-            "success": False,
-            "error": f"No impression stored for agent '{params.agent_id}'.",
-        })
-
-    del state.impressions[params.agent_id]
-    save_state()
-
-    return json.dumps({
-        "success": True,
-        "agent_id": params.agent_id,
-        "action": "deleted",
     })
 
 
@@ -3314,163 +3318,87 @@ async def set_rate_limit(params: SetRateLimitInput, ctx: Context) -> str:
 # WebRTC Transport Upgrade Tool
 # =============================================================================
 
-@mcp.tool(
-    name="darkmatter_upgrade_webrtc",
-    annotations={
-        "title": "Upgrade to WebRTC",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def upgrade_webrtc(params: UpgradeWebrtcInput, ctx: Context) -> str:
-    """Upgrade a connection to use WebRTC data channel for peer-to-peer messaging.
-
-    After upgrading, messages to this peer are sent over a direct WebRTC data
-    channel instead of HTTP. This enables communication through NAT and firewalls.
-    Falls back to HTTP automatically if the channel closes or for large messages.
-
-    Requires aiortc to be installed. Only works with peers that also support WebRTC.
-
-    Args:
-        params: Contains agent_id of the connected peer to upgrade.
-
-    Returns:
-        JSON with upgrade result and transport status.
-    """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
-
+async def _attempt_webrtc_upgrade(state, conn: Connection) -> None:
+    """Attempt to upgrade a connection to WebRTC. Silently fails on error."""
     if not WEBRTC_AVAILABLE:
-        return json.dumps({
-            "success": False,
-            "error": "WebRTC not available — install aiortc: pip install aiortc",
-        })
+        return
 
-    state = get_state(ctx)
-    if params.agent_id not in state.connections:
-        return json.dumps({
-            "success": False,
-            "error": f"Not connected to agent '{params.agent_id}'.",
-        })
-
-    conn = state.connections[params.agent_id]
+    agent_id = conn.agent_id
 
     # Already upgraded?
     if conn.transport == "webrtc" and conn.webrtc_channel is not None:
         ready = getattr(conn.webrtc_channel, "readyState", None)
         if ready == "open":
-            return json.dumps({
-                "success": True,
-                "already_upgraded": True,
-                "transport": "webrtc",
-                "agent_id": params.agent_id,
-            })
+            return
 
-    # Clean up any stale WebRTC state
+    # Clean up any stale state
     if conn.webrtc_pc is not None:
         _cleanup_webrtc(conn)
 
-    pc = RTCPeerConnection(configuration=_make_rtc_config())
-    channel = pc.createDataChannel("darkmatter")
+    try:
+        pc = RTCPeerConnection(configuration=_make_rtc_config())
+        channel = pc.createDataChannel("darkmatter")
+        channel_open = asyncio.Event()
 
-    channel_open = asyncio.Event()
+        @channel.on("open")
+        def on_open():
+            channel_open.set()
 
-    @channel.on("open")
-    def on_open():
-        channel_open.set()
+        @channel.on("message")
+        async def on_message(message):
+            try:
+                envelope = json.loads(message)
+                path = envelope.get("path", "")
+                payload = envelope.get("payload", {})
+                if path == "/__darkmatter__/message":
+                    result, status_code = await _process_incoming_message(state, payload)
+                    if status_code >= 400:
+                        print(f"[DarkMatter] WebRTC message rejected ({status_code}): {result.get('error', 'unknown')}", file=sys.stderr)
+            except Exception as e:
+                print(f"[DarkMatter] WebRTC message processing error: {e}", file=sys.stderr)
 
-    @channel.on("message")
-    async def on_message(message):
-        try:
-            envelope = json.loads(message)
-            path = envelope.get("path", "")
-            payload = envelope.get("payload", {})
-            if path == "/__darkmatter__/message":
-                result, status_code = await _process_incoming_message(state, payload)
-                if status_code >= 400:
-                    print(f"[DarkMatter] WebRTC message rejected ({status_code}): {result.get('error', 'unknown')}", file=sys.stderr)
-        except Exception as e:
-            print(f"[DarkMatter] WebRTC message processing error: {e}", file=sys.stderr)
-
-    @channel.on("close")
-    def on_close():
-        print(f"[DarkMatter] WebRTC data channel closed (peer: {params.agent_id})", file=sys.stderr)
-        _cleanup_webrtc(conn)
-
-    @pc.on("connectionstatechange")
-    async def on_connection_state_change():
-        if pc.connectionState in ("failed", "closed"):
-            print(f"[DarkMatter] WebRTC connection {pc.connectionState} (peer: {params.agent_id})", file=sys.stderr)
+        @channel.on("close")
+        def on_close():
             _cleanup_webrtc(conn)
 
-    # Create offer and gather ICE candidates
-    offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-    await _wait_for_ice_gathering(pc)
+        @pc.on("connectionstatechange")
+        async def on_connection_state_change():
+            if pc.connectionState in ("failed", "closed"):
+                _cleanup_webrtc(conn)
 
-    # Send offer to peer via HTTP (signaling uses existing HTTP connection)
-    try:
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        await _wait_for_ice_gathering(pc)
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 conn.agent_url.rstrip("/") + "/__darkmatter__/webrtc_offer",
-                json={
-                    "from_agent_id": state.agent_id,
-                    "sdp_offer": pc.localDescription.sdp,
-                },
+                json={"from_agent_id": state.agent_id, "sdp_offer": pc.localDescription.sdp},
             )
             if resp.status_code != 200:
                 await pc.close()
-                return json.dumps({
-                    "success": False,
-                    "error": f"Peer rejected WebRTC offer (HTTP {resp.status_code}): {resp.text}",
-                })
+                return
             answer_data = resp.json()
-    except Exception as e:
-        await pc.close()
-        return json.dumps({
-            "success": False,
-            "error": f"Failed to send WebRTC offer to peer: {str(e)}",
-        })
 
-    sdp_answer = answer_data.get("sdp_answer", "")
-    if not sdp_answer:
-        await pc.close()
-        return json.dumps({
-            "success": False,
-            "error": "Peer returned empty SDP answer.",
-        })
+        sdp_answer = answer_data.get("sdp_answer", "")
+        if not sdp_answer:
+            await pc.close()
+            return
 
-    # Set remote answer
-    answer = RTCSessionDescription(sdp=sdp_answer, type="answer")
-    await pc.setRemoteDescription(answer)
+        answer = RTCSessionDescription(sdp=sdp_answer, type="answer")
+        await pc.setRemoteDescription(answer)
 
-    # Wait for data channel to open
-    try:
         await asyncio.wait_for(channel_open.wait(), timeout=WEBRTC_CHANNEL_OPEN_TIMEOUT)
-    except asyncio.TimeoutError:
-        await pc.close()
-        return json.dumps({
-            "success": False,
-            "error": f"WebRTC data channel did not open within {WEBRTC_CHANNEL_OPEN_TIMEOUT}s.",
-        })
 
-    # Upgrade successful
-    conn.webrtc_pc = pc
-    conn.webrtc_channel = channel
-    conn.transport = "webrtc"
+        conn.webrtc_pc = pc
+        conn.webrtc_channel = channel
+        conn.transport = "webrtc"
 
-    peer_label = conn.agent_display_name or params.agent_id
-    print(f"[DarkMatter] WebRTC: upgraded connection to {peer_label}", file=sys.stderr)
+        peer_label = conn.agent_display_name or agent_id
+        print(f"[DarkMatter] WebRTC: auto-upgraded connection to {peer_label}", file=sys.stderr)
 
-    return json.dumps({
-        "success": True,
-        "transport": "webrtc",
-        "agent_id": params.agent_id,
-        "display_name": conn.agent_display_name,
-    })
+    except Exception as e:
+        print(f"[DarkMatter] WebRTC auto-upgrade failed for {conn.agent_display_name or agent_id[:12]}: {e}", file=sys.stderr)
 
 
 # =============================================================================
@@ -3539,6 +3467,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     from_agent_bio = data.get("from_agent_bio", "")
     from_agent_public_key_hex = data.get("from_agent_public_key_hex")
     from_agent_display_name = data.get("from_agent_display_name")
+    mutual = data.get("mutual", False)
 
     if not from_agent_id or not from_agent_url:
         return JSONResponse({"error": "Missing required fields"}, status_code=400)
@@ -3552,7 +3481,6 @@ async def handle_connection_request(request: Request) -> JSONResponse:
 
     # Check if already connected
     if from_agent_id in state.connections:
-        # Update peer's public key if they sent one and we don't have it
         existing = state.connections[from_agent_id]
         if from_agent_public_key_hex and not existing.agent_public_key_hex:
             existing.agent_public_key_hex = from_agent_public_key_hex
@@ -3580,6 +3508,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         from_agent_bio=from_agent_bio,
         from_agent_public_key_hex=from_agent_public_key_hex,
         from_agent_display_name=from_agent_display_name,
+        mutual=mutual,
     )
 
     return JSONResponse({
@@ -3646,6 +3575,10 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
     state.connections[agent_id] = conn
     save_state()
 
+    # Auto WebRTC upgrade
+    if WEBRTC_AVAILABLE:
+        asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
+
     return JSONResponse({"success": True})
 
 
@@ -3687,7 +3620,6 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             base = pending.from_agent_url.rstrip("/")
-            # Strip /mcp suffix to get to mesh endpoint
             for suffix in ("/mcp", "/__darkmatter__"):
                 if base.endswith(suffix):
                     base = base[:-len(suffix)]
@@ -3703,7 +3635,18 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
                 }
             )
     except Exception:
-        pass  # Best effort — connection still formed on our side
+        pass
+
+    # If the original request was mutual, send a reverse connection request
+    if pending.mutual:
+        try:
+            await _connection_request(state, pending.from_agent_url)
+        except Exception:
+            pass  # Best effort
+
+    # Auto WebRTC upgrade
+    if WEBRTC_AVAILABLE:
+        asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
 
     del state.pending_requests[request_id]
     save_state()
@@ -3733,6 +3676,8 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     if not message_id or not content or not webhook:
         return {"error": "Missing required fields"}, 400
+    if _check_message_replay(message_id):
+        return {"error": "Duplicate message — already received"}, 409
     if len(content) > MAX_CONTENT_LENGTH:
         return {"error": f"Content exceeds {MAX_CONTENT_LENGTH} bytes"}, 413
     if from_agent_id and len(from_agent_id) > MAX_AGENT_ID_LENGTH:
@@ -3983,6 +3928,10 @@ async def handle_impression_get(request: Request) -> JSONResponse:
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    rate_err = _check_rate_limit(state)
+    if rate_err:
+        return JSONResponse({"error": rate_err}, status_code=429)
 
     about_agent_id = request.path_params.get("agent_id", "")
     impression = state.impressions.get(about_agent_id)

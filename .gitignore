@@ -2,7 +2,10 @@
 .mcp.json
 darkmatter_state*.json
 __pycache__/
+*.pyc
 .venv/
+.DS_Store
+.env
 
 # Glance memory shards
 .glance/

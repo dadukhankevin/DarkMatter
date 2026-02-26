@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eu
 
 echo "=== DarkMatter Bootstrap ==="
 echo ""
@@ -20,7 +20,16 @@ if [ -z "$PYTHON_CMD" ]; then
     echo "ERROR: Python not found. Install Python 3.10+ first."
     exit 1
 fi
-echo "Using $PYTHON_CMD ($($PYTHON_CMD --version 2>&1))"
+
+# Verify Python version is 3.10+
+PY_VERSION=$("$PYTHON_CMD" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+PY_MAJOR=$("$PYTHON_CMD" -c "import sys; print(sys.version_info.major)" 2>/dev/null)
+PY_MINOR=$("$PYTHON_CMD" -c "import sys; print(sys.version_info.minor)" 2>/dev/null)
+if [ "$PY_MAJOR" -lt 3 ] 2>/dev/null || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; } 2>/dev/null; then
+    echo "ERROR: Python 3.10+ required, found $PY_VERSION. Please upgrade."
+    exit 1
+fi
+echo "Using $PYTHON_CMD ($PY_VERSION)"
 
 # Create directory
 mkdir -p "$DM_DIR"
@@ -28,6 +37,12 @@ mkdir -p "$DM_DIR"
 # Download server
 echo "Downloading server.py..."
 curl -fsSL "$GITHUB_RAW" -o "$DM_DIR/server.py"
+# Trust-the-source: we download from GitHub over HTTPS. Print checksum for manual verification.
+if command -v sha256sum >/dev/null 2>&1; then
+    echo "SHA256: $(sha256sum "$DM_DIR/server.py" | cut -d' ' -f1)"
+else
+    echo "SHA256: $(shasum -a 256 "$DM_DIR/server.py" | cut -d' ' -f1)"
+fi
 
 # Create venv and install dependencies
 if [ ! -d "$VENV_DIR" ]; then
@@ -41,8 +56,15 @@ echo "Installing dependencies..."
 # Find free port in 8100-8110
 PORT=8100
 while [ $PORT -le 8110 ]; do
-    if ! lsof -i :$PORT >/dev/null 2>&1; then
-        break
+    if command -v lsof >/dev/null 2>&1; then
+        if ! lsof -i :$PORT >/dev/null 2>&1; then
+            break
+        fi
+    else
+        # Fallback: use Python socket to check if port is in use
+        if ! "$PYTHON_CMD" -c "import socket; s=socket.socket(); s.settimeout(0.1); exit(0 if s.connect_ex(('127.0.0.1',$PORT)) else 1)" 2>/dev/null; then
+            break
+        fi
     fi
     PORT=$((PORT + 1))
 done
@@ -100,7 +122,7 @@ config['mcpServers']['darkmatter'] = entry
 print(json.dumps(config, indent=2))
 ")
     if [ $? -eq 0 ]; then
-        echo "$MERGED" > "$MCP_JSON"
+        printf '%s\n' "$MERGED" > "$MCP_JSON"
         echo "Updated existing $MCP_JSON"
     else
         echo "ERROR: Failed to merge into $MCP_JSON"

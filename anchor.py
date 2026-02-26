@@ -13,11 +13,14 @@ Storage is in-memory with optional JSON file backup. No database needed.
 Stale entries (>24h unseen) are pruned on writes.
 """
 
+import collections
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Blueprint, request, jsonify
 
@@ -28,6 +31,17 @@ STALE_THRESHOLD = 86400  # 24 hours in seconds
 
 # Max age for peer_update timestamps (prevents replay attacks)
 PEER_UPDATE_MAX_AGE = 300  # 5 minutes
+
+# Directory size cap — prevents memory exhaustion from mass registration
+MAX_DIRECTORY_SIZE = 10000
+
+# URL validation
+MAX_URL_LENGTH = 2048
+
+# Per-IP rate limiting for peer_update
+PEER_UPDATE_RATE_LIMIT = 10       # max updates per window per IP
+PEER_UPDATE_RATE_WINDOW = 60      # window in seconds
+_peer_update_timestamps: dict[str, collections.deque] = {}
 
 
 def _verify_peer_update_signature(public_key_hex: str, signature_hex: str,
@@ -52,6 +66,21 @@ def _is_timestamp_fresh(timestamp: str) -> bool:
         return age <= PEER_UPDATE_MAX_AGE
     except Exception:
         return False
+
+def _validate_url(url: str) -> str | None:
+    """Validate URL scheme and length. Returns error string or None."""
+    if len(url) > MAX_URL_LENGTH:
+        return f"URL exceeds maximum length ({MAX_URL_LENGTH} chars)"
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "Invalid URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"URL scheme must be http or https, got '{parsed.scheme}'"
+    if not parsed.hostname:
+        return "URL has no hostname"
+    return None
+
 
 # In-memory directory: {agent_id: {url, public_key_hex, last_seen}}
 _directory: dict[str, dict] = {}
@@ -81,8 +110,8 @@ def _save_backup() -> None:
         Path(_backup_path).parent.mkdir(parents=True, exist_ok=True)
         with open(_backup_path, "w") as f:
             json.dump(_directory, f)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DarkMatter Anchor] Failed to save backup: {e}", file=sys.stderr)
 
 
 def _load_backup() -> None:
@@ -112,6 +141,25 @@ def anchor_peer_update():
     First registration pins the public key. Subsequent updates must use
     the same key and provide a valid signature.
     """
+    # Per-IP rate limiting
+    client_ip = request.access_route[0] if request.access_route else (request.remote_addr or "unknown")
+    now = time.time()
+    cutoff = now - PEER_UPDATE_RATE_WINDOW
+    if client_ip not in _peer_update_timestamps:
+        _peer_update_timestamps[client_ip] = collections.deque()
+    ts = _peer_update_timestamps[client_ip]
+    while ts and ts[0] < cutoff:
+        ts.popleft()
+    if len(ts) >= PEER_UPDATE_RATE_LIMIT:
+        return jsonify({"error": "Rate limit exceeded"}), 429
+    ts.append(now)
+
+    # Evict stale IPs when dict grows too large
+    if len(_peer_update_timestamps) > 1000:
+        empty_ips = [ip for ip, dq in _peer_update_timestamps.items() if not dq]
+        for ip in empty_ips:
+            del _peer_update_timestamps[ip]
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "JSON body required"}), 400
@@ -124,6 +172,15 @@ def anchor_peer_update():
 
     if not agent_id or not new_url:
         return jsonify({"error": "Missing agent_id or new_url"}), 400
+
+    # Validate URL scheme and length
+    url_err = _validate_url(new_url)
+    if url_err:
+        return jsonify({"error": url_err}), 400
+
+    # Validate agent_id length
+    if len(agent_id) > 128:
+        return jsonify({"error": "agent_id too long"}), 400
 
     if not public_key_hex or not signature or not timestamp:
         return jsonify({"error": "Missing public_key_hex, signature, or timestamp"}), 400
@@ -142,6 +199,12 @@ def anchor_peer_update():
     if existing and existing.get("public_key_hex"):
         if public_key_hex != existing["public_key_hex"]:
             return jsonify({"error": "Public key mismatch"}), 403
+
+    # Check directory size cap (only for new entries)
+    if agent_id not in _directory and len(_directory) >= MAX_DIRECTORY_SIZE:
+        _prune_stale()
+        if len(_directory) >= MAX_DIRECTORY_SIZE:
+            return jsonify({"error": "Directory full"}), 429
 
     _directory[agent_id] = {
         "url": new_url,

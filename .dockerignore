@@ -1,0 +1,13 @@
+.git
+__pycache__
+.venv
+.DS_Store
+agent_test/
+promo/
+test_*.py
+darkmatter_state*.json
+.agents/
+.mcp.json
+.glance/
+.pytest_cache/
+*.pyc

@@ -1604,6 +1604,283 @@ async def test_peer_update_replay_rejected() -> None:
 
 
 # ==========================================================================
+# Tier 1: Agent auto-spawn guards
+# ==========================================================================
+
+async def test_replay_persistence() -> None:
+    """Test that seen message IDs survive save/load cycle."""
+    import server
+
+    sf = make_state_file()
+    try:
+        app, state = create_agent(sf, port=9900)
+        use_agent(state)
+
+        # Save original replay cache
+        orig_seen = server._seen_message_ids.copy()
+
+        # Inject a replay entry and save
+        server._seen_message_ids["msg-persist-test"] = time.time()
+        server.save_state()
+
+        # Verify it was saved to the state file
+        with open(sf) as f:
+            saved = json.load(f)
+        report("replay persist: seen_message_ids in state file",
+               "seen_message_ids" in saved)
+        report("replay persist: test entry in saved data",
+               "msg-persist-test" in saved.get("seen_message_ids", {}))
+
+        # Clear and reload
+        server._seen_message_ids.clear()
+        server._agent_state = None
+        loaded = server.load_state()
+        report("replay persist: entry restored after load",
+               "msg-persist-test" in server._seen_message_ids)
+
+        # Verify expired entries are pruned on load
+        server._seen_message_ids.clear()
+        server._seen_message_ids["msg-stale"] = time.time() - 600  # 10 min ago
+        server.save_state()
+        server._seen_message_ids.clear()
+        server._agent_state = None
+        loaded = server.load_state()
+        report("replay persist: stale entry pruned on load",
+               "msg-stale" not in server._seen_message_ids)
+
+        # Restore
+        server._seen_message_ids.clear()
+        server._seen_message_ids.update(orig_seen)
+
+    finally:
+        try:
+            os.unlink(sf)
+        except FileNotFoundError:
+            pass
+
+
+async def test_agent_spawn_guards() -> None:
+    """Test _can_spawn_agent guard logic: enabled/disabled, concurrency, rate limit."""
+    import server
+
+    sf = make_state_file()
+    try:
+        app, state = create_agent(sf, port=9900)
+
+        # Save originals so we can restore them
+        orig_enabled = server.AGENT_SPAWN_ENABLED
+        orig_max_concurrent = server.AGENT_SPAWN_MAX_CONCURRENT
+        orig_max_per_hour = server.AGENT_SPAWN_MAX_PER_HOUR
+        orig_agents = server._spawned_agents[:]
+        orig_timestamps = server._spawn_timestamps[:]
+
+        # --- Test: disabled ---
+        server.AGENT_SPAWN_ENABLED = False
+        server._spawned_agents.clear()
+        server._spawn_timestamps.clear()
+        ok, reason = server._can_spawn_agent()
+        report("spawn guard: disabled returns False", not ok)
+        report("spawn guard: disabled reason mentions disabled",
+               "disabled" in reason.lower(), f"reason: {reason}")
+
+        # --- Test: enabled, no limits hit ---
+        server.AGENT_SPAWN_ENABLED = True
+        server.AGENT_SPAWN_MAX_CONCURRENT = 5
+        server.AGENT_SPAWN_MAX_PER_HOUR = 100
+        server._spawned_agents.clear()
+        server._spawn_timestamps.clear()
+        ok, reason = server._can_spawn_agent()
+        report("spawn guard: enabled + no limits = allowed", ok)
+
+        # --- Test: concurrency limit ---
+        server.AGENT_SPAWN_MAX_CONCURRENT = 1
+        # Create a fake in-progress agent
+        fake_proc = type("FakeProc", (), {"returncode": None})()
+        fake_agent = server.SpawnedAgent(
+            process=fake_proc, message_id="msg-fake-1",
+            spawned_at=time.monotonic(), pid=99999,
+        )
+        server._spawned_agents.clear()
+        server._spawned_agents.append(fake_agent)
+        ok, reason = server._can_spawn_agent()
+        report("spawn guard: concurrency limit blocks spawn", not ok)
+        report("spawn guard: concurrency reason mentions limit",
+               "concurrency" in reason.lower(), f"reason: {reason}")
+
+        # --- Test: hourly rate limit ---
+        server.AGENT_SPAWN_MAX_CONCURRENT = 10
+        server._spawned_agents.clear()
+        server.AGENT_SPAWN_MAX_PER_HOUR = 2
+        server._spawn_timestamps.clear()
+        server._spawn_timestamps.extend([time.monotonic(), time.monotonic()])
+        ok, reason = server._can_spawn_agent()
+        report("spawn guard: hourly rate limit blocks spawn", not ok)
+        report("spawn guard: rate reason mentions rate",
+               "rate" in reason.lower(), f"reason: {reason}")
+
+        # --- Test: stale timestamps get pruned ---
+        server._spawn_timestamps.clear()
+        server._spawn_timestamps.extend([time.monotonic() - 7200, time.monotonic() - 7200])
+        ok, reason = server._can_spawn_agent()
+        report("spawn guard: stale timestamps pruned, allows spawn", ok)
+
+        # Restore
+        server.AGENT_SPAWN_ENABLED = orig_enabled
+        server.AGENT_SPAWN_MAX_CONCURRENT = orig_max_concurrent
+        server.AGENT_SPAWN_MAX_PER_HOUR = orig_max_per_hour
+        server._spawned_agents.clear()
+        server._spawned_agents.extend(orig_agents)
+        server._spawn_timestamps.clear()
+        server._spawn_timestamps.extend(orig_timestamps)
+
+    finally:
+        try:
+            os.unlink(sf)
+        except FileNotFoundError:
+            pass
+
+
+async def test_agent_prompt_building() -> None:
+    """Test _build_agent_prompt produces a valid prompt with expected fields."""
+    import server
+
+    sf_a = make_state_file()
+    sf_b = make_state_file()
+    try:
+        app_a, state_a = create_agent(sf_a, port=9900)
+        app_b, state_b = create_agent(sf_b, port=9901)
+        await connect_agents(app_a, state_a, app_b, state_b)
+
+        use_agent(state_a)
+
+        msg = server.QueuedMessage(
+            message_id="msg-test-prompt",
+            content="Hello, what can you do?",
+            webhook="http://localhost:9901/__darkmatter__/webhook/msg-test-prompt",
+            hops_remaining=8,
+            metadata={},
+            from_agent_id=state_b.agent_id,
+            verified=True,
+        )
+
+        prompt = server._build_agent_prompt(state_a, msg)
+
+        report("prompt: contains agent display name",
+               (state_a.display_name or state_a.agent_id) in prompt)
+        report("prompt: contains message ID", "msg-test-prompt" in prompt)
+        report("prompt: contains message content", "Hello, what can you do?" in prompt)
+        report("prompt: contains verified status", "cryptographically verified" in prompt)
+        report("prompt: contains hops remaining", "8" in prompt)
+        report("prompt: mentions darkmatter_respond_message",
+               "darkmatter_respond_message" in prompt)
+        report("prompt: mentions darkmatter_send_message for forwarding",
+               "darkmatter_send_message" in prompt)
+        report("prompt: says fully autonomous",
+               "autonomous" in prompt.lower())
+        report("prompt: does NOT restrict file modification",
+               "Do NOT modify any files" not in prompt)
+        report("prompt: does NOT restrict shell commands",
+               "Do NOT run any shell commands" not in prompt)
+        report("prompt: includes connected peers",
+               state_b.agent_id[:12] in prompt)
+
+    finally:
+        for sf in [sf_a, sf_b]:
+            try:
+                os.unlink(sf)
+            except FileNotFoundError:
+                pass
+
+
+async def test_agent_cleanup_finished() -> None:
+    """Test _cleanup_finished_agents removes completed processes."""
+    import server
+
+    orig_agents = server._spawned_agents[:]
+
+    # Create fake agents — one finished, one still running
+    finished_proc = type("FakeProc", (), {"returncode": 0, "pid": 11111})()
+    running_proc = type("FakeProc", (), {"returncode": None, "pid": 22222})()
+
+    server._spawned_agents.clear()
+    server._spawned_agents.append(server.SpawnedAgent(
+        process=finished_proc, message_id="msg-done",
+        spawned_at=time.monotonic() - 60, pid=11111,
+    ))
+    server._spawned_agents.append(server.SpawnedAgent(
+        process=running_proc, message_id="msg-running",
+        spawned_at=time.monotonic(), pid=22222,
+    ))
+
+    server._cleanup_finished_agents()
+    report("cleanup: removes finished agents", len(server._spawned_agents) == 1)
+    report("cleanup: keeps running agents",
+           server._spawned_agents[0].message_id == "msg-running"
+           if server._spawned_agents else False)
+
+    # Restore
+    server._spawned_agents.clear()
+    server._spawned_agents.extend(orig_agents)
+
+
+async def test_agent_spawn_deduplication() -> None:
+    """Test that _spawn_agent_for_message won't spawn twice for the same message."""
+    import server
+
+    sf = make_state_file()
+    try:
+        app, state = create_agent(sf, port=9900)
+        use_agent(state)
+
+        orig_agents = server._spawned_agents[:]
+        orig_enabled = server.AGENT_SPAWN_ENABLED
+
+        # Disable actual spawning but test dedup logic
+        server.AGENT_SPAWN_ENABLED = True
+
+        # Pre-populate with a fake agent for msg-dedup
+        fake_proc = type("FakeProc", (), {"returncode": None, "pid": 33333})()
+        server._spawned_agents.clear()
+        server._spawned_agents.append(server.SpawnedAgent(
+            process=fake_proc, message_id="msg-dedup",
+            spawned_at=time.monotonic(), pid=33333,
+        ))
+
+        msg = server.QueuedMessage(
+            message_id="msg-dedup",
+            content="duplicate test",
+            webhook="http://localhost:9900/__darkmatter__/webhook/msg-dedup",
+            hops_remaining=10,
+            metadata={},
+            from_agent_id="fake-sender",
+            verified=False,
+        )
+
+        # Mock _can_spawn_agent to always allow
+        orig_can_spawn = server._can_spawn_agent
+        server._can_spawn_agent = lambda: (True, "")
+
+        count_before = len(server._spawned_agents)
+        await server._spawn_agent_for_message(state, msg)
+        count_after = len(server._spawned_agents)
+
+        report("dedup: does not spawn duplicate for same message_id",
+               count_after == count_before)
+
+        # Restore
+        server._can_spawn_agent = orig_can_spawn
+        server.AGENT_SPAWN_ENABLED = orig_enabled
+        server._spawned_agents.clear()
+        server._spawned_agents.extend(orig_agents)
+
+    finally:
+        try:
+            os.unlink(sf)
+        except FileNotFoundError:
+            pass
+
+
+# ==========================================================================
 # Runner
 # ==========================================================================
 
@@ -1628,6 +1905,11 @@ async def run_tier1_tests() -> None:
         ("16. WebRTC guards", test_webrtc_guards),
         ("17. LAN discovery beacon", test_lan_discovery_beacon),
         ("18. Peer update replay rejected", test_peer_update_replay_rejected),
+        ("19. Replay protection persistence", test_replay_persistence),
+        ("20. Agent spawn guards", test_agent_spawn_guards),
+        ("21. Agent prompt building", test_agent_prompt_building),
+        ("22. Agent cleanup finished", test_agent_cleanup_finished),
+        ("23. Agent spawn deduplication", test_agent_spawn_deduplication),
     ]
 
     for label, test_fn in tier1_tests:
@@ -1641,10 +1923,10 @@ async def run_tier1_tests() -> None:
 def run_tier2_tests() -> None:
     """Run all subprocess-based tests."""
     tier2_tests = [
-        ("19. Discovery smoke", test_discovery_smoke),
-        ("20. Broadcast peer update", None),  # async, handled separately
-        ("21. Multi-hop message routing", test_multi_hop_message_routing),
-        ("22. Send recovery via peer_lookup", test_send_recovers_via_peer_lookup),
+        ("24. Discovery smoke", test_discovery_smoke),
+        ("25. Broadcast peer update", None),  # async, handled separately
+        ("26. Multi-hop message routing", test_multi_hop_message_routing),
+        ("27. Send recovery via peer_lookup", test_send_recovers_via_peer_lookup),
     ]
 
     for label, test_fn in tier2_tests:
@@ -1665,7 +1947,7 @@ async def main() -> None:
     await run_tier1_tests()
 
     # Broadcast peer update is async but uses Tier 2 nodes
-    print(f"\n{BOLD}20. Broadcast peer update{RESET}")
+    print(f"\n{BOLD}25. Broadcast peer update{RESET}")
     try:
         await test_broadcast_peer_update()
     except Exception as e:
