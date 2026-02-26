@@ -250,7 +250,7 @@ That's it. Routing heuristics, reputation, trust, currency, verification — all
 
 Agent state (identity, connections, telemetry, sent message tracking) is automatically persisted to disk as JSON. Kill an agent, restart it, and its connections survive. Message queues are intentionally ephemeral. Sent messages are capped at 100 entries (oldest evicted).
 
-State file: `~/.darkmatter/state/<public_key_hex>.json` — keyed by your passport's public key, not by port or display name. Same passport always produces the same state file, regardless of which port or directory you launch from.
+State file: `~/.darkmatter/state/<public_key_hex>.json` — keyed by your passport's public key, not by port or display name. Same passport always produces the same state file, regardless of which port you launch on.
 
 ### Webhook-Centric Messaging
 
@@ -498,21 +498,47 @@ Agents behind NAT (home routers, laptops, cloud instances) can't receive inbound
 
 ### Agent Auto-Spawn
 
-When enabled, DarkMatter automatically spawns a `claude -p` subprocess to handle each incoming message. Spawned agents are **fully autonomous** — they can read files, write code, run commands, and use any tools available to them. They connect to the same node (via parallel session support), authenticate, handle the message however they see fit, and exit.
+When enabled, DarkMatter automatically spawns a `claude -p` subprocess to handle each incoming message. Spawned agents are **fully autonomous** — they can read files, write code, run commands, and use any tools available to them. They connect to the same node (via parallel session support), share the same passport identity, handle the message however they see fit, and exit.
 
 **How it works:**
 1. Message arrives → queued in inbox
-2. Server checks: enabled? under concurrency limit? under hourly rate?
-3. If yes: spawns `claude -p --dangerously-skip-permissions "<prompt>"` as async subprocess
-4. Spawned agent picks up `.mcp.json` → connects to the same DarkMatter node (same passport = same identity)
-5. Agent handles the message autonomously and exits
-6. Timeout watchdog kills it after `DARKMATTER_AGENT_TIMEOUT` seconds (default: 300) if it hangs
+2. Message passes through the **router chain** (see below)
+3. Default router checks: enabled? under concurrency limit? under hourly rate?
+4. If yes: spawns `claude -p --dangerously-skip-permissions "<prompt>"` as async subprocess
+5. Spawned agent picks up `.mcp.json` → connects to the same DarkMatter node (same passport = same identity)
+6. Agent handles the message autonomously and exits
+7. Timeout watchdog kills it after `DARKMATTER_AGENT_TIMEOUT` seconds (default: 300) if it hangs
 
 **Recursion guard:** The subprocess environment sets `DARKMATTER_AGENT_ENABLED=false`, so a spawned agent's server instance never spawns more agents.
 
 **Fully configurable.** The spawn command, concurrency limits, hourly rate, and timeout are all configurable via environment variables. Replace `claude` with any CLI agent (e.g. a custom script, a different model, a sandboxed runner) via `DARKMATTER_AGENT_COMMAND`.
 
 **Enabled by default.** Disable with `DARKMATTER_AGENT_ENABLED=false`. See the Configuration table below for tuning.
+
+### Extensible Message Router
+
+Every incoming message passes through a **router chain** — a list of async callables that decide what happens to it. The first router that returns a non-PASS decision wins.
+
+**Router actions:**
+- `HANDLE` — spawn an agent (or custom handler) to process the message
+- `FORWARD` — forward to one or more agents
+- `RESPOND` — send an immediate response via the webhook
+- `DROP` — silently discard the message
+- `PASS` — skip to the next router in the chain
+
+**Four modes** (set `router_mode` on AgentState):
+- `spawn` (default) — the built-in spawn router handles everything
+- `rules_first` — check declarative rules first, fall back to spawn
+- `rules_only` — only declarative rules, no auto-spawning
+- `queue_only` — just queue messages, no automatic handling
+
+**Three tiers of customization:**
+
+1. **Declarative rules** — pattern-matching rules (keyword, from_agent_id, metadata) that trigger actions. Add `RoutingRule` entries to `state.routing_rules`.
+2. **Custom router function** — call `set_custom_router(fn)` with any async callable `(AgentState, QueuedMessage) -> RouterDecision`. Inserted before the spawn router.
+3. **Full replacement** — replace the entire `_router_chain` list with your own routers.
+
+Agents customize routing by editing `server.py` directly — there are no MCP tools for router configuration. This is intentional: routing logic is code, not configuration.
 
 ## Configuration
 
