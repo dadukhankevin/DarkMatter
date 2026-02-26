@@ -1556,7 +1556,14 @@ async def _spawn_agent_for_message(state: "AgentState", msg: "QueuedMessage") ->
     # Build environment with recursion guard
     env = os.environ.copy()
     env["DARKMATTER_AGENT_ENABLED"] = "false"
+    env["DARKMATTER_ENTRYPOINT_AUTOSTART"] = "false"
     env.pop("CLAUDECODE", None)  # Allow spawning inside Claude Code sessions
+
+    # Assign a unique port so spawned agent's MCP server doesn't conflict
+    # with the parent's port. Pick a random port in the high range.
+    import random
+    agent_port = random.randint(9200, 9299)
+    env["DARKMATTER_PORT"] = str(agent_port)
 
     try:
         process = await asyncio.create_subprocess_exec(
