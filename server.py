@@ -4730,9 +4730,9 @@ async def _run_stdio_with_http() -> None:
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
 
-    # Load our state to get our agent_id (if we have one)
-    our_state = load_state()
-    our_agent_id = our_state.agent_id if our_state else None
+    # Load our passport to get our agent_id (if we have one)
+    _priv, _pub = _load_or_create_passport()
+    our_agent_id = _pub
 
     # Check who owns the port
     port_owner = _check_port_owner(host, port)
