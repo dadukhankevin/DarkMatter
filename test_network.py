@@ -59,18 +59,32 @@ def make_state_file() -> str:
 
 
 def create_agent(state_path: str, *, port: int = 9900) -> tuple:
-    """Create a fresh DarkMatter app + state, isolated from other agents."""
+    """Create a fresh DarkMatter app + state, isolated from other agents.
+
+    Each agent gets a unique keypair so they have distinct identities,
+    bypassing the passport file (which would give all agents the same
+    identity since they share a working directory).
+    """
     import server
 
     server._agent_state = None
 
-    os.environ["DARKMATTER_STATE_FILE"] = state_path
     os.environ["DARKMATTER_PORT"] = str(port)
     os.environ["DARKMATTER_DISCOVERY"] = "false"
     os.environ.pop("DARKMATTER_AGENT_ID", None)
     os.environ.pop("DARKMATTER_MCP_TOKEN", None)
     os.environ.pop("DARKMATTER_GENESIS", None)
 
+    # Generate a unique keypair for this agent (bypass passport file)
+    priv, pub = server._generate_keypair()
+    server._agent_state = server.AgentState(
+        agent_id=pub,
+        bio="A DarkMatter mesh agent.",
+        status=server.AgentStatus.ACTIVE,
+        port=port,
+        private_key_hex=priv,
+        public_key_hex=pub,
+    )
     app = server.create_app()
     state = server._agent_state
     return app, state
@@ -172,7 +186,8 @@ class TestNode:
     def __init__(self, port: int, *, display_name: str = ""):
         self.port = port
         self.display_name = display_name or f"test-node-{port}"
-        self.state_file = tempfile.mktemp(suffix=".json", prefix=f"dm_{port}_")
+        # Each node gets its own temp working directory with a unique passport
+        self.workdir = tempfile.mkdtemp(prefix=f"dm_{port}_")
         self.proc: subprocess.Popen | None = None
         self.agent_id: str | None = None
         self.public_key_hex: str | None = None
@@ -184,7 +199,6 @@ class TestNode:
             "DARKMATTER_PORT": str(self.port),
             "DARKMATTER_HOST": "127.0.0.1",
             "DARKMATTER_DISPLAY_NAME": self.display_name,
-            "DARKMATTER_STATE_FILE": self.state_file,
             "DARKMATTER_DISCOVERY": "false",
             "DARKMATTER_TRANSPORT": "http",
         }
@@ -194,6 +208,7 @@ class TestNode:
         self.proc = subprocess.Popen(
             [PYTHON, SERVER],
             env=env,
+            cwd=self.workdir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
@@ -209,12 +224,17 @@ class TestNode:
                 if r.status_code == 200:
                     info = r.json()
                     self.agent_id = info.get("agent_id")
-                    # Read keys from state file
-                    if os.path.exists(self.state_file):
-                        with open(self.state_file) as f:
-                            state_data = json.load(f)
-                        self.public_key_hex = state_data.get("public_key_hex")
-                        self.private_key_hex = state_data.get("private_key_hex")
+                    # Read keys from passport file in workdir
+                    passport_path = os.path.join(self.workdir, ".darkmatter", "passport.key")
+                    if os.path.exists(passport_path):
+                        with open(passport_path) as f:
+                            priv_hex = f.read().strip()
+                        self.private_key_hex = priv_hex
+                        # Derive public key from private key
+                        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+                        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+                        pk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
+                        self.public_key_hex = pk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
                     return True
             except httpx.HTTPError:
                 pass
@@ -229,8 +249,10 @@ class TestNode:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait()
-        if os.path.exists(self.state_file):
-            os.unlink(self.state_file)
+        # Clean up workdir
+        import shutil
+        if os.path.exists(self.workdir):
+            shutil.rmtree(self.workdir, ignore_errors=True)
 
     @property
     def base_url(self) -> str:
@@ -332,7 +354,11 @@ class TestNode:
             timeout=5.0,
         )
 
-        return {"status_code": resp.status_code, "data": resp.json(), "message_id": message_id}
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+        return {"status_code": resp.status_code, "data": data, "message_id": message_id}
 
     def get_peer_lookup(self, agent_id: str) -> dict:
         """GET /peer_lookup/{agent_id} on this node."""
@@ -361,7 +387,11 @@ class TestNode:
             json=payload,
             timeout=5.0,
         )
-        return {"status_code": resp.status_code, "data": resp.json()}
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+        return {"status_code": resp.status_code, "data": data}
 
     def __repr__(self) -> str:
         return f"<TestNode {self.display_name} port={self.port} pid={self.proc.pid if self.proc else None}>"
@@ -934,12 +964,11 @@ async def test_broadcast_peer_update() -> None:
     """_broadcast_peer_update notifies all connected peers of URL change."""
     import server
 
-    paths = [make_state_file() for _ in range(3)]
     nodes = []
     try:
         # We need real HTTP for broadcast, so use Tier 2 nodes
         # Start nodes and connect them
-        for i, path in enumerate(paths):
+        for i in range(3):
             node = TestNode(BASE_PORT + i, display_name=f"bcast-{i}")
             node.start()
             nodes.append(node)
@@ -1623,8 +1652,9 @@ async def test_replay_persistence() -> None:
         server._seen_message_ids["msg-persist-test"] = time.time()
         server.save_state()
 
-        # Verify it was saved to the state file
-        with open(sf) as f:
+        # Verify it was saved to the state file (now keyed by public_key_hex)
+        state_path = server._state_file_path()
+        with open(state_path) as f:
             saved = json.load(f)
         report("replay persist: seen_message_ids in state file",
                "seen_message_ids" in saved)
@@ -1634,17 +1664,19 @@ async def test_replay_persistence() -> None:
         # Clear and reload
         server._seen_message_ids.clear()
         server._agent_state = None
-        loaded = server.load_state()
+        loaded = server._load_state_from_file(state_path)
         report("replay persist: entry restored after load",
                "msg-persist-test" in server._seen_message_ids)
 
         # Verify expired entries are pruned on load
         server._seen_message_ids.clear()
         server._seen_message_ids["msg-stale"] = time.time() - 600  # 10 min ago
+        # Re-set agent state so save_state works
+        server._agent_state = state
         server.save_state()
         server._seen_message_ids.clear()
         server._agent_state = None
-        loaded = server.load_state()
+        loaded = server._load_state_from_file(state_path)
         report("replay persist: stale entry pruned on load",
                "msg-stale" not in server._seen_message_ids)
 
@@ -1653,9 +1685,11 @@ async def test_replay_persistence() -> None:
         server._seen_message_ids.update(orig_seen)
 
     finally:
+        # Clean up state file
         try:
-            os.unlink(sf)
-        except FileNotFoundError:
+            state_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "state", f"{state.public_key_hex}.json")
+            os.unlink(state_path)
+        except (FileNotFoundError, NameError):
             pass
 
 

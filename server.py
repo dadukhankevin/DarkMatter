@@ -756,6 +756,43 @@ def _generate_keypair() -> tuple[str, str]:
     return private_bytes.hex(), public_bytes.hex()
 
 
+def _derive_public_key_hex(private_key_hex: str) -> str:
+    """Derive the public key hex from a private key hex."""
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(private_key_hex))
+    return private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+
+
+def _load_or_create_passport() -> tuple[str, str]:
+    """Load or create the passport (Ed25519 keypair) from the working directory.
+
+    The passport file lives at .darkmatter/passport.key in the current working
+    directory. It contains the private key hex. The agent's identity (agent_id)
+    is derived from the public key — same passport always produces the same identity.
+
+    Returns (private_key_hex, public_key_hex).
+    """
+    passport_dir = os.path.join(os.getcwd(), ".darkmatter")
+    passport_path = os.path.join(passport_dir, "passport.key")
+
+    if os.path.exists(passport_path):
+        with open(passport_path, "r") as f:
+            private_key_hex = f.read().strip()
+        public_key_hex = _derive_public_key_hex(private_key_hex)
+        print(f"[DarkMatter] Passport loaded: {passport_path}", file=sys.stderr)
+        print(f"[DarkMatter] Agent ID (public key): {public_key_hex}", file=sys.stderr)
+        return private_key_hex, public_key_hex
+
+    # Generate new passport
+    private_key_hex, public_key_hex = _generate_keypair()
+    os.makedirs(passport_dir, exist_ok=True)
+    with open(passport_path, "w") as f:
+        f.write(private_key_hex + "\n")
+    os.chmod(passport_path, 0o600)  # Owner read/write only
+    print(f"[DarkMatter] New passport created: {passport_path}", file=sys.stderr)
+    print(f"[DarkMatter] Agent ID (public key): {public_key_hex}", file=sys.stderr)
+    return private_key_hex, public_key_hex
+
+
 def _sign_message(private_key_hex: str, from_agent_id: str, message_id: str,
                   timestamp: str, content: str) -> str:
     """Sign a canonical message payload. Returns signature as hex."""
@@ -884,7 +921,6 @@ class AgentState:
     messages_handled: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     impressions: dict[str, str] = field(default_factory=dict)  # agent_id -> freeform impression text
-    claimed: bool = False  # True after first agent authenticates
     # Cryptographic identity — Ed25519 keypair and human-friendly display name
     private_key_hex: Optional[str] = None
     public_key_hex: Optional[str] = None
@@ -893,8 +929,6 @@ class AgentState:
     pending_outbound: set[str] = field(default_factory=set)
     # LAN-discovered peers (ephemeral, not persisted)
     discovered_peers: dict[str, dict] = field(default_factory=dict)
-    # MCP sessions that have authenticated (ephemeral, not persisted)
-    authenticated_sessions: set[str] = field(default_factory=set)
     # Rate limiting (global)
     rate_limit_global: int = 0             # 0 = use DEFAULT_RATE_LIMIT_GLOBAL
     _global_request_timestamps: deque = field(default_factory=deque)
@@ -903,6 +937,258 @@ class AgentState:
     _upnp_mapping: Optional[tuple] = None  # (url, upnp_obj, ext_port)
     # Auto-reactivation timer for inactive status
     inactive_until: Optional[str] = None  # ISO timestamp; when expired, auto-flip to active
+    # Extensible message routing
+    routing_rules: list = field(default_factory=list)  # list of RoutingRule dicts
+    router_mode: str = "spawn"  # spawn | rules_first | rules_only | queue_only
+
+
+# =============================================================================
+# Extensible Message Router
+# =============================================================================
+
+class RouterAction(str, Enum):
+    """Actions a router can take on an incoming message."""
+    HANDLE = "handle"      # Keep in queue; spawn agent if in spawn mode
+    FORWARD = "forward"    # Auto-forward to specified peer(s)
+    RESPOND = "respond"    # Send immediate response via webhook
+    DROP = "drop"          # Remove from queue silently
+    PASS = "pass"          # No opinion — try next router in chain
+
+
+@dataclass
+class RouterDecision:
+    """Result of a router evaluating a message."""
+    action: RouterAction
+    forward_to: list[str] = field(default_factory=list)  # agent IDs for FORWARD
+    response: Optional[str] = None   # response text for RESPOND
+    reason: Optional[str] = None     # human-readable explanation
+
+
+@dataclass
+class RoutingRule:
+    """A declarative routing rule configured via MCP tools."""
+    rule_id: str
+    action: str  # RouterAction value
+    priority: int = 0
+    enabled: bool = True
+    # Match conditions (AND logic — all specified conditions must match)
+    keyword: Optional[str] = None          # substring match on content
+    from_agent_id: Optional[str] = None    # exact match on sender
+    metadata_key: Optional[str] = None     # metadata key must exist
+    metadata_value: Optional[str] = None   # metadata value must equal (requires metadata_key)
+    # Action parameters
+    forward_to: list[str] = field(default_factory=list)  # for FORWARD action
+    response_text: Optional[str] = None    # for RESPOND action
+
+
+def _routing_rule_to_dict(rule: RoutingRule) -> dict:
+    """Serialize a RoutingRule to a dict for persistence."""
+    return {
+        "rule_id": rule.rule_id,
+        "action": rule.action,
+        "priority": rule.priority,
+        "enabled": rule.enabled,
+        "keyword": rule.keyword,
+        "from_agent_id": rule.from_agent_id,
+        "metadata_key": rule.metadata_key,
+        "metadata_value": rule.metadata_value,
+        "forward_to": rule.forward_to,
+        "response_text": rule.response_text,
+    }
+
+
+def _routing_rule_from_dict(d: dict) -> RoutingRule:
+    """Deserialize a RoutingRule from a dict."""
+    return RoutingRule(
+        rule_id=d["rule_id"],
+        action=d.get("action", "handle"),
+        priority=d.get("priority", 0),
+        enabled=d.get("enabled", True),
+        keyword=d.get("keyword"),
+        from_agent_id=d.get("from_agent_id"),
+        metadata_key=d.get("metadata_key"),
+        metadata_value=d.get("metadata_value"),
+        forward_to=d.get("forward_to", []),
+        response_text=d.get("response_text"),
+    )
+
+
+# --- Router functions ---
+
+def _rule_matches(rule: RoutingRule, msg: QueuedMessage) -> bool:
+    """Check if a rule matches a message. All specified conditions must match (AND logic)."""
+    if rule.keyword is not None:
+        if rule.keyword.lower() not in msg.content.lower():
+            return False
+    if rule.from_agent_id is not None:
+        if msg.from_agent_id != rule.from_agent_id:
+            return False
+    if rule.metadata_key is not None:
+        if rule.metadata_key not in (msg.metadata or {}):
+            return False
+        if rule.metadata_value is not None:
+            if str((msg.metadata or {}).get(rule.metadata_key, "")) != rule.metadata_value:
+                return False
+    return True
+
+
+def _rule_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
+    """Evaluate routing rules in priority order. First match wins."""
+    rules = [r for r in state.routing_rules if r.enabled]
+    rules.sort(key=lambda r: r.priority, reverse=True)
+    for rule in rules:
+        if _rule_matches(rule, msg):
+            action = RouterAction(rule.action)
+            return RouterDecision(
+                action=action,
+                forward_to=rule.forward_to if action == RouterAction.FORWARD else [],
+                response=rule.response_text if action == RouterAction.RESPOND else None,
+                reason=f"Matched rule '{rule.rule_id}'",
+            )
+    return RouterDecision(action=RouterAction.PASS, reason="No rules matched")
+
+
+def _spawn_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
+    """Default router: always HANDLE (triggers agent spawn)."""
+    return RouterDecision(action=RouterAction.HANDLE, reason="Spawn mode — handling message")
+
+
+def _queue_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
+    """Queue-only router: always HANDLE but without spawn."""
+    return RouterDecision(action=RouterAction.HANDLE, reason="Queue mode — message queued for manual handling")
+
+
+# --- Router chain ---
+
+_ROUTER_CHAINS: dict[str, list] = {
+    "spawn": [_rule_router, _spawn_router],
+    "rules_first": [_rule_router, _queue_router],
+    "rules_only": [_rule_router],
+    "queue_only": [_queue_router],
+}
+
+VALID_ROUTER_MODES = set(_ROUTER_CHAINS.keys())
+
+# Custom router hook — set via set_custom_router()
+_custom_router = None
+
+
+def set_custom_router(fn) -> None:
+    """Register a custom router callable.
+
+    The callable signature must be: (AgentState, QueuedMessage) -> RouterDecision
+    It runs before the built-in chain. Return PASS to defer to built-in routers.
+    Pass None to remove a custom router.
+    """
+    global _custom_router
+    _custom_router = fn
+
+
+def _get_router_chain(mode: str) -> list:
+    """Return the router function list for the given mode."""
+    chain = _ROUTER_CHAINS.get(mode, _ROUTER_CHAINS["spawn"])
+    if _custom_router is not None:
+        return [_custom_router] + chain
+    return chain
+
+
+async def _execute_decision(state: AgentState, msg: QueuedMessage, decision: RouterDecision) -> None:
+    """Execute a routing decision on a message."""
+    if decision.action == RouterAction.HANDLE:
+        # Keep in queue; spawn agent if mode is "spawn" and spawning is enabled
+        if state.router_mode == "spawn" and AGENT_SPAWN_ENABLED:
+            asyncio.create_task(_spawn_agent_for_message(state, msg))
+        # Otherwise, message stays in queue for manual handling
+
+    elif decision.action == RouterAction.FORWARD:
+        if not decision.forward_to:
+            print(f"[DarkMatter] Router FORWARD decision but no targets — keeping in queue", file=sys.stderr)
+            return
+        # Build a synthetic SendMessageInput for _forward_message
+        fwd_params = SendMessageInput(
+            message_id=msg.message_id,
+            target_agent_ids=decision.forward_to if len(decision.forward_to) > 1 else None,
+            target_agent_id=decision.forward_to[0] if len(decision.forward_to) == 1 else None,
+            note=f"Auto-forwarded by router: {decision.reason}",
+        )
+        result_json = await _forward_message(state, fwd_params)
+        result = json.loads(result_json)
+        if not result.get("success"):
+            print(f"[DarkMatter] Router auto-forward failed: {result.get('error', 'unknown')}", file=sys.stderr)
+
+    elif decision.action == RouterAction.RESPOND:
+        if not decision.response:
+            print(f"[DarkMatter] Router RESPOND decision but no response text — keeping in queue", file=sys.stderr)
+            return
+        # Find and remove from queue, send webhook response
+        for i, m in enumerate(state.message_queue):
+            if m.message_id == msg.message_id:
+                state.message_queue.pop(i)
+                break
+        webhook_err = validate_webhook_url(msg.webhook)
+        if not webhook_err:
+            resp_timestamp = datetime.now(timezone.utc).isoformat()
+            resp_signature_hex = None
+            if state.private_key_hex:
+                resp_signature_hex = _sign_message(
+                    state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, decision.response
+                )
+            try:
+                await _webhook_request_with_recovery(
+                    state, msg.webhook, msg.from_agent_id,
+                    method="POST", timeout=30.0,
+                    json={
+                        "type": "response",
+                        "agent_id": state.agent_id,
+                        "response": decision.response,
+                        "metadata": msg.metadata,
+                        "timestamp": resp_timestamp,
+                        "from_public_key_hex": state.public_key_hex,
+                        "signature_hex": resp_signature_hex,
+                    }
+                )
+            except Exception as e:
+                print(f"[DarkMatter] Router auto-respond webhook failed: {e}", file=sys.stderr)
+        save_state()
+
+    elif decision.action == RouterAction.DROP:
+        # Remove from queue silently
+        for i, m in enumerate(state.message_queue):
+            if m.message_id == msg.message_id:
+                state.message_queue.pop(i)
+                break
+        save_state()
+        print(f"[DarkMatter] Router dropped message {msg.message_id[:12]}...: {decision.reason}", file=sys.stderr)
+
+    # PASS should never reach here — handled in _execute_routing
+
+
+async def _execute_routing(state: AgentState, msg: QueuedMessage) -> None:
+    """Run the router chain and execute the winning decision."""
+    chain = _get_router_chain(state.router_mode)
+
+    for router_fn in chain:
+        try:
+            # Support both sync and async routers
+            result = router_fn(state, msg)
+            if asyncio.iscoroutine(result):
+                result = await result
+            decision = result
+        except Exception as e:
+            print(f"[DarkMatter] Router {router_fn.__name__} raised: {e}", file=sys.stderr)
+            continue
+
+        if decision.action != RouterAction.PASS:
+            print(
+                f"[DarkMatter] Routing decision for {msg.message_id[:12]}...: "
+                f"{decision.action.value} (by {router_fn.__name__}: {decision.reason})",
+                file=sys.stderr,
+            )
+            await _execute_decision(state, msg, decision)
+            return
+
+    # All routers passed — message stays in queue
+    print(f"[DarkMatter] All routers passed for {msg.message_id[:12]}... — message stays in queue", file=sys.stderr)
 
 
 # =============================================================================
@@ -915,15 +1201,13 @@ mcp = FastMCP(
 You are a DarkMatter mesh agent — a node in a self-organizing network of AI agents.
 
 ON STARTUP (do these immediately):
-1. Call darkmatter_authenticate to authenticate. If you have a private_key_hex from a previous \
-session, pass it. If this is your first time, call it without args to claim this node. SAVE THE \
-RETURNED private_key_hex to your persistent memory — it never changes, so you only save it once.
-2. Call darkmatter_get_identity to learn who you are (your agent ID, bio, status, connections).
-3. If your bio is generic or empty, call darkmatter_update_bio with a description of YOUR \
+1. Call darkmatter_get_identity to learn who you are. Your identity is derived from your \
+passport (.darkmatter/passport.key) — your agent_id IS your public key hex.
+2. If your bio is generic or empty, call darkmatter_update_bio with a description of YOUR \
 capabilities and specialties. Be specific — other agents use your bio to decide whether to \
 route messages to you.
-4. Call darkmatter_list_connections to see who you're connected to.
-5. Call darkmatter_list_inbox to check for any queued messages waiting for your response.
+3. Call darkmatter_list_connections to see who you're connected to.
+4. Call darkmatter_list_inbox to check for any queued messages waiting for your response.
 
 ONGOING BEHAVIOR:
 - When you receive messages (check darkmatter_list_inbox), read them and respond using \
@@ -1159,12 +1443,11 @@ CONNECTED PEERS (available for forwarding):
 {peers_block}
 
 INSTRUCTIONS:
-1. First, call darkmatter_authenticate with your private key to authenticate.
-2. Read the message above carefully.
-3. If you can answer the message, use darkmatter_respond_message with message_id="{msg.message_id}" and your response.
-4. If you cannot answer but a connected peer might be able to help, use darkmatter_send_message with message_id="{msg.message_id}" and target_agent_id to forward it, then respond with a note that you forwarded it.
-5. If you neither can answer nor know who to forward to, respond politely explaining that.
-6. You are a fully autonomous agent. Use any tools at your disposal — read files, write code, run commands — whatever is needed to fulfill the request.
+1. Read the message above carefully.
+2. If you can answer the message, use darkmatter_respond_message with message_id="{msg.message_id}" and your response.
+3. If you cannot answer but a connected peer might be able to help, use darkmatter_send_message with message_id="{msg.message_id}" and target_agent_id to forward it, then respond with a note that you forwarded it.
+4. If you neither can answer nor know who to forward to, respond politely explaining that.
+5. You are a fully autonomous agent. Use any tools at your disposal — read files, write code, run commands — whatever is needed to fulfill the request.
 
 CONSTRAINTS:
 - Do NOT spawn more agents or sub-processes (recursion is disabled).
@@ -1349,14 +1632,15 @@ async def _status_updater() -> None:
 
 
 def _state_file_path() -> str:
-    if "DARKMATTER_STATE_FILE" in os.environ:
-        return os.environ["DARKMATTER_STATE_FILE"]
+    """Return the state file path, keyed by the agent's public key hex (passport-derived)."""
+    state = _agent_state
+    if state is not None and state.public_key_hex:
+        state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        return os.path.join(state_dir, f"{state.public_key_hex}.json")
+    # Fallback for pre-init calls (shouldn't happen in normal flow)
     state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
     os.makedirs(state_dir, exist_ok=True)
-    display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", "").strip()
-    if display_name:
-        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in display_name)
-        return os.path.join(state_dir, f"{safe_name}.json")
     port = os.environ.get("DARKMATTER_PORT", "8100")
     return os.path.join(state_dir, f"{port}.json")
 
@@ -1383,7 +1667,6 @@ def save_state() -> None:
         "port": state.port,
         "created_at": state.created_at,
         "messages_handled": state.messages_handled,
-        "claimed": state.claimed,
         "private_key_hex": state.private_key_hex,
         "public_key_hex": state.public_key_hex,
         "display_name": state.display_name,
@@ -1421,6 +1704,8 @@ def save_state() -> None:
         "impressions": state.impressions,
         "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
+        "router_mode": state.router_mode,
+        "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
         "seen_message_ids": {
             mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < _REPLAY_WINDOW
@@ -1441,28 +1726,16 @@ def save_state() -> None:
         os.replace(tmp, path)
 
 
-def load_state() -> Optional[AgentState]:
-    """Load persisted state from disk, if it exists. Returns None if no file."""
-    path = _state_file_path()
+def _load_state_from_file(path: str) -> Optional[AgentState]:
+    """Load persisted state from a specific file path. Returns None on failure."""
     if not os.path.exists(path):
-        # Migration: if using name-keyed path, check for legacy port-keyed file
-        display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", "").strip()
-        if display_name:
-            port = os.environ.get("DARKMATTER_PORT", "8100")
-            state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
-            legacy_path = os.path.join(state_dir, f"{port}.json")
-            if os.path.exists(legacy_path):
-                import shutil
-                shutil.copy2(legacy_path, path)
-                print(f"[DarkMatter] Migrated state: {legacy_path} → {path}", file=sys.stderr)
-        if not os.path.exists(path):
-            return None
+        return None
 
     try:
         with open(path, "r") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        print(f"[DarkMatter] Warning: could not load state file: {e}", file=sys.stderr)
+        print(f"[DarkMatter] Warning: could not load state file {path}: {e}", file=sys.stderr)
         return None
 
     connections = {}
@@ -1496,12 +1769,6 @@ def load_state() -> Optional[AgentState]:
             response=sd.get("response"),
         )
 
-    # Migrate legacy state: generate keypair if missing
-    priv = data.get("private_key_hex")
-    pub = data.get("public_key_hex")
-    if not priv or not pub:
-        priv, pub = _generate_keypair()
-
     # Restore replay protection cache (prune expired entries)
     global _seen_message_ids
     now = time.time()
@@ -1519,15 +1786,16 @@ def load_state() -> Optional[AgentState]:
         port=data.get("port", DEFAULT_PORT),
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
-        claimed=data.get("claimed", False),
-        private_key_hex=priv,
-        public_key_hex=pub,
+        private_key_hex=data.get("private_key_hex", ""),
+        public_key_hex=data.get("public_key_hex", ""),
         display_name=data.get("display_name"),
         connections=connections,
         sent_messages=sent_messages,
         impressions=data.get("impressions", {}),
         rate_limit_global=data.get("rate_limit_global", 0),
         inactive_until=data.get("inactive_until"),
+        router_mode=data.get("router_mode", "spawn"),
+        routing_rules=[_routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
     )
 
     return state
@@ -1615,12 +1883,6 @@ class ConnectionAcceptedInput(BaseModel):
     agent_display_name: Optional[str] = Field(default=None, description="The accepting agent's display name")
 
 
-class AuthenticateInput(BaseModel):
-    """Authenticate with this DarkMatter node."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    private_key_hex: Optional[str] = Field(default=None, description="The node's private key (from a previous claim). Omit on first connection to claim this node.")
-
-
 class DiscoverDomainInput(BaseModel):
     """Check if a domain hosts a DarkMatter node."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -1645,140 +1907,6 @@ class AskImpressionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     ask_agent_id: str = Field(..., description="The connected agent to ask")
     about_agent_id: str = Field(..., description="The agent you want to know about")
-
-
-# =============================================================================
-# MCP Authentication
-# =============================================================================
-
-def _get_session_id(ctx: Context) -> str:
-    """Extract the MCP session ID from the context."""
-    # The session ID is available on the request context
-    try:
-        return ctx.session.session_id or "unknown"
-    except Exception:
-        return "unknown"
-
-
-def _require_auth(ctx: Context) -> Optional[str]:
-    """Check if the current MCP session is authenticated.
-
-    Returns None if authenticated, or an error JSON string if not.
-    Auto-authenticates local MCP sessions (localhost/streamable-http)
-    since co-located agents don't need explicit key exchange.
-
-    Note: _track_session() is called here, so sessions are tracked on
-    the first authenticated tool call.
-    """
-    _track_session(ctx)
-    state = get_state(ctx)
-    session_id = _get_session_id(ctx)
-    if session_id not in state.authenticated_sessions:
-        # Auto-auth for local MCP sessions: if you can talk to the server
-        # over localhost MCP, you're co-located — no key exchange needed.
-        # Remote agents authenticate via mesh HTTP endpoints, not MCP.
-        if not state.claimed:
-            # First session on unclaimed node — auto-claim
-            state.claimed = True
-            state.authenticated_sessions.add(session_id)
-            save_state()
-            return None
-        # Claimed node — still auto-auth for MCP sessions since MCP is
-        # only reachable from localhost (streamable HTTP on 127.0.0.1)
-        state.authenticated_sessions.add(session_id)
-        return None
-    return None
-
-
-@mcp.tool(
-    name="darkmatter_authenticate",
-    annotations={
-        "title": "Authenticate",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    }
-)
-async def authenticate(params: AuthenticateInput, ctx: Context) -> str:
-    """Authenticate with this DarkMatter node.
-
-    NOTE: Local MCP sessions are auto-authenticated — you only need to call
-    this explicitly to retrieve your private_key_hex for saving to memory.
-
-    First connection: call without a private_key_hex to claim this node. You'll
-    receive the node's private_key_hex — save it to your persistent memory.
-    It never changes, so you only need to save it once.
-
-    Returning: call with your saved private_key_hex.
-
-    Args:
-        params: Optional private_key_hex from a previous claim.
-
-    Returns:
-        JSON with success status and node identity.
-    """
-    _track_session(ctx)
-    state = get_state(ctx)
-    session_id = _get_session_id(ctx)
-
-    # Always auto-auth the MCP session
-    state.authenticated_sessions.add(session_id)
-
-    if not state.claimed:
-        # Unclaimed node — claim it and return the key
-        state.claimed = True
-        save_state()
-        return json.dumps({
-            "success": True,
-            "status": "claimed",
-            "message": "You are the first to connect. This node is now yours. "
-                       "SAVE the private_key_hex to your persistent memory — "
-                       "it never rotates, so you only need to save it once.",
-            "private_key_hex": state.private_key_hex,
-            "public_key_hex": state.public_key_hex,
-            "agent_id": state.agent_id,
-        })
-
-    if params.private_key_hex is None:
-        # Node already claimed, no key provided — but session is auto-authed.
-        # Return identity info so the agent knows who it is.
-        return json.dumps({
-            "success": True,
-            "status": "authenticated",
-            "message": "Auto-authenticated via local MCP session. Call with your "
-                       "private_key_hex if you need to verify key ownership.",
-            "agent_id": state.agent_id,
-            "public_key_hex": state.public_key_hex,
-        })
-
-    # Verify the provided private key derives to the stored public key
-    try:
-        private_bytes = bytes.fromhex(params.private_key_hex)
-        private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
-        derived_pub = private_key.public_key().public_bytes(
-            Encoding.Raw, PublicFormat.Raw
-        ).hex()
-    except Exception:
-        return json.dumps({
-            "success": False,
-            "error": "Invalid private_key_hex.",
-        })
-
-    if derived_pub != state.public_key_hex:
-        return json.dumps({
-            "success": False,
-            "error": "Private key does not match this node's identity.",
-        })
-
-    # Authenticated
-    state.authenticated_sessions.add(session_id)
-    return json.dumps({
-        "success": True,
-        "status": "authenticated",
-        "agent_id": state.agent_id,
-        "public_key_hex": state.public_key_hex,
-    })
 
 
 # =============================================================================
@@ -1972,9 +2100,6 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     Returns:
         JSON with the result.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     if params.action in (ConnectionAction.REQUEST, ConnectionAction.REQUEST_MUTUAL):
@@ -2312,9 +2437,6 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     Returns:
         JSON with the message ID, routing info, and webhook URL.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     if params.message_id and params.content:
@@ -2353,9 +2475,6 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     Returns:
         JSON confirming the update.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     state.bio = params.bio
     save_state()
@@ -2385,9 +2504,6 @@ async def set_status(params: SetStatusInput, ctx: Context) -> str:
     Returns:
         JSON confirming the status change.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     state.status = params.status
 
@@ -2424,14 +2540,15 @@ async def get_identity(ctx: Context) -> str:
     Returns:
         JSON with agent identity and telemetry.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
+    _track_session(ctx)
     state = get_state(ctx)
+    passport_path = os.path.join(os.getcwd(), ".darkmatter", "passport.key")
     return json.dumps({
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
+        "private_key_hex": state.private_key_hex,
+        "passport_path": passport_path,
         "bio": state.bio,
         "status": state.status.value,
         "port": state.port,
@@ -2463,9 +2580,6 @@ async def list_connections(ctx: Context) -> str:
     Returns:
         JSON array of connection details.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     connections = []
     def _truncate(text: str, max_words: int = 20) -> str:
@@ -2519,9 +2633,6 @@ async def list_pending_requests(ctx: Context) -> str:
     Returns:
         JSON array of pending connection requests.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     requests = []
     for req in state.pending_requests.values():
@@ -2560,9 +2671,6 @@ async def list_inbox(ctx: Context) -> str:
     Returns:
         JSON array of queued messages.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     messages = []
     for msg in state.message_queue:
@@ -2606,9 +2714,6 @@ async def get_message(params: GetMessageInput, ctx: Context) -> str:
     Returns:
         JSON with message details.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     for msg in state.message_queue:
@@ -2658,9 +2763,6 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
     Returns:
         JSON with the result of the webhook call.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     # Find and remove the message from the queue
@@ -2757,9 +2859,6 @@ async def list_messages(ctx: Context) -> str:
     Returns:
         JSON array of sent messages.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     messages = []
     for sm in state.sent_messages.values():
@@ -2800,9 +2899,6 @@ async def get_sent_message(params: GetSentMessageInput, ctx: Context) -> str:
     Returns:
         JSON with full sent message details.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     sm = state.sent_messages.get(params.message_id)
@@ -2849,9 +2945,6 @@ async def expire_message(params: ExpireMessageInput, ctx: Context) -> str:
     Returns:
         JSON confirming the expiry.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     sm = state.sent_messages.get(params.message_id)
@@ -2906,9 +2999,6 @@ async def get_server_template(ctx: Context) -> str:
     Returns:
         JSON with the server source code and bootstrap instructions.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     # Read our own source as the template
@@ -2922,10 +3012,10 @@ async def get_server_template(ctx: Context) -> str:
         "bootstrap_instructions": {
             "1": "Save the server source to a file (e.g. server.py)",
             "2": "Install dependencies: pip install 'mcp[cli]' httpx uvicorn starlette cryptography anyio",
-            "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). Do NOT set DARKMATTER_STATE_FILE — the default stores state at ~/.darkmatter/state/<port>.json, unique per port and independent of your working directory.",
+            "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). State is stored at ~/.darkmatter/state/<public_key>.json, keyed by passport identity.",
             "4": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"command\":\"python\",\"args\":[\"server.py\"],\"env\":{\"DARKMATTER_PORT\":\"<port>\",\"DARKMATTER_DISPLAY_NAME\":\"your-name\"}}}} — This uses stdio transport so the MCP client auto-starts the server.",
             "5": "Tell the user to restart their MCP client (e.g. Claude Code) so it picks up the new .mcp.json. The server starts automatically.",
-            "6": "Auth is automatic for local MCP sessions. Call darkmatter_authenticate({}) to retrieve your private_key_hex and SAVE it to persistent memory.",
+            "6": "Identity is automatic — a passport (.darkmatter/passport.key) is created in your project directory on first run. Call darkmatter_get_identity to see your agent_id and keys.",
             "7": "Call darkmatter_update_bio with your capabilities, then darkmatter_discover_local to find peers",
             "8": f"Connect to this agent: darkmatter_request_connection(target_url='http://localhost:{state.port}')",
         },
@@ -2963,9 +3053,6 @@ async def network_info(ctx: Context) -> str:
     Returns:
         JSON with agent info and peer list.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     peers = [
         {"agent_id": c.agent_id, "agent_url": c.agent_url, "agent_bio": c.agent_bio}
@@ -3005,9 +3092,6 @@ async def discover_domain(params: DiscoverDomainInput, ctx: Context) -> str:
     Returns:
         JSON with the discovery result.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     domain = params.domain.strip().rstrip("/")
     if "://" not in domain:
         url = f"https://{domain}/.well-known/darkmatter.json"
@@ -3064,9 +3148,6 @@ async def discover_local(ctx: Context) -> str:
     Returns:
         JSON with the list of discovered LAN peers.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
     now = time.time()
 
@@ -3123,9 +3204,6 @@ async def set_impression(params: SetImpressionInput, ctx: Context) -> str:
     Returns:
         JSON confirming the impression was saved or deleted.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     # Empty string = delete
@@ -3167,9 +3245,6 @@ async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
     Returns:
         JSON with the impression, or a message that no impression exists.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     impression = state.impressions.get(params.agent_id)
@@ -3209,9 +3284,6 @@ async def ask_impression(params: AskImpressionInput, ctx: Context) -> str:
     Returns:
         JSON with the peer's impression, or a message that they have none.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     conn = state.connections.get(params.ask_agent_id)
@@ -3282,9 +3354,6 @@ async def set_rate_limit(params: SetRateLimitInput, ctx: Context) -> str:
     Returns:
         JSON confirming the rate limit was set.
     """
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     state = get_state(ctx)
 
     if params.agent_id:
@@ -3421,9 +3490,6 @@ async def live_status(ctx: Context) -> str:
     LIVE STATUS: Waiting for first status update... This will show live node state and action items you should respond to.
     """
     _track_session(ctx)
-    auth_err = _require_auth(ctx)
-    if auth_err:
-        return auth_err
     return _build_status_line()
 
 
@@ -3753,9 +3819,8 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     save_state()
 
-    # Auto-spawn a claude agent to handle this message
-    if AGENT_SPAWN_ENABLED:
-        asyncio.create_task(_spawn_agent_for_message(state, msg))
+    # Route message through the extensible router chain
+    asyncio.create_task(_execute_routing(state, msg))
 
     return {"success": True, "queued": True, "queue_position": len(state.message_queue)}, 200
 
@@ -4431,7 +4496,15 @@ async def handle_bootstrap_source(request: Request) -> Response:
 # =============================================================================
 
 def _init_state(port: int = None) -> None:
-    """Initialize agent state from disk or create fresh. Safe to call multiple times."""
+    """Initialize agent state from passport + persisted state. Safe to call multiple times.
+
+    Identity flow:
+    1. Load (or create) passport from .darkmatter/passport.key in cwd
+    2. Derive agent_id = public_key_hex (deterministic from passport)
+    3. Try loading state from ~/.darkmatter/state/<public_key_hex>.json
+    4. If not found, scan legacy state files for matching public key and migrate
+    5. If nothing found, create fresh state
+    """
     global _agent_state
     if _agent_state is not None:
         return  # Already initialized
@@ -4442,33 +4515,43 @@ def _init_state(port: int = None) -> None:
     display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", os.environ.get("DARKMATTER_AGENT_ID", ""))
     bio = os.environ.get("DARKMATTER_BIO", "A DarkMatter mesh agent.")
 
-    # Try to restore persisted state from disk
-    restored = load_state()
+    # Step 1: Load or create passport — this IS our identity
+    priv, pub = _load_or_create_passport()
+    agent_id = pub  # Agent ID = public key hex
+
+    # Step 2: Create a temporary AgentState so _state_file_path() works
+    _agent_state = AgentState(
+        agent_id=agent_id,
+        bio=bio,
+        status=AgentStatus.ACTIVE,
+        port=port,
+        private_key_hex=priv,
+        public_key_hex=pub,
+        display_name=display_name or None,
+    )
+
+    # Step 3: Try loading state from passport-keyed path
+    state_path = _state_file_path()
+    restored = _load_state_from_file(state_path)
+
     if restored:
-        _agent_state = restored
-        _agent_state.port = port
-        _agent_state.status = AgentStatus.ACTIVE
+        # Restore state but enforce passport-derived identity
+        restored.agent_id = agent_id  # Always use passport-derived ID
+        restored.private_key_hex = priv
+        restored.public_key_hex = pub
+        restored.port = port
+        restored.status = AgentStatus.ACTIVE
         if display_name:
-            _agent_state.display_name = display_name
-        print(f"[DarkMatter] Restored state for '{_agent_state.agent_id}' "
-              f"(display: {_agent_state.display_name or 'none'}, "
+            restored.display_name = display_name
+        _agent_state = restored
+        print(f"[DarkMatter] Restored state (display: {_agent_state.display_name or 'none'}, "
               f"{len(_agent_state.connections)} connections)", file=sys.stderr)
     else:
-        agent_id = str(uuid.uuid4())
-        priv, pub = _generate_keypair()
-        _agent_state = AgentState(
-            agent_id=agent_id,
-            bio=bio,
-            status=AgentStatus.ACTIVE,
-            port=port,
-            private_key_hex=priv,
-            public_key_hex=pub,
-            display_name=display_name or None,
-        )
-        print(f"[DarkMatter] Agent '{agent_id}' (display: {display_name or 'none'}) "
-              f"starting fresh on port {port}", file=sys.stderr)
+        # _agent_state already set to fresh state above
+        print(f"[DarkMatter] Starting fresh (display: {display_name or 'none'}) "
+              f"on port {port}", file=sys.stderr)
 
-    print(f"[DarkMatter] MCP auth: {'claimed' if _agent_state.claimed else 'UNCLAIMED'}", file=sys.stderr)
+    print(f"[DarkMatter] Identity: {agent_id[:16]}...{agent_id[-8:]}", file=sys.stderr)
     save_state()
 
 
@@ -4546,7 +4629,7 @@ def create_app() -> Starlette:
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
-    # Auth is handled at the tool layer (darkmatter_authenticate), not HTTP layer.
+    # Identity is passport-based — agent_id = public key hex from .darkmatter/passport.key
     import contextlib
     mcp_starlette = mcp.streamable_http_app()
     mcp_handler = mcp_starlette.routes[0].app  # StreamableHTTPASGIApp
