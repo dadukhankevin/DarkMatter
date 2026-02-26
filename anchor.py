@@ -14,6 +14,7 @@ Stale entries (>24h unseen) are pruned on writes.
 """
 
 import collections
+import fcntl
 import json
 import os
 import sys
@@ -34,6 +35,10 @@ PEER_UPDATE_MAX_AGE = 300  # 5 minutes
 
 # Directory size cap — prevents memory exhaustion from mass registration
 MAX_DIRECTORY_SIZE = 10000
+
+# Webhook relay settings
+RELAY_BUFFER_MAX_PER_SENDER = 100
+RELAY_ENTRY_TTL = 3600  # 1 hour
 
 # URL validation
 MAX_URL_LENGTH = 2048
@@ -87,6 +92,12 @@ _directory: dict[str, dict] = {}
 
 # JSON file backup path (configurable via env)
 _backup_path: str | None = os.environ.get("DARKMATTER_ANCHOR_BACKUP")
+
+# Webhook relay buffer file — shared across workers via file I/O + flock
+_relay_buffer_path: str = os.environ.get(
+    "DARKMATTER_RELAY_BUFFER",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".darkmatter_relay_buffer.json"),
+)
 
 anchor_bp = Blueprint("darkmatter_anchor", __name__)
 
@@ -248,11 +259,253 @@ def anchor_well_known():
     })
 
 
+# ---------------------------------------------------------------------------
+# Webhook Relay — buffer webhook callbacks for NAT-ed agents
+#
+# Storage is a JSON file protected by flock so multiple gunicorn workers
+# can safely read/write the same buffer.
+# ---------------------------------------------------------------------------
+
+def _read_relay_buffer() -> dict[str, list[dict]]:
+    """Read the relay buffer from disk. Returns empty dict if missing/corrupt."""
+    try:
+        with open(_relay_buffer_path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_relay_buffer(buf: dict[str, list[dict]]) -> None:
+    """Write the relay buffer to disk atomically with exclusive lock."""
+    try:
+        Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(_relay_buffer_path, "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(buf, f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[DarkMatter Anchor] Failed to write relay buffer: {e}", file=sys.stderr)
+
+
+def _prune_relay_buffer(buf: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Remove expired entries from a relay buffer dict. Returns pruned copy."""
+    now = time.time()
+    pruned = {}
+    for sender_id, entries in buf.items():
+        valid = [e for e in entries if now - e.get("timestamp", 0) < RELAY_ENTRY_TTL]
+        if valid:
+            pruned[sender_id] = valid
+    return pruned
+
+
+def _verify_relay_poll_signature(agent_id: str, signature_hex: str, timestamp: str) -> bool:
+    """Verify Ed25519 signature for relay poll requests.
+
+    The agent signs "relay_poll\\n{agent_id}\\n{timestamp}" to prove identity.
+    Uses the public key from the peer directory if registered.
+    """
+    entry = _directory.get(agent_id)
+    if not entry or not entry.get("public_key_hex"):
+        return False
+    try:
+        public_bytes = bytes.fromhex(entry["public_key_hex"])
+        public_key = Ed25519PublicKey.from_public_bytes(public_bytes)
+        signature = bytes.fromhex(signature_hex)
+        payload = f"relay_poll\n{agent_id}\n{timestamp}".encode("utf-8")
+        public_key.verify(signature, payload)
+        return True
+    except Exception:
+        return False
+
+
+@anchor_bp.route("/__darkmatter__/webhook_relay/<sender_agent_id>/<message_id>", methods=["POST"])
+def relay_webhook_post(sender_agent_id, message_id):
+    """Buffer an incoming webhook callback for a NAT-ed sender."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    buf = _prune_relay_buffer(_read_relay_buffer())
+
+    if sender_agent_id not in buf:
+        buf[sender_agent_id] = []
+
+    entries = buf[sender_agent_id]
+
+    # Enforce per-sender limit — prune oldest
+    while len(entries) >= RELAY_BUFFER_MAX_PER_SENDER:
+        entries.pop(0)
+
+    entries.append({
+        "message_id": message_id,
+        "data": data,
+        "timestamp": time.time(),
+    })
+
+    _write_relay_buffer(buf)
+    return jsonify({"success": True, "buffered": True})
+
+
+@anchor_bp.route("/__darkmatter__/webhook_relay/<sender_agent_id>/<message_id>", methods=["GET"])
+def relay_webhook_status(sender_agent_id, message_id):
+    """Webhook status proxy — return a generic OK so agents know the webhook is valid."""
+    return jsonify({"status": "relay", "message_id": message_id})
+
+
+@anchor_bp.route("/__darkmatter__/webhook_relay_poll/<sender_agent_id>", methods=["GET"])
+def relay_webhook_poll(sender_agent_id):
+    """Drain buffered webhook callbacks for a sender. Requires Ed25519 signature."""
+    signature_hex = request.args.get("signature", "")
+    timestamp = request.args.get("timestamp", "")
+
+    if not signature_hex or not timestamp:
+        return jsonify({"error": "Missing signature or timestamp"}), 400
+
+    if not _is_timestamp_fresh(timestamp):
+        return jsonify({"error": "Timestamp expired"}), 403
+
+    if not _verify_relay_poll_signature(sender_agent_id, signature_hex, timestamp):
+        return jsonify({"error": "Invalid signature"}), 403
+
+    buf = _prune_relay_buffer(_read_relay_buffer())
+    entries = buf.pop(sender_agent_id, [])
+    _write_relay_buffer(buf)
+
+    now = time.time()
+    valid = [e for e in entries if now - e.get("timestamp", 0) < RELAY_ENTRY_TTL]
+
+    return jsonify({
+        "success": True,
+        "callbacks": [{"message_id": e["message_id"], "data": e["data"]} for e in valid],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Connection Relay — buffer connection_accepted callbacks for NAT-ed agents
+#
+# Same file-based buffer approach as webhook relay, but stored under a
+# separate "connections" top-level key to avoid collisions.
+# ---------------------------------------------------------------------------
+
+CONN_RELAY_BUFFER_MAX_PER_AGENT = 20
+CONN_RELAY_ENTRY_TTL = 3600  # 1 hour
+
+
+def _read_conn_relay_buffer() -> dict[str, list[dict]]:
+    """Read the connection relay buffer from the shared relay buffer file."""
+    try:
+        with open(_relay_buffer_path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        top = data.get("connections") if isinstance(data, dict) else None
+        return top if isinstance(top, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_conn_relay_buffer(conn_buf: dict[str, list[dict]]) -> None:
+    """Write the connection relay buffer back into the shared relay buffer file."""
+    try:
+        Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
+        # Read existing file to preserve webhook entries
+        try:
+            with open(_relay_buffer_path) as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                full = json.load(f)
+                fcntl.flock(f, fcntl.LOCK_UN)
+            if not isinstance(full, dict):
+                full = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            full = {}
+        full["connections"] = conn_buf
+        with open(_relay_buffer_path, "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(full, f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[DarkMatter Anchor] Failed to write conn relay buffer: {e}", file=sys.stderr)
+
+
+def _prune_conn_relay_buffer(buf: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Remove expired entries from the connection relay buffer."""
+    now = time.time()
+    pruned = {}
+    for agent_id, entries in buf.items():
+        valid = [e for e in entries if now - e.get("timestamp", 0) < CONN_RELAY_ENTRY_TTL]
+        if valid:
+            pruned[agent_id] = valid
+    return pruned
+
+
+@anchor_bp.route("/__darkmatter__/connection_relay/<target_agent_id>", methods=["POST"])
+def relay_connection_post(target_agent_id):
+    """Buffer a connection_accepted callback for a NAT-ed target agent."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    buf = _prune_conn_relay_buffer(_read_conn_relay_buffer())
+
+    if target_agent_id not in buf:
+        buf[target_agent_id] = []
+
+    entries = buf[target_agent_id]
+
+    # Enforce per-agent limit — prune oldest
+    while len(entries) >= CONN_RELAY_BUFFER_MAX_PER_AGENT:
+        entries.pop(0)
+
+    entries.append({
+        "data": data,
+        "timestamp": time.time(),
+    })
+
+    _write_conn_relay_buffer(buf)
+    return jsonify({"success": True, "buffered": True})
+
+
+@anchor_bp.route("/__darkmatter__/connection_relay_poll/<agent_id>", methods=["GET"])
+def relay_connection_poll(agent_id):
+    """Drain buffered connection callbacks for an agent. Requires Ed25519 signature."""
+    signature_hex = request.args.get("signature", "")
+    timestamp = request.args.get("timestamp", "")
+
+    if not signature_hex or not timestamp:
+        return jsonify({"error": "Missing signature or timestamp"}), 400
+
+    if not _is_timestamp_fresh(timestamp):
+        return jsonify({"error": "Timestamp expired"}), 403
+
+    if not _verify_relay_poll_signature(agent_id, signature_hex, timestamp):
+        return jsonify({"error": "Invalid signature"}), 403
+
+    buf = _prune_conn_relay_buffer(_read_conn_relay_buffer())
+    entries = buf.pop(agent_id, [])
+    _write_conn_relay_buffer(buf)
+
+    now = time.time()
+    valid = [e for e in entries if now - e.get("timestamp", 0) < CONN_RELAY_ENTRY_TTL]
+
+    return jsonify({
+        "success": True,
+        "callbacks": [e["data"] for e in valid],
+    })
+
+
 # CSRF exemption list — these routes need to be exempt when used with Flask-WTF
 CSRF_EXEMPT_VIEWS = [
     "darkmatter_anchor.anchor_peer_update",
     "darkmatter_anchor.anchor_peer_lookup",
     "darkmatter_anchor.anchor_well_known",
+    "darkmatter_anchor.relay_webhook_post",
+    "darkmatter_anchor.relay_webhook_status",
+    "darkmatter_anchor.relay_webhook_poll",
+    "darkmatter_anchor.relay_connection_post",
+    "darkmatter_anchor.relay_connection_poll",
 ]
 
 

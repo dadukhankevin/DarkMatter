@@ -319,6 +319,49 @@ async def _discover_public_url(port: int) -> str:
     return url
 
 
+async def _check_nat_status(public_url: str) -> bool:
+    """Check if we're behind NAT by probing our own public URL.
+
+    Returns True if NAT is detected (self-probe fails).
+    """
+    if "localhost" in public_url or "127.0.0.1" in public_url:
+        return True
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{public_url}/__darkmatter__/status")
+            return resp.status_code != 200
+    except Exception:
+        return True
+
+
+def _check_nat_status_sync(public_url: str) -> bool:
+    """Synchronous version of NAT detection for entrypoint.py."""
+    if "localhost" in public_url or "127.0.0.1" in public_url:
+        return True
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            resp = client.get(f"{public_url}/__darkmatter__/status")
+            return resp.status_code != 200
+    except Exception:
+        return True
+
+
+def _build_webhook_url(state, message_id: str) -> str:
+    """Build the webhook URL, using anchor relay if behind NAT."""
+    if state.nat_detected and ANCHOR_NODES:
+        anchor = ANCHOR_NODES[0]
+        return f"{anchor}/__darkmatter__/webhook_relay/{state.agent_id}/{message_id}"
+    return f"{_get_public_url(state.port)}/__darkmatter__/webhook/{message_id}"
+
+
+def _sign_relay_poll(private_key_hex: str, agent_id: str, timestamp: str) -> str:
+    """Sign a relay poll request. Returns signature hex."""
+    private_bytes = bytes.fromhex(private_key_hex)
+    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    payload = f"relay_poll\n{agent_id}\n{timestamp}".encode("utf-8")
+    return private_key.sign(payload).hex()
+
+
 def _try_upnp_mapping(local_port: int) -> Optional[tuple]:
     """Try to create a UPnP port mapping. Returns (url, upnp_obj, ext_port) or None.
 
@@ -521,7 +564,8 @@ async def _webhook_request_with_recovery(
         # Reconstruct webhook URL with the new base
         parsed = urlparse(current_url if attempt == 1 else webhook_url)
         path = parsed.path  # e.g. /__darkmatter__/webhook/msg-xxx
-        if not path.startswith("/__darkmatter__/webhook/"):
+        if not (path.startswith("/__darkmatter__/webhook/") or
+                path.startswith("/__darkmatter__/webhook_relay/")):
             break
 
         new_base = new_base.rstrip("/")
@@ -738,10 +782,152 @@ async def _network_health_loop(state) -> None:
             # --- Connection health checks ---
             await _check_connection_health(state)
 
+            # --- Webhook relay polling (NAT-ed nodes) ---
+            if state.nat_detected and ANCHOR_NODES and state.private_key_hex:
+                await _poll_webhook_relay(state)
+
         except asyncio.CancelledError:
             return
         except Exception as e:
             print(f"[DarkMatter] Health loop error: {e}", file=sys.stderr)
+
+
+async def _poll_webhook_relay(state) -> None:
+    """Poll anchor node for buffered webhook callbacks (NAT relay)."""
+    anchor = ANCHOR_NODES[0]
+    ts = datetime.now(timezone.utc).isoformat()
+    sig = _sign_relay_poll(state.private_key_hex, state.agent_id, ts)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{anchor}/__darkmatter__/webhook_relay_poll/{state.agent_id}",
+                params={"signature": sig, "timestamp": ts},
+            )
+            if resp.status_code != 200:
+                return
+            data = resp.json()
+            callbacks = data.get("callbacks", [])
+            for cb in callbacks:
+                msg_id = cb.get("message_id", "")
+                cb_data = cb.get("data", {})
+                if msg_id and cb_data:
+                    result, _ = _process_webhook_locally(state, msg_id, cb_data)
+                    if result.get("success"):
+                        print(f"[DarkMatter] Relay: processed webhook for {msg_id}", file=sys.stderr)
+    except Exception as e:
+        print(f"[DarkMatter] Relay poll error: {e}", file=sys.stderr)
+
+    # Also poll for connection relay callbacks
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{anchor}/__darkmatter__/connection_relay_poll/{state.agent_id}",
+                params={"signature": sig, "timestamp": ts},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                for cb_data in data.get("callbacks", []):
+                    if isinstance(cb_data, dict) and cb_data.get("agent_id"):
+                        _process_connection_relay_callback(state, cb_data)
+    except Exception as e:
+        print(f"[DarkMatter] Connection relay poll error: {e}", file=sys.stderr)
+
+
+def _process_connection_relay_callback(state, data: dict) -> bool:
+    """Process a connection_accepted payload received via anchor relay.
+
+    Matches against pending_outbound, creates Connection(OUTBOUND), saves state.
+    Returns True if a connection was created.
+    """
+    agent_id = data.get("agent_id", "")
+    agent_url = data.get("agent_url", "")
+    agent_bio = data.get("agent_bio", "")
+    agent_public_key_hex = data.get("agent_public_key_hex")
+    agent_display_name = data.get("agent_display_name")
+
+    if not agent_id or not agent_url:
+        return False
+
+    # Match against pending_outbound (same logic as handle_connection_accepted)
+    agent_base = agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
+    matched = None
+    for pending_url in state.pending_outbound:
+        pending_base = pending_url.rsplit("/mcp", 1)[0].rstrip("/")
+        if pending_base == agent_base:
+            matched = pending_url
+            break
+
+    if matched is None and agent_id:
+        for pending_url, pending_agent_id in state.pending_outbound.items():
+            if pending_agent_id == agent_id:
+                matched = pending_url
+                break
+
+    if matched is None:
+        return False
+
+    del state.pending_outbound[matched]
+
+    conn = Connection(
+        agent_id=agent_id,
+        agent_url=agent_url,
+        agent_bio=agent_bio[:MAX_BIO_LENGTH],
+        direction=ConnectionDirection.OUTBOUND,
+        agent_public_key_hex=agent_public_key_hex,
+        agent_display_name=agent_display_name,
+    )
+    state.connections[agent_id] = conn
+    save_state()
+    print(f"[DarkMatter] Connection relay: accepted by {agent_id[:12]}...", file=sys.stderr)
+    return True
+
+
+async def _notify_connection_accepted(state, pending) -> None:
+    """Notify the requesting agent that we accepted their connection.
+
+    Tries direct POST first. On failure, falls back to anchor relay
+    so NAT-ed requestors can pick up the acceptance via polling.
+    """
+    payload = {
+        "agent_id": state.agent_id,
+        "agent_url": f"{_get_public_url(state.port)}/mcp",
+        "agent_bio": state.bio,
+        "agent_public_key_hex": state.public_key_hex,
+        "agent_display_name": state.display_name,
+    }
+
+    base = pending.from_agent_url.rstrip("/")
+    for suffix in ("/mcp", "/__darkmatter__"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+
+    # Try direct POST first
+    direct_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                base + "/__darkmatter__/connection_accepted",
+                json=payload,
+            )
+            direct_ok = resp.status_code < 400
+    except Exception:
+        pass
+
+    # Fallback to anchor relay if direct POST failed
+    if not direct_ok and ANCHOR_NODES:
+        try:
+            anchor = ANCHOR_NODES[0]
+            target_agent_id = pending.from_agent_id
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{anchor}/__darkmatter__/connection_relay/{target_agent_id}",
+                    json=payload,
+                )
+            print(f"[DarkMatter] Connection accept relayed via anchor for {target_agent_id[:12]}...", file=sys.stderr)
+        except Exception as e:
+            print(f"[DarkMatter] Connection relay fallback failed: {e}", file=sys.stderr)
 
 
 # =============================================================================
@@ -925,8 +1111,8 @@ class AgentState:
     private_key_hex: Optional[str] = None
     public_key_hex: Optional[str] = None
     display_name: Optional[str] = None
-    # Track agent URLs we've sent outbound connection requests to (not persisted)
-    pending_outbound: set[str] = field(default_factory=set)
+    # Track outbound connection requests: url → agent_id (not persisted)
+    pending_outbound: dict[str, str] = field(default_factory=dict)
     # LAN-discovered peers (ephemeral, not persisted)
     discovered_peers: dict[str, dict] = field(default_factory=dict)
     # Rate limiting (global)
@@ -940,6 +1126,8 @@ class AgentState:
     # Extensible message routing
     routing_rules: list = field(default_factory=list)  # list of RoutingRule dicts
     router_mode: str = "spawn"  # spawn | rules_first | rules_only | queue_only
+    # NAT detection (ephemeral — re-detected each startup)
+    nat_detected: bool = False
 
 
 # =============================================================================
@@ -1474,6 +1662,7 @@ async def _spawn_agent_for_message(state: "AgentState", msg: "QueuedMessage") ->
     # Build environment with recursion guard
     env = os.environ.copy()
     env["DARKMATTER_AGENT_ENABLED"] = "false"
+    env.pop("CLAUDECODE", None)  # Allow spawning inside Claude Code sessions
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -1794,7 +1983,7 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
         impressions=data.get("impressions", {}),
         rate_limit_global=data.get("rate_limit_global", 0),
         inactive_until=data.get("inactive_until"),
-        router_mode=data.get("router_mode", "spawn"),
+        router_mode=data.get("router_mode") or "spawn",
         routing_rules=[_routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
     )
 
@@ -1968,7 +2157,7 @@ async def _connection_request(state, target_url: str, mutual: bool = False) -> s
                     "agent_bio": result.get("agent_bio", ""),
                 })
 
-            state.pending_outbound.add(target_base)
+            state.pending_outbound[target_base] = result.get("agent_id", "")
             return json.dumps({
                 "success": True,
                 "status": "pending",
@@ -2020,21 +2209,8 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
         )
         state.connections[request.from_agent_id] = conn
 
-        # Notify the requesting agent that we accepted
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                await client.post(
-                    request.from_agent_url.rstrip("/") + "/__darkmatter__/connection_accepted",
-                    json={
-                        "agent_id": state.agent_id,
-                        "agent_url": f"{_get_public_url(state.port)}/mcp",
-                        "agent_bio": state.bio,
-                        "agent_public_key_hex": state.public_key_hex,
-                        "agent_display_name": state.display_name,
-                    }
-                )
-        except Exception:
-            pass
+        # Notify the requesting agent that we accepted (with anchor relay fallback)
+        await _notify_connection_accepted(state, request)
 
         # If the original request was mutual, send a reverse connection request
         if request.mutual:
@@ -2201,8 +2377,7 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
-    public_url = _get_public_url(state.port)
-    webhook = f"{public_url}/__darkmatter__/webhook/{message_id}"
+    webhook = _build_webhook_url(state, message_id)
 
     if params.target_agent_id:
         conn = state.connections.get(params.target_agent_id)
@@ -3580,6 +3755,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     return JSONResponse({
         "auto_accepted": False,
         "request_id": request_id,
+        "agent_id": state.agent_id,
         "message": "Connection request queued. Awaiting agent decision.",
     })
 
@@ -3613,7 +3789,9 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
     if url_err:
         return JSONResponse({"error": url_err}, status_code=400)
 
-    # Verify we actually sent a pending outbound request to this agent's URL
+    # Verify we actually sent a pending outbound request to this agent
+    # Match by URL first, then fall back to agent_id (URLs can differ between
+    # public IP and localhost, so agent_id is the reliable identifier)
     agent_base = agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
     matched = None
     for pending_url in state.pending_outbound:
@@ -3622,13 +3800,19 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
             matched = pending_url
             break
 
+    if matched is None and agent_id:
+        for pending_url, pending_agent_id in state.pending_outbound.items():
+            if pending_agent_id == agent_id:
+                matched = pending_url
+                break
+
     if matched is None:
         return JSONResponse(
             {"error": "No pending outbound connection request for this agent."},
             status_code=403,
         )
 
-    state.pending_outbound.discard(matched)
+    del state.pending_outbound[matched]
 
     conn = Connection(
         agent_id=agent_id,
@@ -3682,26 +3866,8 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
     )
     state.connections[pending.from_agent_id] = conn
 
-    # Notify the requesting agent that we accepted
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            base = pending.from_agent_url.rstrip("/")
-            for suffix in ("/mcp", "/__darkmatter__"):
-                if base.endswith(suffix):
-                    base = base[:-len(suffix)]
-                    break
-            await client.post(
-                base + "/__darkmatter__/connection_accepted",
-                json={
-                    "agent_id": state.agent_id,
-                    "agent_url": f"{_get_public_url(state.port)}/mcp",
-                    "agent_bio": state.bio,
-                    "agent_public_key_hex": state.public_key_hex,
-                    "agent_display_name": state.display_name,
-                }
-            )
-    except Exception:
-        pass
+    # Notify the requesting agent that we accepted (with anchor relay fallback)
+    await _notify_connection_accepted(state, pending)
 
     # If the original request was mutual, send a reverse connection request
     if pending.mutual:
@@ -3752,11 +3918,10 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if url_err:
         return {"error": f"Invalid webhook: {url_err}"}, 400
 
-    # Reject messages from agents we're not connected to
-    if not from_agent_id or from_agent_id not in state.connections:
-        return {"error": "Not connected — only connected agents can send messages."}, 403
+    if not from_agent_id:
+        return {"error": "Missing from_agent_id."}, 400
 
-    # Rate limit check
+    # Rate limit check (only applied to connected agents)
     conn_for_rate = state.connections.get(from_agent_id)
     rate_err = _check_rate_limit(state, conn_for_rate)
     if rate_err:
@@ -3773,8 +3938,9 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     from_public_key_hex = data.get("from_public_key_hex")
     signature_hex = data.get("signature_hex")
     verified = False
+    is_connected = from_agent_id in state.connections
 
-    if from_agent_id in state.connections:
+    if is_connected:
         conn = state.connections[from_agent_id]
         if conn.agent_public_key_hex:
             # We have a stored public key for this peer — signature is REQUIRED
@@ -3794,6 +3960,16 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
                     return {"error": "Invalid signature — message authenticity could not be verified."}, 403
                 conn.agent_public_key_hex = from_public_key_hex
                 verified = True
+    elif from_public_key_hex and signature_hex and msg_timestamp:
+        # Not connected, but accept if the message is cryptographically signed.
+        # Connections manage trust/rate-limiting; signatures prove identity.
+        if not _verify_message(from_public_key_hex, signature_hex,
+                               from_agent_id, message_id, msg_timestamp, content):
+            return {"error": "Invalid signature — message authenticity could not be verified."}, 403
+        verified = True
+    else:
+        # No connection AND no signature — reject
+        return {"error": "Not connected — unsigned messages require a connection."}, 403
 
     # Replay protection: reject messages with stale timestamps
     if verified and msg_timestamp and not _is_timestamp_fresh(msg_timestamp):
@@ -3842,6 +4018,55 @@ async def handle_message(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=status_code)
 
 
+def _process_webhook_locally(state, message_id: str, data: dict) -> tuple[dict, int]:
+    """Process a webhook callback payload locally. Returns (response_dict, status_code).
+
+    Shared by handle_webhook_post (direct) and relay poll (NAT).
+    """
+    sm = state.sent_messages.get(message_id)
+    if not sm:
+        return {"error": f"No sent message with ID '{message_id}'"}, 404
+
+    update_type = data.get("type", "")
+    agent_id = data.get("agent_id", "unknown")
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    if update_type == "forwarded":
+        sm.updates.append({
+            "type": "forwarded",
+            "agent_id": agent_id,
+            "target_agent_id": data.get("target_agent_id", ""),
+            "note": data.get("note"),
+            "timestamp": timestamp,
+        })
+        save_state()
+        return {"success": True, "recorded": "forwarded"}, 200
+
+    elif update_type == "response":
+        sm.response = {
+            "agent_id": agent_id,
+            "response": data.get("response", ""),
+            "metadata": data.get("metadata", {}),
+            "timestamp": timestamp,
+        }
+        sm.status = "responded"
+        save_state()
+        return {"success": True, "recorded": "response"}, 200
+
+    elif update_type == "expired":
+        sm.updates.append({
+            "type": "expired",
+            "agent_id": agent_id,
+            "note": data.get("note"),
+            "timestamp": timestamp,
+        })
+        save_state()
+        return {"success": True, "recorded": "expired"}, 200
+
+    else:
+        return {"error": f"Unknown update type: '{update_type}'"}, 400
+
+
 async def handle_webhook_post(request: Request) -> JSONResponse:
     """Handle incoming webhook updates (forwarding notifications, responses).
 
@@ -3866,55 +4091,14 @@ async def handle_webhook_post(request: Request) -> JSONResponse:
         return JSONResponse({"error": rate_err}, status_code=429)
 
     message_id = request.path_params.get("message_id", "")
-    sm = state.sent_messages.get(message_id)
-    if not sm:
-        return JSONResponse({"error": f"No sent message with ID '{message_id}'"}, status_code=404)
 
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    update_type = data.get("type", "")
-    agent_id = data.get("agent_id", "unknown")
-    timestamp = datetime.now(timezone.utc).isoformat()
-
-    if update_type == "forwarded":
-        update = {
-            "type": "forwarded",
-            "agent_id": agent_id,
-            "target_agent_id": data.get("target_agent_id", ""),
-            "note": data.get("note"),
-            "timestamp": timestamp,
-        }
-        sm.updates.append(update)
-        save_state()
-        return JSONResponse({"success": True, "recorded": "forwarded"})
-
-    elif update_type == "response":
-        sm.response = {
-            "agent_id": agent_id,
-            "response": data.get("response", ""),
-            "metadata": data.get("metadata", {}),
-            "timestamp": timestamp,
-        }
-        sm.status = "responded"
-        save_state()
-        return JSONResponse({"success": True, "recorded": "response"})
-
-    elif update_type == "expired":
-        update = {
-            "type": "expired",
-            "agent_id": agent_id,
-            "note": data.get("note"),
-            "timestamp": timestamp,
-        }
-        sm.updates.append(update)
-        save_state()
-        return JSONResponse({"success": True, "recorded": "expired"})
-
-    else:
-        return JSONResponse({"error": f"Unknown update type: '{update_type}'"}, status_code=400)
+    result, status_code = _process_webhook_locally(state, message_id, data)
+    return JSONResponse(result, status_code=status_code)
 
 
 async def handle_webhook_get(request: Request) -> JSONResponse:
@@ -4599,8 +4783,11 @@ def create_app() -> Starlette:
         asyncio.create_task(_status_updater())
         print(f"[DarkMatter] Live status updater: ENABLED (5s interval)", file=sys.stderr)
 
-        # Discover public URL and start network health loop
+        # Discover public URL and detect NAT
         _agent_state.public_url = await _discover_public_url(port)
+        _agent_state.nat_detected = await _check_nat_status(_agent_state.public_url)
+        if _agent_state.nat_detected:
+            print(f"[DarkMatter] NAT detected: True — using anchor webhook relay", file=sys.stderr)
         asyncio.create_task(_network_health_loop(_agent_state))
         print(f"[DarkMatter] Network health loop: ENABLED ({HEALTH_CHECK_INTERVAL}s interval)", file=sys.stderr)
         print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
