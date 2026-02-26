@@ -119,6 +119,11 @@ AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "
 AGENT_SPAWN_COMMAND = os.environ.get("DARKMATTER_AGENT_COMMAND", "claude")
 AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "300"))
 
+# Entrypoint (human node) auto-start configuration
+ENTRYPOINT_AUTOSTART = os.environ.get("DARKMATTER_ENTRYPOINT_AUTOSTART", "true").lower() == "true"
+ENTRYPOINT_PORT = int(os.environ.get("DARKMATTER_ENTRYPOINT_PORT", "8200"))
+ENTRYPOINT_PATH = os.environ.get("DARKMATTER_ENTRYPOINT_PATH")  # explicit path, or None to search
+
 
 # =============================================================================
 # Input Validation
@@ -817,117 +822,6 @@ async def _poll_webhook_relay(state) -> None:
                         print(f"[DarkMatter] Relay: processed webhook for {msg_id}", file=sys.stderr)
     except Exception as e:
         print(f"[DarkMatter] Relay poll error: {e}", file=sys.stderr)
-
-    # Also poll for connection relay callbacks
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{anchor}/__darkmatter__/connection_relay_poll/{state.agent_id}",
-                params={"signature": sig, "timestamp": ts},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                for cb_data in data.get("callbacks", []):
-                    if isinstance(cb_data, dict) and cb_data.get("agent_id"):
-                        _process_connection_relay_callback(state, cb_data)
-    except Exception as e:
-        print(f"[DarkMatter] Connection relay poll error: {e}", file=sys.stderr)
-
-
-def _process_connection_relay_callback(state, data: dict) -> bool:
-    """Process a connection_accepted payload received via anchor relay.
-
-    Matches against pending_outbound, creates Connection(OUTBOUND), saves state.
-    Returns True if a connection was created.
-    """
-    agent_id = data.get("agent_id", "")
-    agent_url = data.get("agent_url", "")
-    agent_bio = data.get("agent_bio", "")
-    agent_public_key_hex = data.get("agent_public_key_hex")
-    agent_display_name = data.get("agent_display_name")
-
-    if not agent_id or not agent_url:
-        return False
-
-    # Match against pending_outbound (same logic as handle_connection_accepted)
-    agent_base = agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
-    matched = None
-    for pending_url in state.pending_outbound:
-        pending_base = pending_url.rsplit("/mcp", 1)[0].rstrip("/")
-        if pending_base == agent_base:
-            matched = pending_url
-            break
-
-    if matched is None and agent_id:
-        for pending_url, pending_agent_id in state.pending_outbound.items():
-            if pending_agent_id == agent_id:
-                matched = pending_url
-                break
-
-    if matched is None:
-        return False
-
-    del state.pending_outbound[matched]
-
-    conn = Connection(
-        agent_id=agent_id,
-        agent_url=agent_url,
-        agent_bio=agent_bio[:MAX_BIO_LENGTH],
-        direction=ConnectionDirection.OUTBOUND,
-        agent_public_key_hex=agent_public_key_hex,
-        agent_display_name=agent_display_name,
-    )
-    state.connections[agent_id] = conn
-    save_state()
-    print(f"[DarkMatter] Connection relay: accepted by {agent_id[:12]}...", file=sys.stderr)
-    return True
-
-
-async def _notify_connection_accepted(state, pending) -> None:
-    """Notify the requesting agent that we accepted their connection.
-
-    Tries direct POST first. On failure, falls back to anchor relay
-    so NAT-ed requestors can pick up the acceptance via polling.
-    """
-    payload = {
-        "agent_id": state.agent_id,
-        "agent_url": f"{_get_public_url(state.port)}/mcp",
-        "agent_bio": state.bio,
-        "agent_public_key_hex": state.public_key_hex,
-        "agent_display_name": state.display_name,
-    }
-
-    base = pending.from_agent_url.rstrip("/")
-    for suffix in ("/mcp", "/__darkmatter__"):
-        if base.endswith(suffix):
-            base = base[:-len(suffix)]
-            break
-
-    # Try direct POST first
-    direct_ok = False
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                base + "/__darkmatter__/connection_accepted",
-                json=payload,
-            )
-            direct_ok = resp.status_code < 400
-    except Exception:
-        pass
-
-    # Fallback to anchor relay if direct POST failed
-    if not direct_ok and ANCHOR_NODES:
-        try:
-            anchor = ANCHOR_NODES[0]
-            target_agent_id = pending.from_agent_id
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    f"{anchor}/__darkmatter__/connection_relay/{target_agent_id}",
-                    json=payload,
-                )
-            print(f"[DarkMatter] Connection accept relayed via anchor for {target_agent_id[:12]}...", file=sys.stderr)
-        except Exception as e:
-            print(f"[DarkMatter] Connection relay fallback failed: {e}", file=sys.stderr)
 
 
 # =============================================================================
@@ -2209,8 +2103,21 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
         )
         state.connections[request.from_agent_id] = conn
 
-        # Notify the requesting agent that we accepted (with anchor relay fallback)
-        await _notify_connection_accepted(state, request)
+        # Notify the requesting agent that we accepted
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.post(
+                    request.from_agent_url.rstrip("/") + "/__darkmatter__/connection_accepted",
+                    json={
+                        "agent_id": state.agent_id,
+                        "agent_url": f"{_get_public_url(state.port)}/mcp",
+                        "agent_bio": state.bio,
+                        "agent_public_key_hex": state.public_key_hex,
+                        "agent_display_name": state.display_name,
+                    }
+                )
+        except Exception:
+            pass
 
         # If the original request was mutual, send a reverse connection request
         if request.mutual:
@@ -3866,8 +3773,26 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
     )
     state.connections[pending.from_agent_id] = conn
 
-    # Notify the requesting agent that we accepted (with anchor relay fallback)
-    await _notify_connection_accepted(state, pending)
+    # Notify the requesting agent that we accepted
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            base = pending.from_agent_url.rstrip("/")
+            for suffix in ("/mcp", "/__darkmatter__"):
+                if base.endswith(suffix):
+                    base = base[:-len(suffix)]
+                    break
+            await client.post(
+                base + "/__darkmatter__/connection_accepted",
+                json={
+                    "agent_id": state.agent_id,
+                    "agent_url": f"{_get_public_url(state.port)}/mcp",
+                    "agent_bio": state.bio,
+                    "agent_public_key_hex": state.public_key_hex,
+                    "agent_display_name": state.display_name,
+                }
+            )
+    except Exception:
+        pass
 
     # If the original request was mutual, send a reverse connection request
     if pending.mutual:
@@ -4542,6 +4467,78 @@ async def _scan_local_ports(state: AgentState) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _find_entrypoint_path() -> Optional[str]:
+    """Locate the entrypoint.py script for the human node."""
+    if ENTRYPOINT_PATH:
+        return ENTRYPOINT_PATH if os.path.isfile(ENTRYPOINT_PATH) else None
+    # Fallback: check ~/.darkmatter/entrypoint.py
+    fallback = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.py")
+    return fallback if os.path.isfile(fallback) else None
+
+
+async def _ensure_entrypoint_running() -> None:
+    """Auto-start the entrypoint (human node) on port 8200 if not already running."""
+    if not ENTRYPOINT_AUTOSTART:
+        return
+
+    # Probe to see if entrypoint is already up
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.5)) as client:
+            resp = await client.get(f"http://127.0.0.1:{ENTRYPOINT_PORT}/.well-known/darkmatter.json")
+            if resp.status_code == 200:
+                print(f"[DarkMatter] Entrypoint already running on port {ENTRYPOINT_PORT}", file=sys.stderr)
+                return
+    except Exception:
+        pass
+
+    # Try to acquire lockfile (non-blocking) to prevent races
+    import subprocess
+    lockfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.lock")
+    try:
+        lock_fd = os.open(lockfile_path, os.O_CREAT | os.O_WRONLY)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        # Another agent is already spawning
+        print(f"[DarkMatter] Entrypoint spawn locked by another agent, skipping", file=sys.stderr)
+        return
+
+    try:
+        path = _find_entrypoint_path()
+        if not path:
+            print(f"[DarkMatter] Entrypoint script not found, cannot auto-start", file=sys.stderr)
+            return
+
+        entrypoint_dir = os.path.dirname(os.path.abspath(path))
+        log_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.log")
+        log_file = open(log_path, "a")
+
+        print(f"[DarkMatter] Spawning entrypoint: {path}", file=sys.stderr)
+        subprocess.Popen(
+            [sys.executable, path],
+            start_new_session=True,
+            cwd=entrypoint_dir,
+            stdout=log_file,
+            stderr=log_file,
+        )
+
+        # Poll until the entrypoint is healthy (up to 10s)
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.5)) as client:
+                    resp = await client.get(f"http://127.0.0.1:{ENTRYPOINT_PORT}/.well-known/darkmatter.json")
+                    if resp.status_code == 200:
+                        print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT}", file=sys.stderr)
+                        return
+            except Exception:
+                pass
+
+        print(f"[DarkMatter] Entrypoint failed to start within 10s (check {log_path})", file=sys.stderr)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 async def _discovery_loop(state: AgentState) -> None:
     """Periodically discover peers via local HTTP scan and LAN multicast."""
     loop = asyncio.get_event_loop()
@@ -4557,6 +4554,12 @@ async def _discovery_loop(state: AgentState) -> None:
             # Scan localhost ports for other nodes
             try:
                 await _scan_local_ports(state)
+            except Exception:
+                pass
+
+            # Ensure entrypoint (human node) is running
+            try:
+                await _ensure_entrypoint_running()
             except Exception:
                 pass
 
@@ -4798,6 +4801,9 @@ def create_app() -> Starlette:
             print(f"[DarkMatter] Anchor nodes: registered with {len(ANCHOR_NODES)} anchor(s)", file=sys.stderr)
         elif ANCHOR_NODES:
             print(f"[DarkMatter] Anchor nodes: configured but no public URL yet", file=sys.stderr)
+
+        # Auto-start entrypoint (human node) if not already running
+        asyncio.create_task(_ensure_entrypoint_running())
 
     # DarkMatter mesh protocol routes
     darkmatter_routes = [

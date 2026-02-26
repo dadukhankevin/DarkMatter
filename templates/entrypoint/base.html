@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}WormHole{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['"JetBrains Mono"', 'monospace'],
+          },
+          colors: {
+            ink: '#0f0f0f',
+            dim: '#1a1a1a',
+            slab: '#222222',
+            edge: '#2a2a2a',
+            muted: '#666666',
+            faint: '#444444',
+            ghost: '#333333',
+            pale: '#999999',
+            bright: '#e0e0e0',
+            solar: {
+              50: '#fef6f0',
+              100: '#fde8d8',
+              200: '#fbd4b8',
+              300: '#f8bb8a',
+              400: '#e89050',
+              500: '#dd8040',
+              600: '#c46a30',
+              700: '#a85525',
+            },
+            mesh: {
+              green: '#34d399',
+              red: '#f87171',
+              blue: '#60a5fa',
+              purple: '#a78bfa',
+              yellow: '#fbbf24',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    ::selection { background: #dd8040; color: #0f0f0f; }
+    input:focus, textarea:focus, button:focus { outline: none; }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #444; }
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+    @keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .fade-in { animation: fade-in 0.2s ease-out; }
+
+    /* Toast system */
+    @keyframes toast-in { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes toast-out { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(100%); } }
+    .toast-enter { animation: toast-in 0.25s ease-out forwards; }
+    .toast-exit { animation: toast-out 0.2s ease-in forwards; }
+  </style>
+</head>
+<body class="bg-ink h-full font-mono text-bright antialiased">
+
+  <!-- Top bar -->
+  <header class="h-12 bg-dim border-b border-edge flex items-center justify-between px-4 shrink-0">
+    <div class="flex items-center gap-3">
+      <div class="flex items-center gap-2">
+        <div class="w-2 h-2 rounded-full bg-solar-400 pulse-dot"></div>
+        <span class="text-solar-400 font-semibold text-sm tracking-wide">WORMHOLE</span>
+      </div>
+      <span class="text-faint text-xs italic">speak to the hivemind</span>
+      <span class="text-faint">|</span>
+      <span class="text-pale text-xs">{{ state.display_name or 'Human' }}</span>
+      <span class="text-muted text-xs font-light">{{ short_id(state.agent_id) }}</span>
+    </div>
+    <div class="flex items-center gap-4 text-xs">
+      <div class="flex items-center gap-1.5" id="nav-connections">
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
+        <span class="text-pale">{{ state.connections|length }}</span>
+      </div>
+      <div class="flex items-center gap-1.5 hidden" id="nav-inbox-badge">
+        <div class="w-1.5 h-1.5 rounded-full bg-solar-400"></div>
+        <span class="text-solar-400 font-medium">0</span>
+      </div>
+      <div class="flex items-center gap-1.5 hidden" id="nav-pending-badge">
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple"></div>
+        <span class="text-mesh-purple font-medium">0</span>
+      </div>
+    </div>
+  </header>
+
+  {% block content %}{% endblock %}
+
+  <!-- Toast container -->
+  <div id="toast-container" class="fixed bottom-4 right-4 flex flex-col gap-2 z-50 pointer-events-none"></div>
+
+  <script>
+    // --- Toast system ---
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toast-container');
+      const colors = {
+        success: 'border-mesh-green/40 bg-mesh-green/10 text-mesh-green',
+        error: 'border-mesh-red/40 bg-mesh-red/10 text-mesh-red',
+        info: 'border-mesh-blue/40 bg-mesh-blue/10 text-mesh-blue',
+      };
+      const cls = colors[type] || colors.info;
+      const el = document.createElement('div');
+      el.className = `pointer-events-auto border rounded-lg px-4 py-2.5 text-xs font-medium shadow-lg toast-enter ${cls}`;
+      el.textContent = message;
+      container.appendChild(el);
+      setTimeout(() => {
+        el.classList.remove('toast-enter');
+        el.classList.add('toast-exit');
+        el.addEventListener('animationend', () => el.remove());
+      }, 3000);
+    }
+
+    // --- Polling ---
+    let _pollInterval = null;
+
+    function startPolling() {
+      _pollInterval = setInterval(pollServer, 3000);
+      pollServer();
+    }
+
+    function pollServer() {
+      fetch('/api/poll')
+        .then(r => r.json())
+        .then(data => {
+          const inboxBadge = document.getElementById('nav-inbox-badge');
+          const pendingBadge = document.getElementById('nav-pending-badge');
+          const connCount = document.getElementById('nav-connections');
+
+          if (data.inbox.length > 0) {
+            inboxBadge.querySelector('span').textContent = data.inbox.length;
+            inboxBadge.classList.remove('hidden');
+          } else {
+            inboxBadge.classList.add('hidden');
+          }
+
+          if (data.pending_requests.length > 0) {
+            pendingBadge.querySelector('span').textContent = data.pending_requests.length;
+            pendingBadge.classList.remove('hidden');
+          } else {
+            pendingBadge.classList.add('hidden');
+          }
+
+          connCount.querySelector('span').textContent = data.connections.length;
+
+          if (typeof onPollData === 'function') onPollData(data);
+        })
+        .catch(() => {});
+    }
+
+    document.addEventListener('DOMContentLoaded', startPolling);
+  </script>
+</body>
+</html>

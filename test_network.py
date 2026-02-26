@@ -130,7 +130,7 @@ async def connect_agents(app_a, state_a, app_b, state_b) -> None:
 
     # Simulate the /connection_accepted callback on B so both sides record it
     use_agent(state_b)
-    state_b.pending_outbound.add(f"http://localhost:{state_a.port}/mcp")
+    state_b.pending_outbound[f"http://localhost:{state_a.port}/mcp"] = state_a.agent_id
     async with httpx.AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client:
         resp3 = await client.post("/__darkmatter__/connection_accepted", json={
             "agent_id": state_a.agent_id,

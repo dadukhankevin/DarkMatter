@@ -1,0 +1,550 @@
+{% extends "base.html" %}
+{% block title %}WormHole{% endblock %}
+{% block content %}
+
+<div class="flex h-[calc(100vh-48px)]">
+
+  <!-- ================================================================== -->
+  <!-- Left sidebar — Connections + Discovery                              -->
+  <!-- ================================================================== -->
+  <div class="w-72 bg-dim border-r border-edge flex flex-col shrink-0 overflow-hidden">
+
+    <!-- Connect form -->
+    <div class="p-3 border-b border-edge">
+      <form id="connect-form" class="flex gap-1.5">
+        <input type="text" name="url" placeholder="http://localhost:8100"
+          class="flex-1 bg-slab border border-edge rounded px-2.5 py-1.5 text-xs text-bright placeholder-muted focus:border-solar-500 transition-colors">
+        <button type="submit"
+          class="bg-solar-600 hover:bg-solar-500 text-ink text-xs font-semibold px-3 py-1.5 rounded transition-colors">
+          +
+        </button>
+      </form>
+    </div>
+
+    <!-- Pending requests -->
+    <div id="pending-section" class="hidden border-b border-edge">
+      <div class="px-3 py-2 flex items-center gap-2">
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple pulse-dot"></div>
+        <span class="text-xs text-mesh-purple font-medium uppercase tracking-wider">Pending</span>
+      </div>
+      <div id="pending-list" class="px-3 pb-2 space-y-1.5"></div>
+    </div>
+
+    <!-- Discovered agents -->
+    <div id="discovered-section" class="border-b border-edge">
+      <div class="px-3 py-2 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="w-1.5 h-1.5 rounded-full bg-mesh-blue"></div>
+          <span class="text-xs text-mesh-blue font-medium uppercase tracking-wider">Discovered</span>
+        </div>
+        <button onclick="fetch('/api/scan',{method:'POST'}).then(()=>pollServer())"
+          class="text-muted hover:text-pale text-xs transition-colors" title="Rescan">
+          scan
+        </button>
+      </div>
+      <div id="discovered-list" class="px-3 pb-2 space-y-1.5">
+        <p class="text-xs text-muted italic">Scanning...</p>
+      </div>
+    </div>
+
+    <!-- Connected agents -->
+    <div class="flex-1 overflow-y-auto">
+      <div class="px-3 py-2 flex items-center gap-2">
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
+        <span class="text-xs text-mesh-green font-medium uppercase tracking-wider">Connected</span>
+      </div>
+      <div id="connections-list" class="px-3 pb-3 space-y-1.5">
+        {% if state.connections|length == 0 %}
+        <p class="text-xs text-muted italic">No connections</p>
+        {% endif %}
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- Main chat area                                                      -->
+  <!-- ================================================================== -->
+  <div class="flex-1 flex flex-col min-w-0 bg-ink">
+
+    <!-- Chat stream -->
+    <div id="chat-stream" class="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+      <div id="empty-state" class="flex flex-col items-center justify-center h-full text-center">
+        <div class="text-solar-500 text-2xl font-light mb-2">~</div>
+        <p class="text-muted text-sm">enter the wormhole &mdash; connect to an agent to begin</p>
+      </div>
+    </div>
+
+    <!-- Compose bar -->
+    <div class="border-t border-edge bg-dim px-4 py-3">
+      <form id="compose-form" class="flex gap-3 items-end">
+        <select name="target" id="target-select"
+          class="bg-slab border border-edge rounded px-2.5 py-2 text-xs text-pale min-w-[120px] focus:border-solar-500 transition-colors">
+          <option value="auto">auto-route</option>
+          {% for c in state.connections.values() %}
+          <option value="{{ c.agent_id }}">{{ c.agent_display_name or short_id(c.agent_id) }}</option>
+          {% endfor %}
+        </select>
+        <div class="flex-1 relative">
+          <textarea name="content" id="compose-input" rows="1"
+            placeholder="Message the mesh..."
+            class="w-full bg-slab border border-edge rounded-lg px-4 py-2.5 text-sm text-bright placeholder-muted resize-none focus:border-solar-500 transition-colors"
+            oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'"></textarea>
+        </div>
+        <button type="submit" id="send-btn"
+          class="bg-solar-500 hover:bg-solar-400 text-ink text-sm font-semibold px-5 py-2.5 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+          Send
+        </button>
+      </form>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const chatStream = document.getElementById('chat-stream');
+const emptyState = document.getElementById('empty-state');
+const pendingSection = document.getElementById('pending-section');
+const pendingListEl = document.getElementById('pending-list');
+const discoveredList = document.getElementById('discovered-list');
+const connectionsList = document.getElementById('connections-list');
+const targetSelect = document.getElementById('target-select');
+const composeForm = document.getElementById('compose-form');
+const composeInput = document.getElementById('compose-input');
+const sendBtn = document.getElementById('send-btn');
+const connectForm = document.getElementById('connect-form');
+let renderedOutbox = new Map();
+let renderedInbox = new Map();
+let optimisticMessages = new Map(); // temp_id -> element
+
+function shortId(id) {
+  if (!id) return '?';
+  if (id.length > 16) return id.slice(0, 8) + '...' + id.slice(-4);
+  return id;
+}
+
+function timeAgo(iso) {
+  if (!iso) return '';
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 5) return 'now';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm';
+  if (s < 86400) return Math.floor(s/3600) + 'h';
+  return Math.floor(s/86400) + 'd';
+}
+
+function esc(t) {
+  const d = document.createElement('div');
+  d.textContent = t;
+  return d.innerHTML;
+}
+
+// ---------------------------------------------------------------------------
+// AJAX helpers
+// ---------------------------------------------------------------------------
+
+function ajaxPost(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+    body: JSON.stringify(body),
+  }).then(r => r.json());
+}
+
+// ---------------------------------------------------------------------------
+// Compose — fetch-based send with optimistic bubble
+// ---------------------------------------------------------------------------
+
+composeForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const content = composeInput.value.trim();
+  if (!content) return;
+  const target = targetSelect.value;
+
+  // Disable while sending
+  sendBtn.disabled = true;
+  composeInput.value = '';
+  composeInput.style.height = 'auto';
+
+  // Optimistic bubble
+  const tempId = '_opt_' + Date.now();
+  addOptimisticBubble(tempId, content);
+
+  try {
+    const result = await ajaxPost('/send', { content, target });
+    // Remove optimistic — next poll picks up the real one
+    removeOptimisticBubble(tempId);
+    if (!result.success) {
+      showToast(result.error || 'Send failed', 'error');
+    }
+  } catch (err) {
+    removeOptimisticBubble(tempId);
+    showToast('Failed to send message', 'error');
+  } finally {
+    sendBtn.disabled = false;
+    composeInput.focus();
+  }
+});
+
+composeInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    composeForm.dispatchEvent(new Event('submit'));
+  }
+});
+
+function addOptimisticBubble(tempId, content) {
+  if (emptyState) emptyState.style.display = 'none';
+  const html = `
+    <div class="flex justify-end fade-in">
+      <div class="max-w-[65%] min-w-[200px]">
+        <div class="bg-slab border border-edge rounded-xl px-4 py-3 opacity-70">
+          <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(content)}</p>
+        </div>
+        <div class="flex justify-end items-center gap-2 mt-1 px-2">
+          <div class="w-1.5 h-1.5 rounded-full bg-muted pulse-dot"></div>
+          <span class="text-xs text-muted">sending...</span>
+        </div>
+      </div>
+    </div>`;
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  div.dataset.optId = tempId;
+  chatStream.appendChild(div);
+  optimisticMessages.set(tempId, div);
+  chatStream.scrollTop = chatStream.scrollHeight;
+}
+
+function removeOptimisticBubble(tempId) {
+  const el = optimisticMessages.get(tempId);
+  if (el) { el.remove(); optimisticMessages.delete(tempId); }
+}
+
+// ---------------------------------------------------------------------------
+// Connect form — fetch-based
+// ---------------------------------------------------------------------------
+
+connectForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const urlInput = connectForm.querySelector('input[name="url"]');
+  const url = urlInput.value.trim();
+  if (!url) return;
+
+  const btn = connectForm.querySelector('button');
+  btn.disabled = true;
+  try {
+    const result = await ajaxPost('/connect', { url });
+    if (result.success) {
+      showToast(result.status === 'connected' ? 'Connected' : 'Connection request sent', 'success');
+      urlInput.value = '';
+    } else {
+      showToast(result.error || 'Connection failed', 'error');
+    }
+  } catch (err) {
+    showToast('Connection failed', 'error');
+  } finally {
+    btn.disabled = false;
+  }
+  pollServer();
+});
+
+// ---------------------------------------------------------------------------
+// Render outbound message
+// ---------------------------------------------------------------------------
+
+function renderOutbound(msg) {
+  const el = renderedOutbox.get(msg.message_id);
+
+  let statusDot = 'bg-muted';
+  let statusLabel = 'sending';
+  if (msg.status === 'active') { statusDot = 'bg-mesh-yellow'; statusLabel = 'active'; }
+  if (msg.status === 'responded') { statusDot = 'bg-mesh-green'; statusLabel = 'responded'; }
+  if (msg.status === 'expired') { statusDot = 'bg-mesh-red'; statusLabel = 'expired'; }
+
+  const html = `
+    <div class="flex justify-end fade-in">
+      <div class="max-w-[65%] min-w-[200px]">
+        <div class="bg-slab border border-edge rounded-xl px-4 py-3">
+          <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(msg.content)}</p>
+        </div>
+        <div class="flex justify-end items-center gap-2 mt-1 px-2">
+          <div class="w-1.5 h-1.5 rounded-full ${statusDot}"></div>
+          <span class="text-xs text-muted">${statusLabel}</span>
+          <span class="text-xs text-faint">${timeAgo(msg.created_at)}</span>
+        </div>
+        ${msg.response ? `
+        <div class="mt-2 flex justify-end">
+          <div class="bg-dim border border-edge rounded-xl px-4 py-3 max-w-full">
+            <div class="flex items-center gap-2 mb-1.5">
+              <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
+              <span class="text-xs text-mesh-green font-medium">${esc(msg.response_display_name || shortId(msg.response_agent))}</span>
+            </div>
+            <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(msg.response)}</p>
+          </div>
+        </div>` : ''}
+      </div>
+    </div>`;
+
+  if (el) {
+    el.innerHTML = html;
+  } else {
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    div.dataset.msgId = msg.message_id;
+    chatStream.appendChild(div);
+    renderedOutbox.set(msg.message_id, div);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Render inbox message — fetch-based reply
+// ---------------------------------------------------------------------------
+
+function renderInbox(msg) {
+  if (renderedInbox.has(msg.message_id)) return;
+
+  const wrapper = document.createElement('div');
+  wrapper.dataset.inboxId = msg.message_id;
+
+  wrapper.innerHTML = `
+    <div class="flex justify-start fade-in">
+      <div class="max-w-[65%] min-w-[200px]">
+        <div class="bg-dim border border-edge rounded-xl px-4 py-3">
+          <div class="flex items-center gap-2 mb-1.5">
+            <div class="w-1.5 h-1.5 rounded-full bg-mesh-blue"></div>
+            <span class="text-xs text-mesh-blue font-medium">${esc(msg.from_display_name)}</span>
+            <span class="text-xs text-faint">${timeAgo(msg.received_at)}</span>
+          </div>
+          <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(msg.content)}</p>
+        </div>
+        <div class="mt-2 reply-area">
+          <div class="flex gap-1.5">
+            <input type="text" placeholder="Reply..."
+              class="reply-input flex-1 bg-slab border border-edge rounded-lg px-3 py-2 text-xs text-bright placeholder-muted focus:border-solar-500 transition-colors">
+            <button type="button"
+              class="reply-btn bg-mesh-blue/20 hover:bg-mesh-blue/30 text-mesh-blue text-xs font-medium px-3 py-2 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+              Reply
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  const replyInput = wrapper.querySelector('.reply-input');
+  const replyBtn = wrapper.querySelector('.reply-btn');
+
+  async function doReply() {
+    const text = replyInput.value.trim();
+    if (!text) return;
+    replyBtn.disabled = true;
+    replyBtn.textContent = 'Replying...';
+    replyInput.disabled = true;
+    try {
+      const result = await ajaxPost(`/respond/${encodeURIComponent(msg.message_id)}`, { response: text });
+      if (result.success) {
+        showToast('Reply sent', 'success');
+        wrapper.remove();
+        renderedInbox.delete(msg.message_id);
+      } else {
+        showToast(result.error || 'Reply failed', 'error');
+        replyBtn.disabled = false;
+        replyBtn.textContent = 'Reply';
+        replyInput.disabled = false;
+      }
+    } catch (err) {
+      showToast('Reply failed', 'error');
+      replyBtn.disabled = false;
+      replyBtn.textContent = 'Reply';
+      replyInput.disabled = false;
+    }
+  }
+
+  replyBtn.addEventListener('click', doReply);
+  replyInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doReply(); }
+  });
+
+  chatStream.appendChild(wrapper);
+  renderedInbox.set(msg.message_id, wrapper);
+}
+
+// ---------------------------------------------------------------------------
+// Render pending requests — fetch-based accept/reject
+// ---------------------------------------------------------------------------
+
+function renderPending(requests) {
+  if (requests.length === 0) {
+    pendingSection.classList.add('hidden');
+    return;
+  }
+  pendingSection.classList.remove('hidden');
+  pendingListEl.innerHTML = '';
+
+  requests.forEach(r => {
+    const el = document.createElement('div');
+    el.className = 'bg-slab border border-edge rounded-lg p-2.5 flex items-center justify-between gap-2';
+    el.innerHTML = `
+      <div class="min-w-0">
+        <div class="text-xs text-bright font-medium truncate">${esc(r.from_display_name)}</div>
+        ${r.from_bio ? `<div class="text-xs text-muted truncate mt-0.5">${esc(r.from_bio.slice(0, 50))}</div>` : ''}
+      </div>
+      <div class="flex gap-1 shrink-0">
+        <button class="accept-btn bg-mesh-green/15 hover:bg-mesh-green/25 text-mesh-green text-xs px-2 py-1 rounded transition-colors font-medium">Accept</button>
+        <button class="reject-btn bg-mesh-red/15 hover:bg-mesh-red/25 text-mesh-red text-xs px-2 py-1 rounded transition-colors">Deny</button>
+      </div>`;
+
+    el.querySelector('.accept-btn').addEventListener('click', async () => {
+      try {
+        const result = await ajaxPost(`/accept/${encodeURIComponent(r.request_id)}`, {});
+        if (result.success) {
+          showToast(`Connected to ${r.from_display_name}`, 'success');
+        }
+      } catch (err) {
+        showToast('Accept failed', 'error');
+      }
+      pollServer();
+    });
+
+    el.querySelector('.reject-btn').addEventListener('click', async () => {
+      try {
+        await ajaxPost(`/reject/${encodeURIComponent(r.request_id)}`, {});
+        showToast('Request denied', 'info');
+      } catch (err) {
+        showToast('Reject failed', 'error');
+      }
+      pollServer();
+    });
+
+    pendingListEl.appendChild(el);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Render discovered agents — fetch-based connect
+// ---------------------------------------------------------------------------
+
+function renderDiscovered(agents) {
+  if (agents.length === 0) {
+    discoveredList.innerHTML = '<p class="text-xs text-muted italic">No agents found on local ports</p>';
+    return;
+  }
+  discoveredList.innerHTML = '';
+
+  agents.forEach(a => {
+    const el = document.createElement('div');
+    el.className = 'bg-slab border border-edge rounded-lg p-2.5 flex items-center justify-between gap-2';
+    el.innerHTML = `
+      <div class="min-w-0">
+        <div class="flex items-center gap-1.5">
+          <span class="text-xs text-bright font-medium truncate">${esc(a.display_name)}</span>
+          <span class="text-xs text-faint">:${a.port}</span>
+        </div>
+        ${a.bio ? `<div class="text-xs text-muted truncate mt-0.5">${esc(a.bio.slice(0, 50))}</div>` : ''}
+      </div>
+      <button type="button"
+        class="connect-btn shrink-0 bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-xs px-2.5 py-1 rounded transition-colors font-medium">
+        Connect
+      </button>`;
+
+    el.querySelector('.connect-btn').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = '...';
+      try {
+        const result = await ajaxPost('/connect', { url: a.url });
+        if (result.success) {
+          showToast(result.status === 'connected' ? `Connected to ${a.display_name}` : 'Connection request sent', 'success');
+        } else {
+          showToast(result.error || 'Connection failed', 'error');
+        }
+      } catch (err) {
+        showToast('Connection failed', 'error');
+      }
+      btn.disabled = false;
+      btn.textContent = 'Connect';
+      pollServer();
+    });
+
+    discoveredList.appendChild(el);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Render connections — fetch-based disconnect
+// ---------------------------------------------------------------------------
+
+function renderConnections(conns) {
+  if (conns.length === 0) {
+    connectionsList.innerHTML = '<p class="text-xs text-muted italic">No connections</p>';
+  } else {
+    connectionsList.innerHTML = '';
+    conns.forEach(c => {
+      const el = document.createElement('div');
+      el.className = 'bg-slab border border-edge rounded-lg p-2.5 group';
+      el.innerHTML = `
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-1.5 min-w-0">
+            <div class="w-1.5 h-1.5 rounded-full bg-mesh-green shrink-0"></div>
+            <span class="text-xs text-bright font-medium truncate">${esc(c.display_name)}</span>
+          </div>
+          <button type="button" class="dc-btn text-faint hover:text-mesh-red text-xs opacity-0 group-hover:opacity-100 transition-all" title="Disconnect">&times;</button>
+        </div>
+        ${c.bio ? `<div class="text-xs text-muted truncate mt-1 pl-3">${esc(c.bio.slice(0, 60))}</div>` : ''}
+        ${c.last_activity ? `<div class="text-xs text-faint mt-0.5 pl-3">active ${timeAgo(c.last_activity)} ago</div>` : ''}`;
+
+      el.querySelector('.dc-btn').addEventListener('click', async () => {
+        try {
+          await ajaxPost(`/disconnect/${encodeURIComponent(c.agent_id)}`, {});
+          showToast(`Disconnected from ${c.display_name}`, 'info');
+        } catch (err) {
+          showToast('Disconnect failed', 'error');
+        }
+        pollServer();
+      });
+
+      connectionsList.appendChild(el);
+    });
+  }
+
+  // Update target select
+  const cur = targetSelect.value;
+  const opts = ['<option value="auto">auto-route</option>'];
+  conns.forEach(c => opts.push(`<option value="${c.agent_id}">${esc(c.display_name)}</option>`));
+  targetSelect.innerHTML = opts.join('');
+  if ([...targetSelect.options].some(o => o.value === cur)) targetSelect.value = cur;
+}
+
+// ---------------------------------------------------------------------------
+// Main poll handler
+// ---------------------------------------------------------------------------
+
+function onPollData(data) {
+  const hasContent = data.outbox.length > 0 || data.inbox.length > 0;
+  if (hasContent && emptyState) emptyState.style.display = 'none';
+  if (!hasContent && optimisticMessages.size === 0 && emptyState) emptyState.style.display = '';
+
+  // Remove stale inbox
+  const inboxIds = new Set(data.inbox.map(m => m.message_id));
+  for (const [mid, el] of renderedInbox) {
+    if (!inboxIds.has(mid)) { el.remove(); renderedInbox.delete(mid); }
+  }
+
+  // Merge + sort chronologically
+  const all = [];
+  data.outbox.forEach(m => all.push({...m, _type: 'out', _ts: m.created_at}));
+  data.inbox.forEach(m => all.push({...m, _type: 'in', _ts: m.received_at}));
+  all.sort((a, b) => (a._ts || '').localeCompare(b._ts || ''));
+
+  all.forEach(m => m._type === 'out' ? renderOutbound(m) : renderInbox(m));
+
+  renderPending(data.pending_requests);
+  renderDiscovered(data.discovered || []);
+  renderConnections(data.connections);
+
+  // Auto-scroll
+  const near = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight < 150;
+  if (near) chatStream.scrollTop = chatStream.scrollHeight;
+}
+</script>
+
+{% endblock %}
