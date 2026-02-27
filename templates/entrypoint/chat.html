@@ -1551,41 +1551,59 @@ function diffActivity(prev, curr) {
 // =========================================================================
 function buildTimelineItems(data) {
   const items = [];
+  const conns = data.connections || [];
+  const findConn = (id) => conns.find(cn => cn.agent_id === id);
+
   for (const msg of (data.outbox || [])) {
+    const recipientNames = (msg.routed_to || []).map(id => {
+      const c = findConn(id);
+      return c ? agentLabel(c) : shortId(id);
+    }).join(', ') || 'auto-route';
+
+    // Sent message
     items.push({
       id: msg.message_id,
       type: 'sent',
       content: msg.content,
       timestamp: msg.timestamp || msg.created_at,
       agent_ids: msg.routed_to || [],
-      display_name: (msg.routed_to || []).map(id => {
-        const c = (data.connections || []).find(cn => cn.agent_id === id);
-        return c ? agentLabel(c) : shortId(id);
-      }).join(', ') || 'auto-route',
+      display_name: recipientNames,
       status: msg.status,
       updates: msg.updates || [],
-      responses: (msg.responses || []).map(r => {
-        // Enrich response display_name from connections if available
-        const c = (data.connections || []).find(cn => cn.agent_id === r.agent_id);
-        return c ? { ...r, display_name: agentLabel(c), bio: c.bio } : r;
-      }),
     });
+
+    // Each response becomes its own flat item
+    for (let i = 0; i < (msg.responses || []).length; i++) {
+      const r = msg.responses[i];
+      const c = findConn(r.agent_id);
+      const name = c ? agentLabel(c) : (r.display_name || shortId(r.agent_id));
+      items.push({
+        id: msg.message_id + '_r' + i,
+        type: 'response',
+        content: r.response,
+        timestamp: r.timestamp,
+        agent_ids: [r.agent_id],
+        display_name: name,
+        reply_to_content: msg.content,
+        reply_to_name: 'You',
+      });
+    }
   }
+
   for (const msg of (data.inbox || [])) {
+    const c = findConn(msg.from_agent_id);
     items.push({
       id: 'inbox_' + msg.message_id,
       type: 'received',
       content: msg.content,
-      timestamp: msg.timestamp || msg.created_at,
+      timestamp: msg.timestamp || msg.received_at || msg.created_at,
       agent_ids: [msg.from_agent_id],
-      display_name: (() => {
-        const c = (data.connections || []).find(cn => cn.agent_id === msg.from_agent_id);
-        return c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id));
-      })(),
+      display_name: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
       from_agent_id: msg.from_agent_id,
       raw_message_id: msg.message_id,
     });
   }
+
   items.sort((a, b) => {
     const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
     const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
@@ -1618,62 +1636,60 @@ function buildWebhookBadges(updates) {
   return html;
 }
 
+function buildItemHTML(item) {
+  if (item.type === 'sent') return buildSentItemHTML(item);
+  if (item.type === 'response') return buildResponseItemHTML(item);
+  return buildReceivedItemHTML(item);
+}
+
 function buildSentItemHTML(item) {
   return `
-    <div class="flex items-start gap-2 min-w-0">
-      <svg width="12" height="12" viewBox="0 0 10 10" class="text-solar-400 shrink-0 mt-0.5"><path d="M2 5h6M6 3l2 2-2 2" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
-      <div class="min-w-0 flex-1">
-        <div class="flex items-center gap-1.5">
-          <span class="text-[12px] text-pale font-medium">You</span>
-          <span class="text-[12px] text-faint">&rarr;</span>
-          <span class="text-[12px] text-solar-400 font-medium truncate">${item.display_name}</span>
-          <span class="text-[11px] text-faint shrink-0">${relativeTime(item.timestamp)}</span>
-        </div>
-        <div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
-        ${buildWebhookBadges(item.updates)}
-        ${buildResponseThreads(item.responses)}
+    <div class="min-w-0">
+      <div class="flex items-center gap-1.5">
+        <span class="text-[12px] text-solar-400 font-medium">You</span>
+        <span class="text-[11px] text-faint">&rarr;</span>
+        <span class="text-[12px] text-solar-400/70 truncate">${item.display_name}</span>
+        <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(item.timestamp)}</span>
       </div>
+      <div class="truncated-content text-[12px] text-pale mt-1 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
+      ${buildWebhookBadges(item.updates)}
+    </div>`;
+}
+
+function buildResponseItemHTML(item) {
+  const preview = (item.reply_to_content || '').slice(0, 50);
+  return `
+    <div class="min-w-0">
+      <div class="flex items-center gap-1.5 text-[10px] text-faint mb-0.5 cursor-pointer" onclick="this.nextElementSibling.nextElementSibling.querySelector('.truncated-content')?.classList.toggle('expanded')">
+        <svg width="10" height="10" viewBox="0 0 10 10" class="shrink-0 opacity-40"><path d="M2 6.5C2 4 4 2.5 7 2.5M7 2.5L5.5 1M7 2.5L5.5 4" stroke="currentColor" stroke-width="1" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="truncate">replying to <span class="text-solar-400/70">${item.reply_to_name}</span>: ${escapeHtml(preview)}</span>
+      </div>
+      <div class="flex items-center gap-1.5">
+        <span class="text-[12px] text-mesh-green font-medium truncate">${item.display_name}</span>
+        <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(item.timestamp)}</span>
+      </div>
+      <div class="truncated-content text-[12px] text-pale mt-1 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
     </div>`;
 }
 
 function buildReceivedItemHTML(item) {
   return `
-    <div class="flex items-start gap-2 min-w-0">
-      <svg width="12" height="12" viewBox="0 0 10 10" class="text-mesh-blue shrink-0 mt-0.5"><path d="M8 5H2M4 3L2 5l2 2" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
-      <div class="min-w-0 flex-1">
-        <div class="flex items-center gap-1.5">
-          <span class="text-[12px] text-mesh-blue font-medium truncate">${item.display_name}</span>
-          <span class="text-[11px] text-faint shrink-0">${relativeTime(item.timestamp)}</span>
-        </div>
-        <div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
-        <div class="flex gap-1.5 mt-1.5">
-          <input type="text" placeholder="Reply..."
-            data-message-id="${item.raw_message_id || ''}"
-            class="timeline-reply-input flex-1 bg-slab border border-edge rounded px-2 py-1 text-[12px] text-bright placeholder-muted focus:border-mesh-blue/40 transition-colors min-w-0">
-          <button type="button" data-message-id="${item.raw_message_id || ''}"
-            class="timeline-reply-btn bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[11px] font-medium px-2.5 py-1 rounded transition-colors disabled:opacity-30 shrink-0">
-            Reply
-          </button>
-        </div>
+    <div class="min-w-0">
+      <div class="flex items-center gap-1.5">
+        <span class="text-[12px] text-mesh-blue font-medium truncate">${item.display_name}</span>
+        <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(item.timestamp)}</span>
+      </div>
+      <div class="truncated-content text-[12px] text-pale mt-1 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
+      <div class="flex gap-1.5 mt-1.5">
+        <input type="text" placeholder="Reply..."
+          data-message-id="${item.raw_message_id || ''}"
+          class="timeline-reply-input flex-1 bg-slab border border-edge rounded px-2 py-1 text-[12px] text-bright placeholder-muted focus:border-mesh-blue/40 transition-colors min-w-0">
+        <button type="button" data-message-id="${item.raw_message_id || ''}"
+          class="timeline-reply-btn bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[11px] font-medium px-2.5 py-1 rounded transition-colors disabled:opacity-30 shrink-0">
+          Reply
+        </button>
       </div>
     </div>`;
-}
-
-function buildResponseThreads(responses) {
-  if (!responses || !responses.length) return '';
-  let html = '';
-  for (const r of responses) {
-    const name = agentLabel(r);
-    html += `
-      <div class="pl-3 ml-2 border-l-2 border-mesh-green/20 mt-1.5">
-        <div class="flex items-center gap-1.5">
-          <span class="text-[12px] text-mesh-green font-medium truncate">${name}</span>
-          <span class="text-[11px] text-faint shrink-0">${relativeTime(r.timestamp)}</span>
-        </div>
-        <div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(r.response)}</div>
-      </div>`;
-  }
-  return html;
 }
 
 function escapeHtml(str) {
@@ -1683,16 +1699,16 @@ function escapeHtml(str) {
 
 function createTimelineElement(item) {
   const el = document.createElement('div');
-  const borderCls = item.type === 'sent' ? 'border-solar-500/20' : 'border-mesh-blue/20';
-  el.className = `p-2.5 rounded-lg border ${borderCls} bg-slab/30 hover:bg-slab/60 transition-colors timeline-enter`;
+  const borders = { sent: 'border-solar-500/15', received: 'border-mesh-blue/15', response: 'border-mesh-green/15' };
+  const borderCls = borders[item.type] || 'border-edge';
+  el.className = `px-3 py-2 rounded-lg border ${borderCls} bg-slab/20 hover:bg-slab/40 transition-colors timeline-enter`;
   el.dataset.timelineId = item.id;
   el.dataset.agentIds = JSON.stringify(item.agent_ids || []);
-  el.innerHTML = item.type === 'sent' ? buildSentItemHTML(item) : buildReceivedItemHTML(item);
+  el.innerHTML = buildItemHTML(item);
 
   el.addEventListener('mouseenter', () => highlightTimelineItem(item));
   el.addEventListener('mouseleave', () => clearTimelineHighlight());
 
-  // Wire up reply for inbox items
   if (item.type === 'received' && item.raw_message_id) {
     wireTimelineReply(el, item);
   }
@@ -1757,18 +1773,13 @@ function renderTimeline(data) {
     if (dismissedTimeline.has(item.id)) continue;
     const existing = renderedTimeline.get(item.id);
     if (existing) {
-      // Update content in-place (for webhook badges, responses)
-      const html = item.type === 'sent' ? buildSentItemHTML(item) : buildReceivedItemHTML(item);
-      const inner = existing.querySelector('.flex.items-start');
-      if (inner && inner.innerHTML !== html.trim()) {
-        // Re-check: only rebuild if content actually changed
-        const wrapper = existing.firstElementChild;
-        if (wrapper) {
-          existing.innerHTML = html;
-          // Re-attach hover listeners
-          existing.addEventListener('mouseenter', () => highlightTimelineItem(item));
-          existing.addEventListener('mouseleave', () => clearTimelineHighlight());
-        }
+      // Update content in-place (for webhook badges)
+      const html = buildItemHTML(item);
+      if (existing.innerHTML !== html) {
+        existing.innerHTML = html;
+        existing.addEventListener('mouseenter', () => highlightTimelineItem(item));
+        existing.addEventListener('mouseleave', () => clearTimelineHighlight());
+        if (item.type === 'received' && item.raw_message_id) wireTimelineReply(existing, item);
       }
     } else {
       const el = createTimelineElement(item);
