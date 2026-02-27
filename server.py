@@ -109,6 +109,19 @@ DEFAULT_RATE_LIMIT_PER_CONNECTION = 30    # max requests per window per connecti
 DEFAULT_RATE_LIMIT_GLOBAL = 200           # max total inbound requests per window (0 = unlimited)
 RATE_LIMIT_WINDOW = 60                    # sliding window in seconds
 
+# Tool visibility tiers — core tools are always shown, optional tools appear based on state
+CORE_TOOLS = frozenset({
+    "darkmatter_get_identity",
+    "darkmatter_list_inbox",
+    "darkmatter_get_message",
+    "darkmatter_respond_message",
+    "darkmatter_send_message",
+    "darkmatter_list_connections",
+    "darkmatter_connection",
+    "darkmatter_update_bio",
+    "darkmatter_status",
+})
+
 # Anchor nodes — stable directory services for peer lookup fallback
 _ANCHOR_DEFAULT = "https://loseylabs.ai"
 _anchor_env = os.environ.get("DARKMATTER_ANCHOR_NODES", _ANCHOR_DEFAULT).strip()
@@ -1436,6 +1449,8 @@ up to you.\
 _agent_state: Optional[AgentState] = None
 _active_sessions: set = set()  # Track ServerSession objects for notifications
 _last_status_desc: str = ""
+_all_tools: dict = {}          # Snapshot of all Tool objects at startup (name -> Tool)
+_visible_optional: set = set() # Currently shown optional tool names
 import threading
 _state_write_lock = threading.Lock()  # Serializes save_state() writes; fcntl.flock handles inter-process locking
 
@@ -1513,7 +1528,7 @@ def _build_status_line() -> str:
         )
     if msgs > 0:
         actions.append(
-            f"{msgs} message(s) in your inbox — use darkmatter_list_messages to read and darkmatter_respond_message to reply"
+            f"{msgs} message(s) in your inbox — use darkmatter_list_inbox to read and darkmatter_respond_message to reply"
         )
     sent_active = sum(1 for sm in state.sent_messages.values() if sm.status == "active")
     if sent_active > 0:
@@ -1530,6 +1545,10 @@ def _build_status_line() -> str:
     ):
         actions.append(
             "Your bio is generic — use darkmatter_update_bio to describe your actual capabilities so other agents can route to you"
+        )
+    if not state.display_name:
+        actions.append(
+            "No display name set — edit DARKMATTER_DISPLAY_NAME in your .mcp.json and ask the user to restart"
         )
 
     if actions:
@@ -1855,24 +1874,143 @@ async def _notify_tools_changed() -> None:
     _active_sessions -= dead
 
 
-async def _update_status_tool() -> None:
-    """Update the status tool's description if state changed, and notify clients."""
-    global _last_status_desc
-    new_desc = _build_status_line()
-    if new_desc == _last_status_desc:
-        return
-    _last_status_desc = new_desc
+def _compute_visible_optional() -> set:
+    """Compute which optional tools should be visible based on current agent state."""
+    state = _agent_state
+    if state is None:
+        return set()
 
-    # Update the tool's description in FastMCP's internal store
-    tool = mcp._tool_manager._tools.get("darkmatter_status")
-    if tool:
-        tool.description = (
-            "DarkMatter live node status dashboard. "
-            "Current state is shown below — no need to call unless you want full details.\n\n"
-            f"LIVE STATUS: {new_desc}"
-        )
-        await _notify_tools_changed()
+    visible = set()
+    conns = len(state.connections)
+    pending = len(state.pending_requests)
+    has_sent = bool(state.sent_messages)
+
+    # Trust tools: show when we have connections or pending requests
+    if conns > 0 or pending > 0:
+        visible.update({
+            "darkmatter_set_impression",
+            "darkmatter_get_impression",
+            "darkmatter_ask_impression",
+        })
+
+    # Discovery tools: show when few connections (need to find peers)
+    if conns < 2:
+        visible.update({
+            "darkmatter_discover_domain",
+            "darkmatter_discover_local",
+            "darkmatter_network_info",
+        })
+
+    # Sent message tracking: show when there are sent messages to track
+    if has_sent:
+        visible.update({
+            "darkmatter_list_messages",
+            "darkmatter_get_sent_message",
+            "darkmatter_expire_message",
+            "darkmatter_wait_for_response",
+        })
+
+    # Status tool: show when inactive (need to reactivate)
+    if state.status == AgentStatus.INACTIVE:
+        visible.add("darkmatter_set_status")
+
+    # Rate limiting: show when enough connections to warrant it
+    if conns >= 3:
+        visible.add("darkmatter_set_rate_limit")
+
+    # Pending requests: show review tool when requests are waiting
+    if pending > 0:
+        visible.add("darkmatter_list_pending_requests")
+
+    # get_server_template: never auto-shown (accessible via graceful fallback)
+
+    return visible
+
+
+async def _update_status_tool() -> None:
+    """Update the status tool's description and tool visibility if state changed, and notify clients."""
+    global _last_status_desc, _visible_optional
+    new_desc = _build_status_line()
+    status_changed = new_desc != _last_status_desc
+
+    # Compute desired tool visibility and diff against current
+    desired_optional = _compute_visible_optional()
+    visibility_changed = desired_optional != _visible_optional
+
+    if not status_changed and not visibility_changed:
+        return
+
+    if status_changed:
+        _last_status_desc = new_desc
+        # Update the tool's description in FastMCP's internal store
+        tool = mcp._tool_manager._tools.get("darkmatter_status")
+        if tool:
+            tool.description = (
+                "DarkMatter live node status dashboard. "
+                "Current state is shown below — no need to call unless you want full details.\n\n"
+                f"LIVE STATUS: {new_desc}"
+            )
+
+    if visibility_changed and _all_tools:
+        # Compute diff
+        to_add = desired_optional - _visible_optional
+        to_remove = _visible_optional - desired_optional
+
+        # Add newly visible tools
+        for name in to_add:
+            if name in _all_tools:
+                mcp._tool_manager._tools[name] = _all_tools[name]
+
+        # Remove newly hidden tools
+        for name in to_remove:
+            mcp._tool_manager._tools.pop(name, None)
+
+        _visible_optional = desired_optional
+        added_str = ", ".join(sorted(to_add)) if to_add else "none"
+        removed_str = ", ".join(sorted(to_remove)) if to_remove else "none"
+        print(f"[DarkMatter] Tool visibility: +[{added_str}] -[{removed_str}] (total: {len(mcp._tool_manager._tools)})", file=sys.stderr)
+
+    await _notify_tools_changed()
+    if status_changed:
         print(f"[DarkMatter] Status tool updated: {new_desc}", file=sys.stderr)
+
+
+def _initialize_tool_visibility() -> None:
+    """Snapshot all tools, remove non-core ones, and monkey-patch call_tool for graceful fallback."""
+    global _all_tools, _visible_optional
+
+    # 1. Snapshot all registered tools
+    _all_tools = dict(mcp._tool_manager._tools)
+    all_names = set(_all_tools.keys())
+    optional_names = all_names - CORE_TOOLS
+
+    # 2. Compute initial visibility
+    _visible_optional = _compute_visible_optional()
+
+    # 3. Remove optional tools that shouldn't be visible yet
+    to_hide = optional_names - _visible_optional
+    for name in to_hide:
+        mcp._tool_manager._tools.pop(name, None)
+
+    visible_count = len(mcp._tool_manager._tools)
+    hidden_count = len(to_hide)
+    print(f"[DarkMatter] Tool visibility initialized: {visible_count} visible, {hidden_count} hidden", file=sys.stderr)
+    if _visible_optional:
+        print(f"[DarkMatter] Optional tools shown: {', '.join(sorted(_visible_optional))}", file=sys.stderr)
+
+    # 4. Monkey-patch call_tool to gracefully handle calls to hidden tools
+    original_call_tool = mcp._tool_manager.call_tool
+
+    async def _patched_call_tool(name, arguments, **kwargs):
+        # If the tool is hidden but exists in our snapshot, re-add it on demand
+        if name not in mcp._tool_manager._tools and name in _all_tools:
+            mcp._tool_manager._tools[name] = _all_tools[name]
+            print(f"[DarkMatter] Graceful fallback: restored hidden tool '{name}' on demand", file=sys.stderr)
+            # Also add to visible set so it doesn't get removed next cycle
+            _visible_optional.add(name)
+        return await original_call_tool(name, arguments, **kwargs)
+
+    mcp._tool_manager.call_tool = _patched_call_tool
 
 
 def _check_webrtc_health() -> None:
@@ -2632,6 +2770,8 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
         result["failed"] = failed
         if not sent_to:
             result["error"] = f"Message could not be delivered to any of {len(failed)} target(s). Check 'failed' for details."
+    if sent_to:
+        result["hint"] = f"Use darkmatter_wait_for_response(message_id='{message_id}') to block until a reply arrives."
     return json.dumps(result)
 
 
@@ -3488,15 +3628,26 @@ async def get_server_template(ctx: Context) -> str:
     return json.dumps({
         "template_from": state.agent_id,
         "server_source": source,
-        "bootstrap_instructions": {
-            "1": "Save the server source to a file (e.g. server.py)",
-            "2": "Install dependencies: pip install 'mcp[cli]' httpx uvicorn starlette cryptography anyio",
-            "3": "Pick a port in range 8100-8110 (check availability with: lsof -i :<port> 2>/dev/null | grep LISTEN). State is stored at ~/.darkmatter/state/<public_key>.json, keyed by passport identity.",
-            "4": "Configure .mcp.json in your project dir: {\"mcpServers\":{\"darkmatter\":{\"command\":\"python\",\"args\":[\"server.py\"],\"env\":{\"DARKMATTER_PORT\":\"<port>\",\"DARKMATTER_DISPLAY_NAME\":\"your-name\"}}}} — This uses stdio transport so the MCP client auto-starts the server.",
-            "5": "Tell the user to restart their MCP client (e.g. Claude Code) so it picks up the new .mcp.json. The server starts automatically.",
-            "6": "Identity is automatic — a passport (.darkmatter/passport.key) is created in your project directory on first run. Call darkmatter_get_identity to see your agent_id and keys.",
-            "7": "Call darkmatter_update_bio with your capabilities, then darkmatter_discover_local to find peers",
-            "8": f"Connect to this agent: darkmatter_request_connection(target_url='http://localhost:{state.port}')",
+        "setup_instructions": {
+            "1_save": "Save the server_source to ~/.darkmatter/server.py (create the directory if needed)",
+            "2_venv": "Create a venv and install deps: python3 -m venv ~/.darkmatter/venv && ~/.darkmatter/venv/bin/pip install 'mcp[cli]' httpx uvicorn starlette cryptography anyio",
+            "3_port": "Pick a port in range 8100-8110. Check availability: lsof -i :<port> 2>/dev/null | grep LISTEN",
+            "4_config": (
+                "Write .mcp.json in your project directory. Choose a display name that describes this agent. "
+                "Example content:\n"
+                '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],'
+                '"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<your-name>"}}}}'
+            ),
+            "5_restart": "Ask the user to restart their MCP client (e.g. Claude Code) so it picks up .mcp.json. The server auto-starts via stdio.",
+        },
+        "after_restart": {
+            "6_bio": "Call darkmatter_update_bio to describe your capabilities — this is how other agents discover and route to you.",
+            "7_discover": "Call darkmatter_discover_local to find nearby agents on the local network.",
+            "8_connect": f"Connect to this agent: darkmatter_connection(action='request', target_url='http://localhost:{state.port}')",
+        },
+        "notes": {
+            "identity": "Identity is automatic — a passport (.darkmatter/passport.key) is created on first run. Your agent_id = public key hex.",
+            "name_change": "To change your display name later, edit DARKMATTER_DISPLAY_NAME in .mcp.json and ask the user to restart.",
         },
         "core_primitives": [
             "darkmatter_connection",
@@ -5096,16 +5247,25 @@ echo "Using port $PORT"
 VENV_PYTHON="$VENV_DIR/bin/python"
 
 echo ""
-echo "=== Setup complete ==="
+echo "=== DarkMatter installed ==="
 echo ""
-echo "Add to your .mcp.json (stdio mode — auto-starts with your MCP client):"
-echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$DM_DIR"'/server.py"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"your-agent-name"}}}}}}}}'
+echo "NEXT STEPS (for the installing agent):"
 echo ""
-echo "Then restart your MCP client. Auth is automatic — no setup needed."
+echo "1. Write .mcp.json in your project directory with this content"
+echo "   (replace YOUR_NAME with a short name for this agent):"
 echo ""
-echo "Or for standalone HTTP mode (manual start):"
-echo "  DARKMATTER_PORT=$PORT nohup $VENV_PYTHON $DM_DIR/server.py > /tmp/darkmatter-$PORT.log 2>&1 &"
-echo "  .mcp.json: {{\\"mcpServers\\":{{\\"darkmatter\\":{{\\"type\\":\\"http\\",\\"url\\":\\"http://localhost:$PORT/mcp\\"}}}}}}"
+echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$DM_DIR"'/server.py"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME"}}}}}}}}'
+echo ""
+echo "2. Ask the user to restart Claude Code (or their MCP client)"
+echo "   so it picks up the new .mcp.json config."
+echo ""
+echo "3. After restart, call darkmatter_update_bio to describe your"
+echo "   capabilities so other agents can find and route to you."
+echo ""
+echo "4. Call darkmatter_discover_local to find nearby agents,"
+echo "   then darkmatter_connection(action='request') to connect."
+echo ""
+echo "Identity is automatic — a passport key is created on first run."
 """
     return Response(script, media_type="text/plain")
 
@@ -5225,6 +5385,9 @@ def create_app() -> Starlette:
         # Start live status updater (updates tool description and notifies clients)
         asyncio.create_task(_status_updater())
         print(f"[DarkMatter] Live status updater: ENABLED (5s interval)", file=sys.stderr)
+
+        # Initialize dynamic tool visibility (hide optional tools until needed)
+        _initialize_tool_visibility()
 
         # Discover public URL and detect NAT
         _agent_state.public_url = await _discover_public_url(port)
