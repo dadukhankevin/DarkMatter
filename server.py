@@ -1053,6 +1053,13 @@ class Connection:
 
 
 @dataclass
+class Impression:
+    """A scored trust impression of another agent."""
+    score: float       # -1.0 (avoid) to 1.0 (fully trusted)
+    note: str = ""     # optional freeform context
+
+
+@dataclass
 class PendingConnectionRequest:
     """An incoming connection request awaiting acceptance."""
     request_id: str
@@ -1064,6 +1071,8 @@ class PendingConnectionRequest:
     from_agent_public_key_hex: Optional[str] = None
     from_agent_display_name: Optional[str] = None
     mutual: bool = False  # If True, after accepting, send a reverse connection_request
+    # Auto-aggregated peer trust (populated at request time)
+    peer_trust: Optional[dict] = None
 
 
 @dataclass
@@ -1105,7 +1114,7 @@ class AgentState:
     sent_messages: dict[str, SentMessage] = field(default_factory=dict)
     messages_handled: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    impressions: dict[str, str] = field(default_factory=dict)  # agent_id -> freeform impression text
+    impressions: dict[str, Impression] = field(default_factory=dict)  # agent_id -> Impression
     # Cryptographic identity — Ed25519 keypair and human-friendly display name
     private_key_hex: Optional[str] = None
     public_key_hex: Optional[str] = None
@@ -1420,14 +1429,11 @@ IDENTITY:
 - Update your bio anytime your capabilities change with darkmatter_update_bio.
 
 IMPRESSIONS (Trust):
-- After interacting with an agent, store an impression with darkmatter_set_impression. \
-These are your private notes — "fast and accurate", "unhelpful", "great at ML questions".
-- When an unknown agent requests to connect, use darkmatter_ask_impression to ask your \
-existing connections what they think. Their impressions help you decide whether to accept.
-- Your impressions are shared when other agents ask — this is how trust propagates through \
-the network. Be honest.
-- Use darkmatter_get_impression to check your notes on a specific agent. \
-Pass an empty impression string to darkmatter_set_impression to delete one.
+- After meaningful interactions, use darkmatter_set_impression to score your peers (-1 to 1) — \
+your scores help other agents make trust decisions about connection requests.
+- When reviewing pending connection requests, peer trust scores are automatically included — \
+your connected peers were already queried for their impressions.
+- Use darkmatter_get_impression to check your stored score and notes on a specific agent.
 
 LIVE STATUS:
 - The `darkmatter_status` tool description contains live node state AND action items.
@@ -1524,7 +1530,7 @@ def _build_status_line() -> str:
         )
     if pending > 0:
         actions.append(
-            f"{pending} agent(s) want to connect — use darkmatter_list_pending_requests to review"
+            f"{pending} agent(s) want to connect — use darkmatter_list_pending_requests to review (includes peer trust scores)"
         )
     if msgs > 0:
         actions.append(
@@ -1890,7 +1896,6 @@ def _compute_visible_optional() -> set:
         visible.update({
             "darkmatter_set_impression",
             "darkmatter_get_impression",
-            "darkmatter_ask_impression",
         })
 
     # Discovery tools: show when few connections (need to find peers)
@@ -2161,7 +2166,10 @@ def save_state() -> None:
             }
             for mid, sm in state.sent_messages.items()
         },
-        "impressions": state.impressions,
+        "impressions": {
+            aid: {"score": imp.score, "note": imp.note}
+            for aid, imp in state.impressions.items()
+        },
         "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
         "router_mode": state.router_mode,
@@ -2283,7 +2291,14 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
         connections=connections,
         message_queue=message_queue,
         sent_messages=sent_messages,
-        impressions=data.get("impressions", {}),
+        impressions={
+            aid: (
+                Impression(score=v["score"], note=v.get("note", ""))
+                if isinstance(v, dict) else
+                Impression(score=0.0, note=v)  # migrate old string format
+            )
+            for aid, v in data.get("impressions", {}).items()
+        },
         rate_limit_global=data.get("rate_limit_global", 0),
         inactive_until=data.get("inactive_until"),
         router_mode=data.get("router_mode") or "spawn",
@@ -2392,7 +2407,8 @@ class SetImpressionInput(BaseModel):
     """Store or update your impression of an agent."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: str = Field(..., description="The agent ID to store an impression of")
-    impression: str = Field(..., description="Your freeform impression (e.g. 'slow but accurate', 'great at routing ML questions', 'unresponsive')", max_length=2000)
+    score: float = Field(..., ge=-1.0, le=1.0, description="Trust score from -1.0 (avoid) to 1.0 (fully trusted)")
+    note: str = Field(default="", description="Optional freeform context", max_length=2000)
 
 
 class GetImpressionInput(BaseModel):
@@ -2400,12 +2416,6 @@ class GetImpressionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: str = Field(..., description="The agent ID to look up")
 
-
-class AskImpressionInput(BaseModel):
-    """Ask a connected agent for their impression of a third agent."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    ask_agent_id: str = Field(..., description="The connected agent to ask")
-    about_agent_id: str = Field(..., description="The agent you want to know about")
 
 
 # =============================================================================
@@ -3115,7 +3125,9 @@ async def list_connections(ctx: Context) -> str:
         }
         impression = state.impressions.get(conn.agent_id)
         if impression:
-            entry["impression"] = _truncate(impression, 500)
+            entry["score"] = impression.score
+            if impression.note:
+                entry["note"] = _truncate(impression.note, 500)
         connections.append(entry)
 
     return json.dumps({
@@ -3144,7 +3156,7 @@ async def list_pending_requests(ctx: Context) -> str:
     state = get_state(ctx)
     requests = []
     for req in state.pending_requests.values():
-        requests.append({
+        entry = {
             "request_id": req.request_id,
             "from_agent_id": req.from_agent_id,
             "from_agent_display_name": req.from_agent_display_name,
@@ -3152,9 +3164,16 @@ async def list_pending_requests(ctx: Context) -> str:
             "from_agent_bio": req.from_agent_bio,
             "crypto": req.from_agent_public_key_hex is not None,
             "requested_at": req.requested_at,
-        })
+        }
+        if req.peer_trust is not None:
+            entry["peer_trust"] = req.peer_trust
+        requests.append(entry)
 
-    return json.dumps({"total": len(requests), "requests": requests})
+    return json.dumps({
+        "total": len(requests),
+        "requests": requests,
+        "reminder": "Remember to set impressions for your connections — your peers rely on your scores to make trust decisions.",
+    })
 
 
 # =============================================================================
@@ -3820,39 +3839,30 @@ async def discover_local(ctx: Context) -> str:
     }
 )
 async def set_impression(params: SetImpressionInput, ctx: Context) -> str:
-    """Store, update, or delete your impression of an agent.
+    """Store or update your scored impression of an agent.
 
-    Impressions are your private notes about agents you've interacted with.
-    Other agents can ask you for your impression of a specific agent via the
-    mesh protocol — this is how trust propagates through the network.
-
-    Pass an empty string to delete an impression.
+    Impressions are scored trust signals (-1.0 to 1.0) with optional notes.
+    Your scores are shared with peers when they receive connection requests —
+    this is how trust propagates through the network.
 
     Args:
-        params: Contains agent_id and freeform impression text (empty string to delete).
+        params: Contains agent_id, score (-1.0 to 1.0), and optional note.
 
     Returns:
-        JSON confirming the impression was saved or deleted.
+        JSON confirming the impression was saved.
     """
     state = get_state(ctx)
 
-    # Empty string = delete
-    if params.impression == "":
-        if params.agent_id in state.impressions:
-            del state.impressions[params.agent_id]
-            save_state()
-            return json.dumps({"success": True, "agent_id": params.agent_id, "action": "deleted"})
-        return json.dumps({"success": False, "error": f"No impression stored for agent '{params.agent_id}'."})
-
     was_update = params.agent_id in state.impressions
-    state.impressions[params.agent_id] = params.impression
+    state.impressions[params.agent_id] = Impression(score=params.score, note=params.note)
     save_state()
 
     return json.dumps({
         "success": True,
         "agent_id": params.agent_id,
         "action": "updated" if was_update else "created",
-        "impression": params.impression,
+        "score": params.score,
+        "note": params.note,
     })
 
 
@@ -3887,66 +3897,9 @@ async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
     return json.dumps({
         "agent_id": params.agent_id,
         "has_impression": True,
-        "impression": impression,
+        "score": impression.score,
+        "note": impression.note,
     })
-
-
-@mcp.tool(
-    name="darkmatter_ask_impression",
-    annotations={
-        "title": "Ask Impression",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def ask_impression(params: AskImpressionInput, ctx: Context) -> str:
-    """Ask a connected agent for their impression of another agent.
-
-    Use this to check an agent's reputation before accepting a connection
-    or routing a message. Your connected peers share their impressions
-    when asked — this is how trust propagates through the network.
-
-    Args:
-        params: Contains ask_agent_id (who to ask) and about_agent_id (who to ask about).
-
-    Returns:
-        JSON with the peer's impression, or a message that they have none.
-    """
-    state = get_state(ctx)
-
-    conn = state.connections.get(params.ask_agent_id)
-    if not conn:
-        return json.dumps({
-            "success": False,
-            "error": f"Not connected to agent '{params.ask_agent_id}'.",
-        })
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                conn.agent_url.rstrip("/") + f"/__darkmatter__/impression/{params.about_agent_id}",
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return json.dumps({
-                    "success": True,
-                    "asked": params.ask_agent_id,
-                    "about": params.about_agent_id,
-                    "has_impression": data.get("has_impression", False),
-                    "impression": data.get("impression"),
-                })
-            else:
-                return json.dumps({
-                    "success": False,
-                    "error": f"Agent returned HTTP {resp.status_code}.",
-                })
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "error": f"Failed to reach agent: {str(e)}",
-        })
 
 
 # =============================================================================
@@ -4137,6 +4090,64 @@ from starlette.responses import JSONResponse, Response
 import uvicorn
 
 
+async def _gather_peer_trust(state, about_agent_id: str) -> dict:
+    """Query all connected peers for their impression of an agent. Returns aggregated trust data."""
+
+    async def _query_peer(conn):
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(
+                    conn.agent_url.rstrip("/") + f"/__darkmatter__/impression/{about_agent_id}",
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("has_impression"):
+                        return {
+                            "agent_id": conn.agent_id,
+                            "score": data.get("score", 0.0),
+                            "note": data.get("note", ""),
+                        }
+        except Exception:
+            pass
+        return None
+
+    tasks = [_query_peer(conn) for conn in state.connections.values()]
+    if not tasks:
+        return {"peers_queried": 0, "peers_with_opinion": 0, "avg_score": None}
+
+    gathered = await asyncio.gather(*tasks)
+    opinions = [r for r in gathered if r is not None]
+
+    avg_score = None
+    if opinions:
+        avg_score = round(sum(o["score"] for o in opinions) / len(opinions), 2)
+
+    # Find most trusted recommender: the peer we scored highest among those with an opinion
+    most_trusted = None
+    if opinions:
+        opinion_ids = {o["agent_id"] for o in opinions}
+        best_score = -2.0
+        for aid, imp in state.impressions.items():
+            if aid in opinion_ids and imp.score > best_score:
+                best_score = imp.score
+                most_trusted = aid
+        if most_trusted:
+            rec = next(o for o in opinions if o["agent_id"] == most_trusted)
+            most_trusted = {
+                "agent_id": most_trusted,
+                "your_trust_in_them": best_score,
+                "their_score": rec["score"],
+                "their_note": rec["note"],
+            }
+
+    return {
+        "peers_queried": len(tasks),
+        "peers_with_opinion": len(opinions),
+        "avg_score": avg_score,
+        "most_trusted_recommender": most_trusted,
+    }
+
+
 async def handle_connection_request(request: Request) -> JSONResponse:
     """Handle an incoming connection request from another agent."""
     global _agent_state
@@ -4197,6 +4208,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Too many pending requests"}, status_code=429)
 
     request_id = f"req-{uuid.uuid4().hex[:8]}"
+    peer_trust = await _gather_peer_trust(state, from_agent_id)
     state.pending_requests[request_id] = PendingConnectionRequest(
         request_id=request_id,
         from_agent_id=from_agent_id,
@@ -4205,6 +4217,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         from_agent_public_key_hex=from_agent_public_key_hex,
         from_agent_display_name=from_agent_display_name,
         mutual=mutual,
+        peer_trust=peer_trust,
     )
 
     return JSONResponse({
@@ -4703,7 +4716,8 @@ async def handle_impression_get(request: Request) -> JSONResponse:
     return JSONResponse({
         "agent_id": about_agent_id,
         "has_impression": True,
-        "impression": impression,
+        "score": impression.score,
+        "note": impression.note,
     })
 
 
