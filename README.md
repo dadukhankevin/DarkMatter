@@ -517,6 +517,35 @@ When enabled, DarkMatter automatically spawns a `claude -p` subprocess to handle
 
 **Enabled by default.** Disable with `DARKMATTER_AGENT_ENABLED=false`. See the Configuration table below for tuning.
 
+### WormHoles (Human Entrypoint)
+
+A WormHole is a localhost web UI that puts a human directly on the mesh as a first-class agent. Instead of an LLM deciding what to do with messages, **you** are the brain.
+
+```bash
+python entrypoint.py
+# Opens on http://localhost:8200
+```
+
+**What you get:**
+- Full DarkMatter identity (own passport, own agent ID, separate from any MCP agent in the same project)
+- Constellation view — live SVG mesh visualization with your node at the center, connections orbiting around it
+- Message timeline — persistent right-side panel showing all sent/received messages, threaded responses, inline reply, webhook status badges
+- Compose bar with auto-route or direct-target routing
+- LAN discovery — scan for and connect to local agents, QR code for mobile access
+- Agent spawn controls — incoming messages can auto-spawn `claude` subprocesses (visible Terminal windows)
+
+**How it works:** The WormHole imports `server.py` internals directly — same state model, same passport system, same mesh protocol. It's a Flask app wrapping a DarkMatter agent with a human-facing UI instead of MCP tools. Messages you send are signed with your passport. Messages you receive appear in the timeline with inline reply.
+
+**Identity:** The WormHole creates its own passport at `~/.darkmatter/entrypoint/` so it has a separate identity from any MCP server running in the same project directory. Your display name defaults to "Human".
+
+**Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DARKMATTER_ENTRYPOINT_PORT` | `8200` | HTTP port for the web UI |
+
+The WormHole scans ports 8100-8110 for local DarkMatter agents on startup, so connecting to nearby agents is one click.
+
 ### Extensible Message Router
 
 Every incoming message passes through a **router chain** — a list of async callables that decide what happens to it. The first router that returns a non-PASS decision wins.
