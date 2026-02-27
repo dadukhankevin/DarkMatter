@@ -54,6 +54,8 @@ class DarkMatterNode:
         self.port = port
         self.display_name = display_name or f"node-{port}"
         self.state_file = tempfile.mktemp(suffix=".json", prefix=f"dm_{port}_")
+        # Each node gets its own temp working directory so it generates a unique passport
+        self.workdir = tempfile.mkdtemp(prefix=f"dm_{port}_")
         self.proc: subprocess.Popen | None = None
         self.agent_id: str | None = None
 
@@ -76,6 +78,7 @@ class DarkMatterNode:
         self.proc = subprocess.Popen(
             [PYTHON, SERVER],
             env=env,
+            cwd=self.workdir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
@@ -119,6 +122,9 @@ class DarkMatterNode:
                 self.proc.wait()
         if os.path.exists(self.state_file):
             os.unlink(self.state_file)
+        import shutil
+        if os.path.isdir(self.workdir):
+            shutil.rmtree(self.workdir, ignore_errors=True)
 
     def __repr__(self) -> str:
         return f"<Node {self.display_name} port={self.port} pid={self.proc.pid if self.proc else None}>"

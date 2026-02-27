@@ -13,9 +13,13 @@ import asyncio
 import atexit
 import json
 import os
+import socket
 import sys
 import time
 import uuid
+import random
+import shlex
+import subprocess
 import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +35,7 @@ def _is_ajax():
 # Import DarkMatter internals from server.py
 # ---------------------------------------------------------------------------
 
-_darkmatter_dir = os.path.join(os.path.expanduser("~"), ".darkmatter")
+_darkmatter_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".darkmatter")
 if _darkmatter_dir not in sys.path:
     sys.path.insert(0, _darkmatter_dir)
 
@@ -62,8 +66,9 @@ os.environ.setdefault("DARKMATTER_PORT", str(PORT))
 
 server._init_state(PORT)
 os.chdir(_original_cwd)
-server._agent_state.router_mode = "queue_only"
-server.AGENT_SPAWN_ENABLED = False
+server._agent_state.router_mode = "spawn"
+server.AGENT_SPAWN_ENABLED = True
+server.AGENT_SPAWN_TERMINAL = True  # always open visible Terminal.app windows
 
 # Discover public URL using the same logic as the real server
 # (env var > UPnP port mapping > ipify public IP > localhost fallback)
@@ -119,6 +124,18 @@ app = Flask(__name__, template_folder=os.path.join(os.path.dirname(os.path.abspa
 
 def _get_public_url():
     return state.public_url or f"http://localhost:{PORT}"
+
+
+def _get_lan_ip():
+    """Get LAN IP using UDP connect trick (no actual traffic sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 def _short_id(agent_id):
@@ -211,44 +228,63 @@ _discovery_thread.start()
 # ---------------------------------------------------------------------------
 
 def _relay_poll_loop():
-    """Background thread: poll anchor for buffered webhook and connection callbacks."""
+    """Background thread: poll anchors for buffered webhook and connection callbacks.
+
+    Tries each anchor in order, tracks last working anchor for failover.
+    """
+    _last_working = None
     while True:
         try:
             time.sleep(5)
             if not state.nat_detected or not server.ANCHOR_NODES or not state.private_key_hex:
                 continue
 
-            anchor = server.ANCHOR_NODES[0]
             ts = datetime.now(timezone.utc).isoformat()
             sig = server._sign_relay_poll(state.private_key_hex, state.agent_id, ts)
 
-            with httpx.Client(timeout=10.0) as client:
-                # Poll for webhook callbacks
-                resp = client.get(
-                    f"{anchor}/__darkmatter__/webhook_relay_poll/{state.agent_id}",
-                    params={"signature": sig, "timestamp": ts},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for cb in data.get("callbacks", []):
-                        msg_id = cb.get("message_id", "")
-                        cb_data = cb.get("data", {})
-                        if msg_id and cb_data:
-                            result, _ = server._process_webhook_locally(state, msg_id, cb_data)
-                            if result.get("success"):
-                                print(f"[DarkMatter Entrypoint] Relay: processed webhook for {msg_id}", file=sys.stderr)
+            # Try anchors in order: last working first, then the rest
+            ordered = list(server.ANCHOR_NODES)
+            if _last_working and _last_working in ordered:
+                ordered.remove(_last_working)
+                ordered.insert(0, _last_working)
 
-                # Poll for connection relay callbacks
-                resp2 = client.get(
-                    f"{anchor}/__darkmatter__/connection_relay_poll/{state.agent_id}",
-                    params={"signature": sig, "timestamp": ts},
-                )
-                if resp2.status_code == 200:
-                    data2 = resp2.json()
-                    for cb_data in data2.get("callbacks", []):
-                        if isinstance(cb_data, dict) and cb_data.get("agent_id"):
-                            server._process_connection_relay_callback(state, cb_data)
-                            print(f"[DarkMatter Entrypoint] Relay: connection accepted by {cb_data['agent_id'][:12]}...", file=sys.stderr)
+            for anchor in ordered:
+                try:
+                    with httpx.Client(timeout=10.0) as client:
+                        # Poll for webhook callbacks
+                        resp = client.get(
+                            f"{anchor}/__darkmatter__/webhook_relay_poll/{state.agent_id}",
+                            params={"signature": sig, "timestamp": ts},
+                        )
+                        if resp.status_code != 200:
+                            continue
+                        _last_working = anchor
+                        data = resp.json()
+                        callbacks = data.get("callbacks", [])
+                        if callbacks:
+                            print(f"[DarkMatter Entrypoint] Relay poll: got {len(callbacks)} callback(s)", file=sys.stderr)
+                        for cb in callbacks:
+                            msg_id = cb.get("message_id", "")
+                            cb_data = cb.get("data", {})
+                            if msg_id and cb_data:
+                                result, status = server._process_webhook_locally(state, msg_id, cb_data)
+                                if result.get("success"):
+                                    print(f"[DarkMatter Entrypoint] Relay: webhook for {msg_id} OK", file=sys.stderr)
+
+                        # Poll for connection relay callbacks
+                        resp2 = client.get(
+                            f"{anchor}/__darkmatter__/connection_relay_poll/{state.agent_id}",
+                            params={"signature": sig, "timestamp": ts},
+                        )
+                        if resp2.status_code == 200:
+                            data2 = resp2.json()
+                            for cb_data in data2.get("callbacks", []):
+                                if isinstance(cb_data, dict) and cb_data.get("agent_id"):
+                                    server._process_connection_relay_callback(state, cb_data)
+                                    print(f"[DarkMatter Entrypoint] Relay: connection accepted by {cb_data['agent_id'][:12]}...", file=sys.stderr)
+                        break  # success — don't try other anchors
+                except Exception:
+                    continue
         except Exception:
             pass
 
@@ -256,6 +292,87 @@ def _relay_poll_loop():
 if state.nat_detected:
     _relay_thread = threading.Thread(target=_relay_poll_loop, daemon=True)
     _relay_thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Peer spawned agent count
+# ---------------------------------------------------------------------------
+
+def _get_peer_spawned_agents(conn):
+    """GET <peer_url>/__darkmatter__/status and return spawned_agents count."""
+    try:
+        base = _resolve_base_url(conn)
+        resp = requests.get(f"{base}/__darkmatter__/status", timeout=1)
+        if resp.ok:
+            return resp.json().get("spawned_agents", 0)
+    except Exception:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Synchronous agent spawning (Flask-compatible)
+# ---------------------------------------------------------------------------
+
+def _spawn_agent_sync(msg):
+    """Spawn a claude agent in a new Terminal.app window."""
+    ok, reason = server._can_spawn_agent()
+    if not ok:
+        print(f"[Entrypoint] Not spawning: {reason}", file=sys.stderr)
+        return
+
+    for agent in server._spawned_agents:
+        if agent.message_id == msg.message_id:
+            return
+
+    server.save_state()
+    prompt = server._build_agent_prompt(state, msg)
+
+    # Build the command to run directly in Terminal
+    # PID tracking: write PID to file so we can count active agents
+    pids_dir = os.path.join(os.path.expanduser("~/.darkmatter"), "spawn_pids")
+    os.makedirs(pids_dir, exist_ok=True)
+    pid_file = os.path.join(pids_dir, f"{msg.message_id}.pid")
+
+    unsets = " && ".join(f"unset {v}" for v in server.AGENT_SPAWN_ENV_CLEANUP)
+    cmd_parts = [server.AGENT_SPAWN_COMMAND] + server.AGENT_SPAWN_ARGS + [prompt]
+    cmd = " ".join(shlex.quote(p) for p in cmd_parts)
+    pid_track = (
+        f"echo $$ > {shlex.quote(pid_file)} && "
+        f"trap {shlex.quote(f'rm -f {pid_file}')} EXIT"
+    )
+    full_cmd = f"{pid_track} && cd {shlex.quote(os.getcwd())} && {unsets} && {cmd}"
+
+    # Escape for AppleScript string
+    escaped_cmd = full_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    apple_script = f'tell application "Terminal" to do script "{escaped_cmd}"'
+
+    try:
+        subprocess.run(["osascript", "-e", apple_script], check=False)
+
+        # Wait for PID file so we can track the agent
+        pid = None
+        for _ in range(20):
+            time.sleep(0.25)
+            try:
+                pid = int(open(pid_file).read().strip())
+                break
+            except (FileNotFoundError, ValueError):
+                continue
+
+        agent = server.SpawnedAgent(
+            process=None,
+            message_id=msg.message_id,
+            spawned_at=time.monotonic(),
+            pid=pid,
+            terminal_mode=True,
+            pid_file=pid_file,
+        )
+        server._spawned_agents.append(agent)
+        server._spawn_timestamps.append(time.monotonic())
+        print(f"[Entrypoint] Spawned terminal agent (PID {pid or 'pending'}) for {msg.message_id[:12]}...", file=sys.stderr)
+    except Exception as e:
+        print(f"[Entrypoint] Spawn failed: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -517,16 +634,18 @@ def dm_accept_pending():
         pass
 
     if not direct_ok and server.ANCHOR_NODES:
-        try:
-            anchor = server.ANCHOR_NODES[0]
-            with httpx.Client(timeout=10.0) as client:
-                client.post(
-                    f"{anchor}/__darkmatter__/connection_relay/{pending.from_agent_id}",
-                    json=payload,
-                )
-            print(f"[DarkMatter Entrypoint] Connection accept relayed via anchor for {pending.from_agent_id[:12]}...", file=sys.stderr)
-        except Exception:
-            pass
+        for anchor in server.ANCHOR_NODES:
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    resp = client.post(
+                        f"{anchor}/__darkmatter__/connection_relay/{pending.from_agent_id}",
+                        json=payload,
+                    )
+                    if resp.status_code < 400:
+                        print(f"[DarkMatter Entrypoint] Connection accept relayed via {anchor} for {pending.from_agent_id[:12]}...", file=sys.stderr)
+                        break
+            except Exception:
+                continue
 
     if pending.mutual:
         try:
@@ -620,6 +739,10 @@ def dm_message():
 
     server.save_state()
 
+    # Trigger agent spawn for incoming message
+    if server.AGENT_SPAWN_ENABLED and state.router_mode == "spawn":
+        threading.Thread(target=_spawn_agent_sync, args=(msg,), daemon=True).start()
+
     return jsonify({"success": True, "queued": True, "queue_position": len(state.message_queue)})
 
 
@@ -634,7 +757,21 @@ def dm_webhook_post(message_id):
     agent_id = data.get("agent_id", "unknown")
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    if update_type == "forwarded":
+    if update_type == "received":
+        sm.updates.append({
+            "type": "received", "agent_id": agent_id,
+            "timestamp": timestamp,
+        })
+        server.save_state()
+        return jsonify({"success": True, "recorded": "received"})
+    elif update_type == "responding":
+        sm.updates.append({
+            "type": "responding", "agent_id": agent_id,
+            "timestamp": timestamp,
+        })
+        server.save_state()
+        return jsonify({"success": True, "recorded": "responding"})
+    elif update_type == "forwarded":
         sm.updates.append({
             "type": "forwarded", "agent_id": agent_id,
             "target_agent_id": data.get("target_agent_id", ""),
@@ -643,10 +780,10 @@ def dm_webhook_post(message_id):
         server.save_state()
         return jsonify({"success": True, "recorded": "forwarded"})
     elif update_type == "response":
-        sm.response = {
+        sm.responses.append({
             "agent_id": agent_id, "response": data.get("response", ""),
             "metadata": data.get("metadata", {}), "timestamp": timestamp,
-        }
+        })
         sm.status = "responded"
         server.save_state()
         return jsonify({"success": True, "recorded": "response"})
@@ -687,6 +824,10 @@ def dm_peer_update():
     if conn is None:
         return jsonify({"error": "Unknown agent"}), 404
     conn.agent_url = new_url
+    # Update bio if included in the peer_update payload
+    new_bio = data.get("bio")
+    if new_bio is not None and isinstance(new_bio, str):
+        conn.agent_bio = new_bio[:server.MAX_BIO_LENGTH]
     server.save_state()
     return jsonify({"success": True, "updated": True})
 
@@ -797,17 +938,54 @@ def _sync_send_message(content, target_agent_id=None):
             conn.messages_declined += 1
             failed.append({"agent_id": conn.agent_id, "error": str(e)})
 
-    sent_msg = server.SentMessage(
-        message_id=message_id, content=content, status="active",
-        initial_hops=10, routed_to=sent_to,
-    )
-    state.sent_messages[message_id] = sent_msg
-    server.save_state()
+    if sent_to:
+        sent_msg = server.SentMessage(
+            message_id=message_id, content=content, status="active",
+            initial_hops=10, routed_to=sent_to,
+        )
+        state.sent_messages[message_id] = sent_msg
+        server.save_state()
 
-    result = {"success": len(sent_to) > 0, "message_id": message_id, "routed_to": sent_to}
+    # Spawn a local terminal agent to handle this conversation
+    if server.AGENT_SPAWN_ENABLED:
+        spawn_msg = server.QueuedMessage(
+            message_id=message_id, content=content,
+            webhook=webhook, hops_remaining=0, metadata={},
+            from_agent_id="entrypoint",
+        )
+        threading.Thread(target=_spawn_agent_sync, args=(spawn_msg,), daemon=True).start()
+
+    result = {"success": len(sent_to) > 0 or server.AGENT_SPAWN_ENABLED, "message_id": message_id, "routed_to": sent_to}
     if failed:
         result["failed"] = failed
+        if not sent_to:
+            result["error"] = failed[0]["error"] if len(failed) == 1 else f"{len(failed)} deliveries failed"
     return result
+
+
+def _sync_broadcast_message(content):
+    """Send a message to all connected agents (each gets its own message_id)."""
+    conns = [c for c in state.connections.values() if c.agent_id != state.agent_id]
+    if not conns:
+        return {"success": False, "error": "No agents connected."}
+
+    sent_ids = []
+    failed = []
+    for conn in conns:
+        result = _sync_send_message(content, conn.agent_id)
+        if result.get("success"):
+            sent_ids.append(result["message_id"])
+        else:
+            failed.append({"agent_id": conn.agent_id, "error": result.get("error", "Unknown error")})
+
+    return {
+        "success": len(sent_ids) > 0,
+        "broadcast": True,
+        "sent_count": len(sent_ids),
+        "message_ids": sent_ids,
+        "failed_count": len(failed),
+        "failed": failed if failed else None,
+    }
 
 
 def _sync_respond_to_message(message_id, response_text):
@@ -873,6 +1051,14 @@ def send():
         if _is_ajax():
             return jsonify({"success": False, "error": "Empty message"}), 400
         return redirect(url_for("index"))
+
+    if target == "broadcast":
+        if _is_ajax():
+            result = _sync_broadcast_message(content)
+            return jsonify(result)
+        threading.Thread(target=_sync_broadcast_message, args=(content,), daemon=True).start()
+        return redirect(url_for("index"))
+
     target_id = None if target == "auto" else target
     if _is_ajax():
         result = _sync_send_message(content, target_id)
@@ -959,15 +1145,17 @@ def accept(request_id):
         pass
 
     if not direct_ok and server.ANCHOR_NODES:
-        try:
-            anchor = server.ANCHOR_NODES[0]
-            with httpx.Client(timeout=10.0) as client:
-                client.post(
-                    f"{anchor}/__darkmatter__/connection_relay/{pending.from_agent_id}",
-                    json=payload,
-                )
-        except Exception:
-            pass
+        for anchor in server.ANCHOR_NODES:
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    resp = client.post(
+                        f"{anchor}/__darkmatter__/connection_relay/{pending.from_agent_id}",
+                        json=payload,
+                    )
+                    if resp.status_code < 400:
+                        break
+            except Exception:
+                continue
 
     display_name = pending.from_agent_display_name or _short_id(pending.from_agent_id)
     del state.pending_requests[request_id]
@@ -1010,13 +1198,22 @@ def poll():
         "received_at": msg.received_at,
     } for msg in state.message_queue]
 
-    outbox = [{
-        "message_id": sm.message_id, "status": sm.status, "content": sm.content,
-        "response": sm.response.get("response") if sm.response else None,
-        "response_agent": sm.response.get("agent_id") if sm.response else None,
-        "response_display_name": _display_name_for(sm.response["agent_id"]) if sm.response else None,
-        "routed_to": sm.routed_to, "created_at": sm.created_at,
-    } for sm in sorted(state.sent_messages.values(), key=lambda s: s.created_at, reverse=True)[:50]]
+    outbox = []
+    for sm in sorted(state.sent_messages.values(), key=lambda s: s.created_at, reverse=True)[:50]:
+        responses = [{
+            "agent_id": r["agent_id"],
+            "display_name": _display_name_for(r["agent_id"]),
+            "response": r.get("response", ""),
+            "timestamp": r.get("timestamp"),
+        } for r in getattr(sm, "responses", [])]
+        routed_to_names = [_display_name_for(rid) for rid in sm.routed_to]
+        outbox.append({
+            "message_id": sm.message_id, "status": sm.status, "content": sm.content,
+            "routed_to": sm.routed_to, "routed_to_names": routed_to_names,
+            "created_at": sm.created_at,
+            "updates": getattr(sm, "updates", []),
+            "responses": responses,
+        })
 
     pending = [{
         "request_id": req.request_id, "from_agent_id": req.from_agent_id,
@@ -1024,11 +1221,25 @@ def poll():
         "from_bio": req.from_agent_bio, "requested_at": req.requested_at,
     } for req in state.pending_requests.values()]
 
+    # Query peers for spawned agent counts in parallel
+    peer_conns = [c for c in state.connections.values() if c.agent_id != state.agent_id]
+    spawned_counts = {}
+    if peer_conns:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_get_peer_spawned_agents, c): c.agent_id for c in peer_conns}
+            for future in as_completed(futures):
+                agent_id = futures[future]
+                try:
+                    spawned_counts[agent_id] = future.result()
+                except Exception:
+                    spawned_counts[agent_id] = 0
+
     connections = [{
         "agent_id": c.agent_id,
         "display_name": c.agent_display_name or _short_id(c.agent_id),
         "bio": c.agent_bio, "direction": c.direction.value,
         "last_activity": c.last_activity,
+        "spawned_agents": spawned_counts.get(c.agent_id, 0),
     } for c in state.connections.values() if c.agent_id != state.agent_id]
 
     # Discovered agents (not yet connected)
@@ -1040,9 +1251,38 @@ def poll():
             "status": a["status"], "accepting": a["accepting"],
         } for a in _discovered_agents.values() if a["agent_id"] not in connected_ids]
 
+    lan_ip = _get_lan_ip()
+    lan_url = f"http://{lan_ip}:{PORT}" if lan_ip != "127.0.0.1" else None
+
+    total_active_agents = sum(c.get("spawned_agents", 0) for c in connections)
+
     return jsonify({
+        "self": {
+            "agent_id": state.agent_id,
+            "display_name": state.display_name or "Human",
+            "lan_url": lan_url,
+            "public_url": _get_public_url(),
+            "nat_detected": getattr(state, "nat_detected", False),
+            "connections_count": len(state.connections),
+            "total_active_agents": total_active_agents,
+        },
         "inbox": inbox, "outbox": outbox, "pending_requests": pending,
         "connections": connections, "discovered": discovered,
+    })
+
+
+@app.route("/api/info", methods=["GET"])
+def info():
+    """Static agent info for initial page load."""
+    lan_ip = _get_lan_ip()
+    lan_url = f"http://{lan_ip}:{PORT}" if lan_ip != "127.0.0.1" else None
+    return jsonify({
+        "agent_id": state.agent_id,
+        "display_name": state.display_name or "Human",
+        "lan_url": lan_url,
+        "public_url": _get_public_url(),
+        "nat_detected": getattr(state, "nat_detected", False),
+        "port": PORT,
     })
 
 

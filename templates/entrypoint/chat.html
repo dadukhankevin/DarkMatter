@@ -1,33 +1,40 @@
 {% extends "base.html" %}
-{% block title %}WormHole{% endblock %}
+{% block title %}DarkMatter{% endblock %}
 {% block content %}
 
-<div class="flex h-[calc(100vh-48px)]">
+<div class="flex h-[calc(100vh-44px)] relative">
 
   <!-- ================================================================== -->
-  <!-- Left sidebar — Connections + Discovery                              -->
+  <!-- LEFT PANEL — QR Code + Connect + Discovery + Pending + Connections  -->
   <!-- ================================================================== -->
-  <div class="w-72 bg-dim border-r border-edge flex flex-col shrink-0 overflow-hidden">
+  <div id="left-panel" class="w-64 bg-dim border-r border-edge flex flex-col shrink-0 overflow-hidden hidden md:flex z-20">
+
+    <!-- QR Code panel -->
+    <div id="qr-panel" class="border-b border-edge">
+      <button onclick="toggleQR()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-slab/50 transition-colors">
+        <div class="flex items-center gap-2">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="0.5" y="0.5" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="0.8" class="text-mesh-cyan"/><rect x="7.5" y="0.5" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="0.8" class="text-mesh-cyan"/><rect x="0.5" y="7.5" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="0.8" class="text-mesh-cyan"/><rect x="8" y="8" width="3" height="3" rx="0.5" fill="currentColor" class="text-mesh-cyan" opacity="0.4"/></svg>
+          <span class="text-[10px] text-mesh-cyan font-medium uppercase tracking-wider">LAN Access</span>
+        </div>
+        <svg id="qr-chevron" class="text-muted transition-transform" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+      </button>
+      <div id="qr-content" class="px-3 pb-3 hidden">
+        <div id="qr-code" class="flex justify-center mb-2"></div>
+        <div id="qr-url" class="text-[10px] text-pale text-center break-all select-all"></div>
+        <div id="qr-unavailable" class="text-[10px] text-muted text-center italic hidden">LAN not available</div>
+      </div>
+    </div>
 
     <!-- Connect form -->
-    <div class="p-3 border-b border-edge">
+    <div class="px-3 py-2.5 border-b border-edge">
       <form id="connect-form" class="flex gap-1.5">
-        <input type="text" name="url" placeholder="http://localhost:8100"
-          class="flex-1 bg-slab border border-edge rounded px-2.5 py-1.5 text-xs text-bright placeholder-muted focus:border-solar-500 transition-colors">
+        <input type="text" name="url" placeholder="http://host:port"
+          class="flex-1 bg-slab border border-edge rounded px-2 py-1.5 text-[11px] text-bright placeholder-muted focus:border-solar-500/60 transition-colors min-w-0">
         <button type="submit"
-          class="bg-solar-600 hover:bg-solar-500 text-ink text-xs font-semibold px-3 py-1.5 rounded transition-colors">
+          class="bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-2.5 py-1.5 rounded transition-colors shrink-0">
           +
         </button>
       </form>
-    </div>
-
-    <!-- Pending requests -->
-    <div id="pending-section" class="hidden border-b border-edge">
-      <div class="px-3 py-2 flex items-center gap-2">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple pulse-dot"></div>
-        <span class="text-xs text-mesh-purple font-medium uppercase tracking-wider">Pending</span>
-      </div>
-      <div id="pending-list" class="px-3 pb-2 space-y-1.5"></div>
     </div>
 
     <!-- Discovered agents -->
@@ -35,92 +42,278 @@
       <div class="px-3 py-2 flex items-center justify-between">
         <div class="flex items-center gap-2">
           <div class="w-1.5 h-1.5 rounded-full bg-mesh-blue"></div>
-          <span class="text-xs text-mesh-blue font-medium uppercase tracking-wider">Discovered</span>
+          <span class="text-[10px] text-mesh-blue font-medium uppercase tracking-wider">Discovered</span>
         </div>
         <button onclick="fetch('/api/scan',{method:'POST'}).then(()=>pollServer())"
-          class="text-muted hover:text-pale text-xs transition-colors" title="Rescan">
-          scan
-        </button>
+          class="text-muted hover:text-pale text-[10px] transition-colors">scan</button>
       </div>
-      <div id="discovered-list" class="px-3 pb-2 space-y-1.5">
-        <p class="text-xs text-muted italic">Scanning...</p>
+      <div id="discovered-list" class="px-3 pb-2 space-y-1">
+        <p class="text-[10px] text-muted italic">Scanning...</p>
       </div>
     </div>
 
-    <!-- Connected agents -->
-    <div class="flex-1 overflow-y-auto">
+    <!-- Pending requests -->
+    <div id="pending-section" class="hidden border-b border-edge">
+      <div class="px-3 py-2 flex items-center gap-2">
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple pulse-dot"></div>
+        <span class="text-[10px] text-mesh-purple font-medium uppercase tracking-wider">Pending</span>
+      </div>
+      <div id="pending-list" class="px-3 pb-2 space-y-1"></div>
+    </div>
+
+    <!-- Connections list -->
+    <div class="border-b border-edge">
       <div class="px-3 py-2 flex items-center gap-2">
         <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
-        <span class="text-xs text-mesh-green font-medium uppercase tracking-wider">Connected</span>
+        <span class="text-[10px] text-mesh-green font-medium uppercase tracking-wider">Connections</span>
+        <span class="text-[10px] text-muted ml-auto" id="sidebar-conn-count">0</span>
       </div>
-      <div id="connections-list" class="px-3 pb-3 space-y-1.5">
-        {% if state.connections|length == 0 %}
-        <p class="text-xs text-muted italic">No connections</p>
-        {% endif %}
+      <div id="connections-list" class="px-3 pb-2 space-y-0.5 max-h-40 overflow-y-auto">
+        <p class="text-[10px] text-muted italic">No connections</p>
       </div>
     </div>
 
+    <!-- Activity feed -->
+    <div class="flex-1 flex flex-col min-h-0">
+      <div class="px-3 py-2 flex items-center gap-2 shrink-0">
+        <div class="w-1.5 h-1.5 rounded-full bg-solar-400"></div>
+        <span class="text-[10px] text-solar-400 font-medium uppercase tracking-wider">Activity</span>
+      </div>
+      <div id="activity-feed" class="px-3 pb-2 space-y-0.5 overflow-y-auto flex-1">
+        <p class="text-[10px] text-muted italic">Waiting for activity...</p>
+      </div>
+    </div>
+
+    <!-- NAT status footer -->
+    <div id="nat-status" class="px-3 py-2 border-t border-edge hidden">
+      <div class="flex items-center gap-1.5">
+        <div class="w-1 h-1 rounded-full bg-mesh-yellow"></div>
+        <span class="text-[9px] text-muted">NAT detected — using relay</span>
+      </div>
+    </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- Main chat area                                                      -->
+  <!-- CONSTELLATION — Full-area SVG + floating overlays                    -->
   <!-- ================================================================== -->
-  <div class="flex-1 flex flex-col min-w-0 bg-ink">
+  <div id="constellation-area" class="flex-1 relative bg-ink overflow-hidden">
 
-    <!-- Chat stream -->
-    <div id="chat-stream" class="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-      <div id="empty-state" class="flex flex-col items-center justify-center h-full text-center">
-        <div class="text-solar-500 text-2xl font-light mb-2">~</div>
-        <p class="text-muted text-sm">enter the wormhole &mdash; connect to an agent to begin</p>
-      </div>
+    <!-- SVG fills entire area -->
+    <svg id="mesh-svg" class="absolute inset-0 w-full h-full"></svg>
+
+    <!-- Hover tooltip -->
+    <div id="mesh-tooltip" class="absolute hidden bg-slab border border-edge rounded px-2.5 py-1.5 text-[10px] z-30 pointer-events-none shadow-lg max-w-[200px]">
+      <div class="text-bright font-medium" id="mesh-tooltip-name"></div>
+      <div class="text-muted mt-0.5" id="mesh-tooltip-bio"></div>
     </div>
 
-    <!-- Compose bar -->
-    <div class="border-t border-edge bg-dim px-4 py-3">
-      <form id="compose-form" class="flex gap-3 items-end">
-        <select name="target" id="target-select"
-          class="bg-slab border border-edge rounded px-2.5 py-2 text-xs text-pale min-w-[120px] focus:border-solar-500 transition-colors">
-          <option value="auto">auto-route</option>
-          {% for c in state.connections.values() %}
-          <option value="{{ c.agent_id }}">{{ c.agent_display_name or short_id(c.agent_id) }}</option>
-          {% endfor %}
-        </select>
-        <div class="flex-1 relative">
-          <textarea name="content" id="compose-input" rows="1"
-            placeholder="Message the mesh..."
-            class="w-full bg-slab border border-edge rounded-lg px-4 py-2.5 text-sm text-bright placeholder-muted resize-none focus:border-solar-500 transition-colors"
-            oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'"></textarea>
+    <!-- Empty state -->
+    <div id="empty-state" class="absolute inset-0 flex flex-col items-center justify-center text-center select-none pointer-events-none z-10">
+      <div class="relative mb-4">
+        <div class="w-16 h-16 rounded-full border border-edge flex items-center justify-center glow-pulse">
+          <div class="w-3 h-3 rounded-full bg-solar-500/60"></div>
         </div>
-        <button type="submit" id="send-btn"
-          class="bg-solar-500 hover:bg-solar-400 text-ink text-sm font-semibold px-5 py-2.5 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-          Send
-        </button>
+      </div>
+      <p class="text-muted text-xs">connect to an agent to begin</p>
+      <p class="text-faint text-[10px] mt-1">the constellation will form around you</p>
+    </div>
+
+    <!-- Floating compose bar -->
+    <div id="compose-bar" class="absolute bottom-4 left-4 right-4 z-30">
+      <form id="compose-form">
+        <div id="compose-container" class="bg-dim/90 backdrop-blur-md border border-edge rounded-xl transition-colors focus-within:border-solar-500/40 shadow-xl">
+          <!-- Route pill row -->
+          <div class="flex items-center px-3 pt-2.5 pb-0">
+            <div class="relative" id="target-dropdown-wrap">
+              <button type="button" id="target-dropdown-btn" onclick="toggleDropdown()"
+                class="flex items-center gap-1.5 text-[11px] text-pale hover:text-bright bg-edge/40 hover:bg-edge/70 rounded-full px-2.5 py-1 transition-colors">
+                <svg id="route-icon" width="10" height="10" viewBox="0 0 10 10" class="text-mesh-green shrink-0"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
+                <span id="target-label">auto-route</span>
+                <svg width="8" height="8" viewBox="0 0 8 8" class="text-muted shrink-0"><path d="M2 3l2 2 2-2" stroke="currentColor" stroke-width="1" fill="none"/></svg>
+              </button>
+              <div id="target-dropdown-menu" class="dropdown-menu absolute bottom-full left-0 mb-1 w-52 bg-slab border border-edge rounded-lg shadow-xl z-30 py-1 max-h-48 overflow-y-auto"></div>
+            </div>
+          </div>
+          <!-- Textarea + send button -->
+          <div class="flex items-end gap-2 px-3 pt-1.5 pb-2.5">
+            <textarea name="content" id="compose-input" rows="1"
+              placeholder="Message the mesh..."
+              class="flex-1 bg-transparent text-sm text-bright placeholder-muted resize-none leading-relaxed p-0 border-0 focus:ring-0"
+              style="max-height:120px;outline:none"
+              oninput="autoGrow(this)"></textarea>
+            <button type="submit" id="send-btn"
+              class="w-8 h-8 rounded-full bg-solar-500 hover:bg-solar-400 text-ink flex items-center justify-center transition-colors disabled:opacity-30 disabled:cursor-not-allowed shrink-0 mb-0.5"
+              title="Send">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+            </button>
+          </div>
+        </div>
+        <input type="hidden" name="target" id="target-value" value="auto">
+        <div class="flex items-center justify-end mt-1 px-1">
+          <span class="text-[9px] text-faint"><kbd class="text-muted">Shift+Enter</kbd> newline &middot; <kbd class="text-muted">Enter</kbd> send</span>
+        </div>
       </form>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- RIGHT PANEL — Message Timeline                                      -->
+  <!-- ================================================================== -->
+  <div id="right-panel" class="relative bg-dim border-l border-edge flex flex-col shrink-0 overflow-hidden hidden md:flex z-20" style="width:320px;min-width:200px;max-width:50vw">
+    <!-- Drag handle for resizing -->
+    <div id="right-panel-handle" class="absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-solar-500/30 active:bg-solar-500/40 transition-colors z-30" style="left:0"></div>
+    <div class="px-3 py-2.5 border-b border-edge flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M1 3h10M1 6h7M1 9h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" class="text-solar-400"/></svg>
+        <span class="text-[11px] text-solar-400 font-medium uppercase tracking-wider">Messages</span>
+      </div>
+      <span id="timeline-count" class="text-[10px] text-muted bg-edge/50 rounded-full px-1.5 py-0.5 min-w-[18px] text-center">0</span>
+    </div>
+    <div id="timeline-scroll" class="flex-1 overflow-y-auto px-2.5 py-2 space-y-2"></div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- MOBILE DRAWER — Left panel on small screens                         -->
+  <!-- ================================================================== -->
+  <div id="mobile-drawer-overlay" class="drawer-overlay fixed inset-0 bg-black/60 z-50 md:hidden" onclick="toggleMobileDrawer()">
+    <div class="drawer-panel absolute left-0 top-0 bottom-0 w-72 bg-dim border-r border-edge flex flex-col overflow-hidden" onclick="event.stopPropagation()" style="transform:translateX(-100%)">
+      <div class="px-3 py-2.5 border-b border-edge flex items-center justify-between">
+        <span class="text-[10px] text-solar-400 font-medium uppercase tracking-wider">DarkMatter</span>
+        <button onclick="toggleMobileDrawer()" class="text-muted hover:text-bright text-xs">&times;</button>
+      </div>
+      <!-- Connected agents (mobile) -->
+      <div class="flex-1 overflow-y-auto px-3 py-2 space-y-1" id="mobile-connections-list"></div>
+      <!-- Activity feed (mobile) -->
+      <div class="border-t border-edge">
+        <div class="px-3 py-2 flex items-center gap-2">
+          <div class="w-1.5 h-1.5 rounded-full bg-solar-400"></div>
+          <span class="text-[10px] text-solar-400 font-medium uppercase tracking-wider">Activity</span>
+        </div>
+        <div id="mobile-activity-feed" class="px-3 pb-2 space-y-0.5 max-h-36 overflow-y-auto"></div>
+      </div>
     </div>
   </div>
 
 </div>
 
+<style>
+  /* Constellation-specific animations */
+  @keyframes ring-expand {
+    0% { r: 8; opacity: 0.8; stroke-width: 2; }
+    100% { r: 30; opacity: 0; stroke-width: 0.5; }
+  }
+  @keyframes responding-throb {
+    0%, 100% { r: 6; opacity: 0.6; }
+    50% { r: 10; opacity: 0.3; }
+  }
+  @keyframes scatter-particle {
+    0% { opacity: 0.8; }
+    100% { opacity: 0; }
+  }
+  .responding-ring {
+    animation: responding-throb 1.2s ease-in-out infinite;
+  }
+  /* Mobile drawer slides from left */
+  .drawer-panel { transition: transform 0.3s ease; }
+  .drawer-overlay.active .drawer-panel { transform: translateX(0) !important; }
+  /* Timeline sidebar */
+  @keyframes timeline-in { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
+  .timeline-enter { animation: timeline-in 0.25s ease-out forwards; }
+  .truncated-content { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .truncated-content.expanded { -webkit-line-clamp: unset; }
+  .connector-line { pointer-events: none; }
+  body.resizing-panel, body.resizing-panel * { cursor: col-resize !important; user-select: none !important; }
+</style>
+
 <script>
-const chatStream = document.getElementById('chat-stream');
-const emptyState = document.getElementById('empty-state');
+// =========================================================================
+// State
+// =========================================================================
 const pendingSection = document.getElementById('pending-section');
 const pendingListEl = document.getElementById('pending-list');
 const discoveredList = document.getElementById('discovered-list');
 const connectionsList = document.getElementById('connections-list');
-const targetSelect = document.getElementById('target-select');
+const mobileConnectionsList = document.getElementById('mobile-connections-list');
 const composeForm = document.getElementById('compose-form');
 const composeInput = document.getElementById('compose-input');
 const sendBtn = document.getElementById('send-btn');
 const connectForm = document.getElementById('connect-form');
-let renderedOutbox = new Map();
-let renderedInbox = new Map();
-let optimisticMessages = new Map(); // temp_id -> element
+const activityFeed = document.getElementById('activity-feed');
+const mobileActivityFeed = document.getElementById('mobile-activity-feed');
+const targetValue = document.getElementById('target-value');
+const targetLabel = document.getElementById('target-label');
+const targetMenu = document.getElementById('target-dropdown-menu');
+const constellationArea = document.getElementById('constellation-area');
+const emptyState = document.getElementById('empty-state');
 
+// Diff-tracking maps
+const renderedConns = new Map();
+const renderedConnsMobile = new Map();
+const renderedDiscovered = new Map();
+const renderedPending = new Map();
+
+// SVG engine — persistent element refs
+const svgRefs = {
+  defs: null,
+  lineGroup: null,
+  labelGroup: null,
+  nodeGroup: null,
+  particleGroup: null,
+  hitGroup: null,
+  connectorGroup: null,
+  centerNode: null,
+  centerGlow: null,
+  centerLabel: null,
+  centerAgentLabel: null,
+  hintText: null,
+  lines: new Map(),       // agent_id -> { base, glow } (two lines — base dashed + glow overlay)
+  nodes: new Map(),       // agent_id -> { circle, label, hit, glow }
+  lineHits: new Map(),    // agent_id -> invisible thick hit area for hover
+};
+const nodePositions = new Map();  // agent_id -> { x, y }
+let centerPos = { x: 0, y: 0 };
+let svgW = 0, svgH = 0;
+let currentConns = [];
+
+// Message visualization
+const messageVisuals = new Map();  // message_id -> { lastUpdateIndex, respondingRings: [] }
+const respondingRings = new Map(); // agent_id -> SVG circle element
+const lineWaveTimers = new Map();  // agent_id -> { raf, startTime }
+const lineMessageHistory = new Map(); // agent_id -> [{ content, status, direction, time }]
+
+// Polling state
+let prevPollData = null;
+let activityItems = [];
+const MAX_ACTIVITY = 30;
+let totalActiveAgents = 0;
+const prevAgentCounts = new Map();
+let qrInitialized = false;
+let qrExpanded = false;
+
+// Timeline sidebar state
+const timelineScroll = document.getElementById('timeline-scroll');
+const timelineCountEl = document.getElementById('timeline-count');
+const renderedTimeline = new Map(); // message_id -> DOM element
+let timelineConnectorLine = null;
+let highlightedTimelineAgent = null;
+
+// =========================================================================
+// Utilities
+// =========================================================================
 function shortId(id) {
   if (!id) return '?';
   if (id.length > 16) return id.slice(0, 8) + '...' + id.slice(-4);
   return id;
+}
+
+let selfAgentId = null;  // set from poll data
+function agentLabel(obj) {
+  if (!obj) return '?';
+  const id = obj.agent_id || obj.from_agent_id;
+  if (id && id === selfAgentId) return 'You';
+  return (obj.display_name || obj.from_display_name || '').trim()
+    || (obj.bio || obj.from_bio || '').trim().slice(0, 30)
+    || shortId(id);
 }
 
 function timeAgo(iso) {
@@ -139,10 +332,6 @@ function esc(t) {
   return d.innerHTML;
 }
 
-// ---------------------------------------------------------------------------
-// AJAX helpers
-// ---------------------------------------------------------------------------
-
 function ajaxPost(url, body) {
   return fetch(url, {
     method: 'POST',
@@ -151,34 +340,910 @@ function ajaxPost(url, body) {
   }).then(r => r.json());
 }
 
-// ---------------------------------------------------------------------------
-// Compose — fetch-based send with optimistic bubble
-// ---------------------------------------------------------------------------
+function autoGrow(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
 
+function svgEl(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  if (attrs) Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, String(v)));
+  return el;
+}
+
+// =========================================================================
+// QR Code
+// =========================================================================
+function toggleQR() {
+  const content = document.getElementById('qr-content');
+  const chevron = document.getElementById('qr-chevron');
+  qrExpanded = !qrExpanded;
+  content.classList.toggle('hidden', !qrExpanded);
+  chevron.style.transform = qrExpanded ? 'rotate(180deg)' : '';
+}
+
+function initQR(lanUrl) {
+  if (qrInitialized) return;
+  const el = document.getElementById('qr-code');
+  const urlEl = document.getElementById('qr-url');
+  const unavailEl = document.getElementById('qr-unavailable');
+  if (!lanUrl) { unavailEl.classList.remove('hidden'); return; }
+  qrInitialized = true;
+  urlEl.textContent = lanUrl;
+  el.innerHTML = '';
+  const style = getComputedStyle(document.documentElement);
+  new QRCode(el, {
+    text: lanUrl, width: 120, height: 120,
+    colorDark: style.getPropertyValue('--qr-fg').trim() || '#e2e2ea',
+    colorLight: style.getPropertyValue('--qr-bg').trim() || '#111113',
+    correctLevel: QRCode.CorrectLevel.M,
+  });
+  if (!qrExpanded) toggleQR();
+}
+
+function onThemeChange() {
+  if (qrInitialized) {
+    qrInitialized = false;
+    initQR(document.getElementById('qr-url').textContent);
+  }
+  // Force SVG re-render for theme-dependent colors
+  rebuildSVG();
+}
+
+// =========================================================================
+// Custom dropdown
+// =========================================================================
+let dropdownOpen = false;
+
+function toggleDropdown() {
+  dropdownOpen = !dropdownOpen;
+  document.getElementById('target-dropdown-wrap').classList.toggle('dropdown-open', dropdownOpen);
+}
+
+function selectTarget(el) {
+  const val = el.dataset.value;
+  const label = el.textContent.trim();
+  targetValue.value = val;
+  targetLabel.textContent = label;
+  const iconEl = document.getElementById('route-icon');
+  if (val === 'broadcast') {
+    iconEl.innerHTML = '<circle cx="5" cy="3" r="1.8" fill="currentColor"/><circle cx="2.5" cy="7.5" r="1.8" fill="currentColor"/><circle cx="7.5" cy="7.5" r="1.8" fill="currentColor"/>';
+    iconEl.setAttribute('class', 'text-mesh-yellow shrink-0');
+  } else if (val === 'auto') {
+    iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
+    iconEl.setAttribute('class', 'text-mesh-green shrink-0');
+  } else {
+    iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
+    iconEl.setAttribute('class', 'text-mesh-blue shrink-0');
+  }
+  dropdownOpen = false;
+  document.getElementById('target-dropdown-wrap').classList.remove('dropdown-open');
+}
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#target-dropdown-wrap') && dropdownOpen) {
+    dropdownOpen = false;
+    document.getElementById('target-dropdown-wrap').classList.remove('dropdown-open');
+  }
+});
+
+function updateDropdownOptions(conns) {
+  const cur = targetValue.value;
+  let html = `<div class="dropdown-option px-3 py-1.5 text-[11px] text-pale hover:bg-edge/50 cursor-pointer flex items-center gap-2 transition-colors rounded mx-1"
+    data-value="auto" onclick="selectTarget(this)">
+    <svg width="10" height="10" viewBox="0 0 10 10" class="text-mesh-green shrink-0"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
+    auto-route
+  </div>
+  <div class="dropdown-option px-3 py-1.5 text-[11px] text-pale hover:bg-edge/50 cursor-pointer flex items-center gap-2 transition-colors rounded mx-1"
+    data-value="broadcast" onclick="selectTarget(this)">
+    <svg width="10" height="10" viewBox="0 0 10 10" class="text-mesh-yellow shrink-0"><circle cx="5" cy="3" r="1.8" fill="currentColor"/><circle cx="2.5" cy="7.5" r="1.8" fill="currentColor"/><circle cx="7.5" cy="7.5" r="1.8" fill="currentColor"/></svg>
+    broadcast all
+  </div>`;
+  if (conns.length > 0) {
+    html += `<div class="border-t border-edge my-1 mx-2"></div>`;
+    conns.forEach(c => {
+      html += `<div class="dropdown-option px-3 py-1.5 text-[11px] text-pale hover:bg-edge/50 cursor-pointer flex items-center gap-2 transition-colors rounded mx-1"
+        data-value="${c.agent_id}" onclick="selectTarget(this)">
+        <svg width="10" height="10" viewBox="0 0 10 10" class="text-mesh-blue shrink-0"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
+        ${esc(agentLabel(c))}
+      </div>`;
+    });
+  }
+  targetMenu.innerHTML = html;
+  const validValues = ['auto', 'broadcast', ...conns.map(c => c.agent_id)];
+  if (!validValues.includes(cur)) {
+    targetValue.value = 'auto';
+    targetLabel.textContent = 'auto-route';
+    const iconEl = document.getElementById('route-icon');
+    iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
+    iconEl.setAttribute('class', 'text-mesh-green shrink-0');
+  }
+}
+
+// =========================================================================
+// Activity feed
+// =========================================================================
+function addActivity(icon, color, text) {
+  const item = { icon, color, text, time: new Date().toISOString() };
+  activityItems.unshift(item);
+  if (activityItems.length > MAX_ACTIVITY) activityItems.pop();
+  renderActivityFeed();
+}
+
+function renderActivityFeed() {
+  const html = activityItems.map(a =>
+    `<div class="flex items-center gap-1.5 text-[10px] feed-in">
+      <span class="${a.color}">${a.icon}</span>
+      <span class="text-pale truncate flex-1">${esc(a.text)}</span>
+      <span class="text-faint shrink-0">${timeAgo(a.time)}</span>
+    </div>`
+  ).join('');
+  const placeholder = activityItems.length === 0
+    ? '<p class="text-[10px] text-muted italic">Waiting for activity...</p>' : '';
+  activityFeed.innerHTML = html || placeholder;
+  if (mobileActivityFeed) mobileActivityFeed.innerHTML = html || placeholder;
+}
+
+// =========================================================================
+// Incremental SVG Engine — Constellation
+// =========================================================================
+function initSVG() {
+  const svg = document.getElementById('mesh-svg');
+  if (!svg) return;
+  svg.innerHTML = '';
+
+  // Defs
+  svgRefs.defs = svgEl('defs');
+  svgRefs.defs.innerHTML = `
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-sm" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="line-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>`;
+  svg.appendChild(svgRefs.defs);
+
+  // Layered groups: lines → edgeLabels → nodes → particles → hit areas
+  svgRefs.lineGroup = svgEl('g');
+  svgRefs.labelGroup = svgEl('g');
+  svgRefs.nodeGroup = svgEl('g');
+  svgRefs.particleGroup = svgEl('g');
+  svgRefs.hitGroup = svgEl('g');
+  svgRefs.connectorGroup = svgEl('g');
+  svg.appendChild(svgRefs.lineGroup);
+  svg.appendChild(svgRefs.labelGroup);
+  svg.appendChild(svgRefs.nodeGroup);
+  svg.appendChild(svgRefs.particleGroup);
+  svg.appendChild(svgRefs.hitGroup);
+  svg.appendChild(svgRefs.connectorGroup);
+
+  // Center glow
+  svgRefs.centerGlow = svgEl('circle', {
+    cx: 0, cy: 0, r: 24,
+    fill: '#dd8040', opacity: 0.1,
+    filter: 'url(#glow)',
+  });
+  svgRefs.centerGlow.classList.add('mesh-glow-pulse');
+  svgRefs.nodeGroup.appendChild(svgRefs.centerGlow);
+
+  // Center node
+  svgRefs.centerNode = svgEl('circle', {
+    cx: 0, cy: 0, r: 9,
+    fill: '#dd8040',
+  });
+  svgRefs.centerNode.style.transition = 'r 0.4s ease';
+  svgRefs.nodeGroup.appendChild(svgRefs.centerNode);
+
+  // Center label
+  svgRefs.centerLabel = svgEl('text', {
+    x: 0, y: 24,
+    'text-anchor': 'middle',
+    fill: 'rgb(var(--c-pale))',
+    'font-size': '9',
+    'font-family': 'JetBrains Mono, monospace',
+  });
+  svgRefs.centerLabel.textContent = 'You';
+  svgRefs.nodeGroup.appendChild(svgRefs.centerLabel);
+
+  // Center agent count label (shown when agents > 0)
+  svgRefs.centerAgentLabel = svgEl('text', {
+    x: 0, y: 35,
+    'text-anchor': 'middle',
+    fill: '#22d3ee',
+    'font-size': '7',
+    'font-family': 'JetBrains Mono, monospace',
+    opacity: 0,
+  });
+  svgRefs.centerAgentLabel.style.transition = 'opacity 0.3s ease';
+  svgRefs.nodeGroup.appendChild(svgRefs.centerAgentLabel);
+
+  // Hint text (shown when no connections)
+  svgRefs.hintText = svgEl('text', {
+    x: 0, y: 44,
+    'text-anchor': 'middle',
+    fill: 'rgb(var(--c-muted))',
+    'font-size': '9',
+    'font-family': 'JetBrains Mono, monospace',
+  });
+  svgRefs.hintText.textContent = 'no peers connected';
+  svgRefs.nodeGroup.appendChild(svgRefs.hintText);
+
+  updateSVGLayout();
+}
+
+function updateSVGLayout() {
+  const svg = document.getElementById('mesh-svg');
+  const area = constellationArea;
+  if (!svg || !area) return;
+
+  const rect = area.getBoundingClientRect();
+  svgW = rect.width || 800;
+  svgH = rect.height || 600;
+  svg.setAttribute('viewBox', `0 0 ${svgW} ${svgH}`);
+
+  // Center node offset upward to leave room for compose bar
+  centerPos = { x: svgW / 2, y: svgH * 0.42 };
+
+  // Update center elements
+  if (svgRefs.centerNode) {
+    svgRefs.centerNode.setAttribute('cx', centerPos.x);
+    svgRefs.centerNode.setAttribute('cy', centerPos.y);
+  }
+  if (svgRefs.centerGlow) {
+    svgRefs.centerGlow.setAttribute('cx', centerPos.x);
+    svgRefs.centerGlow.setAttribute('cy', centerPos.y);
+  }
+  if (svgRefs.centerLabel) {
+    svgRefs.centerLabel.setAttribute('x', centerPos.x);
+    svgRefs.centerLabel.setAttribute('y', centerPos.y + 24);
+  }
+  if (svgRefs.centerAgentLabel) {
+    svgRefs.centerAgentLabel.setAttribute('x', centerPos.x);
+    svgRefs.centerAgentLabel.setAttribute('y', centerPos.y + 35);
+  }
+  if (svgRefs.hintText) {
+    svgRefs.hintText.setAttribute('x', centerPos.x);
+    svgRefs.hintText.setAttribute('y', centerPos.y + 44);
+  }
+
+  // Recalculate peer positions
+  layoutPeers(currentConns);
+}
+
+function layoutPeers(conns) {
+  const radius = Math.min(svgW, svgH) * 0.3;
+  nodePositions.clear();
+
+  conns.forEach((c, i) => {
+    const angle = conns.length === 1 ? -Math.PI / 2
+      : (2 * Math.PI * i / conns.length) - Math.PI / 2;
+    const x = centerPos.x + radius * Math.cos(angle);
+    const y = centerPos.y + radius * Math.sin(angle);
+    nodePositions.set(c.agent_id, { x, y });
+  });
+
+  // Update existing SVG element positions
+  for (const [agentId, pos] of nodePositions) {
+    const refs = svgRefs.nodes.get(agentId);
+    if (refs) {
+      refs.circle.setAttribute('cx', pos.x);
+      refs.circle.setAttribute('cy', pos.y);
+      refs.label.setAttribute('x', pos.x);
+      refs.label.setAttribute('y', pos.y + 18);
+      refs.hit.setAttribute('cx', pos.x);
+      refs.hit.setAttribute('cy', pos.y);
+      if (refs.glow) {
+        refs.glow.setAttribute('cx', pos.x);
+        refs.glow.setAttribute('cy', pos.y);
+      }
+    }
+    const lineRefs = svgRefs.lines.get(agentId);
+    if (lineRefs) {
+      for (const el of [lineRefs.base, lineRefs.glow]) {
+        el.setAttribute('x1', centerPos.x);
+        el.setAttribute('y1', centerPos.y);
+        el.setAttribute('x2', pos.x);
+        el.setAttribute('y2', pos.y);
+      }
+    }
+    const lineHit = svgRefs.lineHits.get(agentId);
+    if (lineHit) {
+      lineHit.setAttribute('x1', centerPos.x);
+      lineHit.setAttribute('y1', centerPos.y);
+      lineHit.setAttribute('x2', pos.x);
+      lineHit.setAttribute('y2', pos.y);
+    }
+  }
+
+  // Update responding rings positions
+  for (const [agentId, ring] of respondingRings) {
+    const pos = nodePositions.get(agentId);
+    if (pos) {
+      ring.setAttribute('cx', pos.x);
+      ring.setAttribute('cy', pos.y);
+    }
+  }
+}
+
+function updateConstellationNodes(conns) {
+  currentConns = conns;
+  const currentIds = new Set(conns.map(c => c.agent_id));
+
+  // Show/hide hint + empty state
+  if (svgRefs.hintText) {
+    svgRefs.hintText.setAttribute('display', conns.length === 0 ? '' : 'none');
+  }
+  if (emptyState) {
+    emptyState.style.display = conns.length === 0 ? '' : 'none';
+  }
+
+  // Remove stale nodes
+  for (const [id, refs] of svgRefs.nodes) {
+    if (!currentIds.has(id)) {
+      refs.circle.remove();
+      refs.label.remove();
+      refs.hit.remove();
+      if (refs.glow) refs.glow.remove();
+      svgRefs.nodes.delete(id);
+    }
+  }
+  for (const [id, refs] of svgRefs.lines) {
+    if (!currentIds.has(id)) {
+      refs.base.remove();
+      refs.glow.remove();
+      svgRefs.lines.delete(id);
+    }
+  }
+  for (const [id, hit] of svgRefs.lineHits) {
+    if (!currentIds.has(id)) {
+      hit.remove();
+      svgRefs.lineHits.delete(id);
+    }
+  }
+
+  // Layout positions first
+  layoutPeers(conns);
+
+  // Add new nodes + lines
+  conns.forEach(c => {
+    const pos = nodePositions.get(c.agent_id);
+    if (!pos) return;
+
+    // Line (base dashed + glow overlay + invisible hit area)
+    if (!svgRefs.lines.has(c.agent_id)) {
+      const base = svgEl('line', {
+        x1: centerPos.x, y1: centerPos.y, x2: pos.x, y2: pos.y,
+        stroke: 'rgb(var(--c-edge))', 'stroke-width': 1.5, 'stroke-dasharray': '5,4',
+        'stroke-linecap': 'round',
+      });
+      const glow = svgEl('line', {
+        x1: centerPos.x, y1: centerPos.y, x2: pos.x, y2: pos.y,
+        stroke: '#dd8040', 'stroke-width': 2, opacity: 0,
+        'stroke-linecap': 'round', filter: 'url(#line-glow)',
+      });
+      glow.style.transition = 'opacity 0.3s ease';
+      svgRefs.lineGroup.appendChild(base);
+      svgRefs.lineGroup.appendChild(glow);
+      svgRefs.lines.set(c.agent_id, { base, glow });
+
+      // Invisible wide hit area for hover
+      const lineHit = svgEl('line', {
+        x1: centerPos.x, y1: centerPos.y, x2: pos.x, y2: pos.y,
+        stroke: 'transparent', 'stroke-width': 16, class: 'cursor-pointer',
+      });
+      lineHit.addEventListener('mouseenter', (e) => showLineTooltip(c.agent_id, e));
+      lineHit.addEventListener('mousemove', (e) => moveMeshTooltip(e));
+      lineHit.addEventListener('mouseleave', () => hideMeshTooltip());
+      svgRefs.hitGroup.appendChild(lineHit);
+      svgRefs.lineHits.set(c.agent_id, lineHit);
+    }
+
+    // Node
+    if (!svgRefs.nodes.has(c.agent_id)) {
+      const spawned = c.spawned_agents || 0;
+      const glowR = 14 + Math.min(spawned * 4, 16);
+      const nodeR = 6 + Math.min(spawned * 2, 8);
+
+      const glow = svgEl('circle', {
+        cx: pos.x, cy: pos.y, r: glowR,
+        fill: '#34d399', opacity: 0.08, filter: 'url(#glow-sm)',
+      });
+      glow.style.transition = 'r 0.4s ease, opacity 0.3s ease';
+      svgRefs.nodeGroup.appendChild(glow);
+
+      const circle = svgEl('circle', {
+        cx: pos.x, cy: pos.y, r: nodeR,
+        fill: '#34d399',
+      });
+      circle.style.transition = 'r 0.15s ease, fill 0.3s ease';
+      svgRefs.nodeGroup.appendChild(circle);
+
+      const name = agentLabel(c);
+      const label = svgEl('text', {
+        x: pos.x, y: pos.y + 18,
+        'text-anchor': 'middle',
+        fill: 'rgb(var(--c-pale))',
+        'font-size': '8',
+        'font-family': 'JetBrains Mono, monospace',
+      });
+      label.textContent = name.length > 14 ? name.slice(0, 12) + '..' : name;
+      svgRefs.labelGroup.appendChild(label);
+
+      const hit = svgEl('circle', {
+        cx: pos.x, cy: pos.y, r: 20,
+        fill: 'transparent', class: 'cursor-pointer',
+      });
+      hit.addEventListener('mouseenter', (e) => {
+        const baseR = parseFloat(circle.getAttribute('r')) || 6;
+        circle.setAttribute('r', baseR + 2);
+        showMeshTooltip(c, e);
+      });
+      hit.addEventListener('mousemove', (e) => moveMeshTooltip(e));
+      hit.addEventListener('mouseleave', () => {
+        const spawned = c.spawned_agents || 0;
+        circle.setAttribute('r', 6 + Math.min(spawned * 2, 8));
+        hideMeshTooltip();
+      });
+      hit.addEventListener('click', () => {
+        targetValue.value = c.agent_id;
+        targetLabel.textContent = agentLabel(c);
+        const iconEl = document.getElementById('route-icon');
+        iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
+        iconEl.setAttribute('class', 'text-mesh-blue shrink-0');
+        composeInput.focus();
+      });
+      svgRefs.hitGroup.appendChild(hit);
+
+      svgRefs.nodes.set(c.agent_id, { circle, label, hit, glow });
+    } else {
+      // Update existing node — label + size based on spawned agents
+      const refs = svgRefs.nodes.get(c.agent_id);
+      const name = agentLabel(c);
+      const labelText = name.length > 14 ? name.slice(0, 12) + '..' : name;
+      if (refs.label.textContent !== labelText) {
+        refs.label.textContent = labelText;
+      }
+      const spawned = c.spawned_agents || 0;
+      refs.circle.setAttribute('r', 6 + Math.min(spawned * 2, 8));
+      if (refs.glow) {
+        refs.glow.setAttribute('r', 14 + Math.min(spawned * 4, 16));
+      }
+    }
+  });
+}
+
+function rebuildSVG() {
+  // Full rebuild — used on theme change
+  svgRefs.lines.clear();
+  svgRefs.nodes.clear();
+  svgRefs.lineHits.clear();
+  respondingRings.clear();
+  lineWaveTimers.clear();
+  initSVG();
+  updateConstellationNodes(currentConns);
+}
+
+// Mesh tooltip
+function showMeshTooltip(c, e) {
+  const tip = document.getElementById('mesh-tooltip');
+  if (!tip) return;
+  document.getElementById('mesh-tooltip-name').textContent = agentLabel(c);
+  document.getElementById('mesh-tooltip-bio').textContent = c.bio ? c.bio.slice(0, 80) : 'No bio';
+  tip.classList.remove('hidden');
+  moveMeshTooltip(e);
+}
+
+function moveMeshTooltip(e) {
+  const tip = document.getElementById('mesh-tooltip');
+  if (!tip) return;
+  const cr = constellationArea.getBoundingClientRect();
+  let x = e.clientX - cr.left + 12;
+  let y = e.clientY - cr.top - 12;
+  if (x + 200 > cr.width) x = x - 224;
+  if (y < 0) y = y + 30;
+  tip.style.left = x + 'px';
+  tip.style.top = y + 'px';
+}
+
+function hideMeshTooltip() {
+  const tip = document.getElementById('mesh-tooltip');
+  if (tip) {
+    tip.classList.add('hidden');
+    const bioEl = document.getElementById('mesh-tooltip-bio');
+    if (bioEl) bioEl.style.whiteSpace = '';
+  }
+}
+
+// =========================================================================
+// Particle & Ring Animations
+// =========================================================================
+function animateParticle(fromX, fromY, toX, toY, color, duration) {
+  duration = duration || 600;
+  const particle = svgEl('circle', { cx: fromX, cy: fromY, r: 3.5, fill: color, opacity: 0.9 });
+  svgRefs.particleGroup.appendChild(particle);
+
+  const start = performance.now();
+  function step(now) {
+    const t = Math.min((now - start) / duration, 1);
+    const ease = t < 0.5 ? 2*t*t : -1+(4-2*t)*t; // ease in-out quad
+    particle.setAttribute('cx', fromX + (toX - fromX) * ease);
+    particle.setAttribute('cy', fromY + (toY - fromY) * ease);
+    particle.setAttribute('opacity', String(0.9 - t * 0.5));
+    particle.setAttribute('r', String(3.5 - t * 1.5));
+    if (t < 1) requestAnimationFrame(step);
+    else particle.remove();
+  }
+  requestAnimationFrame(step);
+}
+
+function animateSendParticle(agentId) {
+  const pos = nodePositions.get(agentId);
+  if (!pos) return;
+  animateParticle(centerPos.x, centerPos.y, pos.x, pos.y, '#dd8040', 600);
+}
+
+function animateReceiveParticle(agentId) {
+  const pos = nodePositions.get(agentId);
+  if (!pos) return;
+  animateParticle(pos.x, pos.y, centerPos.x, centerPos.y, '#60a5fa', 600);
+}
+
+function animateResponseParticle(agentId) {
+  const pos = nodePositions.get(agentId);
+  if (!pos) return;
+  animateParticle(pos.x, pos.y, centerPos.x, centerPos.y, '#34d399', 700);
+}
+
+function animateForwardParticle(fromAgentId, toAgentId) {
+  const from = nodePositions.get(fromAgentId);
+  const to = nodePositions.get(toAgentId);
+  if (!from || !to) return;
+  animateParticle(from.x, from.y, to.x, to.y, '#a78bfa', 500);
+}
+
+function showRingExpand(agentId, color) {
+  const pos = nodePositions.get(agentId);
+  if (!pos) return;
+  const ring = svgEl('circle', {
+    cx: pos.x, cy: pos.y, r: 8,
+    fill: 'none', stroke: color, 'stroke-width': 2, opacity: 0.8,
+  });
+  svgRefs.particleGroup.appendChild(ring);
+
+  const start = performance.now();
+  const duration = 600;
+  function step(now) {
+    const t = Math.min((now - start) / duration, 1);
+    ring.setAttribute('r', String(8 + t * 25));
+    ring.setAttribute('opacity', String(0.8 * (1 - t)));
+    ring.setAttribute('stroke-width', String(2 - t * 1.5));
+    if (t < 1) requestAnimationFrame(step);
+    else ring.remove();
+  }
+  requestAnimationFrame(step);
+}
+
+function showRespondingThrob(agentId) {
+  if (respondingRings.has(agentId)) return; // already throbbing
+  const pos = nodePositions.get(agentId);
+  if (!pos) return;
+  const ring = svgEl('circle', {
+    cx: pos.x, cy: pos.y, r: 8,
+    fill: 'none', stroke: '#fbbf24', 'stroke-width': 1.5,
+  });
+  ring.classList.add('responding-ring');
+  svgRefs.particleGroup.appendChild(ring);
+  respondingRings.set(agentId, ring);
+
+  // Also tint the node amber
+  const refs = svgRefs.nodes.get(agentId);
+  if (refs) refs.circle.setAttribute('fill', '#fbbf24');
+}
+
+function clearRespondingThrob(agentId) {
+  const ring = respondingRings.get(agentId);
+  if (ring) { ring.remove(); respondingRings.delete(agentId); }
+  // Reset node color
+  const refs = svgRefs.nodes.get(agentId);
+  if (refs) refs.circle.setAttribute('fill', '#34d399');
+}
+
+function showNodeFlash(agentId, color) {
+  const refs = svgRefs.nodes.get(agentId);
+  if (!refs) return;
+  refs.circle.setAttribute('fill', color);
+  refs.circle.setAttribute('r', '10');
+  setTimeout(() => {
+    refs.circle.setAttribute('fill', '#34d399');
+    refs.circle.setAttribute('r', '6');
+  }, 400);
+}
+
+function showScatterParticles(agentId) {
+  const pos = nodePositions.get(agentId);
+  if (!pos) return;
+  for (let i = 0; i < 6; i++) {
+    const angle = (Math.PI * 2 * i) / 6;
+    const dx = Math.cos(angle) * 20;
+    const dy = Math.sin(angle) * 20;
+    const p = svgEl('circle', { cx: pos.x, cy: pos.y, r: 2, fill: '#f87171', opacity: 0.8 });
+    svgRefs.particleGroup.appendChild(p);
+    const start = performance.now();
+    (function(particle, ddx, ddy) {
+      function step(now) {
+        const t = Math.min((now - start) / 500, 1);
+        particle.setAttribute('cx', String(pos.x + ddx * t));
+        particle.setAttribute('cy', String(pos.y + ddy * t));
+        particle.setAttribute('opacity', String(0.8 * (1 - t)));
+        particle.setAttribute('r', String(2 * (1 - t)));
+        if (t < 1) requestAnimationFrame(step);
+        else particle.remove();
+      }
+      requestAnimationFrame(step);
+    })(p, dx, dy);
+  }
+}
+
+// =========================================================================
+// Line Wave — directional dash animation on a connection line
+// =========================================================================
+function startLineWave(agentId, color, duration, direction) {
+  // direction: 'out' = center→peer, 'in' = peer→center
+  duration = duration || 2000;
+  color = color || '#dd8040';
+  const lineRefs = svgRefs.lines.get(agentId);
+  if (!lineRefs) return;
+
+  // Stop any existing wave on this line
+  stopLineWave(agentId);
+
+  const base = lineRefs.base;
+  const glow = lineRefs.glow;
+
+  // Compute dash length from line geometry
+  const x1 = parseFloat(base.getAttribute('x1'));
+  const y1 = parseFloat(base.getAttribute('y1'));
+  const x2 = parseFloat(base.getAttribute('x2'));
+  const y2 = parseFloat(base.getAttribute('y2'));
+  const lineLen = Math.sqrt((x2-x1)**2 + (y2-y1)**2);
+  const dashLen = 12;
+  const gapLen = lineLen; // one dash + big gap = "traveling" look
+
+  glow.setAttribute('stroke', color);
+  glow.setAttribute('stroke-dasharray', `${dashLen},${gapLen}`);
+  glow.setAttribute('opacity', '0.7');
+
+  const startTime = performance.now();
+  const sign = direction === 'in' ? -1 : 1;
+
+  function step(now) {
+    const elapsed = now - startTime;
+    const t = elapsed / duration;
+    if (t >= 1) {
+      glow.setAttribute('opacity', '0');
+      lineWaveTimers.delete(agentId);
+      return;
+    }
+    // Move dash along the line
+    const offset = sign * t * (lineLen + dashLen);
+    glow.setAttribute('stroke-dashoffset', String(-offset));
+    // Fade out in last 30%
+    const alpha = t > 0.7 ? 0.7 * (1 - (t - 0.7) / 0.3) : 0.7;
+    glow.setAttribute('opacity', String(alpha));
+    lineWaveTimers.set(agentId, { raf: requestAnimationFrame(step), startTime });
+  }
+  lineWaveTimers.set(agentId, { raf: requestAnimationFrame(step), startTime });
+}
+
+function stopLineWave(agentId) {
+  const timer = lineWaveTimers.get(agentId);
+  if (timer) {
+    cancelAnimationFrame(timer.raf);
+    lineWaveTimers.delete(agentId);
+  }
+  const lineRefs = svgRefs.lines.get(agentId);
+  if (lineRefs) lineRefs.glow.setAttribute('opacity', '0');
+}
+
+// =========================================================================
+// Line Pulse — brief color flash on the connection line (for webhook updates)
+// =========================================================================
+function pulseLineColor(agentId, color, duration) {
+  duration = duration || 800;
+  const lineRefs = svgRefs.lines.get(agentId);
+  if (!lineRefs) return;
+
+  const base = lineRefs.base;
+  const origStroke = 'rgb(var(--c-edge))';
+
+  base.setAttribute('stroke', color);
+  base.setAttribute('stroke-width', '2.5');
+
+  const start = performance.now();
+  function step(now) {
+    const t = Math.min((now - start) / duration, 1);
+    const w = 2.5 - t * 1; // 2.5 → 1.5
+    base.setAttribute('stroke-width', String(w));
+    if (t >= 1) {
+      base.setAttribute('stroke', origStroke);
+      base.setAttribute('stroke-width', '1.5');
+      return;
+    }
+    // Lerp opacity of color flash
+    if (t > 0.5) {
+      base.setAttribute('stroke', origStroke);
+    }
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+// =========================================================================
+// Line Tooltip — hover over a line to see recent messages
+// =========================================================================
+function trackLineMessage(agentId, content, status, direction) {
+  if (!lineMessageHistory.has(agentId)) lineMessageHistory.set(agentId, []);
+  const history = lineMessageHistory.get(agentId);
+  history.unshift({ content, status, direction, time: new Date().toISOString() });
+  if (history.length > 5) history.length = 5; // keep last 5
+}
+
+function showLineTooltip(agentId, e) {
+  const tip = document.getElementById('mesh-tooltip');
+  if (!tip) return;
+  const nameEl = document.getElementById('mesh-tooltip-name');
+  const bioEl = document.getElementById('mesh-tooltip-bio');
+
+  const history = lineMessageHistory.get(agentId) || [];
+  const conn = currentConns.find(c => c.agent_id === agentId);
+  const name = conn ? agentLabel(conn) : shortId(agentId);
+
+  if (history.length === 0) {
+    nameEl.textContent = name;
+    bioEl.textContent = 'No messages yet';
+  } else {
+    nameEl.textContent = name;
+    const lines = history.slice(0, 3).map(m => {
+      const arrow = m.direction === 'out' ? '\u2192' : '\u2190';
+      const preview = m.content.length > 40 ? m.content.slice(0, 38) + '..' : m.content;
+      return `${arrow} ${preview} (${timeAgo(m.time)})`;
+    });
+    bioEl.textContent = lines.join('\n');
+    bioEl.style.whiteSpace = 'pre-line';
+  }
+
+  tip.classList.remove('hidden');
+  moveMeshTooltip(e);
+}
+
+
+// =========================================================================
+// Message Flow Visualization — process outbox updates
+// =========================================================================
+function processOutboxVisuals(outbox) {
+  for (const msg of outbox) {
+    const updates = msg.updates || [];
+    const responses = msg.responses || [];
+    let vis = messageVisuals.get(msg.message_id);
+    if (!vis) {
+      vis = { lastUpdateIndex: 0, lastResponseCount: 0, sentAnimated: false };
+      messageVisuals.set(msg.message_id, vis);
+    }
+
+    // Animate send particle + line wave on first sight of an active message
+    if (!vis.sentAnimated && msg.status !== 'expired') {
+      vis.sentAnimated = true;
+      const targets = msg.routed_to || [];
+      targets.forEach((id, i) => {
+        setTimeout(() => {
+          animateSendParticle(id);
+          startLineWave(id, '#dd8040', 1500, 'out');
+          trackLineMessage(id, msg.content, msg.status, 'out');
+        }, i * 100);
+      });
+    }
+
+    // Process new updates — each triggers a line pulse + node effect
+    for (let i = vis.lastUpdateIndex; i < updates.length; i++) {
+      const u = updates[i];
+      switch (u.type) {
+        case 'received':
+          showRingExpand(u.agent_id, '#60a5fa');
+          pulseLineColor(u.agent_id, '#60a5fa', 600);
+          addActivity('&#x25CB;', 'text-mesh-blue', `Received by ${shortId(u.agent_id)}`);
+          break;
+        case 'responding':
+          showRespondingThrob(u.agent_id);
+          pulseLineColor(u.agent_id, '#fbbf24', 800);
+          addActivity('&#x2699;', 'text-mesh-yellow', `${shortId(u.agent_id)} is responding...`);
+          break;
+        case 'forwarded':
+          animateForwardParticle(u.agent_id, u.target_agent_id);
+          showRingExpand(u.agent_id, '#a78bfa');
+          pulseLineColor(u.agent_id, '#a78bfa', 600);
+          startLineWave(u.target_agent_id, '#a78bfa', 1500, 'out');
+          addActivity('&#x21B7;', 'text-mesh-purple', `Forwarded by ${shortId(u.agent_id)}`);
+          break;
+        case 'expired':
+          showScatterParticles(u.agent_id);
+          clearRespondingThrob(u.agent_id);
+          showNodeFlash(u.agent_id, '#f87171');
+          pulseLineColor(u.agent_id, '#f87171', 600);
+          addActivity('&#x2717;', 'text-mesh-red', `Expired at ${shortId(u.agent_id)}`);
+          break;
+      }
+    }
+    vis.lastUpdateIndex = updates.length;
+
+    // Process new responses — green flash + return wave + line pulse
+    for (let i = vis.lastResponseCount; i < responses.length; i++) {
+      const r = responses[i];
+      clearRespondingThrob(r.agent_id);
+      showNodeFlash(r.agent_id, '#34d399');
+      animateResponseParticle(r.agent_id);
+      startLineWave(r.agent_id, '#34d399', 1500, 'in');
+      pulseLineColor(r.agent_id, '#34d399', 800);
+      trackLineMessage(r.agent_id, r.response, 'response', 'in');
+      addActivity('&check;', 'text-mesh-green', `Reply from ${agentLabel(r)}`);
+    }
+    vis.lastResponseCount = responses.length;
+  }
+
+  // Clean up visuals for messages no longer in outbox
+  const activeIds = new Set(outbox.map(m => m.message_id));
+  for (const [id] of messageVisuals) {
+    if (!activeIds.has(id)) messageVisuals.delete(id);
+  }
+}
+
+// =========================================================================
+// Compose — send message
+// =========================================================================
 composeForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const content = composeInput.value.trim();
   if (!content) return;
-  const target = targetSelect.value;
+  const target = targetValue.value;
+  const isBroadcast = target === 'broadcast';
 
-  // Disable while sending
   sendBtn.disabled = true;
   composeInput.value = '';
   composeInput.style.height = 'auto';
 
-  // Optimistic bubble
-  const tempId = '_opt_' + Date.now();
-  addOptimisticBubble(tempId, content);
-
   try {
     const result = await ajaxPost('/send', { content, target });
-    // Remove optimistic — next poll picks up the real one
-    removeOptimisticBubble(tempId);
     if (!result.success) {
       showToast(result.error || 'Send failed', 'error');
+    } else {
+      if (isBroadcast && result.broadcast) {
+        addActivity('&#x21D1;', 'text-mesh-yellow', `Broadcast to ${result.sent_count} agent${result.sent_count !== 1 ? 's' : ''}`);
+        showToast(`Broadcast to ${result.sent_count} agent${result.sent_count !== 1 ? 's' : ''}`, 'success');
+        for (const [id] of nodePositions) {
+          setTimeout(() => {
+            animateSendParticle(id);
+            startLineWave(id, '#fbbf24', 1200, 'out');
+          }, Math.random() * 200);
+        }
+      } else {
+        addActivity('&uarr;', 'text-solar-400', 'Sent message');
+        if (target !== 'auto' && nodePositions.has(target)) {
+          animateSendParticle(target);
+          startLineWave(target, '#dd8040', 1500, 'out');
+        } else if (result.routed_to && result.routed_to.length > 0) {
+          result.routed_to.forEach((id, i) => setTimeout(() => {
+            animateSendParticle(id);
+            startLineWave(id, '#dd8040', 1500, 'out');
+          }, i * 100));
+        }
+      }
     }
   } catch (err) {
-    removeOptimisticBubble(tempId);
     showToast('Failed to send message', 'error');
   } finally {
     sendBtn.disabled = false;
@@ -193,37 +1258,9 @@ composeInput.addEventListener('keydown', (e) => {
   }
 });
 
-function addOptimisticBubble(tempId, content) {
-  if (emptyState) emptyState.style.display = 'none';
-  const html = `
-    <div class="flex justify-end fade-in">
-      <div class="max-w-[65%] min-w-[200px]">
-        <div class="bg-slab border border-edge rounded-xl px-4 py-3 opacity-70">
-          <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(content)}</p>
-        </div>
-        <div class="flex justify-end items-center gap-2 mt-1 px-2">
-          <div class="w-1.5 h-1.5 rounded-full bg-muted pulse-dot"></div>
-          <span class="text-xs text-muted">sending...</span>
-        </div>
-      </div>
-    </div>`;
-  const div = document.createElement('div');
-  div.innerHTML = html;
-  div.dataset.optId = tempId;
-  chatStream.appendChild(div);
-  optimisticMessages.set(tempId, div);
-  chatStream.scrollTop = chatStream.scrollHeight;
-}
-
-function removeOptimisticBubble(tempId) {
-  const el = optimisticMessages.get(tempId);
-  if (el) { el.remove(); optimisticMessages.delete(tempId); }
-}
-
-// ---------------------------------------------------------------------------
-// Connect form — fetch-based
-// ---------------------------------------------------------------------------
-
+// =========================================================================
+// Connect form
+// =========================================================================
 connectForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const urlInput = connectForm.querySelector('input[name="url"]');
@@ -235,7 +1272,8 @@ connectForm.addEventListener('submit', async (e) => {
   try {
     const result = await ajaxPost('/connect', { url });
     if (result.success) {
-      showToast(result.status === 'connected' ? 'Connected' : 'Connection request sent', 'success');
+      showToast(result.status === 'connected' ? 'Connected' : 'Request sent', 'success');
+      addActivity('+', 'text-mesh-green', `Connected to ${url.split(':').pop()}`);
       urlInput.value = '';
     } else {
       showToast(result.error || 'Connection failed', 'error');
@@ -248,160 +1286,46 @@ connectForm.addEventListener('submit', async (e) => {
   pollServer();
 });
 
-// ---------------------------------------------------------------------------
-// Render outbound message
-// ---------------------------------------------------------------------------
-
-function renderOutbound(msg) {
-  const el = renderedOutbox.get(msg.message_id);
-
-  let statusDot = 'bg-muted';
-  let statusLabel = 'sending';
-  if (msg.status === 'active') { statusDot = 'bg-mesh-yellow'; statusLabel = 'active'; }
-  if (msg.status === 'responded') { statusDot = 'bg-mesh-green'; statusLabel = 'responded'; }
-  if (msg.status === 'expired') { statusDot = 'bg-mesh-red'; statusLabel = 'expired'; }
-
-  const html = `
-    <div class="flex justify-end fade-in">
-      <div class="max-w-[65%] min-w-[200px]">
-        <div class="bg-slab border border-edge rounded-xl px-4 py-3">
-          <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(msg.content)}</p>
-        </div>
-        <div class="flex justify-end items-center gap-2 mt-1 px-2">
-          <div class="w-1.5 h-1.5 rounded-full ${statusDot}"></div>
-          <span class="text-xs text-muted">${statusLabel}</span>
-          <span class="text-xs text-faint">${timeAgo(msg.created_at)}</span>
-        </div>
-        ${msg.response ? `
-        <div class="mt-2 flex justify-end">
-          <div class="bg-dim border border-edge rounded-xl px-4 py-3 max-w-full">
-            <div class="flex items-center gap-2 mb-1.5">
-              <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
-              <span class="text-xs text-mesh-green font-medium">${esc(msg.response_display_name || shortId(msg.response_agent))}</span>
-            </div>
-            <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(msg.response)}</p>
-          </div>
-        </div>` : ''}
-      </div>
-    </div>`;
-
-  if (el) {
-    el.innerHTML = html;
-  } else {
-    const div = document.createElement('div');
-    div.innerHTML = html;
-    div.dataset.msgId = msg.message_id;
-    chatStream.appendChild(div);
-    renderedOutbox.set(msg.message_id, div);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Render inbox message — fetch-based reply
-// ---------------------------------------------------------------------------
-
-function renderInbox(msg) {
-  if (renderedInbox.has(msg.message_id)) return;
-
-  const wrapper = document.createElement('div');
-  wrapper.dataset.inboxId = msg.message_id;
-
-  wrapper.innerHTML = `
-    <div class="flex justify-start fade-in">
-      <div class="max-w-[65%] min-w-[200px]">
-        <div class="bg-dim border border-edge rounded-xl px-4 py-3">
-          <div class="flex items-center gap-2 mb-1.5">
-            <div class="w-1.5 h-1.5 rounded-full bg-mesh-blue"></div>
-            <span class="text-xs text-mesh-blue font-medium">${esc(msg.from_display_name)}</span>
-            <span class="text-xs text-faint">${timeAgo(msg.received_at)}</span>
-          </div>
-          <p class="text-sm text-bright whitespace-pre-wrap leading-relaxed">${esc(msg.content)}</p>
-        </div>
-        <div class="mt-2 reply-area">
-          <div class="flex gap-1.5">
-            <input type="text" placeholder="Reply..."
-              class="reply-input flex-1 bg-slab border border-edge rounded-lg px-3 py-2 text-xs text-bright placeholder-muted focus:border-solar-500 transition-colors">
-            <button type="button"
-              class="reply-btn bg-mesh-blue/20 hover:bg-mesh-blue/30 text-mesh-blue text-xs font-medium px-3 py-2 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-              Reply
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>`;
-
-  const replyInput = wrapper.querySelector('.reply-input');
-  const replyBtn = wrapper.querySelector('.reply-btn');
-
-  async function doReply() {
-    const text = replyInput.value.trim();
-    if (!text) return;
-    replyBtn.disabled = true;
-    replyBtn.textContent = 'Replying...';
-    replyInput.disabled = true;
-    try {
-      const result = await ajaxPost(`/respond/${encodeURIComponent(msg.message_id)}`, { response: text });
-      if (result.success) {
-        showToast('Reply sent', 'success');
-        wrapper.remove();
-        renderedInbox.delete(msg.message_id);
-      } else {
-        showToast(result.error || 'Reply failed', 'error');
-        replyBtn.disabled = false;
-        replyBtn.textContent = 'Reply';
-        replyInput.disabled = false;
-      }
-    } catch (err) {
-      showToast('Reply failed', 'error');
-      replyBtn.disabled = false;
-      replyBtn.textContent = 'Reply';
-      replyInput.disabled = false;
-    }
-  }
-
-  replyBtn.addEventListener('click', doReply);
-  replyInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doReply(); }
-  });
-
-  chatStream.appendChild(wrapper);
-  renderedInbox.set(msg.message_id, wrapper);
-}
-
-// ---------------------------------------------------------------------------
-// Render pending requests — fetch-based accept/reject
-// ---------------------------------------------------------------------------
-
+// =========================================================================
+// Render pending requests (diff-aware)
+// =========================================================================
 function renderPending(requests) {
   if (requests.length === 0) {
     pendingSection.classList.add('hidden');
+    for (const [id, entry] of renderedPending) { entry.el.remove(); }
+    renderedPending.clear();
     return;
   }
   pendingSection.classList.remove('hidden');
-  pendingListEl.innerHTML = '';
+
+  const currentIds = new Set(requests.map(r => r.request_id));
+  for (const [id, entry] of renderedPending) {
+    if (!currentIds.has(id)) { entry.el.remove(); renderedPending.delete(id); }
+  }
 
   requests.forEach(r => {
+    if (renderedPending.has(r.request_id)) return;
+
     const el = document.createElement('div');
-    el.className = 'bg-slab border border-edge rounded-lg p-2.5 flex items-center justify-between gap-2';
+    el.className = 'bg-slab border border-edge rounded p-2 flex items-center justify-between gap-2 slide-in-left';
     el.innerHTML = `
       <div class="min-w-0">
-        <div class="text-xs text-bright font-medium truncate">${esc(r.from_display_name)}</div>
-        ${r.from_bio ? `<div class="text-xs text-muted truncate mt-0.5">${esc(r.from_bio.slice(0, 50))}</div>` : ''}
+        <div class="text-[11px] text-bright font-medium truncate">${esc(agentLabel(r))}</div>
+        ${r.from_bio ? `<div class="text-[10px] text-muted truncate mt-0.5">${esc(r.from_bio.slice(0, 40))}</div>` : ''}
       </div>
       <div class="flex gap-1 shrink-0">
-        <button class="accept-btn bg-mesh-green/15 hover:bg-mesh-green/25 text-mesh-green text-xs px-2 py-1 rounded transition-colors font-medium">Accept</button>
-        <button class="reject-btn bg-mesh-red/15 hover:bg-mesh-red/25 text-mesh-red text-xs px-2 py-1 rounded transition-colors">Deny</button>
+        <button class="accept-btn bg-mesh-green/15 hover:bg-mesh-green/25 text-mesh-green text-[10px] px-2 py-0.5 rounded transition-colors font-medium">Accept</button>
+        <button class="reject-btn bg-mesh-red/15 hover:bg-mesh-red/25 text-mesh-red text-[10px] px-2 py-0.5 rounded transition-colors">Deny</button>
       </div>`;
 
     el.querySelector('.accept-btn').addEventListener('click', async () => {
       try {
         const result = await ajaxPost(`/accept/${encodeURIComponent(r.request_id)}`, {});
         if (result.success) {
-          showToast(`Connected to ${r.from_display_name}`, 'success');
+          showToast(`Connected to ${agentLabel(r)}`, 'success');
+          addActivity('+', 'text-mesh-green', `Accepted ${agentLabel(r)}`);
         }
-      } catch (err) {
-        showToast('Accept failed', 'error');
-      }
+      } catch (err) { showToast('Accept failed', 'error'); }
       pollServer();
     });
 
@@ -409,141 +1333,624 @@ function renderPending(requests) {
       try {
         await ajaxPost(`/reject/${encodeURIComponent(r.request_id)}`, {});
         showToast('Request denied', 'info');
-      } catch (err) {
-        showToast('Reject failed', 'error');
-      }
+      } catch (err) { showToast('Reject failed', 'error'); }
       pollServer();
     });
 
     pendingListEl.appendChild(el);
+    renderedPending.set(r.request_id, { el });
   });
 }
 
-// ---------------------------------------------------------------------------
-// Render discovered agents — fetch-based connect
-// ---------------------------------------------------------------------------
-
+// =========================================================================
+// Render discovered agents (diff-aware)
+// =========================================================================
 function renderDiscovered(agents) {
-  if (agents.length === 0) {
-    discoveredList.innerHTML = '<p class="text-xs text-muted italic">No agents found on local ports</p>';
+  const currentIds = new Set(agents.map(a => a.agent_id));
+  for (const [id, entry] of renderedDiscovered) {
+    if (!currentIds.has(id)) { entry.el.remove(); renderedDiscovered.delete(id); }
+  }
+
+  if (agents.length === 0 && renderedDiscovered.size === 0) {
+    if (!discoveredList.querySelector('.text-muted')) {
+      discoveredList.innerHTML = '<p class="text-[10px] text-muted italic">No agents found</p>';
+    }
     return;
   }
-  discoveredList.innerHTML = '';
+
+  const placeholder = discoveredList.querySelector('p.text-muted');
+  if (placeholder && agents.length > 0) placeholder.remove();
 
   agents.forEach(a => {
+    const hash = `${a.display_name}|${a.bio}|${a.port}|${a.status}`;
+    const existing = renderedDiscovered.get(a.agent_id);
+    if (existing && existing.hash === hash) return;
+    if (existing) { existing.el.remove(); renderedDiscovered.delete(a.agent_id); }
+
     const el = document.createElement('div');
-    el.className = 'bg-slab border border-edge rounded-lg p-2.5 flex items-center justify-between gap-2';
+    el.className = 'bg-slab border border-edge rounded p-2 flex items-center justify-between gap-2';
     el.innerHTML = `
       <div class="min-w-0">
-        <div class="flex items-center gap-1.5">
-          <span class="text-xs text-bright font-medium truncate">${esc(a.display_name)}</span>
-          <span class="text-xs text-faint">:${a.port}</span>
+        <div class="flex items-center gap-1">
+          <span class="text-[11px] text-bright font-medium truncate">${esc(agentLabel(a))}</span>
+          <span class="text-[10px] text-faint">:${a.port}</span>
         </div>
-        ${a.bio ? `<div class="text-xs text-muted truncate mt-0.5">${esc(a.bio.slice(0, 50))}</div>` : ''}
+        ${a.bio ? `<div class="text-[10px] text-muted truncate mt-0.5">${esc(a.bio.slice(0, 35))}</div>` : ''}
       </div>
       <button type="button"
-        class="connect-btn shrink-0 bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-xs px-2.5 py-1 rounded transition-colors font-medium">
+        class="connect-btn shrink-0 bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[10px] px-2 py-0.5 rounded transition-colors font-medium">
         Connect
       </button>`;
 
     el.querySelector('.connect-btn').addEventListener('click', async (e) => {
       const btn = e.currentTarget;
-      btn.disabled = true;
-      btn.textContent = '...';
+      btn.disabled = true; btn.textContent = '...';
       try {
         const result = await ajaxPost('/connect', { url: a.url });
         if (result.success) {
-          showToast(result.status === 'connected' ? `Connected to ${a.display_name}` : 'Connection request sent', 'success');
-        } else {
-          showToast(result.error || 'Connection failed', 'error');
-        }
-      } catch (err) {
-        showToast('Connection failed', 'error');
-      }
-      btn.disabled = false;
-      btn.textContent = 'Connect';
+          showToast(result.status === 'connected' ? `Connected to ${agentLabel(a)}` : 'Request sent', 'success');
+          addActivity('+', 'text-mesh-green', `Connected to ${agentLabel(a)}`);
+        } else { showToast(result.error || 'Failed', 'error'); }
+      } catch (err) { showToast('Connection failed', 'error'); }
+      btn.disabled = false; btn.textContent = 'Connect';
       pollServer();
     });
 
     discoveredList.appendChild(el);
+    renderedDiscovered.set(a.agent_id, { el, hash });
   });
 }
 
-// ---------------------------------------------------------------------------
-// Render connections — fetch-based disconnect
-// ---------------------------------------------------------------------------
+// =========================================================================
+// Render connections — sidebar list + constellation
+// =========================================================================
+function createCompactConnNode(c) {
+  const el = document.createElement('div');
+  el.className = 'flex items-center justify-between text-[10px] py-0.5 group';
+  el.innerHTML = `
+    <div class="flex items-center gap-1.5 min-w-0">
+      <div class="w-1.5 h-1.5 rounded-full bg-mesh-green shrink-0"></div>
+      <span class="text-pale truncate">${esc(agentLabel(c))}</span>
+      <span class="text-[9px] text-faint">${c.direction === 'inbound' ? '&#8592;' : '&#8594;'}</span>
+    </div>
+    <button type="button" class="dc-btn text-faint hover:text-mesh-red transition-colors ml-1 shrink-0 opacity-0 group-hover:opacity-100">&times;</button>`;
 
-function renderConnections(conns) {
-  if (conns.length === 0) {
-    connectionsList.innerHTML = '<p class="text-xs text-muted italic">No connections</p>';
-  } else {
-    connectionsList.innerHTML = '';
-    conns.forEach(c => {
-      const el = document.createElement('div');
-      el.className = 'bg-slab border border-edge rounded-lg p-2.5 group';
-      el.innerHTML = `
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-1.5 min-w-0">
-            <div class="w-1.5 h-1.5 rounded-full bg-mesh-green shrink-0"></div>
-            <span class="text-xs text-bright font-medium truncate">${esc(c.display_name)}</span>
-          </div>
-          <button type="button" class="dc-btn text-faint hover:text-mesh-red text-xs opacity-0 group-hover:opacity-100 transition-all" title="Disconnect">&times;</button>
-        </div>
-        ${c.bio ? `<div class="text-xs text-muted truncate mt-1 pl-3">${esc(c.bio.slice(0, 60))}</div>` : ''}
-        ${c.last_activity ? `<div class="text-xs text-faint mt-0.5 pl-3">active ${timeAgo(c.last_activity)} ago</div>` : ''}`;
-
-      el.querySelector('.dc-btn').addEventListener('click', async () => {
-        try {
-          await ajaxPost(`/disconnect/${encodeURIComponent(c.agent_id)}`, {});
-          showToast(`Disconnected from ${c.display_name}`, 'info');
-        } catch (err) {
-          showToast('Disconnect failed', 'error');
-        }
-        pollServer();
-      });
-
-      connectionsList.appendChild(el);
-    });
-  }
-
-  // Update target select
-  const cur = targetSelect.value;
-  const opts = ['<option value="auto">auto-route</option>'];
-  conns.forEach(c => opts.push(`<option value="${c.agent_id}">${esc(c.display_name)}</option>`));
-  targetSelect.innerHTML = opts.join('');
-  if ([...targetSelect.options].some(o => o.value === cur)) targetSelect.value = cur;
+  el.querySelector('.dc-btn').addEventListener('click', async () => {
+    try {
+      await ajaxPost(`/disconnect/${encodeURIComponent(c.agent_id)}`, {});
+      showToast(`Disconnected from ${agentLabel(c)}`, 'info');
+      addActivity('&minus;', 'text-mesh-red', `Disconnected from ${agentLabel(c)}`);
+    } catch (err) { showToast('Disconnect failed', 'error'); }
+    pollServer();
+  });
+  return el;
 }
 
-// ---------------------------------------------------------------------------
-// Main poll handler
-// ---------------------------------------------------------------------------
+function createMobileConnNode(c) {
+  const el = document.createElement('div');
+  el.className = 'bg-slab border border-edge rounded p-2 group';
+  el.innerHTML = `
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-1.5 min-w-0">
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-green shrink-0"></div>
+        <span class="text-[11px] text-bright font-medium truncate">${esc(agentLabel(c))}</span>
+        <span class="text-[9px] text-faint">${c.direction === 'inbound' ? '&larr;' : '&rarr;'}</span>
+      </div>
+      <button type="button" class="dc-btn text-faint hover:text-mesh-red text-[11px] opacity-0 group-hover:opacity-100 transition-all">&times;</button>
+    </div>
+    ${c.bio ? `<div class="text-[10px] text-muted truncate mt-0.5 pl-3">${esc(c.bio.slice(0, 50))}</div>` : ''}
+    ${c.last_activity ? `<div class="text-[9px] text-faint mt-0.5 pl-3">${timeAgo(c.last_activity)}</div>` : ''}`;
 
-function onPollData(data) {
-  const hasContent = data.outbox.length > 0 || data.inbox.length > 0;
-  if (hasContent && emptyState) emptyState.style.display = 'none';
-  if (!hasContent && optimisticMessages.size === 0 && emptyState) emptyState.style.display = '';
+  el.querySelector('.dc-btn').addEventListener('click', async () => {
+    try {
+      await ajaxPost(`/disconnect/${encodeURIComponent(c.agent_id)}`, {});
+      showToast(`Disconnected from ${agentLabel(c)}`, 'info');
+      addActivity('&minus;', 'text-mesh-red', `Disconnected from ${agentLabel(c)}`);
+    } catch (err) { showToast('Disconnect failed', 'error'); }
+    pollServer();
+  });
+  return el;
+}
 
-  // Remove stale inbox
-  const inboxIds = new Set(data.inbox.map(m => m.message_id));
-  for (const [mid, el] of renderedInbox) {
-    if (!inboxIds.has(mid)) { el.remove(); renderedInbox.delete(mid); }
+function connHash(c) {
+  return `${c.display_name}|${c.bio}|${c.direction}|${c.last_activity}`;
+}
+
+function renderConnections(conns) {
+  // Update constellation SVG
+  updateConstellationNodes(conns);
+
+  // Sidebar compact list
+  const currentIds = new Set(conns.map(c => c.agent_id));
+  for (const [id, entry] of renderedConns) {
+    if (!currentIds.has(id)) { entry.el.remove(); renderedConns.delete(id); }
+  }
+  conns.forEach(c => {
+    const h = connHash(c);
+    const existing = renderedConns.get(c.agent_id);
+    if (existing && existing.hash === h) return;
+    if (existing) { existing.el.remove(); renderedConns.delete(c.agent_id); }
+    const ph = connectionsList.querySelector('p.text-muted');
+    if (ph) ph.remove();
+    const el = createCompactConnNode(c);
+    connectionsList.appendChild(el);
+    renderedConns.set(c.agent_id, { el, hash: h });
+  });
+  if (conns.length === 0 && connectionsList.children.length === 0) {
+    connectionsList.innerHTML = '<p class="text-[10px] text-muted italic">No connections</p>';
   }
 
-  // Merge + sort chronologically
-  const all = [];
-  data.outbox.forEach(m => all.push({...m, _type: 'out', _ts: m.created_at}));
-  data.inbox.forEach(m => all.push({...m, _type: 'in', _ts: m.received_at}));
-  all.sort((a, b) => (a._ts || '').localeCompare(b._ts || ''));
+  // Mobile list
+  for (const [id, entry] of renderedConnsMobile) {
+    if (!currentIds.has(id)) { entry.el.remove(); renderedConnsMobile.delete(id); }
+  }
+  conns.forEach(c => {
+    const h = connHash(c);
+    const existing = renderedConnsMobile.get(c.agent_id);
+    if (existing && existing.hash === h) return;
+    if (existing) { existing.el.remove(); renderedConnsMobile.delete(c.agent_id); }
+    const el = createMobileConnNode(c);
+    mobileConnectionsList.appendChild(el);
+    renderedConnsMobile.set(c.agent_id, { el, hash: h });
+  });
 
-  all.forEach(m => m._type === 'out' ? renderOutbound(m) : renderInbox(m));
+  document.getElementById('sidebar-conn-count').textContent = conns.length;
+  updateDropdownOptions(conns);
+}
 
+// =========================================================================
+// Activity diffing — detect changes between polls
+// =========================================================================
+function diffActivity(prev, curr) {
+  if (!prev) return;
+
+  const prevConnIds = new Set(prev.connections.map(c => c.agent_id));
+  curr.connections.forEach(c => {
+    if (!prevConnIds.has(c.agent_id)) {
+      addActivity('+', 'text-mesh-green', `Connected: ${agentLabel(c)}`);
+    }
+  });
+
+  const currConnIds = new Set(curr.connections.map(c => c.agent_id));
+  prev.connections.forEach(c => {
+    if (!currConnIds.has(c.agent_id)) {
+      addActivity('&minus;', 'text-mesh-red', `Disconnected: ${agentLabel(c)}`);
+    }
+  });
+
+  const prevInboxIds = new Set(prev.inbox.map(m => m.message_id));
+  curr.inbox.forEach(m => {
+    if (!prevInboxIds.has(m.message_id)) {
+      addActivity('&darr;', 'text-mesh-blue', `Message from ${agentLabel(m)}`);
+      if (m.from_agent_id && nodePositions.has(m.from_agent_id)) {
+        animateReceiveParticle(m.from_agent_id);
+        startLineWave(m.from_agent_id, '#60a5fa', 1500, 'in');
+        pulseLineColor(m.from_agent_id, '#60a5fa', 600);
+        trackLineMessage(m.from_agent_id, m.content, 'inbox', 'in');
+      }
+    }
+  });
+
+  const prevPendingIds = new Set(prev.pending_requests.map(p => p.request_id));
+  curr.pending_requests.forEach(p => {
+    if (!prevPendingIds.has(p.request_id)) {
+      addActivity('?', 'text-mesh-purple', `Request from ${agentLabel(p)}`);
+    }
+  });
+}
+
+// =========================================================================
+// Timeline sidebar
+// =========================================================================
+function buildTimelineItems(data) {
+  const items = [];
+  for (const msg of (data.outbox || [])) {
+    items.push({
+      id: msg.message_id,
+      type: 'sent',
+      content: msg.content,
+      timestamp: msg.timestamp || msg.created_at,
+      agent_ids: msg.routed_to || [],
+      display_name: (msg.routed_to || []).map(id => {
+        const c = (data.connections || []).find(cn => cn.agent_id === id);
+        return c ? agentLabel(c) : shortId(id);
+      }).join(', ') || 'auto-route',
+      status: msg.status,
+      updates: msg.updates || [],
+      responses: (msg.responses || []).map(r => {
+        // Enrich response display_name from connections if available
+        const c = (data.connections || []).find(cn => cn.agent_id === r.agent_id);
+        return c ? { ...r, display_name: agentLabel(c), bio: c.bio } : r;
+      }),
+    });
+  }
+  for (const msg of (data.inbox || [])) {
+    items.push({
+      id: 'inbox_' + msg.message_id,
+      type: 'received',
+      content: msg.content,
+      timestamp: msg.timestamp || msg.created_at,
+      agent_ids: [msg.from_agent_id],
+      display_name: (() => {
+        const c = (data.connections || []).find(cn => cn.agent_id === msg.from_agent_id);
+        return c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id));
+      })(),
+      from_agent_id: msg.from_agent_id,
+      raw_message_id: msg.message_id,
+    });
+  }
+  items.sort((a, b) => {
+    const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+    const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+    return ta - tb;
+  });
+  return items;
+}
+
+function relativeTime(ts) {
+  if (!ts) return '';
+  const diff = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (diff < 60) return 'now';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+  return Math.floor(diff / 86400) + 'd';
+}
+
+function buildWebhookBadges(updates) {
+  if (!updates || !updates.length) return '';
+  const colors = { received: 'bg-blue-500/20 text-blue-400', responding: 'bg-yellow-500/20 text-yellow-400', forwarded: 'bg-purple-500/20 text-purple-400', expired: 'bg-red-500/20 text-red-400' };
+  const seen = new Set();
+  let html = '<div class="flex flex-wrap gap-0.5 mt-1">';
+  for (const u of updates) {
+    if (seen.has(u.type)) continue;
+    seen.add(u.type);
+    const cls = colors[u.type] || 'bg-edge text-muted';
+    html += `<span class="text-[10px] px-1.5 py-0.5 rounded-full ${cls}">${u.type}</span>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function buildSentItemHTML(item) {
+  return `
+    <div class="flex items-start gap-2 min-w-0">
+      <svg width="12" height="12" viewBox="0 0 10 10" class="text-solar-400 shrink-0 mt-0.5"><path d="M2 5h6M6 3l2 2-2 2" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
+      <div class="min-w-0 flex-1">
+        <div class="flex items-center gap-1.5">
+          <span class="text-[12px] text-pale font-medium">You</span>
+          <span class="text-[12px] text-faint">&rarr;</span>
+          <span class="text-[12px] text-solar-400 font-medium truncate">${item.display_name}</span>
+          <span class="text-[11px] text-faint shrink-0">${relativeTime(item.timestamp)}</span>
+        </div>
+        <div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
+        ${buildWebhookBadges(item.updates)}
+        ${buildResponseThreads(item.responses)}
+      </div>
+    </div>`;
+}
+
+function buildReceivedItemHTML(item) {
+  return `
+    <div class="flex items-start gap-2 min-w-0">
+      <svg width="12" height="12" viewBox="0 0 10 10" class="text-mesh-blue shrink-0 mt-0.5"><path d="M8 5H2M4 3L2 5l2 2" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
+      <div class="min-w-0 flex-1">
+        <div class="flex items-center gap-1.5">
+          <span class="text-[12px] text-mesh-blue font-medium truncate">${item.display_name}</span>
+          <span class="text-[11px] text-faint shrink-0">${relativeTime(item.timestamp)}</span>
+        </div>
+        <div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
+        <div class="flex gap-1.5 mt-1.5">
+          <input type="text" placeholder="Reply..."
+            data-message-id="${item.raw_message_id || ''}"
+            class="timeline-reply-input flex-1 bg-slab border border-edge rounded px-2 py-1 text-[12px] text-bright placeholder-muted focus:border-mesh-blue/40 transition-colors min-w-0">
+          <button type="button" data-message-id="${item.raw_message_id || ''}"
+            class="timeline-reply-btn bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[11px] font-medium px-2.5 py-1 rounded transition-colors disabled:opacity-30 shrink-0">
+            Reply
+          </button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function buildResponseThreads(responses) {
+  if (!responses || !responses.length) return '';
+  let html = '';
+  for (const r of responses) {
+    const name = agentLabel(r);
+    html += `
+      <div class="pl-3 ml-2 border-l-2 border-mesh-green/20 mt-1.5">
+        <div class="flex items-center gap-1.5">
+          <span class="text-[12px] text-mesh-green font-medium truncate">${name}</span>
+          <span class="text-[11px] text-faint shrink-0">${relativeTime(r.timestamp)}</span>
+        </div>
+        <div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(r.response)}</div>
+      </div>`;
+  }
+  return html;
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function createTimelineElement(item) {
+  const el = document.createElement('div');
+  const borderCls = item.type === 'sent' ? 'border-solar-500/20' : 'border-mesh-blue/20';
+  el.className = `p-2.5 rounded-lg border ${borderCls} bg-slab/30 hover:bg-slab/60 transition-colors timeline-enter`;
+  el.dataset.timelineId = item.id;
+  el.dataset.agentIds = JSON.stringify(item.agent_ids || []);
+  el.innerHTML = item.type === 'sent' ? buildSentItemHTML(item) : buildReceivedItemHTML(item);
+
+  el.addEventListener('mouseenter', () => highlightTimelineItem(item));
+  el.addEventListener('mouseleave', () => clearTimelineHighlight());
+
+  // Wire up reply for inbox items
+  if (item.type === 'received' && item.raw_message_id) {
+    wireTimelineReply(el, item);
+  }
+  return el;
+}
+
+function wireTimelineReply(el, item) {
+  const input = el.querySelector('.timeline-reply-input');
+  const btn = el.querySelector('.timeline-reply-btn');
+  if (!input || !btn) return;
+
+  async function doReply() {
+    const text = input.value.trim();
+    if (!text) return;
+    btn.disabled = true;
+    input.disabled = true;
+    try {
+      const result = await ajaxPost(`/respond/${encodeURIComponent(item.raw_message_id)}`, { response: text });
+      if (result.success) {
+        showToast('Reply sent', 'success');
+        addActivity('&darr;', 'text-mesh-blue', `Replied to ${item.display_name}`);
+        input.value = '';
+      } else {
+        showToast(result.error || 'Reply failed', 'error');
+      }
+    } catch (err) {
+      showToast('Reply failed', 'error');
+    }
+    btn.disabled = false;
+    input.disabled = false;
+  }
+
+  btn.addEventListener('click', doReply);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doReply(); }
+  });
+}
+
+function renderTimeline(data) {
+  if (!timelineScroll) return;
+  const items = buildTimelineItems(data);
+  const newIds = new Set(items.map(i => i.id));
+
+  // Remove stale items
+  for (const [id, el] of renderedTimeline) {
+    if (!newIds.has(id)) {
+      el.remove();
+      renderedTimeline.delete(id);
+    }
+  }
+
+  // Check if user is near bottom (for auto-scroll)
+  const nearBottom = timelineScroll.scrollHeight - timelineScroll.scrollTop - timelineScroll.clientHeight < 60;
+
+  // Add/update items
+  for (const item of items) {
+    const existing = renderedTimeline.get(item.id);
+    if (existing) {
+      // Update content in-place (for webhook badges, responses)
+      const html = item.type === 'sent' ? buildSentItemHTML(item) : buildReceivedItemHTML(item);
+      const inner = existing.querySelector('.flex.items-start');
+      if (inner && inner.innerHTML !== html.trim()) {
+        // Re-check: only rebuild if content actually changed
+        const wrapper = existing.firstElementChild;
+        if (wrapper) {
+          existing.innerHTML = html;
+          // Re-attach hover listeners
+          existing.addEventListener('mouseenter', () => highlightTimelineItem(item));
+          existing.addEventListener('mouseleave', () => clearTimelineHighlight());
+        }
+      }
+    } else {
+      const el = createTimelineElement(item);
+      timelineScroll.appendChild(el);
+      renderedTimeline.set(item.id, el);
+    }
+  }
+
+  // Update count badge
+  if (timelineCountEl) timelineCountEl.textContent = items.length;
+
+  // Auto-scroll if near bottom
+  if (nearBottom) {
+    timelineScroll.scrollTop = timelineScroll.scrollHeight;
+  }
+}
+
+// Timeline hover → mesh node connector
+function highlightTimelineItem(item) {
+  clearTimelineHighlight();
+  const agentIds = item.agent_ids || [];
+  if (!agentIds.length) return;
+
+  highlightedTimelineAgent = agentIds[0];
+
+  // Enlarge target node + glow
+  for (const agentId of agentIds) {
+    const nodeRef = svgRefs.nodes.get(agentId);
+    if (nodeRef) {
+      nodeRef.circle.setAttribute('r', '7');
+      if (nodeRef.glow) nodeRef.glow.setAttribute('opacity', '0.35');
+    }
+    // Glow connection line
+    const lineRef = svgRefs.lines.get(agentId);
+    if (lineRef && lineRef.glow) {
+      lineRef.glow.setAttribute('opacity', '0.5');
+    }
+  }
+
+  // Draw dotted SVG connector from right panel edge to node
+  drawTimelineConnector(agentIds[0]);
+}
+
+function clearTimelineHighlight() {
+  if (!highlightedTimelineAgent) return;
+
+  // Reset all nodes back
+  for (const [, nodeRef] of svgRefs.nodes) {
+    nodeRef.circle.setAttribute('r', '5');
+    if (nodeRef.glow) nodeRef.glow.setAttribute('opacity', '0.15');
+  }
+  for (const [, lineRef] of svgRefs.lines) {
+    if (lineRef.glow) lineRef.glow.setAttribute('opacity', '0.2');
+  }
+
+  removeTimelineConnector();
+  highlightedTimelineAgent = null;
+}
+
+function drawTimelineConnector(agentId) {
+  if (!svgRefs.connectorGroup) return;
+  const pos = nodePositions.get(agentId);
+  if (!pos) return;
+
+  const line = svgEl('line', {
+    x1: svgW, y1: svgH / 2,
+    x2: pos.x, y2: pos.y,
+    stroke: '#dd8040',
+    'stroke-width': '1',
+    'stroke-dasharray': '4 3',
+    opacity: '0.5',
+  });
+  line.classList.add('connector-line');
+  svgRefs.connectorGroup.appendChild(line);
+  timelineConnectorLine = line;
+}
+
+function removeTimelineConnector() {
+  if (timelineConnectorLine) {
+    timelineConnectorLine.remove();
+    timelineConnectorLine = null;
+  }
+}
+
+// =========================================================================
+// Right panel drag-to-resize
+// =========================================================================
+(function initPanelResize() {
+  const panel = document.getElementById('right-panel');
+  const handle = document.getElementById('right-panel-handle');
+  if (!panel || !handle) return;
+
+  let startX, startW;
+
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    startX = e.clientX;
+    startW = panel.offsetWidth;
+    document.body.classList.add('resizing-panel');
+
+    function onMove(e) {
+      const delta = startX - e.clientX; // dragging left = wider
+      const newW = Math.max(200, Math.min(startW + delta, window.innerWidth * 0.5));
+      panel.style.width = newW + 'px';
+      // Trigger SVG re-layout since constellation area changed
+      if (typeof updateSVGLayout === 'function') updateSVGLayout();
+    }
+    function onUp() {
+      document.body.classList.remove('resizing-panel');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+})();
+
+// =========================================================================
+// Main poll handler
+// =========================================================================
+function onPollData(data) {
+  // Activity diffing
+  if (data.self) selfAgentId = data.self.agent_id;
+  diffActivity(prevPollData, data);
+  prevPollData = JSON.parse(JSON.stringify(data));
+
+  // Render constellation + sidebar
   renderPending(data.pending_requests);
   renderDiscovered(data.discovered || []);
   renderConnections(data.connections);
 
-  // Auto-scroll
-  const near = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight < 150;
-  if (near) chatStream.scrollTop = chatStream.scrollHeight;
+  // Process outbox message visuals (particles, rings, cards)
+  processOutboxVisuals(data.outbox);
+
+  // Render timeline sidebar
+  renderTimeline(data);
+
+  // --- Active agents: grow center node + track per-peer counts ---
+  if (data.self) {
+    const agents = data.self.total_active_agents || 0;
+    totalActiveAgents = agents;
+
+    // Center node grows with total active agents
+    if (svgRefs.centerNode) {
+      const r = 9 + Math.min(agents * 3, 12);
+      svgRefs.centerNode.setAttribute('r', r);
+    }
+    if (svgRefs.centerGlow) {
+      const gr = 24 + Math.min(agents * 6, 24);
+      svgRefs.centerGlow.setAttribute('r', gr);
+      svgRefs.centerGlow.setAttribute('opacity', 0.1 + Math.min(agents * 0.04, 0.2));
+    }
+    // Agent count label below "You"
+    if (svgRefs.centerAgentLabel) {
+      if (agents > 0) {
+        svgRefs.centerAgentLabel.textContent = agents + ' agent' + (agents !== 1 ? 's' : '');
+        svgRefs.centerAgentLabel.setAttribute('opacity', '1');
+      } else {
+        svgRefs.centerAgentLabel.setAttribute('opacity', '0');
+      }
+    }
+  }
+
+  // Per-peer agent count activity logging
+  data.connections.forEach(c => {
+    const count = c.spawned_agents || 0;
+    const prev = prevAgentCounts.get(c.agent_id) || 0;
+    if (count > prev) {
+      const delta = count - prev;
+      addActivity('&#9650;', 'text-cyan-400', `${delta} agent${delta !== 1 ? 's' : ''} spawned on ${agentLabel(c)}`);
+    } else if (count < prev) {
+      addActivity('&#9660;', 'text-mesh-green', `Agent finished on ${agentLabel(c)}`);
+    }
+    prevAgentCounts.set(c.agent_id, count);
+  });
+
+  // QR code init
+  if (data.self && data.self.lan_url && !qrInitialized) {
+    initQR(data.self.lan_url);
+  }
+
+  // NAT status
+  if (data.self && data.self.nat_detected) {
+    document.getElementById('nat-status').classList.remove('hidden');
+  }
+}
+
+// =========================================================================
+// Init
+// =========================================================================
+initSVG();
+
+// ResizeObserver for constellation re-layout
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => updateSVGLayout()).observe(constellationArea);
 }
 </script>
 

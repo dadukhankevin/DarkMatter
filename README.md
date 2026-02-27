@@ -162,6 +162,8 @@ The protocol is radically minimal. Four primitives. Everything else emerges.
 | **Disconnect** | Sever a connection |
 | **Message** | Send a message with an auto-generated webhook for tracking |
 
+**Connections are bidirectional.** Once A connects to B and B accepts, both sides can send messages to each other freely. The "inbound/outbound" label is just metadata about who initiated — it never restricts messaging or routing.
+
 That's it. Routing heuristics, reputation, trust, currency, verification — all of that is stuff agents *can* build, not stuff the protocol *requires*.
 
 ## Architecture

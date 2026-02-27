@@ -3,8 +3,16 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{% block title %}WormHole{% endblock %}</title>
+  <title>{% block title %}DarkMatter{% endblock %}</title>
+  <!-- Apply theme before first paint to prevent flash -->
+  <script>
+    (function() {
+      var t = localStorage.getItem('dm-theme');
+      if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    })();
+  </script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -16,15 +24,15 @@
             mono: ['"JetBrains Mono"', 'monospace'],
           },
           colors: {
-            ink: '#0f0f0f',
-            dim: '#1a1a1a',
-            slab: '#222222',
-            edge: '#2a2a2a',
-            muted: '#666666',
-            faint: '#444444',
-            ghost: '#333333',
-            pale: '#999999',
-            bright: '#e0e0e0',
+            ink: 'rgb(var(--c-ink) / <alpha-value>)',
+            dim: 'rgb(var(--c-dim) / <alpha-value>)',
+            slab: 'rgb(var(--c-slab) / <alpha-value>)',
+            edge: 'rgb(var(--c-edge) / <alpha-value>)',
+            muted: 'rgb(var(--c-muted) / <alpha-value>)',
+            faint: 'rgb(var(--c-faint) / <alpha-value>)',
+            ghost: 'rgb(var(--c-ghost) / <alpha-value>)',
+            pale: 'rgb(var(--c-pale) / <alpha-value>)',
+            bright: 'rgb(var(--c-bright) / <alpha-value>)',
             solar: {
               50: '#fef6f0',
               100: '#fde8d8',
@@ -41,6 +49,7 @@
               blue: '#60a5fa',
               purple: '#a78bfa',
               yellow: '#fbbf24',
+              cyan: '#22d3ee',
             }
           }
         }
@@ -48,52 +57,135 @@
     }
   </script>
   <style>
+    /* Theme variables — dark (default) */
+    :root {
+      --c-ink: 10 10 11;
+      --c-dim: 17 17 19;
+      --c-slab: 25 25 29;
+      --c-edge: 37 37 41;
+      --c-muted: 85 85 96;
+      --c-faint: 58 58 66;
+      --c-ghost: 45 45 53;
+      --c-pale: 142 142 154;
+      --c-bright: 226 226 234;
+      --qr-fg: #e2e2ea;
+      --qr-bg: #111113;
+    }
+    /* Light theme */
+    [data-theme="light"] {
+      --c-ink: 246 246 249;
+      --c-dim: 255 255 255;
+      --c-slab: 235 236 242;
+      --c-edge: 212 212 224;
+      --c-muted: 128 128 155;
+      --c-faint: 182 182 200;
+      --c-ghost: 222 222 234;
+      --c-pale: 82 82 108;
+      --c-bright: 24 24 42;
+      --qr-fg: #1a1a2e;
+      --qr-bg: #ffffff;
+    }
+
     * { box-sizing: border-box; }
-    ::selection { background: #dd8040; color: #0f0f0f; }
+    ::selection { background: #dd8040; color: #0a0a0b; }
+    [data-theme="light"] ::selection { background: #dd8040; color: #fff; }
     input:focus, textarea:focus, button:focus { outline: none; }
-    ::-webkit-scrollbar { width: 5px; }
+
+    /* Scrollbars */
+    ::-webkit-scrollbar { width: 4px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #444; }
-    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    ::-webkit-scrollbar-thumb { background: rgb(var(--c-ghost)); border-radius: 2px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgb(var(--c-faint)); }
+
+    /* Animations */
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
     .pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
-    @keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+    @keyframes fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
     .fade-in { animation: fade-in 0.2s ease-out; }
 
-    /* Toast system */
+    @keyframes slide-in-left { from { opacity: 0; transform: translateX(-12px); } to { opacity: 1; transform: translateX(0); } }
+    .slide-in-left { animation: slide-in-left 0.25s ease-out; }
+
+    @keyframes slide-in-right { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
+    .slide-in-right { animation: slide-in-right 0.25s ease-out; }
+
+    @keyframes glow-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(221,128,64,0); } 50% { box-shadow: 0 0 12px 2px rgba(221,128,64,0.15); } }
+    .glow-pulse { animation: glow-pulse 3s ease-in-out infinite; }
+
     @keyframes toast-in { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
     @keyframes toast-out { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(100%); } }
     .toast-enter { animation: toast-in 0.25s ease-out forwards; }
     .toast-exit { animation: toast-out 0.2s ease-in forwards; }
+
+    @keyframes feed-in { from { opacity: 0; max-height: 0; } to { opacity: 1; max-height: 60px; } }
+    .feed-in { animation: feed-in 0.3s ease-out forwards; }
+
+    /* Custom dropdown */
+    .dropdown-menu { display: none; }
+    .dropdown-open .dropdown-menu { display: block; }
+
+    /* Mesh SVG */
+    @keyframes mesh-glow {
+      0%, 100% { opacity: 0.1; }
+      50% { opacity: 0.25; }
+    }
+    .mesh-glow-pulse { animation: mesh-glow 3s ease-in-out infinite; }
+
+    @keyframes particle-fade {
+      0% { opacity: 0.9; r: 3; }
+      100% { opacity: 0; r: 1; }
+    }
+
+    /* Mobile drawer */
+    .drawer-overlay { opacity: 0; pointer-events: none; transition: opacity 0.3s; }
+    .drawer-overlay.active { opacity: 1; pointer-events: auto; }
+    .drawer-panel { transform: translateX(100%); transition: transform 0.3s ease; }
+    .drawer-overlay.active .drawer-panel { transform: translateX(0); }
   </style>
 </head>
-<body class="bg-ink h-full font-mono text-bright antialiased">
+<body class="bg-ink h-full font-mono text-bright antialiased overflow-hidden">
 
-  <!-- Top bar -->
-  <header class="h-12 bg-dim border-b border-edge flex items-center justify-between px-4 shrink-0">
+  <!-- Top status bar -->
+  <header class="h-11 bg-dim border-b border-edge flex items-center justify-between px-4 shrink-0 z-40 relative">
     <div class="flex items-center gap-3">
       <div class="flex items-center gap-2">
         <div class="w-2 h-2 rounded-full bg-solar-400 pulse-dot"></div>
-        <span class="text-solar-400 font-semibold text-sm tracking-wide">WORMHOLE</span>
+        <span class="text-solar-400 font-semibold text-xs tracking-widest uppercase">DarkMatter</span>
       </div>
-      <span class="text-faint text-xs italic">speak to the hivemind</span>
-      <span class="text-faint">|</span>
-      <span class="text-pale text-xs">{{ state.display_name or 'Human' }}</span>
-      <span class="text-muted text-xs font-light">{{ short_id(state.agent_id) }}</span>
+      <span class="text-faint text-[10px] hidden sm:inline">|</span>
+      <span class="text-pale text-xs hidden sm:inline" id="header-display-name">{{ state.display_name or 'Human' }}</span>
+      <span class="text-muted text-[10px] font-light hidden md:inline" id="header-agent-id">{{ short_id(state.agent_id) }}</span>
     </div>
-    <div class="flex items-center gap-4 text-xs">
+    <div class="flex items-center gap-3 text-xs">
       <div class="flex items-center gap-1.5" id="nav-connections">
         <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
-        <span class="text-pale">{{ state.connections|length }}</span>
+        <span class="text-pale" id="conn-count">{{ state.connections|length }}</span>
+        <span class="text-muted text-[10px] hidden sm:inline">connected</span>
+      </div>
+      <div class="flex items-center gap-1.5 hidden" id="nav-agents-badge">
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-cyan pulse-dot"></div>
+        <span class="text-cyan-400 font-medium">0</span>
+        <span class="text-muted text-[10px] hidden sm:inline">agents</span>
       </div>
       <div class="flex items-center gap-1.5 hidden" id="nav-inbox-badge">
-        <div class="w-1.5 h-1.5 rounded-full bg-solar-400"></div>
+        <div class="w-1.5 h-1.5 rounded-full bg-solar-400 pulse-dot"></div>
         <span class="text-solar-400 font-medium">0</span>
       </div>
       <div class="flex items-center gap-1.5 hidden" id="nav-pending-badge">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple"></div>
+        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple pulse-dot"></div>
         <span class="text-mesh-purple font-medium">0</span>
       </div>
+      <!-- Theme toggle -->
+      <button onclick="toggleTheme()" class="text-pale hover:text-bright transition-colors p-1" title="Toggle theme">
+        <svg id="theme-icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+        <svg id="theme-icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="hidden"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+      </button>
+      <!-- Mobile: toggle right panel -->
+      <button id="mobile-network-toggle" class="md:hidden text-pale hover:text-bright transition-colors p-1"
+        onclick="toggleMobileDrawer()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" fill="currentColor"/><circle cx="3" cy="5" r="1.5" fill="currentColor" opacity="0.5"/><circle cx="13" cy="5" r="1.5" fill="currentColor" opacity="0.5"/><circle cx="5" cy="13" r="1.5" fill="currentColor" opacity="0.5"/><circle cx="11" cy="13" r="1.5" fill="currentColor" opacity="0.5"/><line x1="8" y1="8" x2="3" y2="5" stroke="currentColor" opacity="0.3" stroke-width="0.5"/><line x1="8" y1="8" x2="13" y2="5" stroke="currentColor" opacity="0.3" stroke-width="0.5"/><line x1="8" y1="8" x2="5" y2="13" stroke="currentColor" opacity="0.3" stroke-width="0.5"/><line x1="8" y1="8" x2="11" y2="13" stroke="currentColor" opacity="0.3" stroke-width="0.5"/></svg>
+      </button>
     </div>
   </header>
 
@@ -103,17 +195,39 @@
   <div id="toast-container" class="fixed bottom-4 right-4 flex flex-col gap-2 z-50 pointer-events-none"></div>
 
   <script>
+    // --- Theme ---
+    function toggleTheme() {
+      const html = document.documentElement;
+      const isLight = html.getAttribute('data-theme') === 'light';
+      if (isLight) {
+        html.removeAttribute('data-theme');
+        localStorage.setItem('dm-theme', 'dark');
+      } else {
+        html.setAttribute('data-theme', 'light');
+        localStorage.setItem('dm-theme', 'light');
+      }
+      updateThemeIcons();
+      if (typeof onThemeChange === 'function') onThemeChange();
+    }
+
+    function updateThemeIcons() {
+      const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+      document.getElementById('theme-icon-moon').classList.toggle('hidden', isLight);
+      document.getElementById('theme-icon-sun').classList.toggle('hidden', !isLight);
+    }
+    updateThemeIcons();
+
     // --- Toast system ---
     function showToast(message, type = 'info') {
       const container = document.getElementById('toast-container');
       const colors = {
-        success: 'border-mesh-green/40 bg-mesh-green/10 text-mesh-green',
-        error: 'border-mesh-red/40 bg-mesh-red/10 text-mesh-red',
-        info: 'border-mesh-blue/40 bg-mesh-blue/10 text-mesh-blue',
+        success: 'border-mesh-green/30 bg-mesh-green/8 text-mesh-green',
+        error: 'border-mesh-red/30 bg-mesh-red/8 text-mesh-red',
+        info: 'border-mesh-blue/30 bg-mesh-blue/8 text-mesh-blue',
       };
       const cls = colors[type] || colors.info;
       const el = document.createElement('div');
-      el.className = `pointer-events-auto border rounded-lg px-4 py-2.5 text-xs font-medium shadow-lg toast-enter ${cls}`;
+      el.className = `pointer-events-auto border rounded px-3 py-2 text-[11px] font-medium shadow-xl backdrop-blur-sm toast-enter ${cls}`;
       el.textContent = message;
       container.appendChild(el);
       setTimeout(() => {
@@ -121,6 +235,12 @@
         el.classList.add('toast-exit');
         el.addEventListener('animationend', () => el.remove());
       }, 3000);
+    }
+
+    // --- Mobile drawer ---
+    function toggleMobileDrawer() {
+      const overlay = document.getElementById('mobile-drawer-overlay');
+      if (overlay) overlay.classList.toggle('active');
     }
 
     // --- Polling ---
@@ -137,7 +257,6 @@
         .then(data => {
           const inboxBadge = document.getElementById('nav-inbox-badge');
           const pendingBadge = document.getElementById('nav-pending-badge');
-          const connCount = document.getElementById('nav-connections');
 
           if (data.inbox.length > 0) {
             inboxBadge.querySelector('span').textContent = data.inbox.length;
@@ -153,7 +272,16 @@
             pendingBadge.classList.add('hidden');
           }
 
-          connCount.querySelector('span').textContent = data.connections.length;
+          document.getElementById('conn-count').textContent = data.connections.length;
+
+          const agentsBadge = document.getElementById('nav-agents-badge');
+          const totalAgents = data.self && data.self.total_active_agents || 0;
+          if (totalAgents > 0) {
+            agentsBadge.querySelector('span').textContent = totalAgents;
+            agentsBadge.classList.remove('hidden');
+          } else {
+            agentsBadge.classList.add('hidden');
+          }
 
           if (typeof onPollData === 'function') onPollData(data);
         })

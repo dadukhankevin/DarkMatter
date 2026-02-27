@@ -87,11 +87,11 @@ def _validate_url(url: str) -> str | None:
     return None
 
 
-# In-memory directory: {agent_id: {url, public_key_hex, last_seen}}
-_directory: dict[str, dict] = {}
-
-# JSON file backup path (configurable via env)
-_backup_path: str | None = os.environ.get("DARKMATTER_ANCHOR_BACKUP")
+# File-backed directory — shared across gunicorn workers via flock
+_directory_path: str = os.environ.get(
+    "DARKMATTER_ANCHOR_DIRECTORY",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".darkmatter_anchor_directory.json"),
+)
 
 # Webhook relay buffer file — shared across workers via file I/O + flock
 _relay_buffer_path: str = os.environ.get(
@@ -102,46 +102,37 @@ _relay_buffer_path: str = os.environ.get(
 anchor_bp = Blueprint("darkmatter_anchor", __name__)
 
 
-def _prune_stale() -> None:
-    """Remove entries unseen for more than STALE_THRESHOLD seconds."""
-    now = time.time()
-    stale_ids = [
-        aid for aid, entry in _directory.items()
-        if now - entry.get("last_seen", 0) > STALE_THRESHOLD
-    ]
-    for aid in stale_ids:
-        del _directory[aid]
-
-
-def _save_backup() -> None:
-    """Persist directory to JSON file if backup path is configured."""
-    if not _backup_path:
-        return
+def _read_directory() -> dict[str, dict]:
+    """Read the peer directory from disk. Returns empty dict if missing/corrupt."""
     try:
-        Path(_backup_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(_backup_path, "w") as f:
-            json.dump(_directory, f)
-    except Exception as e:
-        print(f"[DarkMatter Anchor] Failed to save backup: {e}", file=sys.stderr)
-
-
-def _load_backup() -> None:
-    """Load directory from JSON backup file on startup."""
-    global _directory
-    if not _backup_path:
-        return
-    try:
-        with open(_backup_path) as f:
+        with open(_directory_path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
             data = json.load(f)
-        if isinstance(data, dict):
-            _directory = data
-            _prune_stale()
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
+        return {}
 
 
-# Load backup on import
-_load_backup()
+def _write_directory(directory: dict[str, dict]) -> None:
+    """Write the peer directory to disk atomically with exclusive lock."""
+    try:
+        Path(_directory_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(_directory_path, "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(directory, f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[DarkMatter Anchor] Failed to write directory: {e}", file=sys.stderr)
+
+
+def _prune_stale(directory: dict[str, dict]) -> dict[str, dict]:
+    """Return a copy with entries unseen for more than STALE_THRESHOLD removed."""
+    now = time.time()
+    return {
+        aid: entry for aid, entry in directory.items()
+        if now - entry.get("last_seen", 0) <= STALE_THRESHOLD
+    }
 
 
 @anchor_bp.route("/__darkmatter__/peer_update", methods=["POST"])
@@ -204,7 +195,8 @@ def anchor_peer_update():
     if not _verify_peer_update_signature(public_key_hex, signature, agent_id, new_url, timestamp):
         return jsonify({"error": "Invalid signature"}), 403
 
-    existing = _directory.get(agent_id)
+    directory = _read_directory()
+    existing = directory.get(agent_id)
 
     # If entry exists, verify the public key matches the pinned one
     if existing and existing.get("public_key_hex"):
@@ -212,19 +204,19 @@ def anchor_peer_update():
             return jsonify({"error": "Public key mismatch"}), 403
 
     # Check directory size cap (only for new entries)
-    if agent_id not in _directory and len(_directory) >= MAX_DIRECTORY_SIZE:
-        _prune_stale()
-        if len(_directory) >= MAX_DIRECTORY_SIZE:
+    if agent_id not in directory and len(directory) >= MAX_DIRECTORY_SIZE:
+        directory = _prune_stale(directory)
+        if len(directory) >= MAX_DIRECTORY_SIZE:
             return jsonify({"error": "Directory full"}), 429
 
-    _directory[agent_id] = {
+    directory[agent_id] = {
         "url": new_url,
         "public_key_hex": public_key_hex,
         "last_seen": time.time(),
     }
 
-    _prune_stale()
-    _save_backup()
+    directory = _prune_stale(directory)
+    _write_directory(directory)
 
     return jsonify({"success": True, "registered": existing is None})
 
@@ -232,13 +224,15 @@ def anchor_peer_update():
 @anchor_bp.route("/__darkmatter__/peer_lookup/<agent_id>", methods=["GET"])
 def anchor_peer_lookup(agent_id):
     """Look up a registered agent's current URL."""
-    entry = _directory.get(agent_id)
+    directory = _read_directory()
+    entry = directory.get(agent_id)
     if not entry:
         return jsonify({"error": "Unknown agent"}), 404
 
     # Check staleness
     if time.time() - entry.get("last_seen", 0) > STALE_THRESHOLD:
-        del _directory[agent_id]
+        del directory[agent_id]
+        _write_directory(directory)
         return jsonify({"error": "Unknown agent"}), 404
 
     return jsonify({
@@ -255,7 +249,7 @@ def anchor_well_known():
         "darkmatter": True,
         "anchor": True,
         "protocol_version": "0.2",
-        "agents_registered": len(_directory),
+        "agents_registered": len(_read_directory()),
     })
 
 
@@ -307,7 +301,7 @@ def _verify_relay_poll_signature(agent_id: str, signature_hex: str, timestamp: s
     The agent signs "relay_poll\\n{agent_id}\\n{timestamp}" to prove identity.
     Uses the public key from the peer directory if registered.
     """
-    entry = _directory.get(agent_id)
+    entry = _read_directory().get(agent_id)
     if not entry or not entry.get("public_key_hex"):
         return False
     try:

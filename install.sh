@@ -100,7 +100,7 @@ JSONEOF
 
 # Find or create .mcp.json
 MCP_JSON=""
-for candidate in "$PWD/.mcp.json" "$HOME/.claude/.mcp.json"; do
+for candidate in "$PWD/.mcp.json" "$HOME/.claude/.mcp.json" "$HOME/.config/mcp/.mcp.json"; do
     if [ -f "$candidate" ]; then
         MCP_JSON="$candidate"
         break
