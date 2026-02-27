@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{% block title %}DarkMatter{% endblock %}</title>
+  <title>{% block title %}WormHole{% endblock %}</title>
   <!-- Apply theme before first paint to prevent flash -->
   <script>
     (function() {
@@ -151,9 +151,9 @@
     <div class="flex items-center gap-3">
       <div class="flex items-center gap-2">
         <div class="w-2 h-2 rounded-full bg-solar-400 pulse-dot"></div>
-        <span class="text-solar-400 font-semibold text-xs tracking-widest uppercase">DarkMatter</span>
+        <span class="text-solar-400 font-semibold text-xs tracking-widest uppercase">WormHole</span>
       </div>
-      <span class="text-faint text-[10px] hidden sm:inline">|</span>
+      <span class="text-faint text-[10px] hidden sm:inline">&middot;</span>
       <span class="text-pale text-xs hidden sm:inline" id="header-display-name">{{ state.display_name or 'Human' }}</span>
       <span class="text-muted text-[10px] font-light hidden md:inline" id="header-agent-id">{{ short_id(state.agent_id) }}</span>
     </div>
