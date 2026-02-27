@@ -11,6 +11,7 @@ Usage:
 
 import asyncio
 import atexit
+import hashlib
 import json
 import os
 import socket
@@ -47,6 +48,7 @@ import server
 
 PORT = int(os.environ.get("DARKMATTER_ENTRYPOINT_PORT", "8200"))
 SCAN_PORTS = list(range(8100, 8111)) + [PORT]  # scan 8100-8110 + our own port range
+MESSAGE_TIMEOUT_SECONDS = 30  # no webhook callback in 30s = failed
 
 # ---------------------------------------------------------------------------
 # Initialize DarkMatter state
@@ -112,8 +114,99 @@ server.save_state()
 
 state = server._agent_state
 
+# ---------------------------------------------------------------------------
+# Check for cached wallet-derived passport (overrides default passport)
+# ---------------------------------------------------------------------------
+_wallet_passport_path = os.path.join(_entrypoint_data_dir, "wallet_passport.key")
+if os.path.exists(_wallet_passport_path):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
+    with open(_wallet_passport_path, "rb") as _f:
+        _wallet_seed = _f.read()
+    _wallet_pk = Ed25519PrivateKey.from_private_bytes(_wallet_seed)
+    _wallet_priv = _wallet_pk.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()).hex()
+    _wallet_pub = _wallet_pk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    state.agent_id = _wallet_pub
+    state.private_key_hex = _wallet_priv
+    state.public_key_hex = _wallet_pub
+    server.save_state()
+    print(f"[DarkMatter Entrypoint] Wallet identity loaded: {_wallet_pub[:16]}...", file=sys.stderr)
+
 # Clean up UPnP mapping on exit
 atexit.register(server._cleanup_upnp)
+
+
+# ---------------------------------------------------------------------------
+# Background: message timeout + dead peer detection
+# ---------------------------------------------------------------------------
+
+def _message_timeout_checker():
+    """Check for unacknowledged messages and flag unreachable peers."""
+    while True:
+        time.sleep(10)
+        now = datetime.now(timezone.utc)
+        dirty = False
+
+        # Timeout stale sent messages
+        for sm in list(state.sent_messages.values()):
+            if sm.status != "active":
+                continue
+            try:
+                created = datetime.fromisoformat(sm.created_at)
+            except Exception:
+                continue
+            age = (now - created).total_seconds()
+            if age > MESSAGE_TIMEOUT_SECONDS and not sm.responses:
+                # No response at all — whether or not peer ACK'd receipt
+                reason = "No response received" if sm.updates else "No acknowledgement received"
+                sm.status = "timed_out"
+                sm.updates.append({
+                    "type": "timed_out",
+                    "timestamp": now.isoformat(),
+                    "reason": reason,
+                })
+                # Count timeout as a failure for each routed-to peer
+                for agent_id in sm.routed_to:
+                    conn = state.connections.get(agent_id)
+                    if conn:
+                        conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
+                dirty = True
+
+        # Flag unreachable peers based on consecutive recent failures
+        # and probe unreachable ones for recovery
+        for conn in list(state.connections.values()):
+            if conn.agent_id == state.agent_id:
+                continue
+            was_unreachable = getattr(conn, "health_status", "ok") == "unreachable"
+            consecutive = getattr(conn, "_consecutive_failures", 0)
+
+            if consecutive >= 2:
+                if not was_unreachable:
+                    conn.health_status = "unreachable"
+                    dirty = True
+                else:
+                    # Already unreachable — try a lightweight recovery ping
+                    try:
+                        base = _resolve_base_url(conn)
+                        with httpx.Client(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
+                            resp = client.get(base + "/.well-known/darkmatter.json")
+                            if resp.status_code == 200:
+                                conn.health_status = "ok"
+                                conn._consecutive_failures = 0
+                                conn.messages_declined = 0
+                                dirty = True
+                    except Exception:
+                        pass  # Still dead
+            elif was_unreachable:
+                conn.health_status = "ok"
+                dirty = True
+
+        if dirty:
+            server.save_state()
+
+
+threading.Thread(target=_message_timeout_checker, daemon=True).start()
+
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -419,7 +512,9 @@ def _pick_best_agent():
     """Pick the best available agent from connections."""
     candidates = [
         c for c in state.connections.values()
-        if c.health_failures < 3 and c.agent_id != state.agent_id
+        if c.health_failures < 3
+        and c.agent_id != state.agent_id
+        and getattr(c, "health_status", "ok") != "unreachable"
     ]
     if not candidates:
         return None
@@ -929,13 +1024,16 @@ def _sync_send_message(content, target_agent_id=None):
             with httpx.Client(timeout=10.0) as client:
                 resp = client.post(base + "/__darkmatter__/message", json=payload)
                 if resp.status_code >= 400:
+                    conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
                     failed.append({"agent_id": conn.agent_id, "error": resp.text})
                 else:
                     conn.messages_sent += 1
+                    conn._consecutive_failures = 0
                     conn.last_activity = datetime.now(timezone.utc).isoformat()
                     sent_to.append(conn.agent_id)
         except Exception as e:
             conn.messages_declined += 1
+            conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
             failed.append({"agent_id": conn.agent_id, "error": str(e)})
 
     if sent_to:
@@ -943,6 +1041,21 @@ def _sync_send_message(content, target_agent_id=None):
             message_id=message_id, content=content, status="active",
             initial_hops=10, routed_to=sent_to,
         )
+        state.sent_messages[message_id] = sent_msg
+        server.save_state()
+    elif failed:
+        # All deliveries failed — record the failure so UI can show it immediately
+        sent_msg = server.SentMessage(
+            message_id=message_id, content=content, status="failed",
+            initial_hops=10, routed_to=[f["agent_id"] for f in failed],
+        )
+        for f in failed:
+            sent_msg.updates.append({
+                "type": "delivery_failed",
+                "agent_id": f["agent_id"],
+                "error": f["error"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
         state.sent_messages[message_id] = sent_msg
         server.save_state()
 
@@ -964,8 +1077,12 @@ def _sync_send_message(content, target_agent_id=None):
 
 
 def _sync_broadcast_message(content):
-    """Send a message to all connected agents (each gets its own message_id)."""
-    conns = [c for c in state.connections.values() if c.agent_id != state.agent_id]
+    """Send a message to all reachable connected agents (each gets its own message_id)."""
+    conns = [
+        c for c in state.connections.values()
+        if c.agent_id != state.agent_id
+        and getattr(c, "health_status", "ok") != "unreachable"
+    ]
     if not conns:
         return {"success": False, "error": "No agents connected."}
 
@@ -1213,6 +1330,7 @@ def poll():
             "created_at": sm.created_at,
             "updates": getattr(sm, "updates", []),
             "responses": responses,
+            "from_self": True,
         })
 
     pending = [{
@@ -1240,6 +1358,7 @@ def poll():
         "bio": c.agent_bio, "direction": c.direction.value,
         "last_activity": c.last_activity,
         "spawned_agents": spawned_counts.get(c.agent_id, 0),
+        "health_status": getattr(c, "health_status", "ok"),
     } for c in state.connections.values() if c.agent_id != state.agent_id]
 
     # Discovered agents (not yet connected)
@@ -1276,6 +1395,7 @@ def info():
     """Static agent info for initial page load."""
     lan_ip = _get_lan_ip()
     lan_url = f"http://{lan_ip}:{PORT}" if lan_ip != "127.0.0.1" else None
+    wallet_path = os.path.join(_entrypoint_data_dir, "wallet_passport.key")
     return jsonify({
         "agent_id": state.agent_id,
         "display_name": state.display_name or "Human",
@@ -1283,6 +1403,7 @@ def info():
         "public_url": _get_public_url(),
         "nat_detected": getattr(state, "nat_detected", False),
         "port": PORT,
+        "wallet_identity": os.path.exists(wallet_path),
     })
 
 
@@ -1291,6 +1412,201 @@ def scan():
     """Force an immediate discovery scan."""
     _scan_local_agents()
     return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Wallet-derived identity (Solana wallet signing)
+# ---------------------------------------------------------------------------
+
+_wallet_sessions = {}  # session_id -> {created, status, signature_hex, pubkey_hex, remember}
+_WALLET_SESSION_TTL = 300  # 5 minutes
+_WALLET_CHALLENGE = "DarkMatter Identity Derivation v1"
+
+
+def _swap_identity(new_private_key):
+    """Hot-swap the running identity to a new Ed25519 keypair."""
+    from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
+
+    new_priv = new_private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()).hex()
+    new_pub = new_private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+
+    state.agent_id = new_pub
+    state.private_key_hex = new_priv
+    state.public_key_hex = new_pub
+    server.save_state()
+
+
+def _apply_wallet_signature(signature_hex, pubkey_hex, remember=False):
+    """Verify a Solana wallet signature and derive+swap DarkMatter identity.
+
+    Returns (ok, agent_id_or_error).
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    # Verify Ed25519 signature
+    try:
+        sig_bytes = bytes.fromhex(signature_hex)
+        pub_bytes = bytes.fromhex(pubkey_hex)
+        wallet_pubkey = Ed25519PublicKey.from_public_bytes(pub_bytes)
+        wallet_pubkey.verify(sig_bytes, _WALLET_CHALLENGE.encode("utf-8"))
+    except Exception as e:
+        return False, f"Signature verification failed: {e}"
+
+    # Derive Ed25519 seed from signature (deterministic — same wallet = same identity)
+    seed = hashlib.sha256(sig_bytes).digest()
+
+    # Create DarkMatter Ed25519 keypair from seed
+    private_key = Ed25519PrivateKey.from_private_bytes(seed)
+
+    # Optionally cache to disk
+    wallet_path = os.path.join(_entrypoint_data_dir, "wallet_passport.key")
+    if remember:
+        with open(wallet_path, "wb") as f:
+            f.write(seed)
+        os.chmod(wallet_path, 0o600)
+    elif os.path.exists(wallet_path):
+        os.remove(wallet_path)
+
+    _swap_identity(private_key)
+
+    new_agent_id = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    return True, new_agent_id
+
+
+def _cleanup_wallet_sessions():
+    """Remove expired wallet sessions."""
+    now = time.time()
+    expired = [sid for sid, s in _wallet_sessions.items()
+               if now - s["created"] > _WALLET_SESSION_TTL]
+    for sid in expired:
+        del _wallet_sessions[sid]
+
+
+@app.route("/api/wallet-auth", methods=["POST"])
+def wallet_auth():
+    """Derive Ed25519 identity from a Solana wallet signature (browser extension flow)."""
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"ok": False, "error": "No JSON body"}), 400
+
+    signature_hex = data.get("signature", "")
+    pubkey_hex = data.get("public_key", "")
+    challenge = data.get("challenge", "")
+    remember = data.get("remember", False)
+
+    if not signature_hex or not pubkey_hex or not challenge:
+        return jsonify({"ok": False, "error": "Missing fields"}), 400
+    if challenge != _WALLET_CHALLENGE:
+        return jsonify({"ok": False, "error": "Invalid challenge string"}), 400
+
+    ok, result = _apply_wallet_signature(signature_hex, pubkey_hex, remember)
+    if not ok:
+        return jsonify({"ok": False, "error": result}), 400
+    return jsonify({"ok": True, "agent_id": result, "remembered": remember})
+
+
+@app.route("/api/wallet-session", methods=["POST"])
+def wallet_session_create():
+    """Create a signing session for mobile QR flow. Returns session_id + QR URL."""
+    _cleanup_wallet_sessions()
+
+    session_id = uuid.uuid4().hex[:12]
+    remember = request.get_json(force=True, silent=True) or {}
+
+    _wallet_sessions[session_id] = {
+        "created": time.time(),
+        "status": "pending",  # pending -> signed -> applied
+        "signature_hex": None,
+        "pubkey_hex": None,
+        "agent_id": None,
+        "remember": remember.get("remember", False),
+    }
+
+    # Build URL reachable from mobile — prefer LAN, fall back to public
+    lan_ip = _get_lan_ip()
+    if lan_ip != "127.0.0.1":
+        base = f"http://{lan_ip}:{PORT}"
+    else:
+        base = _get_public_url()
+
+    sign_url = f"{base}/wallet-sign?s={session_id}"
+    return jsonify({"ok": True, "session_id": session_id, "url": sign_url})
+
+
+@app.route("/api/wallet-session/<session_id>", methods=["GET"])
+def wallet_session_poll(session_id):
+    """Desktop polls this to check if the mobile has signed."""
+    session = _wallet_sessions.get(session_id)
+    if not session:
+        return jsonify({"ok": False, "error": "Session not found"}), 404
+    if time.time() - session["created"] > _WALLET_SESSION_TTL:
+        del _wallet_sessions[session_id]
+        return jsonify({"ok": False, "error": "Session expired"}), 410
+
+    if session["status"] == "signed":
+        # Apply the signature now
+        ok, result = _apply_wallet_signature(
+            session["signature_hex"], session["pubkey_hex"], session["remember"]
+        )
+        if ok:
+            session["status"] = "applied"
+            session["agent_id"] = result
+            return jsonify({"ok": True, "status": "applied", "agent_id": result})
+        else:
+            session["status"] = "failed"
+            return jsonify({"ok": False, "status": "failed", "error": result})
+
+    return jsonify({"ok": True, "status": session["status"], "agent_id": session.get("agent_id")})
+
+
+@app.route("/api/wallet-session/<session_id>/complete", methods=["POST"])
+def wallet_session_complete(session_id):
+    """Mobile posts the signature here after signing."""
+    session = _wallet_sessions.get(session_id)
+    if not session:
+        return jsonify({"ok": False, "error": "Session not found"}), 404
+    if session["status"] != "pending":
+        return jsonify({"ok": False, "error": "Session already used"}), 400
+
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"ok": False, "error": "No JSON body"}), 400
+
+    session["signature_hex"] = data.get("signature", "")
+    session["pubkey_hex"] = data.get("public_key", "")
+    session["status"] = "signed"
+    return jsonify({"ok": True})
+
+
+@app.route("/wallet-sign")
+def wallet_sign_page():
+    """Minimal signing page opened on mobile via QR code."""
+    session_id = request.args.get("s", "")
+    session = _wallet_sessions.get(session_id)
+    if not session or session["status"] != "pending":
+        return "<h2 style='font-family:monospace;color:#888;text-align:center;margin-top:40vh'>Session expired or invalid.</h2>", 404
+    return render_template("wallet_sign.html", session_id=session_id, challenge=_WALLET_CHALLENGE)
+
+
+@app.route("/api/wallet-disconnect", methods=["POST"])
+def wallet_disconnect():
+    """Revert to the original passport identity and remove cached wallet passport."""
+    wallet_path = os.path.join(_entrypoint_data_dir, "wallet_passport.key")
+    if os.path.exists(wallet_path):
+        os.remove(wallet_path)
+
+    # Reload original passport
+    _saved_cwd = os.getcwd()
+    os.chdir(_entrypoint_data_dir)
+    priv, pub = server._load_or_create_passport()
+    os.chdir(_saved_cwd)
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    pk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv))
+    _swap_identity(pk)
+
+    return jsonify({"ok": True, "agent_id": pub})
 
 
 # ---------------------------------------------------------------------------

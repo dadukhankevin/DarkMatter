@@ -176,6 +176,12 @@
         <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple pulse-dot"></div>
         <span class="text-mesh-purple font-medium">0</span>
       </div>
+      <!-- Wallet connect -->
+      <button id="wallet-btn" onclick="openWalletModal()" class="text-pale hover:text-bright transition-colors p-1" title="Connect Wallet">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><circle cx="18" cy="15" r="1"/>
+        </svg>
+      </button>
       <!-- Theme toggle -->
       <button onclick="toggleTheme()" class="text-pale hover:text-bright transition-colors p-1" title="Toggle theme">
         <svg id="theme-icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
@@ -286,6 +292,13 @@
           if (typeof onPollData === 'function') onPollData(data);
         })
         .catch(() => {});
+    }
+
+    // --- Wallet modal stub (overridden in chat.html) ---
+    if (typeof openWalletModal === 'undefined') {
+      window.openWalletModal = function() {
+        showToast('Wallet modal not available on this page', 'info');
+      };
     }
 
     document.addEventListener('DOMContentLoaded', startPolling);

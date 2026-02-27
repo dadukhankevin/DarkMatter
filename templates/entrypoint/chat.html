@@ -202,22 +202,103 @@
 
 </div>
 
+<!-- ================================================================== -->
+<!-- WALLET MODAL                                                        -->
+<!-- ================================================================== -->
+<div id="wallet-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-[60] hidden flex items-center justify-center" onclick="if(event.target===this)closeWalletModal()">
+  <div class="bg-dim border border-edge rounded-xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden">
+    <div class="px-5 pt-5 pb-3 border-b border-edge flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-solar-400">
+          <rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><circle cx="18" cy="15" r="1"/>
+        </svg>
+        <span class="text-sm font-semibold text-bright">Wallet Identity</span>
+      </div>
+      <button onclick="closeWalletModal()" class="text-muted hover:text-bright transition-colors">&times;</button>
+    </div>
+    <div class="px-5 py-4 space-y-4">
+      <p class="text-[11px] text-pale leading-relaxed">
+        Sign a deterministic challenge with your Solana wallet to derive a mesh identity.
+        The same wallet always produces the same agent ID on any device.
+      </p>
+
+      <!-- Tab buttons: Extension vs Mobile QR -->
+      <div class="flex border border-edge rounded-lg overflow-hidden">
+        <button id="wallet-tab-ext" onclick="walletTab('ext')"
+          class="flex-1 text-[10px] font-semibold py-2 transition-colors bg-slab text-bright">
+          Browser Extension
+        </button>
+        <button id="wallet-tab-qr" onclick="walletTab('qr')"
+          class="flex-1 text-[10px] font-semibold py-2 transition-colors text-muted hover:text-pale">
+          Mobile QR
+        </button>
+      </div>
+
+      <!-- Extension flow -->
+      <div id="wallet-ext-panel">
+        <div class="bg-mesh-yellow/5 border border-mesh-yellow/20 rounded-lg px-3 py-2 mb-3">
+          <p class="text-[10px] text-mesh-yellow">This will change your identity and disconnect existing peers.</p>
+        </div>
+        <label class="flex items-center gap-2 cursor-pointer mb-3">
+          <input type="checkbox" id="wallet-remember" class="w-3.5 h-3.5 rounded border-edge bg-slab accent-solar-500">
+          <span class="text-[11px] text-pale">Remember on this device</span>
+        </label>
+        <div class="flex gap-2">
+          <button id="wallet-connect-btn" onclick="walletAuth()"
+            class="flex-1 bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors">
+            Connect Wallet
+          </button>
+          <button id="wallet-disconnect-btn" onclick="walletDisconnect()"
+            class="hidden bg-mesh-red/10 hover:bg-mesh-red/20 text-mesh-red text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors border border-mesh-red/20">
+            Revert
+          </button>
+        </div>
+        <p class="text-[10px] text-muted mt-2">Phantom, Solflare, Backpack, or any Solana wallet extension.</p>
+      </div>
+
+      <!-- Mobile QR flow -->
+      <div id="wallet-qr-panel" class="hidden">
+        <div class="bg-mesh-yellow/5 border border-mesh-yellow/20 rounded-lg px-3 py-2 mb-3">
+          <p class="text-[10px] text-mesh-yellow">Scan with your phone camera, then sign in your wallet app.</p>
+        </div>
+        <div id="wallet-qr-idle">
+          <label class="flex items-center gap-2 cursor-pointer mb-3">
+            <input type="checkbox" id="wallet-qr-remember" class="w-3.5 h-3.5 rounded border-edge bg-slab accent-solar-500">
+            <span class="text-[11px] text-pale">Remember on this device</span>
+          </label>
+          <button onclick="startQRSession()"
+            class="w-full bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors">
+            Generate QR Code
+          </button>
+        </div>
+        <div id="wallet-qr-active" class="hidden">
+          <div id="wallet-qr-code" class="flex justify-center mb-2"></div>
+          <p id="wallet-qr-url" class="text-[9px] text-muted text-center break-all select-all mb-2"></p>
+          <div class="flex items-center justify-center gap-2">
+            <div class="w-1.5 h-1.5 rounded-full bg-solar-400 pulse-dot"></div>
+            <span class="text-[10px] text-pale">Waiting for signature from mobile...</span>
+          </div>
+        </div>
+        <div id="wallet-qr-done" class="hidden text-center py-2">
+          <p class="text-[11px] text-mesh-green font-medium">Signed! Applying identity...</p>
+        </div>
+      </div>
+
+      <!-- Status (shared) -->
+      <div id="wallet-status" class="hidden text-[11px] text-mesh-green font-mono bg-mesh-green/5 border border-mesh-green/20 rounded-lg px-3 py-2"></div>
+    </div>
+  </div>
+</div>
+
 <style>
   /* Constellation-specific animations */
   @keyframes ring-expand {
     0% { r: 8; opacity: 0.8; stroke-width: 2; }
     100% { r: 30; opacity: 0; stroke-width: 0.5; }
   }
-  @keyframes responding-throb {
-    0%, 100% { r: 6; opacity: 0.6; }
-    50% { r: 10; opacity: 0.3; }
-  }
   @keyframes scatter-particle {
     0% { opacity: 0.8; }
     100% { opacity: 0; }
-  }
-  .responding-ring {
-    animation: responding-throb 1.2s ease-in-out infinite;
   }
   /* Mobile drawer slides from left */
   .drawer-panel { transition: transform 0.3s ease; }
@@ -282,9 +363,21 @@ let svgW = 0, svgH = 0;
 let currentConns = [];
 
 // Message visualization
-const messageVisuals = new Map();  // message_id -> { lastUpdateIndex, respondingRings: [] }
-const respondingRings = new Map(); // agent_id -> SVG circle element
+const messageVisuals = new Map();  // message_id -> { lastUpdateIndex }
 const lineWaveTimers = new Map();  // agent_id -> { raf, startTime }
+
+// Orbital planet system
+const orbitingPlanets = new Map(); // agent_id -> Map<message_id, {el, trail[], angle, speed, orbitR}>
+const orbitAnimFrames = new Map(); // agent_id -> { raf, lastTime }
+const orbitPlanetColors = ['#fbbf24', '#22d3ee', '#a78bfa', '#f472b6', '#34d399', '#fb923c', '#60a5fa'];
+
+// Deterministic color for an agent — consistent across reloads
+function agentColor(agentId) {
+  if (!agentId) return orbitPlanetColors[0];
+  let hash = 0;
+  for (let i = 0; i < agentId.length; i++) hash = ((hash << 5) - hash + agentId.charCodeAt(i)) | 0;
+  return orbitPlanetColors[Math.abs(hash) % orbitPlanetColors.length];
+}
 const lineMessageHistory = new Map(); // agent_id -> [{ content, status, direction, time }]
 
 // Polling state
@@ -449,10 +542,16 @@ function updateDropdownOptions(conns) {
   if (conns.length > 0) {
     html += `<div class="border-t border-edge my-1 mx-2"></div>`;
     conns.forEach(c => {
-      html += `<div class="dropdown-option px-3 py-1.5 text-[11px] text-pale hover:bg-edge/50 cursor-pointer flex items-center gap-2 transition-colors rounded mx-1"
-        data-value="${c.agent_id}" onclick="selectTarget(this)">
-        <svg width="10" height="10" viewBox="0 0 10 10" class="text-mesh-blue shrink-0"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
-        ${esc(agentLabel(c))}
+      const dead = c.health_status === 'unreachable';
+      const dotClass = dead ? 'text-muted shrink-0' : 'text-mesh-blue shrink-0';
+      const textClass = dead ? 'text-muted' : 'text-pale';
+      const hoverClass = dead ? '' : 'hover:bg-edge/50 cursor-pointer';
+      const clickAttr = dead ? '' : 'onclick="selectTarget(this)"';
+      const suffix = dead ? ' <span class="text-[9px] text-mesh-red">\u2298</span>' : '';
+      html += `<div class="dropdown-option px-3 py-1.5 text-[11px] ${textClass} ${hoverClass} flex items-center gap-2 transition-colors rounded mx-1"
+        data-value="${c.agent_id}" ${clickAttr}>
+        <svg width="10" height="10" viewBox="0 0 10 10" class="${dotClass}"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
+        ${esc(agentLabel(c))}${suffix}
       </div>`;
     });
   }
@@ -532,7 +631,7 @@ function initSVG() {
 
   // Center glow
   svgRefs.centerGlow = svgEl('circle', {
-    cx: 0, cy: 0, r: 24,
+    cx: 0, cy: 0, r: 34,
     fill: '#dd8040', opacity: 0.1,
     filter: 'url(#glow)',
   });
@@ -541,7 +640,7 @@ function initSVG() {
 
   // Center node
   svgRefs.centerNode = svgEl('circle', {
-    cx: 0, cy: 0, r: 9,
+    cx: 0, cy: 0, r: 14,
     fill: '#dd8040',
   });
   svgRefs.centerNode.style.transition = 'r 0.4s ease';
@@ -549,7 +648,7 @@ function initSVG() {
 
   // Center label
   svgRefs.centerLabel = svgEl('text', {
-    x: 0, y: 24,
+    x: 0, y: 30,
     'text-anchor': 'middle',
     fill: 'rgb(var(--c-pale))',
     'font-size': '9',
@@ -560,7 +659,7 @@ function initSVG() {
 
   // Center agent count label (shown when agents > 0)
   svgRefs.centerAgentLabel = svgEl('text', {
-    x: 0, y: 35,
+    x: 0, y: 42,
     'text-anchor': 'middle',
     fill: '#22d3ee',
     'font-size': '7',
@@ -572,7 +671,7 @@ function initSVG() {
 
   // Hint text (shown when no connections)
   svgRefs.hintText = svgEl('text', {
-    x: 0, y: 44,
+    x: 0, y: 52,
     'text-anchor': 'middle',
     fill: 'rgb(var(--c-muted))',
     'font-size': '9',
@@ -608,15 +707,15 @@ function updateSVGLayout() {
   }
   if (svgRefs.centerLabel) {
     svgRefs.centerLabel.setAttribute('x', centerPos.x);
-    svgRefs.centerLabel.setAttribute('y', centerPos.y + 24);
+    svgRefs.centerLabel.setAttribute('y', centerPos.y + 30);
   }
   if (svgRefs.centerAgentLabel) {
     svgRefs.centerAgentLabel.setAttribute('x', centerPos.x);
-    svgRefs.centerAgentLabel.setAttribute('y', centerPos.y + 35);
+    svgRefs.centerAgentLabel.setAttribute('y', centerPos.y + 42);
   }
   if (svgRefs.hintText) {
     svgRefs.hintText.setAttribute('x', centerPos.x);
-    svgRefs.hintText.setAttribute('y', centerPos.y + 44);
+    svgRefs.hintText.setAttribute('y', centerPos.y + 52);
   }
 
   // Recalculate peer positions
@@ -642,12 +741,16 @@ function layoutPeers(conns) {
       refs.circle.setAttribute('cx', pos.x);
       refs.circle.setAttribute('cy', pos.y);
       refs.label.setAttribute('x', pos.x);
-      refs.label.setAttribute('y', pos.y + 18);
+      refs.label.setAttribute('y', pos.y + 26);
       refs.hit.setAttribute('cx', pos.x);
       refs.hit.setAttribute('cy', pos.y);
       if (refs.glow) {
         refs.glow.setAttribute('cx', pos.x);
         refs.glow.setAttribute('cy', pos.y);
+      }
+      if (refs.badge) {
+        refs.badge.setAttribute('x', pos.x);
+        refs.badge.setAttribute('y', pos.y);
       }
     }
     const lineRefs = svgRefs.lines.get(agentId);
@@ -668,14 +771,8 @@ function layoutPeers(conns) {
     }
   }
 
-  // Update responding rings positions
-  for (const [agentId, ring] of respondingRings) {
-    const pos = nodePositions.get(agentId);
-    if (pos) {
-      ring.setAttribute('cx', pos.x);
-      ring.setAttribute('cy', pos.y);
-    }
-  }
+  // Sync orbit positions when nodes move
+  syncOrbitPositions();
 }
 
 function updateConstellationNodes(conns) {
@@ -697,6 +794,15 @@ function updateConstellationNodes(conns) {
       refs.label.remove();
       refs.hit.remove();
       if (refs.glow) refs.glow.remove();
+      if (refs.badge) refs.badge.remove();
+      // Clean up any orbiting planets for this node
+      const planets = orbitingPlanets.get(id);
+      if (planets) {
+        for (const [, p] of planets) { p.el.remove(); p.trail.forEach(t => t.remove()); }
+        orbitingPlanets.delete(id);
+      }
+      const anim = orbitAnimFrames.get(id);
+      if (anim) { cancelAnimationFrame(anim.raf); orbitAnimFrames.delete(id); }
       svgRefs.nodes.delete(id);
     }
   }
@@ -754,47 +860,70 @@ function updateConstellationNodes(conns) {
     // Node
     if (!svgRefs.nodes.has(c.agent_id)) {
       const spawned = c.spawned_agents || 0;
-      const glowR = 14 + Math.min(spawned * 4, 16);
-      const nodeR = 6 + Math.min(spawned * 2, 8);
+      const glowR = 18 + Math.min(spawned * 5, 20);
+      const nodeR = 10 + Math.min(spawned * 3, 12);
+
+      const isUnreachable = c.health_status === 'unreachable';
+      const nodeColor = isUnreachable ? '#6b7280' : '#34d399';
+      const glowColor = isUnreachable ? '#6b7280' : '#34d399';
 
       const glow = svgEl('circle', {
         cx: pos.x, cy: pos.y, r: glowR,
-        fill: '#34d399', opacity: 0.08, filter: 'url(#glow-sm)',
+        fill: glowColor, opacity: isUnreachable ? 0.04 : 0.08, filter: 'url(#glow-sm)',
       });
       glow.style.transition = 'r 0.4s ease, opacity 0.3s ease';
       svgRefs.nodeGroup.appendChild(glow);
 
       const circle = svgEl('circle', {
         cx: pos.x, cy: pos.y, r: nodeR,
-        fill: '#34d399',
+        fill: nodeColor,
       });
       circle.style.transition = 'r 0.15s ease, fill 0.3s ease';
       svgRefs.nodeGroup.appendChild(circle);
 
+      // Spawned agent count badge
+      let badge = null;
+      if (spawned > 0) {
+        badge = svgEl('text', {
+          x: pos.x, y: pos.y,
+          'text-anchor': 'middle',
+          'dominant-baseline': 'central',
+          fill: '#fff',
+          'font-size': '7',
+          'font-weight': 'bold',
+          'font-family': 'JetBrains Mono, monospace',
+          'pointer-events': 'none',
+        });
+        badge.textContent = spawned;
+        svgRefs.nodeGroup.appendChild(badge);
+      }
+
       const name = agentLabel(c);
+      const labelSuffix = isUnreachable ? ' \u2298' : '';
       const label = svgEl('text', {
-        x: pos.x, y: pos.y + 18,
+        x: pos.x, y: pos.y + 26,
         'text-anchor': 'middle',
-        fill: 'rgb(var(--c-pale))',
+        fill: isUnreachable ? '#f87171' : 'rgb(var(--c-pale))',
         'font-size': '8',
         'font-family': 'JetBrains Mono, monospace',
       });
-      label.textContent = name.length > 14 ? name.slice(0, 12) + '..' : name;
+      const truncName = name.length > 14 ? name.slice(0, 12) + '..' : name;
+      label.textContent = truncName + labelSuffix;
       svgRefs.labelGroup.appendChild(label);
 
       const hit = svgEl('circle', {
-        cx: pos.x, cy: pos.y, r: 20,
+        cx: pos.x, cy: pos.y, r: 28,
         fill: 'transparent', class: 'cursor-pointer',
       });
       hit.addEventListener('mouseenter', (e) => {
-        const baseR = parseFloat(circle.getAttribute('r')) || 6;
+        const baseR = parseFloat(circle.getAttribute('r')) || 10;
         circle.setAttribute('r', baseR + 2);
         showMeshTooltip(c, e);
       });
       hit.addEventListener('mousemove', (e) => moveMeshTooltip(e));
       hit.addEventListener('mouseleave', () => {
         const spawned = c.spawned_agents || 0;
-        circle.setAttribute('r', 6 + Math.min(spawned * 2, 8));
+        circle.setAttribute('r', 10 + Math.min(spawned * 3, 12));
         hideMeshTooltip();
       });
       hit.addEventListener('click', () => {
@@ -807,19 +936,48 @@ function updateConstellationNodes(conns) {
       });
       svgRefs.hitGroup.appendChild(hit);
 
-      svgRefs.nodes.set(c.agent_id, { circle, label, hit, glow });
+      svgRefs.nodes.set(c.agent_id, { circle, label, hit, glow, badge });
     } else {
-      // Update existing node — label + size based on spawned agents
+      // Update existing node — label + size + badge + health based on state
       const refs = svgRefs.nodes.get(c.agent_id);
+      const isUnreachable = c.health_status === 'unreachable';
       const name = agentLabel(c);
-      const labelText = name.length > 14 ? name.slice(0, 12) + '..' : name;
+      const labelSuffix = isUnreachable ? ' \u2298' : '';
+      const labelText = (name.length > 14 ? name.slice(0, 12) + '..' : name) + labelSuffix;
       if (refs.label.textContent !== labelText) {
         refs.label.textContent = labelText;
       }
-      const spawned = c.spawned_agents || 0;
-      refs.circle.setAttribute('r', 6 + Math.min(spawned * 2, 8));
+      refs.label.setAttribute('fill', isUnreachable ? '#f87171' : 'rgb(var(--c-pale))');
+      refs.circle.setAttribute('fill', isUnreachable ? '#6b7280' : '#34d399');
       if (refs.glow) {
-        refs.glow.setAttribute('r', 14 + Math.min(spawned * 4, 16));
+        refs.glow.setAttribute('fill', isUnreachable ? '#6b7280' : '#34d399');
+        refs.glow.setAttribute('opacity', isUnreachable ? '0.04' : '0.08');
+      }
+      const spawned = c.spawned_agents || 0;
+      refs.circle.setAttribute('r', 10 + Math.min(spawned * 3, 12));
+      if (refs.glow) {
+        refs.glow.setAttribute('r', 18 + Math.min(spawned * 5, 20));
+      }
+      // Update badge
+      if (spawned > 0) {
+        if (!refs.badge) {
+          const pos = nodePositions.get(c.agent_id) || { x: 0, y: 0 };
+          refs.badge = svgEl('text', {
+            x: pos.x, y: pos.y,
+            'text-anchor': 'middle',
+            'dominant-baseline': 'central',
+            fill: '#fff',
+            'font-size': '7',
+            'font-weight': 'bold',
+            'font-family': 'JetBrains Mono, monospace',
+            'pointer-events': 'none',
+          });
+          svgRefs.nodeGroup.appendChild(refs.badge);
+        }
+        refs.badge.textContent = spawned;
+      } else if (refs.badge) {
+        refs.badge.remove();
+        refs.badge = null;
       }
     }
   });
@@ -830,7 +988,13 @@ function rebuildSVG() {
   svgRefs.lines.clear();
   svgRefs.nodes.clear();
   svgRefs.lineHits.clear();
-  respondingRings.clear();
+  // Clean up orbital planets
+  for (const [agentId, planets] of orbitingPlanets) {
+    const anim = orbitAnimFrames.get(agentId);
+    if (anim) cancelAnimationFrame(anim.raf);
+  }
+  orbitingPlanets.clear();
+  orbitAnimFrames.clear();
   lineWaveTimers.clear();
   initSVG();
   updateConstellationNodes(currentConns);
@@ -936,39 +1100,173 @@ function showRingExpand(agentId, color) {
   requestAnimationFrame(step);
 }
 
-function showRespondingThrob(agentId) {
-  if (respondingRings.has(agentId)) return; // already throbbing
-  const pos = nodePositions.get(agentId);
-  if (!pos) return;
-  const ring = svgEl('circle', {
-    cx: pos.x, cy: pos.y, r: 8,
-    fill: 'none', stroke: '#fbbf24', 'stroke-width': 1.5,
-  });
-  ring.classList.add('responding-ring');
-  svgRefs.particleGroup.appendChild(ring);
-  respondingRings.set(agentId, ring);
+// =========================================================================
+// Orbital Planet System — replaces responding throb
+// =========================================================================
+function addOrbitingPlanet(agentId, messageId, fromSelf) {
+  if (!orbitingPlanets.has(agentId)) orbitingPlanets.set(agentId, new Map());
+  const planets = orbitingPlanets.get(agentId);
+  if (planets.has(messageId)) return; // already orbiting
 
-  // Also tint the node amber
+  const pos = nodePositions.get(agentId);
   const refs = svgRefs.nodes.get(agentId);
-  if (refs) refs.circle.setAttribute('fill', '#fbbf24');
+  if (!pos || !refs) return;
+
+  // Color by agent: sent messages use the target agent's color
+  const color = fromSelf ? '#dd8040' : agentColor(agentId);
+  const planetIndex = planets.size;
+  const nodeR = parseFloat(refs.circle.getAttribute('r')) || 10;
+
+  // Each planet gets a unique elliptical orbit + speed
+  const baseR = nodeR + 10 + (planetIndex * 6);
+  const rx = baseR + (Math.random() * 8 - 4);           // semi-major axis
+  const ry = baseR * (0.5 + Math.random() * 0.4);       // semi-minor axis (ellipse)
+  const tilt = Math.random() * Math.PI;                  // orbit tilt angle
+  const period = 1800 + Math.random() * 1400;            // 1.8s–3.2s per revolution
+  const startAngle = Math.random() * Math.PI * 2;
+  const clockwise = Math.random() > 0.3 ? 1 : -1;       // mostly clockwise, some counter
+
+  function orbitPos(angle) {
+    // Read live position in case node moved
+    const p = nodePositions.get(agentId) || pos;
+    const lx = rx * Math.cos(angle);
+    const ly = ry * Math.sin(angle);
+    return {
+      x: p.x + lx * Math.cos(tilt) - ly * Math.sin(tilt),
+      y: p.y + lx * Math.sin(tilt) + ly * Math.cos(tilt),
+    };
+  }
+
+  const startPos = orbitPos(startAngle);
+  const el = svgEl('circle', {
+    cx: startPos.x, cy: startPos.y,
+    r: 3.5, fill: color, opacity: 0.9,
+  });
+  el.style.transition = 'none';
+  svgRefs.particleGroup.appendChild(el);
+
+  // Trail circles
+  const trail = [];
+  const trailSizes = [2.5, 2, 1.5];
+  const trailOpacities = [0.3, 0.2, 0.1];
+  const trailOffsets = [-0.25, -0.5, -0.75];
+  for (let i = 0; i < 3; i++) {
+    const tp = orbitPos(startAngle + trailOffsets[i] * clockwise);
+    const t = svgEl('circle', {
+      cx: tp.x, cy: tp.y,
+      r: trailSizes[i], fill: color, opacity: trailOpacities[i],
+    });
+    svgRefs.particleGroup.appendChild(t);
+    trail.push(t);
+  }
+
+  // Materialize animation: scale 0→1
+  el.setAttribute('r', '0');
+  const matStart = performance.now();
+  function materialize(now) {
+    const t = Math.min((now - matStart) / 200, 1);
+    el.setAttribute('r', String(3.5 * t));
+    if (t < 1) requestAnimationFrame(materialize);
+  }
+  requestAnimationFrame(materialize);
+
+  planets.set(messageId, {
+    el, trail, angle: startAngle,
+    speed: clockwise * (2 * Math.PI) / period,
+    rx, ry, tilt, color, orbitPos,
+  });
+
+  // Tint node amber on first planet
+  if (planets.size === 1) {
+    refs.circle.setAttribute('fill', '#fbbf24');
+  }
+
+  // Start animation loop if not running
+  if (!orbitAnimFrames.has(agentId)) {
+    const lastTime = performance.now();
+    function loop(now) {
+      updateOrbits(agentId, now);
+      orbitAnimFrames.set(agentId, { raf: requestAnimationFrame(loop), lastTime: now });
+    }
+    orbitAnimFrames.set(agentId, { raf: requestAnimationFrame(loop), lastTime });
+  }
 }
 
-function clearRespondingThrob(agentId) {
-  const ring = respondingRings.get(agentId);
-  if (ring) { ring.remove(); respondingRings.delete(agentId); }
-  // Reset node color
-  const refs = svgRefs.nodes.get(agentId);
-  if (refs) refs.circle.setAttribute('fill', '#34d399');
+function removeOrbitingPlanet(agentId, messageId) {
+  const planets = orbitingPlanets.get(agentId);
+  if (!planets) return;
+  const planet = planets.get(messageId);
+  if (!planet) return;
+
+  // Burst animation: expand and fade
+  const burstStart = performance.now();
+  const origR = 3.5;
+  function burst(now) {
+    const t = Math.min((now - burstStart) / 300, 1);
+    planet.el.setAttribute('r', String(origR + t * 8));
+    planet.el.setAttribute('opacity', String(0.9 * (1 - t)));
+    if (t < 1) {
+      requestAnimationFrame(burst);
+    } else {
+      planet.el.remove();
+      planet.trail.forEach(t => t.remove());
+    }
+  }
+  requestAnimationFrame(burst);
+
+  planets.delete(messageId);
+
+  // If no more planets, stop animation and reset node color
+  if (planets.size === 0) {
+    orbitingPlanets.delete(agentId);
+    const anim = orbitAnimFrames.get(agentId);
+    if (anim) { cancelAnimationFrame(anim.raf); orbitAnimFrames.delete(agentId); }
+    const refs = svgRefs.nodes.get(agentId);
+    if (refs) refs.circle.setAttribute('fill', '#34d399');
+  }
+}
+
+function updateOrbits(agentId, now) {
+  const planets = orbitingPlanets.get(agentId);
+  if (!planets || planets.size === 0) return;
+
+  const anim = orbitAnimFrames.get(agentId);
+  const dt = (now - (anim ? anim.lastTime : now)) / 1000;
+
+  for (const [, p] of planets) {
+    p.angle += p.speed * dt;
+    if (p.angle > Math.PI * 2) p.angle -= Math.PI * 2;
+    if (p.angle < 0) p.angle += Math.PI * 2;
+
+    const pp = p.orbitPos(p.angle);
+    p.el.setAttribute('cx', String(pp.x));
+    p.el.setAttribute('cy', String(pp.y));
+
+    // Trail follows at angle offsets
+    const dir = p.speed > 0 ? 1 : -1;
+    const trailOffsets = [-0.25 * dir, -0.5 * dir, -0.75 * dir];
+    for (let i = 0; i < p.trail.length; i++) {
+      const tp = p.orbitPos(p.angle + trailOffsets[i]);
+      p.trail[i].setAttribute('cx', String(tp.x));
+      p.trail[i].setAttribute('cy', String(tp.y));
+    }
+  }
+}
+
+function syncOrbitPositions() {
+  // Called from layoutPeers when nodes move — orbits auto-sync on next frame via nodePositions
+  // Nothing extra needed since updateOrbits reads nodePositions each frame
 }
 
 function showNodeFlash(agentId, color) {
   const refs = svgRefs.nodes.get(agentId);
   if (!refs) return;
+  const spawned = (currentConns.find(c => c.agent_id === agentId) || {}).spawned_agents || 0;
   refs.circle.setAttribute('fill', color);
-  refs.circle.setAttribute('r', '10');
+  refs.circle.setAttribute('r', String(14 + Math.min(spawned * 3, 12)));
   setTimeout(() => {
     refs.circle.setAttribute('fill', '#34d399');
-    refs.circle.setAttribute('r', '6');
+    refs.circle.setAttribute('r', String(10 + Math.min(spawned * 3, 12)));
   }, 400);
 }
 
@@ -1135,78 +1433,21 @@ function showLineTooltip(agentId, e) {
 // =========================================================================
 function processOutboxVisuals(outbox) {
   for (const msg of outbox) {
-    const updates = msg.updates || [];
-    const responses = msg.responses || [];
-    let vis = messageVisuals.get(msg.message_id);
-    if (!vis) {
-      vis = { lastUpdateIndex: 0, lastResponseCount: 0, sentAnimated: false };
-      messageVisuals.set(msg.message_id, vis);
-    }
+    const targets = msg.routed_to || [];
+    const isActive = msg.status === 'active';
 
-    // Animate send particle + line wave on first sight of an active message
-    if (!vis.sentAnimated && msg.status !== 'expired') {
-      vis.sentAnimated = true;
-      const targets = msg.routed_to || [];
-      targets.forEach((id, i) => {
-        setTimeout(() => {
-          animateSendParticle(id);
-          startLineWave(id, '#dd8040', 1500, 'out');
-          trackLineMessage(id, msg.content, msg.status, 'out');
-        }, i * 100);
-      });
-    }
-
-    // Process new updates — each triggers a line pulse + node effect
-    for (let i = vis.lastUpdateIndex; i < updates.length; i++) {
-      const u = updates[i];
-      switch (u.type) {
-        case 'received':
-          showRingExpand(u.agent_id, '#60a5fa');
-          pulseLineColor(u.agent_id, '#60a5fa', 600);
-          addActivity('&#x25CB;', 'text-mesh-blue', `Received by ${shortId(u.agent_id)}`);
-          break;
-        case 'responding':
-          showRespondingThrob(u.agent_id);
-          pulseLineColor(u.agent_id, '#fbbf24', 800);
-          addActivity('&#x2699;', 'text-mesh-yellow', `${shortId(u.agent_id)} is responding...`);
-          break;
-        case 'forwarded':
-          animateForwardParticle(u.agent_id, u.target_agent_id);
-          showRingExpand(u.agent_id, '#a78bfa');
-          pulseLineColor(u.agent_id, '#a78bfa', 600);
-          startLineWave(u.target_agent_id, '#a78bfa', 1500, 'out');
-          addActivity('&#x21B7;', 'text-mesh-purple', `Forwarded by ${shortId(u.agent_id)}`);
-          break;
-        case 'expired':
-          showScatterParticles(u.agent_id);
-          clearRespondingThrob(u.agent_id);
-          showNodeFlash(u.agent_id, '#f87171');
-          pulseLineColor(u.agent_id, '#f87171', 600);
-          addActivity('&#x2717;', 'text-mesh-red', `Expired at ${shortId(u.agent_id)}`);
-          break;
+    // Simple rule: active message = orbit. Not active = no orbit.
+    if (isActive) {
+      for (const id of targets) {
+        addOrbitingPlanet(id, msg.message_id, msg.from_self);
+      }
+    } else {
+      for (const id of targets) {
+        removeOrbitingPlanet(id, msg.message_id);
       }
     }
-    vis.lastUpdateIndex = updates.length;
-
-    // Process new responses — green flash + return wave + line pulse
-    for (let i = vis.lastResponseCount; i < responses.length; i++) {
-      const r = responses[i];
-      clearRespondingThrob(r.agent_id);
-      showNodeFlash(r.agent_id, '#34d399');
-      animateResponseParticle(r.agent_id);
-      startLineWave(r.agent_id, '#34d399', 1500, 'in');
-      pulseLineColor(r.agent_id, '#34d399', 800);
-      trackLineMessage(r.agent_id, r.response, 'response', 'in');
-      addActivity('&check;', 'text-mesh-green', `Reply from ${agentLabel(r)}`);
-    }
-    vis.lastResponseCount = responses.length;
   }
 
-  // Clean up visuals for messages no longer in outbox
-  const activeIds = new Set(outbox.map(m => m.message_id));
-  for (const [id] of messageVisuals) {
-    if (!activeIds.has(id)) messageVisuals.delete(id);
-  }
 }
 
 // =========================================================================
@@ -1249,6 +1490,9 @@ composeForm.addEventListener('submit', async (e) => {
           }, i * 100));
         }
       }
+      // Force poll + scroll timeline to bottom so user sees their message
+      pollServer();
+      if (timelineScroll) setTimeout(() => { timelineScroll.scrollTop = timelineScroll.scrollHeight; }, 300);
     }
   } catch (err) {
     showToast('Failed to send message', 'error');
@@ -1414,10 +1658,14 @@ function renderDiscovered(agents) {
 function createCompactConnNode(c) {
   const el = document.createElement('div');
   el.className = 'flex items-center justify-between text-[10px] py-0.5 group';
+  const isUnreachable = c.health_status === 'unreachable';
+  const dotColor = isUnreachable ? 'bg-mesh-red' : 'bg-mesh-green';
+  const nameClass = isUnreachable ? 'text-muted truncate' : 'text-pale truncate';
+  const suffix = isUnreachable ? ' <span class="text-[8px] text-mesh-red">\u2298</span>' : '';
   el.innerHTML = `
     <div class="flex items-center gap-1.5 min-w-0">
-      <div class="w-1.5 h-1.5 rounded-full bg-mesh-green shrink-0"></div>
-      <span class="text-pale truncate">${esc(agentLabel(c))}</span>
+      <div class="w-1.5 h-1.5 rounded-full ${dotColor} shrink-0"></div>
+      <span class="${nameClass}">${esc(agentLabel(c))}${suffix}</span>
       <span class="text-[9px] text-faint">${c.direction === 'inbound' ? '&#8592;' : '&#8594;'}</span>
     </div>
     <button type="button" class="dc-btn text-faint hover:text-mesh-red transition-colors ml-1 shrink-0 opacity-0 group-hover:opacity-100">&times;</button>`;
@@ -1436,11 +1684,15 @@ function createCompactConnNode(c) {
 function createMobileConnNode(c) {
   const el = document.createElement('div');
   el.className = 'bg-slab border border-edge rounded p-2 group';
+  const isUnreachable = c.health_status === 'unreachable';
+  const dotColor = isUnreachable ? 'bg-mesh-red' : 'bg-mesh-green';
+  const nameClass = isUnreachable ? 'text-[11px] text-muted font-medium truncate' : 'text-[11px] text-bright font-medium truncate';
+  const suffix = isUnreachable ? ' <span class="text-[9px] text-mesh-red">\u2298</span>' : '';
   el.innerHTML = `
     <div class="flex items-center justify-between">
       <div class="flex items-center gap-1.5 min-w-0">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-green shrink-0"></div>
-        <span class="text-[11px] text-bright font-medium truncate">${esc(agentLabel(c))}</span>
+        <div class="w-1.5 h-1.5 rounded-full ${dotColor} shrink-0"></div>
+        <span class="${nameClass}">${esc(agentLabel(c))}${suffix}</span>
         <span class="text-[9px] text-faint">${c.direction === 'inbound' ? '&larr;' : '&rarr;'}</span>
       </div>
       <button type="button" class="dc-btn text-faint hover:text-mesh-red text-[11px] opacity-0 group-hover:opacity-100 transition-all">&times;</button>
@@ -1460,7 +1712,7 @@ function createMobileConnNode(c) {
 }
 
 function connHash(c) {
-  return `${c.display_name}|${c.bio}|${c.direction}|${c.last_activity}`;
+  return `${c.display_name}|${c.bio}|${c.direction}|${c.last_activity}|${c.health_status || 'ok'}`;
 }
 
 function renderConnections(conns) {
@@ -1549,67 +1801,60 @@ function diffActivity(prev, curr) {
 // =========================================================================
 // Timeline sidebar
 // =========================================================================
-function buildTimelineItems(data) {
-  const items = [];
+function buildThreads(data) {
+  const threads = [];
   const conns = data.connections || [];
   const findConn = (id) => conns.find(cn => cn.agent_id === id);
 
+  // Sent messages become threads with answers from responses
   for (const msg of (data.outbox || [])) {
-    const recipientNames = (msg.routed_to || []).map(id => {
-      const c = findConn(id);
-      return c ? agentLabel(c) : shortId(id);
-    }).join(', ') || 'auto-route';
-
-    // Sent message
-    items.push({
-      id: msg.message_id,
-      type: 'sent',
-      content: msg.content,
-      timestamp: msg.timestamp || msg.created_at,
-      agent_ids: msg.routed_to || [],
-      display_name: recipientNames,
-      status: msg.status,
-      updates: msg.updates || [],
-    });
-
-    // Each response becomes its own flat item
-    for (let i = 0; i < (msg.responses || []).length; i++) {
-      const r = msg.responses[i];
+    const agentIds = new Set(msg.routed_to || []);
+    const answers = [];
+    for (const r of (msg.responses || [])) {
       const c = findConn(r.agent_id);
       const name = c ? agentLabel(c) : (r.display_name || shortId(r.agent_id));
-      items.push({
-        id: msg.message_id + '_r' + i,
-        type: 'response',
+      answers.push({
+        agent: name,
         content: r.response,
         timestamp: r.timestamp,
-        agent_ids: [r.agent_id],
-        display_name: name,
-        reply_to_content: msg.content,
-        reply_to_name: 'You',
+        agent_id: r.agent_id,
       });
+      agentIds.add(r.agent_id);
     }
-  }
-
-  for (const msg of (data.inbox || [])) {
-    const c = findConn(msg.from_agent_id);
-    items.push({
-      id: 'inbox_' + msg.message_id,
-      type: 'received',
-      content: msg.content,
-      timestamp: msg.timestamp || msg.received_at || msg.created_at,
-      agent_ids: [msg.from_agent_id],
-      display_name: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
-      from_agent_id: msg.from_agent_id,
-      raw_message_id: msg.message_id,
+    threads.push({
+      id: msg.message_id,
+      type: 'sent',
+      question: msg.content,
+      asker: 'You',
+      timestamp: msg.timestamp || msg.created_at,
+      agent_ids: [...agentIds],
+      answers,
+      updates: msg.updates || [],
     });
   }
 
-  items.sort((a, b) => {
+  // Received messages become threads you can reply to
+  for (const msg of (data.inbox || [])) {
+    const c = findConn(msg.from_agent_id);
+    threads.push({
+      id: 'inbox_' + msg.message_id,
+      type: 'received',
+      question: msg.content,
+      asker: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
+      timestamp: msg.timestamp || msg.received_at || msg.created_at,
+      agent_ids: [msg.from_agent_id],
+      answers: [],
+      raw_message_id: msg.message_id,
+      from_agent_id: msg.from_agent_id,
+    });
+  }
+
+  threads.sort((a, b) => {
     const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
     const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
     return ta - tb;
   });
-  return items;
+  return threads;
 }
 
 function relativeTime(ts) {
@@ -1636,60 +1881,54 @@ function buildWebhookBadges(updates) {
   return html;
 }
 
-function buildItemHTML(item) {
-  if (item.type === 'sent') return buildSentItemHTML(item);
-  if (item.type === 'response') return buildResponseItemHTML(item);
-  return buildReceivedItemHTML(item);
-}
+function buildThreadHTML(thread) {
+  const askerColor = thread.type === 'sent' ? 'text-solar-400' : 'text-mesh-blue';
+  let html = `<div class="min-w-0">`;
 
-function buildSentItemHTML(item) {
-  return `
-    <div class="min-w-0">
-      <div class="flex items-center gap-1.5">
-        <span class="text-[12px] text-solar-400 font-medium">You</span>
-        <span class="text-[11px] text-faint">&rarr;</span>
-        <span class="text-[12px] text-solar-400/70 truncate">${item.display_name}</span>
-        <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(item.timestamp)}</span>
-      </div>
-      <div class="truncated-content text-[12px] text-pale mt-1 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
-      ${buildWebhookBadges(item.updates)}
-    </div>`;
-}
+  // Question header: asker label + timestamp
+  html += `<div class="flex items-center gap-1.5">
+    <span class="text-[10px] ${askerColor} font-medium">${escapeHtml(thread.asker)}</span>
+    <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(thread.timestamp)}</span>
+  </div>`;
 
-function buildResponseItemHTML(item) {
-  const preview = (item.reply_to_content || '').slice(0, 50);
-  return `
-    <div class="min-w-0">
-      <div class="flex items-center gap-1.5 text-[10px] text-faint mb-0.5 cursor-pointer" onclick="this.nextElementSibling.nextElementSibling.querySelector('.truncated-content')?.classList.toggle('expanded')">
-        <svg width="10" height="10" viewBox="0 0 10 10" class="shrink-0 opacity-40"><path d="M2 6.5C2 4 4 2.5 7 2.5M7 2.5L5.5 1M7 2.5L5.5 4" stroke="currentColor" stroke-width="1" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span class="truncate">replying to <span class="text-solar-400/70">${item.reply_to_name}</span>: ${escapeHtml(preview)}</span>
-      </div>
-      <div class="flex items-center gap-1.5">
-        <span class="text-[12px] text-mesh-green font-medium truncate">${item.display_name}</span>
-        <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(item.timestamp)}</span>
-      </div>
-      <div class="truncated-content text-[12px] text-pale mt-1 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
-    </div>`;
-}
+  // Question content — prominent
+  html += `<div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(thread.question)}</div>`;
 
-function buildReceivedItemHTML(item) {
-  return `
-    <div class="min-w-0">
-      <div class="flex items-center gap-1.5">
-        <span class="text-[12px] text-mesh-blue font-medium truncate">${item.display_name}</span>
-        <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(item.timestamp)}</span>
-      </div>
-      <div class="truncated-content text-[12px] text-pale mt-1 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(item.content)}</div>
-      <div class="flex gap-1.5 mt-1.5">
-        <input type="text" placeholder="Reply..."
-          data-message-id="${item.raw_message_id || ''}"
-          class="timeline-reply-input flex-1 bg-slab border border-edge rounded px-2 py-1 text-[12px] text-bright placeholder-muted focus:border-mesh-blue/40 transition-colors min-w-0">
-        <button type="button" data-message-id="${item.raw_message_id || ''}"
-          class="timeline-reply-btn bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[11px] font-medium px-2.5 py-1 rounded transition-colors disabled:opacity-30 shrink-0">
-          Reply
-        </button>
-      </div>
+  // Webhook badges for sent threads
+  if (thread.type === 'sent') {
+    html += buildWebhookBadges(thread.updates);
+  }
+
+  // Answers section
+  if (thread.answers.length > 0) {
+    html += `<div class="border-l-2 border-mesh-green/20 pl-3 ml-1 mt-1.5 space-y-2">`;
+    for (const ans of thread.answers) {
+      html += `<div>
+        <div class="truncated-content text-[12px] text-pale leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(ans.content)}</div>
+        <div class="flex items-center gap-1.5 mt-0.5">
+          <span class="text-[10px] text-faint">${escapeHtml(ans.agent)}</span>
+          <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(ans.timestamp)}</span>
+        </div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Reply input for received threads
+  if (thread.type === 'received' && thread.raw_message_id) {
+    html += `<div class="flex gap-1.5 mt-1.5">
+      <input type="text" placeholder="Reply..."
+        data-message-id="${thread.raw_message_id}"
+        class="timeline-reply-input flex-1 bg-slab border border-edge rounded px-2 py-1 text-[12px] text-bright placeholder-muted focus:border-mesh-blue/40 transition-colors min-w-0">
+      <button type="button" data-message-id="${thread.raw_message_id}"
+        class="timeline-reply-btn bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[11px] font-medium px-2.5 py-1 rounded transition-colors disabled:opacity-30 shrink-0">
+        Reply
+      </button>
     </div>`;
+  }
+
+  html += `</div>`;
+  return html;
 }
 
 function escapeHtml(str) {
@@ -1697,25 +1936,24 @@ function escapeHtml(str) {
   return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-function createTimelineElement(item) {
+function createTimelineElement(thread) {
   const el = document.createElement('div');
-  const borders = { sent: 'border-solar-500/15', received: 'border-mesh-blue/15', response: 'border-mesh-green/15' };
-  const borderCls = borders[item.type] || 'border-edge';
+  const borderCls = thread.type === 'sent' ? 'border-solar-500/15' : 'border-mesh-blue/15';
   el.className = `px-3 py-2 rounded-lg border ${borderCls} bg-slab/20 hover:bg-slab/40 transition-colors timeline-enter`;
-  el.dataset.timelineId = item.id;
-  el.dataset.agentIds = JSON.stringify(item.agent_ids || []);
-  el.innerHTML = buildItemHTML(item);
+  el.dataset.timelineId = thread.id;
+  el.dataset.agentIds = JSON.stringify(thread.agent_ids || []);
+  el.innerHTML = buildThreadHTML(thread);
 
-  el.addEventListener('mouseenter', () => highlightTimelineItem(item));
+  el.addEventListener('mouseenter', () => highlightTimelineItem(thread));
   el.addEventListener('mouseleave', () => clearTimelineHighlight());
 
-  if (item.type === 'received' && item.raw_message_id) {
-    wireTimelineReply(el, item);
+  if (thread.type === 'received' && thread.raw_message_id) {
+    wireTimelineReply(el, thread);
   }
   return el;
 }
 
-function wireTimelineReply(el, item) {
+function wireTimelineReply(el, thread) {
   const input = el.querySelector('.timeline-reply-input');
   const btn = el.querySelector('.timeline-reply-btn');
   if (!input || !btn) return;
@@ -1726,10 +1964,10 @@ function wireTimelineReply(el, item) {
     btn.disabled = true;
     input.disabled = true;
     try {
-      const result = await ajaxPost(`/respond/${encodeURIComponent(item.raw_message_id)}`, { response: text });
+      const result = await ajaxPost(`/respond/${encodeURIComponent(thread.raw_message_id)}`, { response: text });
       if (result.success) {
         showToast('Reply sent', 'success');
-        addActivity('&darr;', 'text-mesh-blue', `Replied to ${item.display_name}`);
+        addActivity('&darr;', 'text-mesh-blue', `Replied to ${thread.asker}`);
         input.value = '';
       } else {
         showToast(result.error || 'Reply failed', 'error');
@@ -1747,16 +1985,19 @@ function wireTimelineReply(el, item) {
   });
 }
 
+const renderedThreadAnswerCount = new Map(); // thread.id -> last known answer count
+
 function renderTimeline(data) {
   if (!timelineScroll) return;
-  const items = buildTimelineItems(data);
-  const newIds = new Set(items.map(i => i.id));
+  const threads = buildThreads(data);
+  const newIds = new Set(threads.map(t => t.id));
 
-  // Remove stale items
+  // Remove stale threads
   for (const [id, el] of renderedTimeline) {
     if (!newIds.has(id)) {
       el.remove();
       renderedTimeline.delete(id);
+      renderedThreadAnswerCount.delete(id);
     }
   }
 
@@ -1768,23 +2009,27 @@ function renderTimeline(data) {
     if (!newIds.has(id)) dismissedTimeline.delete(id);
   }
 
-  // Add/update items
-  for (const item of items) {
-    if (dismissedTimeline.has(item.id)) continue;
-    const existing = renderedTimeline.get(item.id);
+  // Add/update threads
+  for (const thread of threads) {
+    if (dismissedTimeline.has(thread.id)) continue;
+    const existing = renderedTimeline.get(thread.id);
     if (existing) {
-      // Update content in-place (for webhook badges)
-      const html = buildItemHTML(item);
-      if (existing.innerHTML !== html) {
+      // Re-render if answer count changed or content updated
+      const prevCount = renderedThreadAnswerCount.get(thread.id) || 0;
+      const html = buildThreadHTML(thread);
+      if (thread.answers.length !== prevCount || existing.innerHTML !== html) {
         existing.innerHTML = html;
-        existing.addEventListener('mouseenter', () => highlightTimelineItem(item));
+        existing.dataset.agentIds = JSON.stringify(thread.agent_ids || []);
+        existing.addEventListener('mouseenter', () => highlightTimelineItem(thread));
         existing.addEventListener('mouseleave', () => clearTimelineHighlight());
-        if (item.type === 'received' && item.raw_message_id) wireTimelineReply(existing, item);
+        if (thread.type === 'received' && thread.raw_message_id) wireTimelineReply(existing, thread);
+        renderedThreadAnswerCount.set(thread.id, thread.answers.length);
       }
     } else {
-      const el = createTimelineElement(item);
+      const el = createTimelineElement(thread);
       timelineScroll.appendChild(el);
-      renderedTimeline.set(item.id, el);
+      renderedTimeline.set(thread.id, el);
+      renderedThreadAnswerCount.set(thread.id, thread.answers.length);
     }
   }
 
@@ -1809,7 +2054,9 @@ function highlightTimelineItem(item) {
   for (const agentId of agentIds) {
     const nodeRef = svgRefs.nodes.get(agentId);
     if (nodeRef) {
-      nodeRef.circle.setAttribute('r', '7');
+      const conn = currentConns.find(c => c.agent_id === agentId);
+      const spawned = conn ? (conn.spawned_agents || 0) : 0;
+      nodeRef.circle.setAttribute('r', String(12 + Math.min(spawned * 3, 12)));
       if (nodeRef.glow) nodeRef.glow.setAttribute('opacity', '0.35');
     }
     // Glow connection line
@@ -1827,12 +2074,14 @@ function clearTimelineHighlight() {
   if (!highlightedTimelineAgent) return;
 
   // Reset all nodes back
-  for (const [, nodeRef] of svgRefs.nodes) {
-    nodeRef.circle.setAttribute('r', '5');
-    if (nodeRef.glow) nodeRef.glow.setAttribute('opacity', '0.15');
+  for (const [agentId, nodeRef] of svgRefs.nodes) {
+    const conn = currentConns.find(c => c.agent_id === agentId);
+    const spawned = conn ? (conn.spawned_agents || 0) : 0;
+    nodeRef.circle.setAttribute('r', String(10 + Math.min(spawned * 3, 12)));
+    if (nodeRef.glow) nodeRef.glow.setAttribute('opacity', '0.08');
   }
   for (const [, lineRef] of svgRefs.lines) {
-    if (lineRef.glow) lineRef.glow.setAttribute('opacity', '0.2');
+    if (lineRef.glow) lineRef.glow.setAttribute('opacity', '0');
   }
 
   removeTimelineConnector();
@@ -1866,10 +2115,11 @@ function removeTimelineConnector() {
 
 function clearTimeline() {
   if (!timelineScroll) return;
-  // Mark all currently rendered items as dismissed so they don't reappear
+  // Mark all currently rendered threads as dismissed so they don't reappear
   for (const [id] of renderedTimeline) dismissedTimeline.add(id);
   timelineScroll.innerHTML = '';
   renderedTimeline.clear();
+  renderedThreadAnswerCount.clear();
   if (timelineCountEl) timelineCountEl.textContent = '0';
 }
 
@@ -1920,8 +2170,8 @@ function onPollData(data) {
   renderDiscovered(data.discovered || []);
   renderConnections(data.connections);
 
-  // Process outbox message visuals (particles, rings, cards)
-  processOutboxVisuals(data.outbox);
+  // Process outbox message visuals (orbits)
+  try { processOutboxVisuals(data.outbox); } catch(e) { console.error('processOutboxVisuals error:', e); }
 
   // Render timeline sidebar
   renderTimeline(data);
@@ -1933,11 +2183,11 @@ function onPollData(data) {
 
     // Center node grows with total active agents
     if (svgRefs.centerNode) {
-      const r = 9 + Math.min(agents * 3, 12);
+      const r = 14 + Math.min(agents * 3, 12);
       svgRefs.centerNode.setAttribute('r', r);
     }
     if (svgRefs.centerGlow) {
-      const gr = 24 + Math.min(agents * 6, 24);
+      const gr = 34 + Math.min(agents * 6, 24);
       svgRefs.centerGlow.setAttribute('r', gr);
       svgRefs.centerGlow.setAttribute('opacity', 0.1 + Math.min(agents * 0.04, 0.2));
     }
@@ -1985,6 +2235,209 @@ initSVG();
 if (typeof ResizeObserver !== 'undefined') {
   new ResizeObserver(() => updateSVGLayout()).observe(constellationArea);
 }
+
+// =========================================================================
+// Wallet Identity (Solana)
+// =========================================================================
+let _walletQRPollTimer = null;
+
+function openWalletModal() {
+  document.getElementById('wallet-modal').classList.remove('hidden');
+}
+
+function closeWalletModal() {
+  document.getElementById('wallet-modal').classList.add('hidden');
+  if (_walletQRPollTimer) { clearInterval(_walletQRPollTimer); _walletQRPollTimer = null; }
+}
+
+function walletTab(tab) {
+  const extTab = document.getElementById('wallet-tab-ext');
+  const qrTab = document.getElementById('wallet-tab-qr');
+  const extPanel = document.getElementById('wallet-ext-panel');
+  const qrPanel = document.getElementById('wallet-qr-panel');
+  if (tab === 'ext') {
+    extTab.classList.add('bg-slab', 'text-bright');
+    extTab.classList.remove('text-muted');
+    qrTab.classList.remove('bg-slab', 'text-bright');
+    qrTab.classList.add('text-muted');
+    extPanel.classList.remove('hidden');
+    qrPanel.classList.add('hidden');
+  } else {
+    qrTab.classList.add('bg-slab', 'text-bright');
+    qrTab.classList.remove('text-muted');
+    extTab.classList.remove('bg-slab', 'text-bright');
+    extTab.classList.add('text-muted');
+    qrPanel.classList.remove('hidden');
+    extPanel.classList.add('hidden');
+  }
+}
+
+function _getSolanaProvider() {
+  // Phantom, Solflare, Backpack all inject into window.solana or window.phantom.solana
+  if (window.phantom?.solana?.isPhantom) return window.phantom.solana;
+  if (window.solana?.isPhantom) return window.solana;
+  if (window.solflare?.isSolflare) return window.solflare;
+  if (window.backpack?.solana) return window.backpack.solana;
+  if (window.solana) return window.solana;
+  return null;
+}
+
+function _bytesToHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function walletAuth() {
+  const provider = _getSolanaProvider();
+  if (!provider) {
+    showToast('No Solana wallet detected — install Phantom', 'error');
+    return;
+  }
+
+  const btn = document.getElementById('wallet-connect-btn');
+  btn.disabled = true;
+  btn.textContent = 'Connecting...';
+
+  try {
+    // Connect to wallet (prompts user if not already connected)
+    const resp = await provider.connect();
+    const publicKey = resp.publicKey || provider.publicKey;
+
+    btn.textContent = 'Signing...';
+
+    const challenge = "DarkMatter Identity Derivation v1";
+    const encoded = new TextEncoder().encode(challenge);
+    const { signature } = await provider.signMessage(encoded, "utf8");
+
+    const remember = document.getElementById('wallet-remember').checked;
+    const sigHex = _bytesToHex(signature);
+    const pubHex = _bytesToHex(publicKey.toBytes());
+
+    btn.textContent = 'Deriving identity...';
+
+    const authResp = await fetch('/api/wallet-auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ public_key: pubHex, signature: sigHex, challenge, remember }),
+    });
+    const data = await authResp.json();
+
+    if (data.ok) {
+      const statusEl = document.getElementById('wallet-status');
+      statusEl.textContent = 'Identity: ' + data.agent_id.slice(0, 12) + '...' + data.agent_id.slice(-6);
+      statusEl.classList.remove('hidden');
+      showToast('Wallet identity active: ' + data.agent_id.slice(0, 8) + '...', 'success');
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      showToast(data.error || 'Wallet auth failed', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Connect Wallet';
+    }
+  } catch (e) {
+    if (e.code === 4001 || e.message?.includes('rejected')) {
+      showToast('Signature rejected by user', 'info');
+    } else {
+      showToast('Wallet error: ' + (e.message || e), 'error');
+    }
+    btn.disabled = false;
+    btn.textContent = 'Connect Wallet';
+  }
+}
+
+async function walletDisconnect() {
+  try {
+    const resp = await fetch('/api/wallet-disconnect', { method: 'POST' });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast('Reverted to original identity', 'success');
+      setTimeout(() => location.reload(), 1000);
+    } else {
+      showToast('Failed to revert', 'error');
+    }
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+// --- Mobile QR Session ---
+async function startQRSession() {
+  const remember = document.getElementById('wallet-qr-remember').checked;
+  try {
+    const resp = await fetch('/api/wallet-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ remember }),
+    });
+    const data = await resp.json();
+    if (!data.ok) { showToast(data.error || 'Failed to create session', 'error'); return; }
+
+    // Show QR code
+    document.getElementById('wallet-qr-idle').classList.add('hidden');
+    const activeEl = document.getElementById('wallet-qr-active');
+    activeEl.classList.remove('hidden');
+
+    const qrContainer = document.getElementById('wallet-qr-code');
+    qrContainer.innerHTML = '';
+    const style = getComputedStyle(document.documentElement);
+    new QRCode(qrContainer, {
+      text: data.url,
+      width: 160, height: 160,
+      colorDark: style.getPropertyValue('--qr-fg').trim() || '#e2e2ea',
+      colorLight: style.getPropertyValue('--qr-bg').trim() || '#111113',
+      correctLevel: QRCode.CorrectLevel.M,
+    });
+    document.getElementById('wallet-qr-url').textContent = data.url;
+
+    // Poll for completion
+    if (_walletQRPollTimer) clearInterval(_walletQRPollTimer);
+    _walletQRPollTimer = setInterval(async () => {
+      try {
+        const pollResp = await fetch('/api/wallet-session/' + data.session_id);
+        const pollData = await pollResp.json();
+        if (pollData.status === 'applied') {
+          clearInterval(_walletQRPollTimer);
+          _walletQRPollTimer = null;
+          activeEl.classList.add('hidden');
+          document.getElementById('wallet-qr-done').classList.remove('hidden');
+          const statusEl = document.getElementById('wallet-status');
+          statusEl.textContent = 'Identity: ' + pollData.agent_id.slice(0, 12) + '...' + pollData.agent_id.slice(-6);
+          statusEl.classList.remove('hidden');
+          showToast('Wallet identity active: ' + pollData.agent_id.slice(0, 8) + '...', 'success');
+          setTimeout(() => location.reload(), 1200);
+        } else if (pollData.status === 'failed') {
+          clearInterval(_walletQRPollTimer);
+          _walletQRPollTimer = null;
+          showToast(pollData.error || 'Signing failed', 'error');
+          resetQRPanel();
+        }
+      } catch (e) { /* keep polling */ }
+    }, 2000);
+
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+function resetQRPanel() {
+  document.getElementById('wallet-qr-idle').classList.remove('hidden');
+  document.getElementById('wallet-qr-active').classList.add('hidden');
+  document.getElementById('wallet-qr-done').classList.add('hidden');
+}
+
+// Check if wallet identity is active on load and update modal state
+fetch('/api/info').then(r => r.json()).then(data => {
+  const walletBtn = document.getElementById('wallet-btn');
+  if (data.wallet_identity) {
+    if (walletBtn) {
+      walletBtn.classList.remove('text-pale');
+      walletBtn.classList.add('text-solar-400');
+      walletBtn.title = 'Wallet identity active';
+    }
+    document.getElementById('wallet-disconnect-btn').classList.remove('hidden');
+    const statusEl = document.getElementById('wallet-status');
+    statusEl.textContent = 'Active: ' + data.agent_id.slice(0, 12) + '...' + data.agent_id.slice(-6);
+    statusEl.classList.remove('hidden');
+  }
+}).catch(() => {});
 </script>
 
 {% endblock %}
