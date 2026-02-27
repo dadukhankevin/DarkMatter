@@ -21,6 +21,8 @@ import time
 import asyncio
 import fcntl
 import os
+import shlex
+import signal
 import sys
 import ipaddress
 import socket
@@ -112,12 +114,26 @@ _ANCHOR_DEFAULT = "https://loseylabs.ai"
 _anchor_env = os.environ.get("DARKMATTER_ANCHOR_NODES", _ANCHOR_DEFAULT).strip()
 ANCHOR_NODES: list[str] = [u.strip().rstrip("/") for u in _anchor_env.split(",") if u.strip()] if _anchor_env else []
 
+# Track last anchor that responded successfully (for failover)
+_last_working_anchor: str | None = None
+
 # Agent auto-spawn configuration
 AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
 AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
 AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "6"))
 AGENT_SPAWN_COMMAND = os.environ.get("DARKMATTER_AGENT_COMMAND", "claude")
+AGENT_SPAWN_ARGS: list[str] = [
+    a.strip() for a in os.environ.get(
+        "DARKMATTER_AGENT_ARGS", "-p,--dangerously-skip-permissions"
+    ).split(",") if a.strip()
+]
+AGENT_SPAWN_ENV_CLEANUP: list[str] = [
+    v.strip() for v in os.environ.get(
+        "DARKMATTER_AGENT_ENV_CLEANUP", "CLAUDECODE,CLAUDE_CODE_ENTRYPOINT"
+    ).split(",") if v.strip()
+]
 AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "300"))
+AGENT_SPAWN_TERMINAL = os.environ.get("DARKMATTER_AGENT_TERMINAL", "false").lower() == "true"
 
 # Entrypoint (human node) auto-start configuration
 ENTRYPOINT_AUTOSTART = os.environ.get("DARKMATTER_ENTRYPOINT_AUTOSTART", "true").lower() == "true"
@@ -351,10 +367,17 @@ def _check_nat_status_sync(public_url: str) -> bool:
         return True
 
 
+def _get_active_anchor() -> str:
+    """Return the last known working anchor, or the first configured anchor."""
+    if _last_working_anchor and _last_working_anchor in ANCHOR_NODES:
+        return _last_working_anchor
+    return ANCHOR_NODES[0] if ANCHOR_NODES else ""
+
+
 def _build_webhook_url(state, message_id: str) -> str:
     """Build the webhook URL, using anchor relay if behind NAT."""
     if state.nat_detected and ANCHOR_NODES:
-        anchor = ANCHOR_NODES[0]
+        anchor = _get_active_anchor()
         return f"{anchor}/__darkmatter__/webhook_relay/{state.agent_id}/{message_id}"
     return f"{_get_public_url(state.port)}/__darkmatter__/webhook/{message_id}"
 
@@ -672,7 +695,7 @@ def _check_message_replay(message_id: str) -> bool:
 
 
 async def _broadcast_peer_update(state) -> None:
-    """Notify all connected peers and anchor nodes of our current URL."""
+    """Notify all connected peers and anchor nodes of our current URL and bio."""
     if not state.public_url:
         return
 
@@ -681,6 +704,7 @@ async def _broadcast_peer_update(state) -> None:
         "agent_id": state.agent_id,
         "new_url": state.public_url,
         "timestamp": timestamp,
+        "bio": state.bio,
     }
     if state.public_key_hex:
         payload["public_key_hex"] = state.public_key_hex
@@ -798,30 +822,98 @@ async def _network_health_loop(state) -> None:
 
 
 async def _poll_webhook_relay(state) -> None:
-    """Poll anchor node for buffered webhook callbacks (NAT relay)."""
-    anchor = ANCHOR_NODES[0]
+    """Poll anchor nodes for buffered webhook callbacks (NAT relay).
+
+    Tries each anchor in order, updates _last_working_anchor on success.
+    """
+    global _last_working_anchor
     ts = datetime.now(timezone.utc).isoformat()
     sig = _sign_relay_poll(state.private_key_hex, state.agent_id, ts)
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{anchor}/__darkmatter__/webhook_relay_poll/{state.agent_id}",
-                params={"signature": sig, "timestamp": ts},
-            )
-            if resp.status_code != 200:
-                return
-            data = resp.json()
-            callbacks = data.get("callbacks", [])
-            for cb in callbacks:
-                msg_id = cb.get("message_id", "")
-                cb_data = cb.get("data", {})
-                if msg_id and cb_data:
-                    result, _ = _process_webhook_locally(state, msg_id, cb_data)
-                    if result.get("success"):
-                        print(f"[DarkMatter] Relay: processed webhook for {msg_id}", file=sys.stderr)
-    except Exception as e:
-        print(f"[DarkMatter] Relay poll error: {e}", file=sys.stderr)
+    # Try anchors in order: last working first, then the rest
+    ordered = list(ANCHOR_NODES)
+    if _last_working_anchor and _last_working_anchor in ordered:
+        ordered.remove(_last_working_anchor)
+        ordered.insert(0, _last_working_anchor)
+
+    for anchor in ordered:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{anchor}/__darkmatter__/webhook_relay_poll/{state.agent_id}",
+                    params={"signature": sig, "timestamp": ts},
+                )
+                if resp.status_code != 200:
+                    continue
+                _last_working_anchor = anchor
+                data = resp.json()
+                callbacks = data.get("callbacks", [])
+                for cb in callbacks:
+                    msg_id = cb.get("message_id", "")
+                    cb_data = cb.get("data", {})
+                    if msg_id and cb_data:
+                        result, _ = _process_webhook_locally(state, msg_id, cb_data)
+                        if result.get("success"):
+                            print(f"[DarkMatter] Relay: processed webhook for {msg_id}", file=sys.stderr)
+                return  # success — don't try other anchors
+        except Exception as e:
+            print(f"[DarkMatter] Relay poll error ({anchor}): {e}", file=sys.stderr)
+            continue
+
+
+def _process_connection_relay_callback(state, data: dict) -> None:
+    """Process a connection_accepted callback received via anchor relay.
+
+    Called from entrypoint.py's relay poll loop. The data dict has the same
+    shape as the connection_accepted POST body:
+      {agent_id, agent_url, agent_bio, agent_public_key_hex, agent_display_name}
+    """
+    agent_id = data.get("agent_id", "")
+    agent_url = data.get("agent_url", "")
+    agent_bio = data.get("agent_bio", "")
+    agent_public_key_hex = data.get("agent_public_key_hex")
+    agent_display_name = data.get("agent_display_name")
+
+    if not agent_id or not agent_url:
+        print("[DarkMatter] Relay callback: missing agent_id or agent_url", file=sys.stderr)
+        return
+    url_err = validate_url(agent_url)
+    if url_err:
+        print(f"[DarkMatter] Relay callback: invalid URL: {url_err}", file=sys.stderr)
+        return
+
+    # Match against pending outbound requests (same logic as handle_connection_accepted)
+    agent_base = agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
+    matched = None
+    for pending_url in state.pending_outbound:
+        pending_base = pending_url.rsplit("/mcp", 1)[0].rstrip("/")
+        if pending_base == agent_base:
+            matched = pending_url
+            break
+
+    if matched is None and agent_id:
+        for pending_url, pending_agent_id in state.pending_outbound.items():
+            if pending_agent_id == agent_id:
+                matched = pending_url
+                break
+
+    if matched is None:
+        print(f"[DarkMatter] Relay callback: no pending outbound for {agent_id[:12]}...", file=sys.stderr)
+        return
+
+    del state.pending_outbound[matched]
+
+    conn = Connection(
+        agent_id=agent_id,
+        agent_url=agent_url,
+        agent_bio=agent_bio,
+        direction=ConnectionDirection.OUTBOUND,
+        agent_public_key_hex=agent_public_key_hex,
+        agent_display_name=agent_display_name,
+    )
+    state.connections[agent_id] = conn
+    save_state()
+    print(f"[DarkMatter] Relay callback: connection established with {agent_id[:12]}...", file=sys.stderr)
 
 
 # =============================================================================
@@ -984,7 +1076,7 @@ class SentMessage:
     routed_to: list[str]
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updates: list[dict] = field(default_factory=list)  # [{type, agent_id, target_agent_id, note, timestamp}, ...]
-    response: Optional[dict] = None  # {agent_id, response, metadata, timestamp}
+    responses: list[dict] = field(default_factory=list)  # [{agent_id, response, metadata, timestamp}, ...]
 
 
 @dataclass
@@ -1017,6 +1109,8 @@ class AgentState:
     _upnp_mapping: Optional[tuple] = None  # (url, upnp_obj, ext_port)
     # Auto-reactivation timer for inactive status
     inactive_until: Optional[str] = None  # ISO timestamp; when expired, auto-flip to active
+    # Response waiters — message_id -> list of asyncio.Event (ephemeral, not persisted)
+    _response_events: dict[str, list[asyncio.Event]] = field(default_factory=dict)
     # Extensible message routing
     routing_rules: list = field(default_factory=list)  # list of RoutingRule dicts
     router_mode: str = "spawn"  # spawn | rules_first | rules_only | queue_only
@@ -1348,10 +1442,13 @@ _state_write_lock = threading.Lock()  # Serializes save_state() writes; fcntl.fl
 # Agent auto-spawn tracking (ephemeral, not persisted)
 @dataclass
 class SpawnedAgent:
-    process: asyncio.subprocess.Process
+    process: asyncio.subprocess.Process | None  # None in terminal mode
     message_id: str
     spawned_at: float
-    pid: int
+    pid: int | None           # Read lazily from PID file in terminal mode
+    terminal_mode: bool = False
+    pid_file: str | None = None      # ~/.darkmatter/spawn_pids/<msg_id>.pid
+    script_file: str | None = None   # ~/.darkmatter/spawn_scripts/<msg_id>.sh
 
 _spawned_agents: list[SpawnedAgent] = []
 _spawn_timestamps: list[float] = []  # Rolling window for hourly rate limiting
@@ -1474,16 +1571,85 @@ def _can_spawn_agent() -> tuple[bool, str]:
     return True, ""
 
 
+def _is_agent_running(agent: SpawnedAgent) -> bool:
+    """Check if a spawned agent is still running (works in both modes)."""
+    if not agent.terminal_mode:
+        return agent.process is not None and agent.process.returncode is None
+
+    # Terminal mode: read PID from file, check with os.kill(pid, 0)
+    pid = agent.pid
+    if pid is None and agent.pid_file:
+        try:
+            pid = int(open(agent.pid_file).read().strip())
+            agent.pid = pid
+        except (FileNotFoundError, ValueError):
+            return False
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # Process exists but we can't signal it
+
+
+def _kill_agent(agent: SpawnedAgent, force: bool = False) -> None:
+    """Send terminate/kill signal to a spawned agent (works in both modes)."""
+    if not agent.terminal_mode:
+        if agent.process is not None:
+            if force:
+                agent.process.kill()
+            else:
+                agent.process.terminate()
+        return
+
+    # Terminal mode: signal via PID
+    pid = agent.pid
+    if pid is None and agent.pid_file:
+        try:
+            pid = int(open(agent.pid_file).read().strip())
+            agent.pid = pid
+        except (FileNotFoundError, ValueError):
+            return
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def _cleanup_terminal_files(agent: SpawnedAgent) -> None:
+    """Remove PID and script files for a finished terminal agent."""
+    for path in (agent.pid_file, agent.script_file):
+        if path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
 def _cleanup_finished_agents() -> None:
     """Remove finished agent processes from the tracking list."""
     still_running = []
     for agent in _spawned_agents:
-        if agent.process.returncode is not None:
-            print(
-                f"[DarkMatter] Spawned agent PID {agent.pid} exited "
-                f"(code={agent.process.returncode}, msg={agent.message_id[:12]}...)",
-                file=sys.stderr,
-            )
+        if not _is_agent_running(agent):
+            pid_display = agent.pid or "unknown"
+            if agent.terminal_mode:
+                print(
+                    f"[DarkMatter] Terminal agent PID {pid_display} finished "
+                    f"(msg={agent.message_id[:12]}...)",
+                    file=sys.stderr,
+                )
+                _cleanup_terminal_files(agent)
+            else:
+                print(
+                    f"[DarkMatter] Spawned agent PID {pid_display} exited "
+                    f"(code={agent.process.returncode if agent.process else '?'}, msg={agent.message_id[:12]}...)",
+                    file=sys.stderr,
+                )
         else:
             still_running.append(agent)
     _spawned_agents.clear()
@@ -1491,55 +1657,94 @@ def _cleanup_finished_agents() -> None:
 
 
 def _build_agent_prompt(state: "AgentState", msg: "QueuedMessage") -> str:
-    """Build the prompt for a spawned claude agent."""
-    sender_info = msg.from_agent_id or "unknown"
-    conn = state.connections.get(msg.from_agent_id) if msg.from_agent_id else None
-    sender_name = (conn.agent_display_name if conn else None) or sender_info
-    verified_str = "YES (cryptographically verified)" if msg.verified else "NO"
-
-    # Build list of connected agents for forwarding context
-    peers = []
-    for cid, c in state.connections.items():
-        label = c.agent_display_name or cid[:12]
-        bio = c.agent_bio or "no bio"
-        peers.append(f"  - {label} ({cid[:12]}...): {bio}")
-    peers_block = "\n".join(peers) if peers else "  (none)"
-
+    """Build the prompt for a spawned agent."""
     return f"""\
-You are an autonomous DarkMatter mesh agent handling an incoming message.
-
-YOUR IDENTITY:
-- Display name: {state.display_name or 'unnamed'}
-- Agent ID: {state.agent_id}
-- Bio: {state.bio}
-
-INCOMING MESSAGE:
-- Message ID: {msg.message_id}
-- From: {sender_name} (agent_id: {msg.from_agent_id or 'unknown'})
-- Verified: {verified_str}
-- Content: {msg.content}
-- Metadata: {json.dumps(msg.metadata) if msg.metadata else 'none'}
-- Hops remaining: {msg.hops_remaining}
-
-CONNECTED PEERS (available for forwarding):
-{peers_block}
-
-INSTRUCTIONS:
-1. Read the message above carefully.
-2. If you can answer the message, use darkmatter_respond_message with message_id="{msg.message_id}" and your response.
-3. If you cannot answer but a connected peer might be able to help, use darkmatter_send_message with message_id="{msg.message_id}" and target_agent_id to forward it, then respond with a note that you forwarded it.
-4. If you neither can answer nor know who to forward to, respond politely explaining that.
-5. You are a fully autonomous agent. Use any tools at your disposal — read files, write code, run commands — whatever is needed to fulfill the request.
-
-CONSTRAINTS:
-- Do NOT spawn more agents or sub-processes (recursion is disabled).
-- You have {AGENT_SPAWN_TIMEOUT} seconds maximum before being terminated.
-- Keep your response concise and helpful.
+DARKMATTER: You have received a new message, check message {msg.message_id} and respond or forward accordingly.
 """
 
 
+async def _spawn_in_terminal(msg: "QueuedMessage", prompt: str, env: dict, cwd: str) -> SpawnedAgent:
+    """Spawn an agent in a visible Terminal.app window (macOS only).
+
+    Writes a wrapper shell script that records its PID, runs the agent command
+    via exec, and cleans up on exit.  Opens the script in Terminal.app via osascript.
+    """
+    darkmatter_dir = os.path.expanduser("~/.darkmatter")
+    pids_dir = os.path.join(darkmatter_dir, "spawn_pids")
+    scripts_dir = os.path.join(darkmatter_dir, "spawn_scripts")
+    os.makedirs(pids_dir, exist_ok=True)
+    os.makedirs(scripts_dir, exist_ok=True)
+
+    pid_file = os.path.join(pids_dir, f"{msg.message_id}.pid")
+    script_file = os.path.join(scripts_dir, f"{msg.message_id}.sh")
+
+    # Build the env export block
+    env_lines = []
+    for k, v in env.items():
+        env_lines.append(f"export {k}={shlex.quote(v)}")
+    env_block = "\n".join(env_lines)
+
+    # Build the full command
+    cmd_parts = [AGENT_SPAWN_COMMAND] + AGENT_SPAWN_ARGS + [prompt]
+    cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
+
+    unset_block = "\n".join(f"unset {var}" for var in AGENT_SPAWN_ENV_CLEANUP)
+
+    script_content = f"""\
+#!/bin/bash
+# DarkMatter spawned agent — message {msg.message_id[:12]}...
+echo $$ > {shlex.quote(pid_file)}
+
+cleanup() {{
+    rm -f {shlex.quote(pid_file)}
+}}
+trap cleanup EXIT
+
+{unset_block}
+{env_block}
+
+cd {shlex.quote(cwd)}
+
+echo "[DarkMatter] Agent started for message {msg.message_id[:12]}..."
+echo "PID: $$"
+echo "---"
+
+exec {cmd_str}
+"""
+
+    with open(script_file, "w") as f:
+        f.write(script_content)
+    os.chmod(script_file, 0o755)
+
+    # Open in Terminal.app via osascript
+    escaped_path = script_file.replace('\\', '\\\\').replace('"', '\\"')
+    apple_script = f'tell application "Terminal" to do script "{escaped_path}"'
+    await asyncio.create_subprocess_exec("osascript", "-e", apple_script)
+
+    # Wait briefly for PID file to appear
+    pid = None
+    for _ in range(20):
+        await asyncio.sleep(0.25)
+        try:
+            pid = int(open(pid_file).read().strip())
+            break
+        except (FileNotFoundError, ValueError):
+            continue
+
+    agent = SpawnedAgent(
+        process=None,
+        message_id=msg.message_id,
+        spawned_at=time.monotonic(),
+        pid=pid,
+        terminal_mode=True,
+        pid_file=pid_file,
+        script_file=script_file,
+    )
+    return agent
+
+
 async def _spawn_agent_for_message(state: "AgentState", msg: "QueuedMessage") -> None:
-    """Spawn a claude subprocess to handle an incoming message."""
+    """Spawn an agent subprocess to handle an incoming message."""
     ok, reason = _can_spawn_agent()
     if not ok:
         print(f"[DarkMatter] Not spawning agent: {reason}", file=sys.stderr)
@@ -1551,24 +1756,38 @@ async def _spawn_agent_for_message(state: "AgentState", msg: "QueuedMessage") ->
             print(f"[DarkMatter] Agent already spawned for message {msg.message_id[:12]}...", file=sys.stderr)
             return
 
+    # Persist queue so child's MCP server can load the message
+    save_state()
+
     prompt = _build_agent_prompt(state, msg)
 
-    # Build environment with recursion guard
+    # Build environment — disable recursion, avoid port conflicts
     env = os.environ.copy()
     env["DARKMATTER_AGENT_ENABLED"] = "false"
     env["DARKMATTER_ENTRYPOINT_AUTOSTART"] = "false"
-    env.pop("CLAUDECODE", None)  # Allow spawning inside Claude Code sessions
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    for var in AGENT_SPAWN_ENV_CLEANUP:
+        env.pop(var, None)
 
-    # Assign a unique port so spawned agent's MCP server doesn't conflict
-    # with the parent's port. Pick a random port in the high range.
     import random
-    agent_port = random.randint(9200, 9299)
-    env["DARKMATTER_PORT"] = str(agent_port)
+    env["DARKMATTER_PORT"] = str(random.randint(9200, 9299))
 
     try:
+        # Terminal mode: open in a visible Terminal.app window (macOS only)
+        if AGENT_SPAWN_TERMINAL and sys.platform == "darwin":
+            agent = await _spawn_in_terminal(msg, prompt, env, os.getcwd())
+            _spawned_agents.append(agent)
+            _spawn_timestamps.append(time.monotonic())
+            pid_display = agent.pid or "pending"
+            print(
+                f"[DarkMatter] Spawned terminal agent (PID {pid_display}) for message {msg.message_id[:12]}... "
+                f"from {msg.from_agent_id or 'unknown'}",
+                file=sys.stderr,
+            )
+            asyncio.create_task(_agent_timeout_watchdog(agent))
+            return
+
         process = await asyncio.create_subprocess_exec(
-            AGENT_SPAWN_COMMAND, "-p", "--dangerously-skip-permissions", prompt,
+            AGENT_SPAWN_COMMAND, *AGENT_SPAWN_ARGS, prompt,
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1604,21 +1823,24 @@ async def _spawn_agent_for_message(state: "AgentState", msg: "QueuedMessage") ->
 async def _agent_timeout_watchdog(agent: SpawnedAgent) -> None:
     """Kill a spawned agent if it exceeds the timeout."""
     await asyncio.sleep(AGENT_SPAWN_TIMEOUT)
-    if agent.process.returncode is None:
-        print(
-            f"[DarkMatter] Spawned agent PID {agent.pid} timed out after {AGENT_SPAWN_TIMEOUT}s, terminating...",
-            file=sys.stderr,
-        )
-        try:
-            agent.process.terminate()
-            # Give it 5 seconds to clean up, then force kill
-            try:
-                await asyncio.wait_for(agent.process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                print(f"[DarkMatter] Force-killing agent PID {agent.pid}", file=sys.stderr)
-                agent.process.kill()
-        except ProcessLookupError:
-            pass  # Already exited
+    if not _is_agent_running(agent):
+        return
+    pid_display = agent.pid or "unknown"
+    print(
+        f"[DarkMatter] Spawned agent PID {pid_display} timed out after {AGENT_SPAWN_TIMEOUT}s, terminating...",
+        file=sys.stderr,
+    )
+    try:
+        _kill_agent(agent, force=False)
+        # Give it 5 seconds to clean up, then force kill
+        await asyncio.sleep(5.0)
+        if _is_agent_running(agent):
+            print(f"[DarkMatter] Force-killing agent PID {pid_display}", file=sys.stderr)
+            _kill_agent(agent, force=True)
+        if agent.terminal_mode:
+            _cleanup_terminal_files(agent)
+    except ProcessLookupError:
+        pass  # Already exited
 
 
 async def _notify_tools_changed() -> None:
@@ -1723,7 +1945,15 @@ async def _status_updater() -> None:
 
 
 def _state_file_path() -> str:
-    """Return the state file path, keyed by the agent's public key hex (passport-derived)."""
+    """Return the state file path, keyed by the agent's public key hex (passport-derived).
+
+    Respects DARKMATTER_STATE_FILE env var for test isolation (multiple nodes
+    sharing the same passport but needing separate state files).
+    """
+    override = os.environ.get("DARKMATTER_STATE_FILE")
+    if override:
+        os.makedirs(os.path.dirname(override) or ".", exist_ok=True)
+        return override
     state = _agent_state
     if state is not None and state.public_key_hex:
         state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
@@ -1737,9 +1967,10 @@ def _state_file_path() -> str:
 
 
 def save_state() -> None:
-    """Persist durable state (identity, connections, telemetry, sent_messages) to disk.
+    """Persist durable state to disk.
 
-    Message queue and pending requests are NOT persisted — they are ephemeral.
+    Message queue is persisted so spawned child agents can load messages on startup.
+    Pending requests are NOT persisted — they are ephemeral.
     Serialized via _state_write_lock to prevent concurrent writes from interleaving.
     """
     state = _agent_state
@@ -1788,7 +2019,7 @@ def save_state() -> None:
                 "routed_to": sm.routed_to,
                 "created_at": sm.created_at,
                 "updates": sm.updates,
-                "response": sm.response,
+                "responses": sm.responses,
             }
             for mid, sm in state.sent_messages.items()
         },
@@ -1801,6 +2032,19 @@ def save_state() -> None:
             mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < _REPLAY_WINDOW
         },
+        "message_queue": [
+            {
+                "message_id": m.message_id,
+                "content": m.content,
+                "webhook": m.webhook,
+                "hops_remaining": m.hops_remaining,
+                "metadata": m.metadata,
+                "received_at": m.received_at,
+                "from_agent_id": m.from_agent_id,
+                "verified": m.verified,
+            }
+            for m in state.message_queue
+        ],
     }
 
     path = _state_file_path()
@@ -1849,6 +2093,10 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
 
     sent_messages = {}
     for mid, sd in data.get("sent_messages", {}).items():
+        # Migrate old single "response" to "responses" list
+        responses = sd.get("responses", [])
+        if not responses and sd.get("response"):
+            responses = [sd["response"]]
         sent_messages[mid] = SentMessage(
             message_id=sd["message_id"],
             content=sd["content"],
@@ -1857,8 +2105,22 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
             routed_to=sd["routed_to"],
             created_at=sd.get("created_at", ""),
             updates=sd.get("updates", []),
-            response=sd.get("response"),
+            responses=responses,
         )
+
+    # Restore message queue
+    message_queue = []
+    for qd in data.get("message_queue", []):
+        message_queue.append(QueuedMessage(
+            message_id=qd["message_id"],
+            content=qd["content"],
+            webhook=qd["webhook"],
+            hops_remaining=qd.get("hops_remaining", 0),
+            metadata=qd.get("metadata", {}),
+            received_at=qd.get("received_at", ""),
+            from_agent_id=qd.get("from_agent_id"),
+            verified=qd.get("verified", False),
+        ))
 
     # Restore replay protection cache (prune expired entries)
     global _seen_message_ids
@@ -1881,6 +2143,7 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
         public_key_hex=data.get("public_key_hex", ""),
         display_name=data.get("display_name"),
         connections=connections,
+        message_queue=message_queue,
         sent_messages=sent_messages,
         impressions=data.get("impressions", {}),
         rate_limit_global=data.get("rate_limit_global", 0),
@@ -1962,6 +2225,13 @@ class ExpireMessageInput(BaseModel):
     """Expire a sent message so agents stop forwarding it."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="The ID of the sent message to expire")
+
+
+class WaitForResponseInput(BaseModel):
+    """Wait for a response to a sent message."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    message_id: str = Field(..., description="The ID of the sent message to wait on")
+    timeout_seconds: float = Field(default=60, description="How long to wait in seconds before giving up", gt=0)
 
 
 class ConnectionAcceptedInput(BaseModel):
@@ -2568,6 +2838,14 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     state = get_state(ctx)
     state.bio = params.bio
     save_state()
+
+    # Broadcast bio change to all connected peers
+    if state.public_url:
+        try:
+            await _broadcast_peer_update(state)
+        except Exception as e:
+            print(f"[DarkMatter] Failed to broadcast bio update: {e}", file=sys.stderr)
+
     return json.dumps({"success": True, "bio": state.bio})
 
 
@@ -2878,6 +3156,35 @@ async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
             "error": f"Webhook blocked: {webhook_err}",
         })
 
+    # Check if message is still active before responding
+    try:
+        status_resp = await _webhook_request_with_recovery(
+            state, msg.webhook, msg.from_agent_id,
+            method="GET", timeout=10.0,
+        )
+        if status_resp.status_code == 200:
+            webhook_data = status_resp.json()
+            msg_status = webhook_data.get("status", "active")
+            if msg_status == "expired":
+                save_state()
+                return json.dumps({
+                    "success": False,
+                    "error": "Message has been expired by the originator.",
+                    "message_id": msg.message_id,
+                })
+    except Exception as e:
+        print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
+
+    # Notify originator that we're actively responding
+    try:
+        await _webhook_request_with_recovery(
+            state, msg.webhook, msg.from_agent_id,
+            method="POST", timeout=10.0,
+            json={"type": "responding", "agent_id": state.agent_id}
+        )
+    except Exception:
+        pass  # Best-effort notification
+
     # Sign the webhook response
     resp_timestamp = datetime.now(timezone.utc).isoformat()
     resp_signature_hex = None
@@ -3009,7 +3316,7 @@ async def get_sent_message(params: GetSentMessageInput, ctx: Context) -> str:
         "routed_to": sm.routed_to,
         "created_at": sm.created_at,
         "updates": sm.updates,
-        "response": sm.response,
+        "responses": sm.responses,
     })
 
 
@@ -3058,6 +3365,88 @@ async def expire_message(params: ExpireMessageInput, ctx: Context) -> str:
         "success": True,
         "message_id": sm.message_id,
         "status": "expired",
+    })
+
+
+@mcp.tool(
+    name="darkmatter_wait_for_response",
+    annotations={
+        "title": "Wait For Response",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def wait_for_response(params: WaitForResponseInput, ctx: Context) -> str:
+    """Wait for a response to arrive on a sent message.
+
+    Blocks until a response webhook fires for the given message_id, or the
+    timeout expires. If the message already has responses, returns immediately.
+
+    This does NOT block the node — incoming messages, webhooks, and subagent
+    spawns all continue normally while this tool awaits.
+
+    Args:
+        params: Contains message_id to wait on and timeout_seconds.
+
+    Returns:
+        JSON with the response(s) if one arrived, or a timeout indicator.
+    """
+    state = get_state(ctx)
+
+    sm = state.sent_messages.get(params.message_id)
+    if not sm:
+        return json.dumps({
+            "success": False,
+            "error": f"No sent message with ID '{params.message_id}'."
+        })
+
+    # If there are already responses, return immediately
+    if sm.responses:
+        return json.dumps({
+            "success": True,
+            "message_id": sm.message_id,
+            "status": sm.status,
+            "responses": sm.responses,
+        })
+
+    # If the message is expired, no point waiting
+    if sm.status == "expired":
+        return json.dumps({
+            "success": False,
+            "message_id": sm.message_id,
+            "reason": "message_expired",
+            "error": "This message has been expired — no response will arrive.",
+        })
+
+    # Register an event and wait
+    event = asyncio.Event()
+    state._response_events.setdefault(params.message_id, []).append(event)
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=params.timeout_seconds)
+    except asyncio.TimeoutError:
+        # Clean up our event from the list
+        evts = state._response_events.get(params.message_id, [])
+        if event in evts:
+            evts.remove(event)
+            if not evts:
+                state._response_events.pop(params.message_id, None)
+        return json.dumps({
+            "success": False,
+            "message_id": sm.message_id,
+            "reason": "timeout",
+            "timeout_seconds": params.timeout_seconds,
+            "error": f"No response received within {params.timeout_seconds}s.",
+        })
+
+    # Event fired — response arrived
+    return json.dumps({
+        "success": True,
+        "message_id": sm.message_id,
+        "status": sm.status,
+        "responses": sm.responses,
     })
 
 
@@ -3928,6 +4317,18 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     save_state()
 
+    # Notify originator that message was received
+    webhook_err = validate_webhook_url(msg.webhook)
+    if not webhook_err:
+        try:
+            await _webhook_request_with_recovery(
+                state, msg.webhook, msg.from_agent_id,
+                method="POST", timeout=10.0,
+                json={"type": "received", "agent_id": state.agent_id}
+            )
+        except Exception:
+            pass  # Best-effort notification
+
     # Route message through the extensible router chain
     asyncio.create_task(_execute_routing(state, msg))
 
@@ -3964,7 +4365,25 @@ def _process_webhook_locally(state, message_id: str, data: dict) -> tuple[dict, 
     agent_id = data.get("agent_id", "unknown")
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    if update_type == "forwarded":
+    if update_type == "received":
+        sm.updates.append({
+            "type": "received",
+            "agent_id": agent_id,
+            "timestamp": timestamp,
+        })
+        save_state()
+        return {"success": True, "recorded": "received"}, 200
+
+    elif update_type == "responding":
+        sm.updates.append({
+            "type": "responding",
+            "agent_id": agent_id,
+            "timestamp": timestamp,
+        })
+        save_state()
+        return {"success": True, "recorded": "responding"}, 200
+
+    elif update_type == "forwarded":
         sm.updates.append({
             "type": "forwarded",
             "agent_id": agent_id,
@@ -3976,14 +4395,17 @@ def _process_webhook_locally(state, message_id: str, data: dict) -> tuple[dict, 
         return {"success": True, "recorded": "forwarded"}, 200
 
     elif update_type == "response":
-        sm.response = {
+        sm.responses.append({
             "agent_id": agent_id,
             "response": data.get("response", ""),
             "metadata": data.get("metadata", {}),
             "timestamp": timestamp,
-        }
+        })
         sm.status = "responded"
         save_state()
+        # Wake any wait_for_response waiters on this message
+        for evt in state._response_events.pop(message_id, []):
+            evt.set()
         return {"success": True, "recorded": "response"}, 200
 
     elif update_type == "expired":
@@ -4006,10 +4428,12 @@ async def handle_webhook_post(request: Request) -> JSONResponse:
     POST /__darkmatter__/webhook/{message_id}
 
     Body should contain:
-    - type: "forwarded" | "response" | "expired"
+    - type: "received" | "responding" | "forwarded" | "response" | "expired"
     - agent_id: the agent posting this update
+    - For "received": (no extra fields — signals message was queued)
+    - For "responding": (no extra fields — signals agent is actively working on a response)
     - For "forwarded": target_agent_id, optional note
-    - For "response": response text, optional metadata
+    - For "response": response text, optional metadata (multiple agents may respond)
     - For "expired": optional note
     """
     global _agent_state
@@ -4077,6 +4501,7 @@ async def handle_status(request: Request) -> JSONResponse:
         "status": state.status.value,
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
+        "spawned_agents": len(_spawned_agents),
     })
 
 
@@ -4196,6 +4621,12 @@ async def handle_peer_update(request: Request) -> JSONResponse:
 
     old_url = conn.agent_url
     conn.agent_url = new_url
+
+    # Update bio if included in the peer_update payload
+    new_bio = body.get("bio")
+    if new_bio is not None and isinstance(new_bio, str):
+        conn.agent_bio = new_bio[:MAX_BIO_LENGTH]
+
     save_state()
 
     print(f"[DarkMatter] Peer {agent_id[:12]}... updated URL: {old_url} -> {new_url}", file=sys.stderr)
@@ -4479,8 +4910,9 @@ def _find_entrypoint_path() -> Optional[str]:
     """Locate the entrypoint.py script for the human node."""
     if ENTRYPOINT_PATH:
         return ENTRYPOINT_PATH if os.path.isfile(ENTRYPOINT_PATH) else None
-    # Fallback: check ~/.darkmatter/entrypoint.py
-    fallback = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.py")
+    # Fallback: check project directory (one level up from .darkmatter/server.py)
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fallback = os.path.join(project_dir, "entrypoint.py")
     return fallback if os.path.isfile(fallback) else None
 
 
@@ -4813,6 +5245,13 @@ def create_app() -> Starlette:
         # Auto-start entrypoint (human node) if not already running
         asyncio.create_task(_ensure_entrypoint_running())
 
+        # Re-spawn agents for any queued messages left from a previous session
+        if AGENT_SPAWN_ENABLED and _agent_state.router_mode == "spawn" and _agent_state.message_queue:
+            queued_count = len(_agent_state.message_queue)
+            print(f"[DarkMatter] {queued_count} message(s) in queue from previous session, spawning agents...", file=sys.stderr)
+            for msg in list(_agent_state.message_queue):
+                asyncio.create_task(_spawn_agent_for_message(_agent_state, msg))
+
     # DarkMatter mesh protocol routes
     darkmatter_routes = [
         Route("/connection_request", handle_connection_request, methods=["POST"]),
@@ -4873,7 +5312,10 @@ def _print_startup_banner(port: int, transport: str, discovery_enabled: bool) ->
     print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled'}", file=sys.stderr)
     print(f"[DarkMatter] WebRTC: {'AVAILABLE' if WEBRTC_AVAILABLE else 'disabled (pip install aiortc)'}", file=sys.stderr)
     print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
-    print(f"[DarkMatter] Agent auto-spawn: {'ENABLED (max ' + str(AGENT_SPAWN_MAX_CONCURRENT) + ' concurrent, ' + str(AGENT_SPAWN_MAX_PER_HOUR) + '/hr)' if AGENT_SPAWN_ENABLED else 'disabled'}", file=sys.stderr)
+    spawn_info = f"ENABLED (max {AGENT_SPAWN_MAX_CONCURRENT} concurrent, {AGENT_SPAWN_MAX_PER_HOUR}/hr)" if AGENT_SPAWN_ENABLED else "disabled"
+    if AGENT_SPAWN_ENABLED and AGENT_SPAWN_TERMINAL:
+        spawn_info += " [terminal mode]"
+    print(f"[DarkMatter] Agent auto-spawn: {spawn_info}", file=sys.stderr)
     print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
 
 
