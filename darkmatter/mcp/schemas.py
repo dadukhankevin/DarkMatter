@@ -112,7 +112,7 @@ class GetImpressionInput(BaseModel):
 
 
 class SetSuperagentInput(BaseModel):
-    """Set the default superagent URL for gas routing."""
+    """Set the default superagent URL for antimatter routing."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     url: Optional[str] = Field(default=None, description="Superagent URL. Set to null to reset to default.", max_length=MAX_URL_LENGTH)
 

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from darkmatter.config import GAS_MAX_HOPS, GAS_LOG_MAX
+from darkmatter.config import ANTIMATTER_MAX_HOPS, ANTIMATTER_LOG_MAX
 
 
 # =============================================================================
@@ -80,22 +80,22 @@ class Impression:
 
 
 # =============================================================================
-# Gas Economy
+# AntiMatter Economy
 # =============================================================================
 
 @dataclass
-class GasSignal:
-    """A gas fee signal routed through the network via the match game."""
+class AntiMatterSignal:
+    """A antimatter fee signal routed through the network via the match game."""
     signal_id: str
-    original_tx: str            # tx_signature that generated this gas
+    original_tx: str            # tx_signature that generated this signal
     sender_agent_id: str        # A (who sent the payment)
-    amount: float               # gas amount (1% of original)
+    amount: float               # antimatter fee amount (1% of original)
     token: str                  # "SOL" or mint address
     token_decimals: int         # 9 for SOL, 6 for USDC, etc.
-    sender_superagent_wallet: str  # where gas goes on timeout
-    callback_url: str           # B's /__darkmatter__/gas_result endpoint
+    sender_superagent_wallet: str  # where fee goes on timeout
+    callback_url: str           # B's /__darkmatter__/antimatter_result endpoint
     hops: int = 0
-    max_hops: int = GAS_MAX_HOPS
+    max_hops: int = ANTIMATTER_MAX_HOPS
     created_at: str = ""
     path: list[str] = field(default_factory=list)  # agent_ids visited (loop prevention)
 
@@ -223,6 +223,6 @@ class AgentState:
     router_mode: str = "spawn"
     # NAT detection (ephemeral)
     nat_detected: bool = False
-    # Gas economy
+    # AntiMatter economy
     superagent_url: Optional[str] = None
-    gas_log: list[dict] = field(default_factory=list)
+    antimatter_log: list[dict] = field(default_factory=list)

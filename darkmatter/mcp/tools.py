@@ -47,7 +47,7 @@ from darkmatter.config import (
     SUPERAGENT_DEFAULT_URL,
     WEBRTC_AVAILABLE,
     DISCOVERY_MAX_AGE,
-    GAS_RATE,
+    ANTIMATTER_RATE,
     SOLANA_AVAILABLE,
     SOLANA_RPC_URL,
     LAMPORTS_PER_SOL,
@@ -84,7 +84,7 @@ from darkmatter.wallet.solana import (
     send_solana_token,
     _resolve_spl_token,
 )
-from darkmatter.wallet.gas import (
+from darkmatter.wallet.antimatter import (
     get_superagent_wallet,
     _superagent_wallet_cache,
 )
@@ -1465,7 +1465,7 @@ async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
 
 
 # =============================================================================
-# Gas Economy Configuration Tool
+# AntiMatter Economy Configuration Tool
 # =============================================================================
 
 @mcp.tool(
@@ -1479,9 +1479,9 @@ async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
     }
 )
 async def set_superagent(params: SetSuperagentInput, ctx: Context) -> str:
-    """Set the default superagent URL for gas routing.
+    """Set the default superagent URL for antimatter routing.
 
-    The superagent receives gas fees on timeout (when no elder is found).
+    The superagent receives antimatter fees on timeout (when no elder is found).
     Set to null to reset to the default anchor node.
 
     Args:
@@ -1648,8 +1648,8 @@ async def send_sol(params: SendSolInput, ctx: Context) -> str:
                         "tx_signature": result["tx_signature"],
                         "from_wallet": result["from_wallet"],
                         "to_wallet": conn_sol,
-                        "gas_eligible": True,
-                        "gas_rate": GAS_RATE,
+                        "antimatter_eligible": True,
+                        "antimatter_rate": ANTIMATTER_RATE,
                         "sender_created_at": state.created_at,
                         "sender_superagent_wallet": await get_superagent_wallet(state) or "",
                     },
@@ -1716,8 +1716,8 @@ async def send_token(params: SendTokenInput, ctx: Context) -> str:
                         "tx_signature": result["tx_signature"],
                         "from_wallet": result["from_wallet"],
                         "to_wallet": conn_sol,
-                        "gas_eligible": True,
-                        "gas_rate": GAS_RATE,
+                        "antimatter_eligible": True,
+                        "antimatter_rate": ANTIMATTER_RATE,
                         "sender_created_at": state.created_at,
                         "sender_superagent_wallet": await get_superagent_wallet(state) or "",
                     },

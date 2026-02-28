@@ -609,7 +609,7 @@ def dm_message():
     try:
         result, status = loop.run_until_complete(server._process_incoming_message(state, data))
     finally:
-        # Let any background tasks (webhook notify, gas interception) finish
+        # Let any background tasks (webhook notify, antimatter interception) finish
         pending = asyncio.all_tasks(loop)
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
@@ -811,7 +811,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
 
 
 def _sync_send_payment_notification(agent_id, amount, token, tx_result):
-    """Send a payment notification message with gas economy metadata."""
+    """Send a payment notification message with antimatter economy metadata."""
     gas_meta = {
         "type": "solana_payment",
         "amount": amount,
@@ -1083,7 +1083,7 @@ def poll():
     connections = [{
         "agent_id": c.agent_id,
         "display_name": c.agent_display_name or _short_id(c.agent_id),
-        "bio": c.agent_bio, "direction": c.direction.value,
+        "bio": c.agent_bio, "direction": getattr(getattr(c, "direction", None), "value", "unknown"),
         "last_activity": c.last_activity,
         "spawned_agents": spawned_counts.get(c.agent_id, 0),
         "health_status": getattr(c, "health_status", "ok"),
@@ -1222,7 +1222,7 @@ def wallet_send_api():
 
         if result.get("success"):
             result["to_agent_id"] = agent_id
-            # Send payment notification with gas metadata
+            # Send payment notification with antimatter metadata
             try:
                 _sync_send_payment_notification(agent_id, amount, token, result)
                 result["notification_sent"] = True

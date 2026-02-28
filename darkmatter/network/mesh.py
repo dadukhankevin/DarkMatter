@@ -26,7 +26,7 @@ from darkmatter.config import (
     MAX_CONTENT_LENGTH,
     MESSAGE_QUEUE_MAX,
     PROTOCOL_VERSION,
-    GAS_MAX_AGE_S,
+    ANTIMATTER_MAX_AGE_S,
     WEBRTC_AVAILABLE,
     WEBRTC_STUN_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
@@ -35,7 +35,7 @@ from darkmatter.models import (
     AgentState,
     AgentStatus,
     Connection,
-    GasSignal,
+    AntiMatterSignal,
     PendingConnectionRequest,
     QueuedMessage,
 )
@@ -53,12 +53,12 @@ from darkmatter.state import (
     save_state,
     check_message_replay,
 )
-from darkmatter.wallet.gas import (
-    gas_signal_from_dict,
-    log_gas_event,
+from darkmatter.wallet.antimatter import (
+    antimatter_signal_from_dict,
+    log_antimatter_event,
     adjust_trust,
-    run_match_game,
-    initiate_gas_from_payment,
+    run_antimatter_match,
+    initiate_antimatter_from_payment,
 )
 from darkmatter.wallet.solana import (
     send_solana_sol,
@@ -419,7 +419,7 @@ def build_connection_from_accepted(result_data: dict) -> Connection:
     )
 
 
-def process_gas_match(data: dict) -> tuple[dict, int]:
+def process_antimatter_match(data: dict) -> tuple[dict, int]:
     """Stateless match game endpoint. Returns (response_dict, status_code)."""
     n = data.get("n")
     if not isinstance(n, int) or n < 1:
@@ -428,43 +428,43 @@ def process_gas_match(data: dict) -> tuple[dict, int]:
     return {"pick": pick}, 200
 
 
-async def process_gas_signal(state: AgentState, data: dict) -> tuple[dict, int]:
-    """Process a forwarded gas signal and start the match game. Returns (response_dict, status_code)."""
+async def process_antimatter_signal(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process a forwarded antimatter signal and start the match game. Returns (response_dict, status_code)."""
     try:
-        gas = gas_signal_from_dict(data)
+        sig = antimatter_signal_from_dict(data)
     except (KeyError, TypeError) as e:
-        return {"error": f"Invalid gas signal: {e}"}, 400
+        return {"error": f"Invalid antimatter signal: {e}"}, 400
 
-    if gas.hops >= gas.max_hops:
+    if sig.hops >= sig.max_hops:
         return {"error": "Signal expired (max hops)"}, 400
 
-    if gas.created_at:
+    if sig.created_at:
         try:
-            created = datetime.fromisoformat(gas.created_at)
+            created = datetime.fromisoformat(sig.created_at)
             age = (datetime.now(timezone.utc) - created).total_seconds()
-            if age > GAS_MAX_AGE_S:
+            if age > ANTIMATTER_MAX_AGE_S:
                 return {"error": "Signal expired (age)"}, 400
         except (ValueError, TypeError):
             pass
 
-    if state.agent_id in gas.path:
+    if state.agent_id in sig.path:
         return {"error": "Loop detected"}, 400
 
-    log_gas_event(state, {
+    log_antimatter_event(state, {
         "type": "gas_signal_received",
-        "signal_id": gas.signal_id,
-        "hops": gas.hops,
-        "from": gas.path[-1] if gas.path else gas.sender_agent_id,
+        "signal_id": sig.signal_id,
+        "hops": sig.hops,
+        "from": sig.path[-1] if sig.path else sig.sender_agent_id,
     })
 
     # Start match game as background task
-    asyncio.create_task(run_match_game(state, gas, is_originator=False))
+    asyncio.create_task(run_antimatter_match(state, sig, is_originator=False))
 
     return {"accepted": True}, 200
 
 
-async def process_gas_result(state: AgentState, data: dict) -> tuple[dict, int]:
-    """Process a gas resolution callback. B sends gas to destination. Returns (response_dict, status_code)."""
+async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process an antimatter resolution callback. B sends fee to destination. Returns (response_dict, status_code)."""
     signal_id = data.get("signal_id", "")
     dest_wallet = data.get("destination_wallet", "")
     resolved_by = data.get("resolved_by", "")
@@ -474,16 +474,16 @@ async def process_gas_result(state: AgentState, data: dict) -> tuple[dict, int]:
         return {"error": "Missing signal_id"}, 400
 
     original_entry = None
-    for entry in state.gas_log:
-        if entry.get("signal_id") == signal_id and entry.get("type") == "gas_initiated":
+    for entry in state.antimatter_log:
+        if entry.get("signal_id") == signal_id and entry.get("type") == "antimatter_initiated":
             original_entry = entry
             break
 
     if not original_entry:
         return {"error": "Unknown signal_id"}, 404
 
-    for entry in state.gas_log:
-        if entry.get("signal_id") == signal_id and entry.get("type") in ("gas_sent", "gas_kept"):
+    for entry in state.antimatter_log:
+        if entry.get("signal_id") == signal_id and entry.get("type") in ("antimatter_sent", "antimatter_kept"):
             return {"status": "already_resolved"}, 200
 
     amount = original_entry.get("amount", 0)
@@ -502,8 +502,8 @@ async def process_gas_result(state: AgentState, data: dict) -> tuple[dict, int]:
                     token, amount, token_decimals
                 )
 
-            log_gas_event(state, {
-                "type": "gas_sent",
+            log_antimatter_event(state, {
+                "type": "antimatter_sent",
                 "signal_id": signal_id,
                 "resolution": resolution,
                 "destination": dest_wallet,
@@ -518,8 +518,8 @@ async def process_gas_result(state: AgentState, data: dict) -> tuple[dict, int]:
                 adjust_trust(state, resolved_by, 0.01)
 
         except Exception as e:
-            log_gas_event(state, {
-                "type": "gas_send_failed",
+            log_antimatter_event(state, {
+                "type": "antimatter_send_failed",
                 "signal_id": signal_id,
                 "error": str(e),
             })
@@ -534,8 +534,8 @@ async def process_gas_result(state: AgentState, data: dict) -> tuple[dict, int]:
                         state.private_key_hex, state.wallets, sa_wallet,
                         token, amount, token_decimals
                     )
-                log_gas_event(state, {
-                    "type": "gas_sent",
+                log_antimatter_event(state, {
+                    "type": "antimatter_sent",
                     "signal_id": signal_id,
                     "resolution": "timeout",
                     "destination": sa_wallet,
@@ -544,8 +544,8 @@ async def process_gas_result(state: AgentState, data: dict) -> tuple[dict, int]:
             except Exception:
                 pass
     else:
-        log_gas_event(state, {
-            "type": "gas_kept",
+        log_antimatter_event(state, {
+            "type": "antimatter_kept",
             "signal_id": signal_id,
             "reason": "no_destination",
             "amount": amount,
@@ -672,13 +672,13 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         except Exception:
             pass  # Best-effort notification
 
-    # Gas economy: if this is a payment notification with gas_eligible flag, initiate match game
+    # AntiMatter economy: if this is a payment notification with antimatter_eligible flag, initiate match game
     msg_meta = msg.metadata or {}
     if (msg_meta.get("type") == "solana_payment"
-            and msg_meta.get("gas_eligible")
+            and msg_meta.get("antimatter_eligible")
             and msg_meta.get("amount")
             and msg_meta.get("tx_signature")):
-        asyncio.create_task(initiate_gas_from_payment(
+        asyncio.create_task(initiate_antimatter_from_payment(
             state, msg,
             get_public_url_fn=lambda port: get_public_url(port, state),
             save_state_fn=save_state,
@@ -1099,22 +1099,22 @@ async def handle_peer_lookup(request: Request) -> JSONResponse:
 
 
 # =============================================================================
-# Gas Economy HTTP Endpoints
+# AntiMatter HTTP Endpoints
 # =============================================================================
 
 
-async def handle_gas_match(request: Request) -> JSONResponse:
+async def handle_antimatter_match(request: Request) -> JSONResponse:
     """Stateless match game endpoint. Peer picks a random number and returns it."""
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    result, status = process_gas_match(data)
+    result, status = process_antimatter_match(data)
     return JSONResponse(result, status_code=status)
 
 
-async def handle_gas_signal(request: Request) -> JSONResponse:
-    """Receive a forwarded gas signal and run the match game."""
+async def handle_antimatter_signal(request: Request) -> JSONResponse:
+    """Receive a forwarded antimatter signal and run the match game."""
     state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1122,12 +1122,12 @@ async def handle_gas_signal(request: Request) -> JSONResponse:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    result, status = await process_gas_signal(state, data)
+    result, status = await process_antimatter_signal(state, data)
     return JSONResponse(result, status_code=status)
 
 
-async def handle_gas_result(request: Request) -> JSONResponse:
-    """B receives this when a downstream node resolves the gas signal."""
+async def handle_antimatter_result(request: Request) -> JSONResponse:
+    """B receives this when a downstream node resolves the antimatter signal."""
     state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1135,7 +1135,7 @@ async def handle_gas_result(request: Request) -> JSONResponse:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    result, status = await process_gas_result(state, data)
+    result, status = await process_antimatter_result(state, data)
     return JSONResponse(result, status_code=status)
 
 

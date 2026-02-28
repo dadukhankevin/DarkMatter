@@ -1,5 +1,5 @@
 """
-Gas economy — match game, elder selection, gas signals, timeout watchdog.
+AntiMatter economy — match game, elder selection, antimatter signals, timeout watchdog.
 
 Depends on: config, models, wallet/solana (at runtime)
 Uses callbacks for network operations to avoid circular imports.
@@ -16,16 +16,16 @@ from typing import Optional
 import httpx
 
 from darkmatter.config import (
-    GAS_RATE,
-    GAS_MAX_HOPS,
-    GAS_MAX_AGE_S,
-    GAS_LOG_MAX,
+    ANTIMATTER_RATE,
+    ANTIMATTER_MAX_HOPS,
+    ANTIMATTER_MAX_AGE_S,
+    ANTIMATTER_LOG_MAX,
     SUPERAGENT_DEFAULT_URL,
 )
 from darkmatter.models import (
     AgentState,
     Connection,
-    GasSignal,
+    AntiMatterSignal,
     Impression,
     QueuedMessage,
 )
@@ -40,27 +40,27 @@ _SUPERAGENT_CACHE_TTL = 300.0
 # Serialization
 # =============================================================================
 
-def gas_signal_to_dict(gas: GasSignal) -> dict:
-    """Serialize a GasSignal for network transmission."""
+def antimatter_signal_to_dict(sig: AntiMatterSignal) -> dict:
+    """Serialize a AntiMatterSignal for network transmission."""
     return {
-        "signal_id": gas.signal_id,
-        "original_tx": gas.original_tx,
-        "sender_agent_id": gas.sender_agent_id,
-        "amount": gas.amount,
-        "token": gas.token,
-        "token_decimals": gas.token_decimals,
-        "sender_superagent_wallet": gas.sender_superagent_wallet,
-        "callback_url": gas.callback_url,
-        "hops": gas.hops,
-        "max_hops": gas.max_hops,
-        "created_at": gas.created_at,
-        "path": gas.path,
+        "signal_id": sig.signal_id,
+        "original_tx": sig.original_tx,
+        "sender_agent_id": sig.sender_agent_id,
+        "amount": sig.amount,
+        "token": sig.token,
+        "token_decimals": sig.token_decimals,
+        "sender_superagent_wallet": sig.sender_superagent_wallet,
+        "callback_url": sig.callback_url,
+        "hops": sig.hops,
+        "max_hops": sig.max_hops,
+        "created_at": sig.created_at,
+        "path": sig.path,
     }
 
 
-def gas_signal_from_dict(d: dict) -> GasSignal:
-    """Deserialize a GasSignal from network payload."""
-    return GasSignal(
+def antimatter_signal_from_dict(d: dict) -> AntiMatterSignal:
+    """Deserialize a AntiMatterSignal from network payload."""
+    return AntiMatterSignal(
         signal_id=d["signal_id"],
         original_tx=d["original_tx"],
         sender_agent_id=d["sender_agent_id"],
@@ -70,7 +70,7 @@ def gas_signal_from_dict(d: dict) -> GasSignal:
         sender_superagent_wallet=d.get("sender_superagent_wallet", ""),
         callback_url=d["callback_url"],
         hops=d.get("hops", 0),
-        max_hops=d.get("max_hops", GAS_MAX_HOPS),
+        max_hops=d.get("max_hops", ANTIMATTER_MAX_HOPS),
         created_at=d.get("created_at", ""),
         path=d.get("path", []),
     )
@@ -80,12 +80,12 @@ def gas_signal_from_dict(d: dict) -> GasSignal:
 # Helpers
 # =============================================================================
 
-def log_gas_event(state: AgentState, event: dict) -> None:
-    """Append a gas event to state.gas_log, capping at GAS_LOG_MAX."""
+def log_antimatter_event(state: AgentState, event: dict) -> None:
+    """Append a antimatter event to state.antimatter_log, capping at ANTIMATTER_LOG_MAX."""
     event["timestamp"] = datetime.now(timezone.utc).isoformat()
-    state.gas_log.append(event)
-    if len(state.gas_log) > GAS_LOG_MAX:
-        state.gas_log = state.gas_log[-GAS_LOG_MAX:]
+    state.antimatter_log.append(event)
+    if len(state.antimatter_log) > ANTIMATTER_LOG_MAX:
+        state.antimatter_log = state.antimatter_log[-ANTIMATTER_LOG_MAX:]
 
 
 def adjust_trust(state: AgentState, agent_id: str, delta: float) -> None:
@@ -125,11 +125,11 @@ async def get_superagent_wallet(state: AgentState) -> Optional[str]:
 # Elder Selection
 # =============================================================================
 
-def select_elder(state: AgentState, gas: GasSignal) -> Optional[Connection]:
-    """Select an elder (older peer with positive trust) for gas routing.
+def select_elder(state: AgentState, sig: AntiMatterSignal) -> Optional[Connection]:
+    """Select an elder (older peer with positive trust) for antimatter routing.
 
     Weighted random selection by age_seconds * trust_score.
-    Excludes agents already in gas.path (loop prevention).
+    Excludes agents already in sig.path (loop prevention).
     """
     now = datetime.now(timezone.utc)
     candidates = []
@@ -142,7 +142,7 @@ def select_elder(state: AgentState, gas: GasSignal) -> Optional[Connection]:
         imp = state.impressions.get(aid, Impression(score=0.0))
         if imp.score <= 0:
             continue
-        if aid in gas.path:
+        if aid in sig.path:
             continue
         if not conn.wallets.get("solana"):
             continue
@@ -173,35 +173,35 @@ def select_elder(state: AgentState, gas: GasSignal) -> Optional[Connection]:
 # Match Game
 # =============================================================================
 
-async def run_match_game(state: AgentState, gas: GasSignal,
+async def run_antimatter_match(state: AgentState, sig: AntiMatterSignal,
                          is_originator: bool = True,
                          save_state_fn=None) -> None:
-    """Run the match game for gas routing.
+    """Run the match game for antimatter routing.
 
     save_state_fn is injected to avoid circular import with state module.
     """
-    if gas.hops >= gas.max_hops:
-        await resolve_gas(state, gas, "timeout", None, is_originator, save_state_fn=save_state_fn)
+    if sig.hops >= sig.max_hops:
+        await resolve_antimatter(state, sig, "timeout", None, is_originator, save_state_fn=save_state_fn)
         return
 
-    if gas.created_at:
+    if sig.created_at:
         try:
-            created = datetime.fromisoformat(gas.created_at)
+            created = datetime.fromisoformat(sig.created_at)
             age = (datetime.now(timezone.utc) - created).total_seconds()
-            if age > GAS_MAX_AGE_S:
-                await resolve_gas(state, gas, "timeout", None, is_originator, save_state_fn=save_state_fn)
+            if age > ANTIMATTER_MAX_AGE_S:
+                await resolve_antimatter(state, sig, "timeout", None, is_originator, save_state_fn=save_state_fn)
                 return
         except (ValueError, TypeError):
             pass
 
     peers = [
         conn for aid, conn in state.connections.items()
-        if aid not in gas.path and conn.wallets.get("solana")
+        if aid not in sig.path and conn.wallets.get("solana")
     ]
 
     n = len(peers)
     if n == 0:
-        await resolve_gas(state, gas, "terminal", None, is_originator, save_state_fn=save_state_fn)
+        await resolve_antimatter(state, sig, "terminal", None, is_originator, save_state_fn=save_state_fn)
         return
 
     my_number = random.randint(0, n)
@@ -211,8 +211,8 @@ async def run_match_game(state: AgentState, gas: GasSignal,
             base = conn.agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
             async with httpx.AsyncClient(timeout=3.0) as client:
                 resp = await client.post(
-                    base + "/__darkmatter__/gas_match",
-                    json={"signal_id": gas.signal_id, "n": n_val},
+                    base + "/__darkmatter__/antimatter_match",
+                    json={"signal_id": sig.signal_id, "n": n_val},
                 )
                 if resp.status_code == 200:
                     return resp.json().get("pick")
@@ -226,97 +226,97 @@ async def run_match_game(state: AgentState, gas: GasSignal,
     matched = any(pick == my_number for pick in results if pick is not None)
 
     if matched:
-        elder = select_elder(state, gas)
+        elder = select_elder(state, sig)
         if elder:
             dest_wallet = elder.wallets.get("solana", "")
-            await resolve_gas(state, gas, "match", dest_wallet, is_originator,
+            await resolve_antimatter(state, sig, "match", dest_wallet, is_originator,
                               resolved_by=elder.agent_id, save_state_fn=save_state_fn)
         else:
-            await resolve_gas(state, gas, "terminal", None, is_originator, save_state_fn=save_state_fn)
+            await resolve_antimatter(state, sig, "terminal", None, is_originator, save_state_fn=save_state_fn)
     else:
-        elder = select_elder(state, gas)
+        elder = select_elder(state, sig)
         if elder:
-            gas.hops += 1
-            gas.path.append(state.agent_id)
-            forwarded_gas = gas_signal_to_dict(gas)
+            sig.hops += 1
+            sig.path.append(state.agent_id)
+            forwarded_sig = antimatter_signal_to_dict(sig)
 
             try:
                 base = elder.agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     resp = await client.post(
-                        base + "/__darkmatter__/gas_signal",
-                        json=forwarded_gas,
+                        base + "/__darkmatter__/antimatter_signal",
+                        json=forwarded_sig,
                     )
                     if resp.status_code == 200:
-                        log_gas_event(state, {
+                        log_antimatter_event(state, {
                             "type": "forwarded",
-                            "signal_id": gas.signal_id,
+                            "signal_id": sig.signal_id,
                             "forwarded_to": elder.agent_id,
-                            "hops": gas.hops,
+                            "hops": sig.hops,
                         })
                         return
             except Exception:
                 pass
 
-            await resolve_gas(state, gas, "terminal", None, is_originator, save_state_fn=save_state_fn)
+            await resolve_antimatter(state, sig, "terminal", None, is_originator, save_state_fn=save_state_fn)
         else:
-            await resolve_gas(state, gas, "terminal", None, is_originator, save_state_fn=save_state_fn)
+            await resolve_antimatter(state, sig, "terminal", None, is_originator, save_state_fn=save_state_fn)
 
 
 # =============================================================================
-# Gas Resolution
+# AntiMatter Resolution
 # =============================================================================
 
-async def resolve_gas(state: AgentState, gas: GasSignal, resolution: str,
+async def resolve_antimatter(state: AgentState, sig: AntiMatterSignal, resolution: str,
                       dest_wallet: Optional[str], is_originator: bool,
                       resolved_by: str = "", save_state_fn=None) -> None:
-    """Resolve a gas signal — either send gas (if originator) or notify B's callback."""
+    """Resolve a antimatter signal — either send fee (if originator) or notify B's callback."""
     from darkmatter.wallet.solana import send_solana_sol, send_solana_token
 
     if resolution == "timeout":
-        dest_wallet = gas.sender_superagent_wallet or None
+        dest_wallet = sig.sender_superagent_wallet or None
 
     if is_originator:
         if dest_wallet and state.private_key_hex:
             try:
-                if gas.token == "SOL":
+                if sig.token == "SOL":
                     result = await send_solana_sol(
-                        state.private_key_hex, state.wallets, dest_wallet, gas.amount
+                        state.private_key_hex, state.wallets, dest_wallet, sig.amount
                     )
                 else:
                     result = await send_solana_token(
                         state.private_key_hex, state.wallets, dest_wallet,
-                        gas.token, gas.amount, gas.token_decimals
+                        sig.token, sig.amount, sig.token_decimals
                     )
 
-                log_gas_event(state, {
-                    "type": "gas_sent",
-                    "signal_id": gas.signal_id,
+                log_antimatter_event(state, {
+                    "type": "antimatter_sent",
+                    "signal_id": sig.signal_id,
                     "resolution": resolution,
                     "destination": dest_wallet,
-                    "amount": gas.amount,
-                    "token": gas.token,
+                    "amount": sig.amount,
+                    "token": sig.token,
                     "tx_success": result.get("success", False),
                     "tx_signature": result.get("tx_signature"),
                     "resolved_by": resolved_by,
                 })
 
                 if result.get("success"):
-                    adjust_trust(state, gas.sender_agent_id, 0.01)
+                    adjust_trust(state, sig.sender_agent_id, 0.01)
                     if resolved_by:
                         adjust_trust(state, resolved_by, 0.01)
             except Exception as e:
-                log_gas_event(state, {
-                    "type": "gas_send_failed",
-                    "signal_id": gas.signal_id,
+                log_antimatter_event(state, {
+                    "type": "antimatter_send_failed",
+                    "signal_id": sig.signal_id,
                     "error": str(e),
                 })
         elif resolution == "terminal":
-            log_gas_event(state, {
-                "type": "gas_kept",
-                "signal_id": gas.signal_id,
+            log_antimatter_event(state, {
+                "type": "antimatter_kept",
+                "signal_id": sig.signal_id,
                 "reason": "terminal_node",
-                "amount": gas.amount,
+                "amount": sig.amount,
             })
 
         if save_state_fn:
@@ -324,24 +324,24 @@ async def resolve_gas(state: AgentState, gas: GasSignal, resolution: str,
     else:
         try:
             payload = {
-                "signal_id": gas.signal_id,
+                "signal_id": sig.signal_id,
                 "destination_wallet": dest_wallet or "",
                 "resolved_by": resolved_by or state.agent_id,
                 "resolution": resolution,
             }
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(gas.callback_url, json=payload)
+                await client.post(sig.callback_url, json=payload)
 
-            log_gas_event(state, {
-                "type": "gas_resolved_callback",
-                "signal_id": gas.signal_id,
+            log_antimatter_event(state, {
+                "type": "antimatter_resolved_callback",
+                "signal_id": sig.signal_id,
                 "resolution": resolution,
                 "destination": dest_wallet,
             })
         except Exception as e:
-            log_gas_event(state, {
-                "type": "gas_callback_failed",
-                "signal_id": gas.signal_id,
+            log_antimatter_event(state, {
+                "type": "antimatter_callback_failed",
+                "signal_id": sig.signal_id,
                 "error": str(e),
             })
         if save_state_fn:
@@ -349,19 +349,19 @@ async def resolve_gas(state: AgentState, gas: GasSignal, resolution: str,
 
 
 # =============================================================================
-# Gas Initiation & Timeout
+# AntiMatter Initiation & Timeout
 # =============================================================================
 
-async def initiate_gas_from_payment(state: AgentState, msg: QueuedMessage,
+async def initiate_antimatter_from_payment(state: AgentState, msg: QueuedMessage,
                                      get_public_url_fn=None,
                                      save_state_fn=None) -> None:
-    """B receives a payment from A with gas_eligible flag. Calculate gas and start match game."""
+    """B receives a payment from A with antimatter_eligible flag. Calculate fee and start match game."""
     meta = msg.metadata or {}
     amount = meta.get("amount", 0)
-    gas_rate = meta.get("gas_rate", GAS_RATE)
-    gas_amount = amount * gas_rate
+    antimatter_rate = meta.get("antimatter_rate", ANTIMATTER_RATE)
+    antimatter_amount = amount * antimatter_rate
 
-    if gas_amount <= 0:
+    if antimatter_amount <= 0:
         return
 
     token = meta.get("token", "SOL")
@@ -369,18 +369,18 @@ async def initiate_gas_from_payment(state: AgentState, msg: QueuedMessage,
     tx_signature = meta.get("tx_signature", "")
     sender_superagent_wallet = meta.get("sender_superagent_wallet", "")
 
-    signal_id = f"gas-{uuid.uuid4().hex[:12]}"
+    signal_id = f"am-{uuid.uuid4().hex[:12]}"
 
     if get_public_url_fn:
-        callback_url = f"{get_public_url_fn(state.port)}/__darkmatter__/gas_result"
+        callback_url = f"{get_public_url_fn(state.port)}/__darkmatter__/antimatter_result"
     else:
-        callback_url = f"http://localhost:{state.port}/__darkmatter__/gas_result"
+        callback_url = f"http://localhost:{state.port}/__darkmatter__/antimatter_result"
 
-    gas = GasSignal(
+    sig = AntiMatterSignal(
         signal_id=signal_id,
         original_tx=tx_signature,
         sender_agent_id=msg.from_agent_id or "",
-        amount=gas_amount,
+        amount=antimatter_amount,
         token=token,
         token_decimals=token_decimals,
         sender_superagent_wallet=sender_superagent_wallet,
@@ -389,11 +389,11 @@ async def initiate_gas_from_payment(state: AgentState, msg: QueuedMessage,
         path=[],
     )
 
-    log_gas_event(state, {
-        "type": "gas_initiated",
+    log_antimatter_event(state, {
+        "type": "antimatter_initiated",
         "signal_id": signal_id,
         "original_tx": tx_signature,
-        "amount": gas_amount,
+        "amount": antimatter_amount,
         "token": token,
         "token_decimals": token_decimals,
         "sender_agent_id": msg.from_agent_id,
@@ -402,38 +402,38 @@ async def initiate_gas_from_payment(state: AgentState, msg: QueuedMessage,
     if save_state_fn:
         save_state_fn()
 
-    asyncio.create_task(run_match_game(state, gas, is_originator=True, save_state_fn=save_state_fn))
-    asyncio.create_task(gas_timeout_watchdog(state, gas, save_state_fn=save_state_fn))
+    asyncio.create_task(run_antimatter_match(state, sig, is_originator=True, save_state_fn=save_state_fn))
+    asyncio.create_task(antimatter_timeout_watchdog(state, sig, save_state_fn=save_state_fn))
 
 
-async def gas_timeout_watchdog(state: AgentState, gas: GasSignal,
+async def antimatter_timeout_watchdog(state: AgentState, sig: AntiMatterSignal,
                                 save_state_fn=None) -> None:
-    """Watchdog: if B doesn't receive a gas_result within GAS_MAX_AGE_S, penalize."""
+    """Watchdog: if B doesn't receive a antimatter_result within ANTIMATTER_MAX_AGE_S, penalize."""
     from darkmatter.wallet.solana import send_solana_sol, send_solana_token
 
-    await asyncio.sleep(GAS_MAX_AGE_S + 5)
+    await asyncio.sleep(ANTIMATTER_MAX_AGE_S + 5)
 
-    for entry in state.gas_log:
-        if entry.get("signal_id") == gas.signal_id and entry.get("type") in ("gas_sent", "gas_kept"):
+    for entry in state.antimatter_log:
+        if entry.get("signal_id") == sig.signal_id and entry.get("type") in ("antimatter_sent", "antimatter_kept"):
             return
 
-    log_gas_event(state, {
-        "type": "gas_timeout",
-        "signal_id": gas.signal_id,
+    log_antimatter_event(state, {
+        "type": "antimatter_timeout",
+        "signal_id": sig.signal_id,
     })
 
-    if gas.sender_superagent_wallet and state.private_key_hex:
+    if sig.sender_superagent_wallet and state.private_key_hex:
         try:
-            if gas.token == "SOL":
+            if sig.token == "SOL":
                 await send_solana_sol(
                     state.private_key_hex, state.wallets,
-                    gas.sender_superagent_wallet, gas.amount
+                    sig.sender_superagent_wallet, sig.amount
                 )
             else:
                 await send_solana_token(
                     state.private_key_hex, state.wallets,
-                    gas.sender_superagent_wallet, gas.token,
-                    gas.amount, gas.token_decimals
+                    sig.sender_superagent_wallet, sig.token,
+                    sig.amount, sig.token_decimals
                 )
         except Exception:
             pass

@@ -107,13 +107,13 @@ SPL_TOKENS = {
 }
 
 # =============================================================================
-# Gas Economy
+# AntiMatter Economy
 # =============================================================================
 
-GAS_RATE = 0.01          # 1% default gas fee
-GAS_MAX_HOPS = 10        # TTL for gas signal
-GAS_MAX_AGE_S = 300.0    # 5 minute timeout
-GAS_LOG_MAX = 100        # cap gas_log entries
+ANTIMATTER_RATE = 0.01          # 1% default antimatter fee
+ANTIMATTER_MAX_HOPS = 10        # TTL for antimatter signal
+ANTIMATTER_MAX_AGE_S = 300.0    # 5 minute timeout
+ANTIMATTER_LOG_MAX = 100        # cap antimatter_log entries
 SUPERAGENT_DEFAULT_URL = os.environ.get(
     "DARKMATTER_SUPERAGENT",
     ANCHOR_NODES[0] if ANCHOR_NODES else "",

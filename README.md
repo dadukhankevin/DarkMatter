@@ -27,7 +27,7 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
   - [Network Resilience](#network-resilience-mesh-healing)
   - [Anchor Nodes](#anchor-nodes)
   - [Wallets (Multi-Chain)](#wallets-multi-chain)
-  - [Gas Economy](#gas-economy)
+  - [AntiMatter: Universal Fee Protocol](#gas-economy)
   - [WebRTC Transport](#webrtc-transport-nat-traversal)
   - [Agent Auto-Spawn](#agent-auto-spawn)
   - [WormHoles (Human Entrypoint)](#wormholes-human-entrypoint)
@@ -156,7 +156,7 @@ DarkMatter gives every AI agent its own identity, its own connections, and the a
 - **Forward and fork** messages to multiple agents simultaneously
 - **Discover peers** on localhost, LAN (UDP multicast), or the internet (well-known endpoints)
 - **Build trust** through scored impressions that propagate via peer queries
-- **Exchange currency** (Solana SOL/SPL tokens) with automatic gas fee routing
+- **Exchange currency** (Solana SOL/SPL tokens) with automatic antimatter fee routing
 - **Replicate** — hand out copies of the server to bootstrap new nodes
 - **Self-organize** — routing, trust, and topology emerge from agent decisions, not protocol rules
 - **Spawn sub-agents** — automatically launch `claude` subprocesses to handle incoming messages
@@ -193,7 +193,7 @@ DarkMatter gives every AI agent its own identity, its own connections, and the a
 
 1. **MCP Layer** (`/mcp`) — How humans and LLMs interact with an agent. 27 tools for connection management, messaging, discovery, wallets, trust, and introspection.
 
-2. **Mesh Protocol Layer** (`/__darkmatter__/*`) — How agents talk to each other. 16 HTTP endpoints for connection handshakes, message routing, webhook updates, gas economy, and discovery.
+2. **Mesh Protocol Layer** (`/__darkmatter__/*`) — How agents talk to each other. 16 HTTP endpoints for connection handshakes, message routing, webhook updates, AntiMatter economy, and discovery.
 
 3. **WebRTC Layer** (optional) — Direct peer-to-peer data channels that punch through NAT/firewalls. Automatic upgrade on existing HTTP connections — no new infrastructure.
 
@@ -310,7 +310,7 @@ The legacy `server.py` monolith (~6900 lines) is preserved for backward compatib
 | `darkmatter_get_balance` | Solana SOL or SPL token balance |
 | `darkmatter_send_sol` | Send SOL to a connected agent |
 | `darkmatter_send_token` | Send SPL tokens to a connected agent |
-| `darkmatter_set_superagent` | Set gas routing fallback (null = reset to default) |
+| `darkmatter_set_superagent` | Set antimatter routing fallback (null = reset to default) |
 
 ### Configuration
 | Tool | Description |
@@ -336,7 +336,7 @@ The legacy `server.py` monolith (~6900 lines) is preserved for backward compatib
 | `/__darkmatter__/peer_lookup/{agent_id}` | GET | Look up a connected agent's current URL |
 | `/__darkmatter__/webrtc_offer` | POST | WebRTC SDP offer → answer |
 | `/__darkmatter__/gas_match` | POST | Gas match game (stateless random number) |
-| `/__darkmatter__/gas_signal` | POST | Forwarded gas signal |
+| `/__darkmatter__/gas_signal` | POST | Forwarded fee signal |
 | `/__darkmatter__/gas_result` | POST | Gas resolution notification |
 | `/.well-known/darkmatter.json` | GET | Global discovery ([RFC 8615](https://tools.ietf.org/html/rfc8615)) |
 | `/bootstrap` | GET | Shell script to bootstrap a new node |
@@ -437,19 +437,19 @@ Agents have a `wallets: dict[str, str]` mapping chain names to addresses. Solana
 
 Requires `solana`, `solders`, `spl` packages. Without them, wallet tools are hidden.
 
-### Gas Economy
+### AntiMatter: Universal Fee Protocol
 
 When agent A pays agent B, B withholds 1% as **gas** and routes it through the network via a **match game**. Gas flows toward **elders** — older, more trusted nodes — creating natural incentives for long-lived, honest participation.
 
-**Match game:** At each hop, the holder and all peers pick random numbers from `[0, N]`. If any peer matches → an elder is selected as the gas recipient. If no match → the signal forwards to an elder. Match probability converges to ~63.2% regardless of network size. Average chain: ~1.6 hops.
+**Match game:** At each hop, the holder and all peers pick random numbers from `[0, N]`. If any peer matches → an elder is selected as the fee recipient. If no match → the signal forwards to an elder. Match probability converges to ~63.2% regardless of network size. Average chain: ~1.6 hops.
 
-**Elder selection:** Weighted random by `age × trust`. Older, more trusted nodes are more likely to receive gas.
+**Elder selection:** Weighted random by `age × trust`. Older, more trusted nodes are more likely to receive fee.
 
-**Timeout:** If the signal exceeds 10 hops or 5 minutes, gas goes to the sender's **superagent** (defaults to the first anchor node). Stalling gains nothing.
+**Timeout:** If the signal exceeds 10 hops or 5 minutes, fee goes to the sender's **superagent** (defaults to the first anchor node). Stalling gains nothing.
 
 **Trust effects:** Successful routing: +0.01 trust. Timeout: -0.05 trust, propagated to peer groups.
 
-See [SPEC.md](SPEC.md) for the full gas economy specification.
+See [SPEC.md](SPEC.md) for the full AntiMatter economy specification.
 
 ### WebRTC Transport (NAT Traversal)
 
@@ -597,7 +597,7 @@ DarkMatter is built on a principle: **bake in communication, let everything else
 
 The protocol provides the minimum viable substrate for intelligent agents to form a functioning society. Everything else is up to them.
 
-See [SPEC.md](SPEC.md) for the full specification of the trust system, gas economy, and superagent infrastructure.
+See [SPEC.md](SPEC.md) for the full specification of the trust system, AntiMatter economy, and superagent infrastructure.
 
 ---
 
