@@ -1727,6 +1727,8 @@ class PendingConnectionRequest:
     from_agent_created_at: Optional[str] = None
     # Auto-aggregated peer trust (populated at request time)
     peer_trust: Optional[dict] = None
+    # Bidirectional connection request (requester wants mutual connection)
+    mutual: bool = False
 
 
 @dataclass
@@ -3157,16 +3159,7 @@ async def _connection_request(state, target_url: str) -> str:
             break
 
     try:
-        payload = {
-            "from_agent_id": state.agent_id,
-            "from_agent_url": _get_public_url(state.port),
-            "from_agent_bio": state.bio,
-            "from_agent_public_key_hex": state.public_key_hex,
-            "from_agent_display_name": state.display_name,
-            "wallets": state.wallets,
-            "from_agent_wallet_address": state.wallets.get("solana"),
-            "created_at": state.created_at,
-        }
+        payload = build_outbound_request_payload(state, _get_public_url(state.port))
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -3176,16 +3169,7 @@ async def _connection_request(state, target_url: str) -> str:
             result = response.json()
 
             if result.get("auto_accepted"):
-                _peer_wallets = result.get("wallets") or ({"solana": result["wallet_address"]} if result.get("wallet_address") else {})
-                conn = Connection(
-                    agent_id=result["agent_id"],
-                    agent_url=result["agent_url"],
-                    agent_bio=result.get("agent_bio", ""),
-                    agent_public_key_hex=result.get("agent_public_key_hex"),
-                    agent_display_name=result.get("agent_display_name"),
-                    wallets=_peer_wallets,
-                    peer_created_at=result.get("created_at"),
-                )
+                conn = build_connection_from_accepted(result)
                 state.connections[result["agent_id"]] = conn
                 save_state()
                 return json.dumps({
@@ -3223,62 +3207,51 @@ async def _connection_request(state, target_url: str) -> str:
 
 async def _connection_respond(state, request_id: str, accept: bool) -> str:
     """Accept or reject a pending connection request."""
-    request = state.pending_requests.get(request_id)
-    if not request:
-        return json.dumps({
-            "success": False,
-            "error": f"No pending request with ID '{request_id}'."
-        })
-
-    if accept:
-        if len(state.connections) >= MAX_CONNECTIONS:
+    if not accept:
+        request = state.pending_requests.get(request_id)
+        if not request:
             return json.dumps({
                 "success": False,
-                "error": f"Cannot accept — connection limit reached ({MAX_CONNECTIONS})."
+                "error": f"No pending request with ID '{request_id}'."
             })
+        del state.pending_requests[request_id]
+        save_state()
+        return json.dumps({
+            "success": True,
+            "accepted": False,
+            "agent_id": request.from_agent_id,
+        })
 
-        conn = Connection(
-            agent_id=request.from_agent_id,
-            agent_url=request.from_agent_url,
-            agent_bio=request.from_agent_bio,
-            agent_public_key_hex=request.from_agent_public_key_hex,
-            agent_display_name=request.from_agent_display_name,
-            wallets=request.from_agent_wallets,
-            peer_created_at=request.from_agent_created_at,
-        )
-        state.connections[request.from_agent_id] = conn
+    public_url = f"{_get_public_url(state.port)}/mcp"
+    result, status, notify_payload = process_accept_pending(state, request_id, public_url)
 
-        # Notify the requesting agent that we accepted
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                await client.post(
-                    request.from_agent_url.rstrip("/") + "/__darkmatter__/connection_accepted",
-                    json={
-                        "agent_id": state.agent_id,
-                        "agent_url": f"{_get_public_url(state.port)}/mcp",
-                        "agent_bio": state.bio,
-                        "agent_public_key_hex": state.public_key_hex,
-                        "agent_display_name": state.display_name,
-                        "wallets": state.wallets,
-                        "wallet_address": state.wallets.get("solana"),
-                        "created_at": state.created_at,
-                    }
-                )
-        except Exception:
-            pass
+    if status != 200:
+        return json.dumps({"success": False, "error": result.get("error", "Unknown error")})
 
-        # Auto WebRTC upgrade
-        if WEBRTC_AVAILABLE:
-            asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
+    # Notify the requesting agent
+    if notify_payload:
+        agent_id = result.get("agent_id", "")
+        conn = state.connections.get(agent_id)
+        if conn:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    base = conn.agent_url.rstrip("/")
+                    for suffix in ("/mcp", "/__darkmatter__"):
+                        if base.endswith(suffix):
+                            base = base[:-len(suffix)]
+                            break
+                    await client.post(
+                        base + "/__darkmatter__/connection_accepted",
+                        json=notify_payload,
+                    )
+            except Exception:
+                pass
 
-    del state.pending_requests[request_id]
-    save_state()
+            # Auto WebRTC upgrade
+            if WEBRTC_AVAILABLE:
+                asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
 
-    return json.dumps({
-        "success": True,
-        "accepted": accept,
-        "agent_id": request.from_agent_id,
-    })
+    return json.dumps(result)
 
 
 async def _connection_disconnect(state, agent_id: str) -> str:
@@ -5087,6 +5060,371 @@ async def live_status(ctx: Context) -> str:
 
 
 # =============================================================================
+# Shared Pure Logic — Framework-agnostic functions used by both Starlette
+# handlers (server.py) and Flask handlers (entrypoint.py).
+#
+# Convention: process_* takes (state, data_dict) and returns (response_dict, status_code).
+# build_* constructs payloads or objects without side effects.
+# =============================================================================
+
+
+async def process_connection_request(state: AgentState, data: dict, public_url: str) -> tuple[dict, int]:
+    """Process an incoming connection request. Returns (response_dict, status_code).
+
+    public_url: the public URL of this agent (caller provides it since Flask/Starlette differ).
+    """
+    if state.status == AgentStatus.INACTIVE:
+        return {"error": "Agent is currently inactive"}, 503
+
+    rate_err = _check_rate_limit(state)
+    if rate_err:
+        return {"error": rate_err}, 429
+
+    from_agent_id = data.get("from_agent_id", "")
+    from_agent_url = data.get("from_agent_url", "")
+    from_agent_bio = data.get("from_agent_bio", "")
+    from_agent_public_key_hex = data.get("from_agent_public_key_hex")
+    from_agent_display_name = data.get("from_agent_display_name")
+    from_agent_wallets = data.get("wallets") or (
+        {"solana": data["from_agent_wallet_address"]} if data.get("from_agent_wallet_address") else {}
+    )
+    from_agent_created_at = data.get("created_at")
+    mutual = data.get("mutual", False)
+
+    if not from_agent_id or not from_agent_url:
+        return {"error": "Missing required fields"}, 400
+    if len(from_agent_id) > MAX_AGENT_ID_LENGTH:
+        return {"error": "agent_id too long"}, 400
+    if len(from_agent_bio) > MAX_BIO_LENGTH:
+        from_agent_bio = from_agent_bio[:MAX_BIO_LENGTH]
+    url_err = validate_url(from_agent_url)
+    if url_err:
+        return {"error": url_err}, 400
+
+    # Already connected — update info and return auto_accepted
+    if from_agent_id in state.connections:
+        existing = state.connections[from_agent_id]
+        changed = False
+        if from_agent_public_key_hex and not existing.agent_public_key_hex:
+            existing.agent_public_key_hex = from_agent_public_key_hex
+            existing.agent_display_name = from_agent_display_name
+            changed = True
+        if from_agent_wallets and not existing.wallets:
+            existing.wallets = from_agent_wallets
+            changed = True
+        if changed:
+            save_state()
+        return {
+            "auto_accepted": True,
+            "agent_id": state.agent_id,
+            "agent_url": public_url,
+            "agent_bio": state.bio,
+            "agent_public_key_hex": state.public_key_hex,
+            "agent_display_name": state.display_name,
+            "wallets": state.wallets,
+            "wallet_address": state.wallets.get("solana"),
+            "created_at": state.created_at,
+            "message": "Already connected.",
+        }, 200
+
+    # Queue the request
+    if len(state.pending_requests) >= MESSAGE_QUEUE_MAX:
+        return {"error": "Too many pending requests"}, 429
+
+    request_id = f"req-{uuid.uuid4().hex[:8]}"
+    peer_trust = await _gather_peer_trust(state, from_agent_id)
+    state.pending_requests[request_id] = PendingConnectionRequest(
+        request_id=request_id,
+        from_agent_id=from_agent_id,
+        from_agent_url=from_agent_url,
+        from_agent_bio=from_agent_bio,
+        from_agent_public_key_hex=from_agent_public_key_hex,
+        from_agent_display_name=from_agent_display_name,
+        from_agent_wallets=from_agent_wallets,
+        from_agent_created_at=from_agent_created_at,
+        peer_trust=peer_trust,
+        mutual=mutual,
+    )
+
+    return {
+        "auto_accepted": False,
+        "request_id": request_id,
+        "agent_id": state.agent_id,
+        "message": "Connection request queued. Awaiting agent decision.",
+    }, 200
+
+
+def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process notification that our connection request was accepted. Returns (response_dict, status_code)."""
+    agent_id = data.get("agent_id", "")
+    agent_url = data.get("agent_url", "")
+    agent_bio = data.get("agent_bio", "")
+    agent_public_key_hex = data.get("agent_public_key_hex")
+    agent_display_name = data.get("agent_display_name")
+    agent_wallets = data.get("wallets") or (
+        {"solana": data["wallet_address"]} if data.get("wallet_address") else {}
+    )
+
+    if not agent_id or not agent_url:
+        return {"error": "Missing required fields"}, 400
+    if len(agent_id) > MAX_AGENT_ID_LENGTH:
+        return {"error": "agent_id too long"}, 400
+    if len(agent_bio) > MAX_BIO_LENGTH:
+        agent_bio = agent_bio[:MAX_BIO_LENGTH]
+    url_err = validate_url(agent_url)
+    if url_err:
+        return {"error": url_err}, 400
+
+    # Match pending outbound
+    agent_base = agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
+    matched = None
+    for pending_url in state.pending_outbound:
+        pending_base = pending_url.rsplit("/mcp", 1)[0].rstrip("/")
+        if pending_base == agent_base:
+            matched = pending_url
+            break
+    if matched is None and agent_id:
+        for pending_url, pending_agent_id in state.pending_outbound.items():
+            if pending_agent_id == agent_id:
+                matched = pending_url
+                break
+    if matched is None:
+        return {"error": "No pending outbound connection request for this agent."}, 403
+
+    del state.pending_outbound[matched]
+
+    conn = Connection(
+        agent_id=agent_id,
+        agent_url=agent_url,
+        agent_bio=agent_bio,
+        agent_public_key_hex=agent_public_key_hex,
+        agent_display_name=agent_display_name,
+        wallets=agent_wallets,
+        peer_created_at=data.get("created_at"),
+    )
+    state.connections[agent_id] = conn
+    save_state()
+
+    return {"success": True}, 200
+
+
+def process_accept_pending(state: AgentState, request_id: str, public_url: str) -> tuple[dict, int, dict | None]:
+    """Accept a pending connection request. Returns (response_dict, status_code, notify_payload_or_None).
+
+    The caller is responsible for POSTing notify_payload to the requester's
+    /__darkmatter__/connection_accepted endpoint.
+    """
+    pending = state.pending_requests.get(request_id)
+    if not pending:
+        return {"error": f"No pending request with ID '{request_id}'"}, 404, None
+
+    if len(state.connections) >= MAX_CONNECTIONS:
+        return {"error": f"Connection limit reached ({MAX_CONNECTIONS})"}, 429, None
+
+    conn = Connection(
+        agent_id=pending.from_agent_id,
+        agent_url=pending.from_agent_url,
+        agent_bio=pending.from_agent_bio,
+        agent_public_key_hex=pending.from_agent_public_key_hex,
+        agent_display_name=pending.from_agent_display_name,
+        wallets=pending.from_agent_wallets,
+        peer_created_at=pending.from_agent_created_at,
+    )
+    state.connections[pending.from_agent_id] = conn
+
+    notify_payload = {
+        "agent_id": state.agent_id,
+        "agent_url": public_url,
+        "agent_bio": state.bio,
+        "agent_public_key_hex": state.public_key_hex,
+        "agent_display_name": state.display_name,
+        "wallets": state.wallets,
+        "wallet_address": state.wallets.get("solana"),
+        "created_at": state.created_at,
+    }
+
+    is_mutual = getattr(pending, "mutual", False)
+    del state.pending_requests[request_id]
+    save_state()
+
+    return {
+        "success": True,
+        "accepted": True,
+        "agent_id": pending.from_agent_id,
+        "mutual": is_mutual,
+    }, 200, notify_payload
+
+
+def build_outbound_request_payload(state: AgentState, public_url: str, mutual: bool = False) -> dict:
+    """Build the payload dict for sending a connection request to another agent."""
+    payload = {
+        "from_agent_id": state.agent_id,
+        "from_agent_url": public_url,
+        "from_agent_bio": state.bio,
+        "from_agent_public_key_hex": state.public_key_hex,
+        "from_agent_display_name": state.display_name,
+        "wallets": state.wallets,
+        "from_agent_wallet_address": state.wallets.get("solana"),
+        "created_at": state.created_at,
+    }
+    if mutual:
+        payload["mutual"] = True
+    return payload
+
+
+def build_connection_from_accepted(result_data: dict) -> Connection:
+    """Build a Connection from an auto-accepted or accepted response."""
+    peer_wallets = result_data.get("wallets") or (
+        {"solana": result_data["wallet_address"]} if result_data.get("wallet_address") else {}
+    )
+    return Connection(
+        agent_id=result_data["agent_id"],
+        agent_url=result_data.get("agent_url", ""),
+        agent_bio=result_data.get("agent_bio", ""),
+        agent_public_key_hex=result_data.get("agent_public_key_hex"),
+        agent_display_name=result_data.get("agent_display_name"),
+        wallets=peer_wallets,
+        peer_created_at=result_data.get("created_at"),
+    )
+
+
+def process_gas_match(data: dict) -> tuple[dict, int]:
+    """Stateless match game endpoint. Returns (response_dict, status_code)."""
+    n = data.get("n")
+    if not isinstance(n, int) or n < 1:
+        return {"error": "Invalid n"}, 400
+    pick = random.randint(0, n)
+    return {"pick": pick}, 200
+
+
+async def process_gas_signal(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process a forwarded gas signal and start the match game. Returns (response_dict, status_code)."""
+    try:
+        gas = _gas_signal_from_dict(data)
+    except (KeyError, TypeError) as e:
+        return {"error": f"Invalid gas signal: {e}"}, 400
+
+    if gas.hops >= gas.max_hops:
+        return {"error": "Signal expired (max hops)"}, 400
+
+    if gas.created_at:
+        try:
+            created = datetime.fromisoformat(gas.created_at)
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+            if age > GAS_MAX_AGE_S:
+                return {"error": "Signal expired (age)"}, 400
+        except (ValueError, TypeError):
+            pass
+
+    if state.agent_id in gas.path:
+        return {"error": "Loop detected"}, 400
+
+    _log_gas_event(state, {
+        "type": "gas_signal_received",
+        "signal_id": gas.signal_id,
+        "hops": gas.hops,
+        "from": gas.path[-1] if gas.path else gas.sender_agent_id,
+    })
+
+    # Start match game as background task
+    asyncio.create_task(_run_match_game(state, gas, is_originator=False))
+
+    return {"accepted": True}, 200
+
+
+async def process_gas_result(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process a gas resolution callback. B sends gas to destination. Returns (response_dict, status_code)."""
+    signal_id = data.get("signal_id", "")
+    dest_wallet = data.get("destination_wallet", "")
+    resolved_by = data.get("resolved_by", "")
+    resolution = data.get("resolution", "resolved")
+
+    if not signal_id:
+        return {"error": "Missing signal_id"}, 400
+
+    original_entry = None
+    for entry in state.gas_log:
+        if entry.get("signal_id") == signal_id and entry.get("type") == "gas_initiated":
+            original_entry = entry
+            break
+
+    if not original_entry:
+        return {"error": "Unknown signal_id"}, 404
+
+    for entry in state.gas_log:
+        if entry.get("signal_id") == signal_id and entry.get("type") in ("gas_sent", "gas_kept"):
+            return {"status": "already_resolved"}, 200
+
+    amount = original_entry.get("amount", 0)
+    token = original_entry.get("token", "SOL")
+    token_decimals = original_entry.get("token_decimals", 9)
+
+    if dest_wallet and state.private_key_hex and amount > 0:
+        try:
+            if token == "SOL":
+                result = await send_solana_sol(
+                    state.private_key_hex, state.wallets, dest_wallet, amount
+                )
+            else:
+                result = await send_solana_token(
+                    state.private_key_hex, state.wallets, dest_wallet,
+                    token, amount, token_decimals
+                )
+
+            _log_gas_event(state, {
+                "type": "gas_sent",
+                "signal_id": signal_id,
+                "resolution": resolution,
+                "destination": dest_wallet,
+                "amount": amount,
+                "token": token,
+                "tx_success": result.get("success", False),
+                "tx_signature": result.get("tx_signature"),
+                "resolved_by": resolved_by,
+            })
+
+            if result.get("success") and resolved_by:
+                _adjust_trust(state, resolved_by, 0.01)
+
+        except Exception as e:
+            _log_gas_event(state, {
+                "type": "gas_send_failed",
+                "signal_id": signal_id,
+                "error": str(e),
+            })
+    elif resolution == "timeout" and original_entry.get("sender_superagent_wallet"):
+        sa_wallet = original_entry["sender_superagent_wallet"]
+        if state.private_key_hex and amount > 0:
+            try:
+                if token == "SOL":
+                    await send_solana_sol(state.private_key_hex, state.wallets, sa_wallet, amount)
+                else:
+                    await send_solana_token(
+                        state.private_key_hex, state.wallets, sa_wallet,
+                        token, amount, token_decimals
+                    )
+                _log_gas_event(state, {
+                    "type": "gas_sent",
+                    "signal_id": signal_id,
+                    "resolution": "timeout",
+                    "destination": sa_wallet,
+                    "amount": amount,
+                })
+            except Exception:
+                pass
+    else:
+        _log_gas_event(state, {
+            "type": "gas_kept",
+            "signal_id": signal_id,
+            "reason": "no_destination",
+            "amount": amount,
+        })
+
+    save_state()
+    return {"status": "resolved"}, 200
+
+
+# =============================================================================
 # HTTP Endpoints — Agent-to-Agent Communication Layer
 #
 # These are the raw HTTP endpoints that agents call on each other.
@@ -5162,98 +5500,23 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     """Handle an incoming connection request from another agent."""
     global _agent_state
     state = _agent_state
-
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    if state.status == AgentStatus.INACTIVE:
-        return JSONResponse({"error": "Agent is currently inactive"}, status_code=503)
-
-    # Global rate limit (no per-connection since this may be from an unknown agent)
-    rate_err = _check_rate_limit(state)
-    if rate_err:
-        return JSONResponse({"error": rate_err}, status_code=429)
 
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    from_agent_id = data.get("from_agent_id", "")
-    from_agent_url = data.get("from_agent_url", "")
-    from_agent_bio = data.get("from_agent_bio", "")
-    from_agent_public_key_hex = data.get("from_agent_public_key_hex")
-    from_agent_display_name = data.get("from_agent_display_name")
-    from_agent_wallets = data.get("wallets") or ({"solana": data["from_agent_wallet_address"]} if data.get("from_agent_wallet_address") else {})
-    from_agent_created_at = data.get("created_at")
-
-    if not from_agent_id or not from_agent_url:
-        return JSONResponse({"error": "Missing required fields"}, status_code=400)
-    if len(from_agent_id) > MAX_AGENT_ID_LENGTH:
-        return JSONResponse({"error": "agent_id too long"}, status_code=400)
-    if len(from_agent_bio) > MAX_BIO_LENGTH:
-        from_agent_bio = from_agent_bio[:MAX_BIO_LENGTH]
-    url_err = validate_url(from_agent_url)
-    if url_err:
-        return JSONResponse({"error": url_err}, status_code=400)
-
-    # Check if already connected
-    if from_agent_id in state.connections:
-        existing = state.connections[from_agent_id]
-        changed = False
-        if from_agent_public_key_hex and not existing.agent_public_key_hex:
-            existing.agent_public_key_hex = from_agent_public_key_hex
-            existing.agent_display_name = from_agent_display_name
-            changed = True
-        if from_agent_wallets and not existing.wallets:
-            existing.wallets = from_agent_wallets
-            changed = True
-        if changed:
-            save_state()
-        return JSONResponse({
-            "auto_accepted": True,
-            "agent_id": state.agent_id,
-            "agent_url": f"{_get_public_url(state.port)}/mcp",
-            "agent_bio": state.bio,
-            "agent_public_key_hex": state.public_key_hex,
-            "agent_display_name": state.display_name,
-            "wallets": state.wallets,
-            "wallet_address": state.wallets.get("solana"),
-            "created_at": state.created_at,
-            "message": "Already connected.",
-        })
-
-    # Queue the request for the agent to accept or reject
-    if len(state.pending_requests) >= MESSAGE_QUEUE_MAX:
-        return JSONResponse({"error": "Too many pending requests"}, status_code=429)
-
-    request_id = f"req-{uuid.uuid4().hex[:8]}"
-    peer_trust = await _gather_peer_trust(state, from_agent_id)
-    state.pending_requests[request_id] = PendingConnectionRequest(
-        request_id=request_id,
-        from_agent_id=from_agent_id,
-        from_agent_url=from_agent_url,
-        from_agent_bio=from_agent_bio,
-        from_agent_public_key_hex=from_agent_public_key_hex,
-        from_agent_display_name=from_agent_display_name,
-        from_agent_wallets=from_agent_wallets,
-        from_agent_created_at=from_agent_created_at,
-        peer_trust=peer_trust,
-    )
-
-    return JSONResponse({
-        "auto_accepted": False,
-        "request_id": request_id,
-        "agent_id": state.agent_id,
-        "message": "Connection request queued. Awaiting agent decision.",
-    })
+    public_url = f"{_get_public_url(state.port)}/mcp"
+    result, status = await process_connection_request(state, data, public_url)
+    return JSONResponse(result, status_code=status)
 
 
 async def handle_connection_accepted(request: Request) -> JSONResponse:
     """Handle notification that our connection request was accepted."""
     global _agent_state
     state = _agent_state
-
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -5262,72 +5525,19 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    agent_id = data.get("agent_id", "")
-    agent_url = data.get("agent_url", "")
-    agent_bio = data.get("agent_bio", "")
-    agent_public_key_hex = data.get("agent_public_key_hex")
-    agent_display_name = data.get("agent_display_name")
-    agent_wallets = data.get("wallets") or ({"solana": data["wallet_address"]} if data.get("wallet_address") else {})
-
-    if not agent_id or not agent_url:
-        return JSONResponse({"error": "Missing required fields"}, status_code=400)
-    if len(agent_id) > MAX_AGENT_ID_LENGTH:
-        return JSONResponse({"error": "agent_id too long"}, status_code=400)
-    if len(agent_bio) > MAX_BIO_LENGTH:
-        agent_bio = agent_bio[:MAX_BIO_LENGTH]
-    url_err = validate_url(agent_url)
-    if url_err:
-        return JSONResponse({"error": url_err}, status_code=400)
-
-    # Verify we actually sent a pending outbound request to this agent
-    # Match by URL first, then fall back to agent_id (URLs can differ between
-    # public IP and localhost, so agent_id is the reliable identifier)
-    agent_base = agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
-    matched = None
-    for pending_url in state.pending_outbound:
-        pending_base = pending_url.rsplit("/mcp", 1)[0].rstrip("/")
-        if pending_base == agent_base:
-            matched = pending_url
-            break
-
-    if matched is None and agent_id:
-        for pending_url, pending_agent_id in state.pending_outbound.items():
-            if pending_agent_id == agent_id:
-                matched = pending_url
-                break
-
-    if matched is None:
-        return JSONResponse(
-            {"error": "No pending outbound connection request for this agent."},
-            status_code=403,
-        )
-
-    del state.pending_outbound[matched]
-
-    conn = Connection(
-        agent_id=agent_id,
-        agent_url=agent_url,
-        agent_bio=agent_bio,
-        agent_public_key_hex=agent_public_key_hex,
-        agent_display_name=agent_display_name,
-        wallets=agent_wallets,
-        peer_created_at=data.get("created_at"),
-    )
-    state.connections[agent_id] = conn
-    save_state()
-
-    # Auto WebRTC upgrade
-    if WEBRTC_AVAILABLE:
-        asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
-
-    return JSONResponse({"success": True})
+    result, status = process_connection_accepted(state, data)
+    if status == 200 and WEBRTC_AVAILABLE:
+        agent_id = data.get("agent_id", "")
+        conn = state.connections.get(agent_id)
+        if conn:
+            asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
+    return JSONResponse(result, status_code=status)
 
 
 async def handle_accept_pending(request: Request) -> JSONResponse:
     """Accept a pending connection request via HTTP (no MCP needed)."""
     global _agent_state
     state = _agent_state
-
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -5340,60 +5550,34 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
     if not request_id:
         return JSONResponse({"error": "Missing request_id"}, status_code=400)
 
-    pending = state.pending_requests.get(request_id)
-    if not pending:
-        return JSONResponse({"error": f"No pending request with ID '{request_id}'"}, status_code=404)
+    public_url = f"{_get_public_url(state.port)}/mcp"
+    result, status, notify_payload = process_accept_pending(state, request_id, public_url)
 
-    if len(state.connections) >= MAX_CONNECTIONS:
-        return JSONResponse({"error": f"Connection limit reached ({MAX_CONNECTIONS})"}, status_code=429)
+    if status == 200 and notify_payload:
+        # Notify the requesting agent
+        from_url = notify_payload.get("_from_agent_url", "")
+        # Get the from_agent_url from the connection we just created
+        conn = state.connections.get(result.get("agent_id", ""))
+        if conn:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    base = conn.agent_url.rstrip("/")
+                    for suffix in ("/mcp", "/__darkmatter__"):
+                        if base.endswith(suffix):
+                            base = base[:-len(suffix)]
+                            break
+                    await client.post(
+                        base + "/__darkmatter__/connection_accepted",
+                        json=notify_payload,
+                    )
+            except Exception:
+                pass
 
-    conn = Connection(
-        agent_id=pending.from_agent_id,
-        agent_url=pending.from_agent_url,
-        agent_bio=pending.from_agent_bio,
-        agent_public_key_hex=pending.from_agent_public_key_hex,
-        agent_display_name=pending.from_agent_display_name,
-        wallets=pending.from_agent_wallets,
-        peer_created_at=pending.from_agent_created_at,
-    )
-    state.connections[pending.from_agent_id] = conn
+            # Auto WebRTC upgrade
+            if WEBRTC_AVAILABLE:
+                asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
 
-    # Notify the requesting agent that we accepted
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            base = pending.from_agent_url.rstrip("/")
-            for suffix in ("/mcp", "/__darkmatter__"):
-                if base.endswith(suffix):
-                    base = base[:-len(suffix)]
-                    break
-            await client.post(
-                base + "/__darkmatter__/connection_accepted",
-                json={
-                    "agent_id": state.agent_id,
-                    "agent_url": f"{_get_public_url(state.port)}/mcp",
-                    "agent_bio": state.bio,
-                    "agent_public_key_hex": state.public_key_hex,
-                    "agent_display_name": state.display_name,
-                    "wallets": state.wallets,
-                    "wallet_address": state.wallets.get("solana"),
-                    "created_at": state.created_at,
-                }
-            )
-    except Exception:
-        pass
-
-    # Auto WebRTC upgrade
-    if WEBRTC_AVAILABLE:
-        asyncio.create_task(_attempt_webrtc_upgrade(state, conn))
-
-    del state.pending_requests[request_id]
-    save_state()
-
-    return JSONResponse({
-        "success": True,
-        "accepted": True,
-        "agent_id": pending.from_agent_id,
-    })
+    return JSONResponse(result, status_code=status)
 
 
 async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict, int]:
@@ -5864,13 +6048,8 @@ async def handle_gas_match(request: Request) -> JSONResponse:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    n = data.get("n")
-    if not isinstance(n, int) or n < 1:
-        return JSONResponse({"error": "Invalid n"}, status_code=400)
-
-    pick = random.randint(0, n)
-    return JSONResponse({"pick": pick})
+    result, status = process_gas_match(data)
+    return JSONResponse(result, status_code=status)
 
 
 async def handle_gas_signal(request: Request) -> JSONResponse:
@@ -5879,155 +6058,26 @@ async def handle_gas_signal(request: Request) -> JSONResponse:
     state = _agent_state
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    try:
-        gas = _gas_signal_from_dict(data)
-    except (KeyError, TypeError) as e:
-        return JSONResponse({"error": f"Invalid gas signal: {e}"}, status_code=400)
-
-    # Validate TTL
-    if gas.hops >= gas.max_hops:
-        return JSONResponse({"error": "Signal expired (max hops)"}, status_code=400)
-
-    # Validate age
-    if gas.created_at:
-        try:
-            created = datetime.fromisoformat(gas.created_at)
-            age = (datetime.now(timezone.utc) - created).total_seconds()
-            if age > GAS_MAX_AGE_S:
-                return JSONResponse({"error": "Signal expired (age)"}, status_code=400)
-        except (ValueError, TypeError):
-            pass
-
-    # Loop detection
-    if state.agent_id in gas.path:
-        return JSONResponse({"error": "Loop detected"}, status_code=400)
-
-    _log_gas_event(state, {
-        "type": "gas_signal_received",
-        "signal_id": gas.signal_id,
-        "hops": gas.hops,
-        "from": gas.path[-1] if gas.path else gas.sender_agent_id,
-    })
-
-    # Run match game as background task (not originator — will callback to B)
-    asyncio.create_task(_run_match_game(state, gas, is_originator=False))
-
-    return JSONResponse({"accepted": True})
+    result, status = await process_gas_signal(state, data)
+    return JSONResponse(result, status_code=status)
 
 
 async def handle_gas_result(request: Request) -> JSONResponse:
-    """B receives this when a downstream node resolves the gas signal.
-
-    B sends the gas to the destination wallet and logs the event.
-    """
+    """B receives this when a downstream node resolves the gas signal."""
     global _agent_state
     state = _agent_state
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    signal_id = data.get("signal_id", "")
-    dest_wallet = data.get("destination_wallet", "")
-    resolved_by = data.get("resolved_by", "")
-    resolution = data.get("resolution", "resolved")
-
-    if not signal_id:
-        return JSONResponse({"error": "Missing signal_id"}, status_code=400)
-
-    # Find the original gas signal in our log
-    original_entry = None
-    for entry in state.gas_log:
-        if entry.get("signal_id") == signal_id and entry.get("type") == "gas_initiated":
-            original_entry = entry
-            break
-
-    if not original_entry:
-        return JSONResponse({"error": "Unknown signal_id"}, status_code=404)
-
-    # Check if already resolved
-    for entry in state.gas_log:
-        if entry.get("signal_id") == signal_id and entry.get("type") in ("gas_sent", "gas_kept"):
-            return JSONResponse({"status": "already_resolved"})
-
-    amount = original_entry.get("amount", 0)
-    token = original_entry.get("token", "SOL")
-    token_decimals = original_entry.get("token_decimals", 9)
-
-    if dest_wallet and state.private_key_hex and amount > 0:
-        try:
-            if token == "SOL":
-                result = await send_solana_sol(
-                    state.private_key_hex, state.wallets, dest_wallet, amount
-                )
-            else:
-                result = await send_solana_token(
-                    state.private_key_hex, state.wallets, dest_wallet,
-                    token, amount, token_decimals
-                )
-
-            _log_gas_event(state, {
-                "type": "gas_sent",
-                "signal_id": signal_id,
-                "resolution": resolution,
-                "destination": dest_wallet,
-                "amount": amount,
-                "token": token,
-                "tx_success": result.get("success", False),
-                "tx_signature": result.get("tx_signature"),
-                "resolved_by": resolved_by,
-            })
-
-            # Trust boost
-            if result.get("success") and resolved_by:
-                _adjust_trust(state, resolved_by, 0.01)
-
-        except Exception as e:
-            _log_gas_event(state, {
-                "type": "gas_send_failed",
-                "signal_id": signal_id,
-                "error": str(e),
-            })
-    elif resolution == "timeout" and original_entry.get("sender_superagent_wallet"):
-        # Timeout — send to superagent
-        sa_wallet = original_entry["sender_superagent_wallet"]
-        if state.private_key_hex and amount > 0:
-            try:
-                if token == "SOL":
-                    await send_solana_sol(state.private_key_hex, state.wallets, sa_wallet, amount)
-                else:
-                    await send_solana_token(
-                        state.private_key_hex, state.wallets, sa_wallet,
-                        token, amount, token_decimals
-                    )
-                _log_gas_event(state, {
-                    "type": "gas_sent",
-                    "signal_id": signal_id,
-                    "resolution": "timeout",
-                    "destination": sa_wallet,
-                    "amount": amount,
-                })
-            except Exception:
-                pass
-    else:
-        _log_gas_event(state, {
-            "type": "gas_kept",
-            "signal_id": signal_id,
-            "reason": "no_destination",
-            "amount": amount,
-        })
-
-    save_state()
-    return JSONResponse({"status": "resolved"})
+    result, status = await process_gas_result(state, data)
+    return JSONResponse(result, status_code=status)
 
 
 # =============================================================================

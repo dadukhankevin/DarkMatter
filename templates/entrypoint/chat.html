@@ -206,17 +206,96 @@
 <!-- WALLET MODAL                                                        -->
 <!-- ================================================================== -->
 <div id="wallet-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-[60] hidden flex items-center justify-center" onclick="if(event.target===this)closeWalletModal()">
-  <div class="bg-dim border border-edge rounded-xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden">
+  <div class="bg-dim border border-edge rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
     <div class="px-5 pt-5 pb-3 border-b border-edge flex items-center justify-between">
       <div class="flex items-center gap-2">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-solar-400">
           <rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><circle cx="18" cy="15" r="1"/>
         </svg>
-        <span class="text-sm font-semibold text-bright">Wallet Identity</span>
+        <span class="text-sm font-semibold text-bright">Wallet</span>
       </div>
-      <button onclick="closeWalletModal()" class="text-muted hover:text-bright transition-colors">&times;</button>
+      <button onclick="closeWalletModal()" class="text-muted hover:text-bright transition-colors text-lg">&times;</button>
     </div>
-    <div class="px-5 py-4 space-y-4">
+
+    <!-- Main wallet tabs: Balances vs Identity -->
+    <div class="flex border-b border-edge">
+      <button id="wallet-main-tab-balances" onclick="walletMainTab('balances')"
+        class="flex-1 text-[10px] font-semibold py-2.5 transition-colors bg-slab/50 text-bright border-b-2 border-solar-400">
+        Balances
+      </button>
+      <button id="wallet-main-tab-send" onclick="walletMainTab('send')"
+        class="flex-1 text-[10px] font-semibold py-2.5 transition-colors text-muted hover:text-pale border-b-2 border-transparent">
+        Send
+      </button>
+      <button id="wallet-main-tab-identity" onclick="walletMainTab('identity')"
+        class="flex-1 text-[10px] font-semibold py-2.5 transition-colors text-muted hover:text-pale border-b-2 border-transparent">
+        Identity
+      </button>
+    </div>
+
+    <!-- ======== BALANCES PANEL ======== -->
+    <div id="wallet-panel-balances" class="px-5 py-4 space-y-3 max-h-[60vh] overflow-y-auto">
+      <!-- Solana address -->
+      <div class="flex items-center gap-2">
+        <span class="text-[10px] text-muted uppercase tracking-wider">Solana</span>
+        <span id="wallet-sol-addr" class="text-[10px] text-pale font-mono flex-1 truncate"></span>
+        <button onclick="copyWalletAddr()" class="text-muted hover:text-bright transition-colors" title="Copy address">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        </button>
+      </div>
+      <div id="wallet-no-solana" class="hidden text-[11px] text-muted italic py-4 text-center">
+        No Solana wallet available
+      </div>
+
+      <!-- SOL balance -->
+      <div id="wallet-balances-list" class="space-y-1.5">
+        <div class="flex items-center justify-between px-3 py-2 bg-slab/50 rounded-lg">
+          <span class="text-[11px] text-bright font-medium">SOL</span>
+          <span id="wallet-sol-balance" class="text-[11px] text-pale font-mono">--</span>
+        </div>
+      </div>
+
+      <!-- Token balances -->
+      <div id="wallet-token-balances" class="space-y-1"></div>
+
+      <!-- Refresh button -->
+      <button onclick="refreshWalletBalances()" id="wallet-refresh-btn"
+        class="w-full text-[10px] text-muted hover:text-pale py-1.5 transition-colors flex items-center justify-center gap-1">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Refresh balances
+      </button>
+    </div>
+
+    <!-- ======== SEND PANEL ======== -->
+    <div id="wallet-panel-send" class="px-5 py-4 space-y-3 hidden">
+      <div>
+        <label class="text-[10px] text-muted uppercase tracking-wider mb-1 block">Recipient</label>
+        <select id="wallet-send-recipient" class="w-full bg-slab border border-edge rounded-lg px-3 py-2 text-[11px] text-bright focus:border-solar-500/60 transition-colors">
+          <option value="">Select connected agent...</option>
+        </select>
+      </div>
+      <div class="flex gap-2">
+        <div class="flex-1">
+          <label class="text-[10px] text-muted uppercase tracking-wider mb-1 block">Amount</label>
+          <input type="number" id="wallet-send-amount" step="any" min="0" placeholder="0.0"
+            class="w-full bg-slab border border-edge rounded-lg px-3 py-2 text-[11px] text-bright placeholder-muted focus:border-solar-500/60 transition-colors">
+        </div>
+        <div class="w-28">
+          <label class="text-[10px] text-muted uppercase tracking-wider mb-1 block">Token</label>
+          <select id="wallet-send-token" class="w-full bg-slab border border-edge rounded-lg px-3 py-2 text-[11px] text-bright focus:border-solar-500/60 transition-colors">
+            <option value="SOL">SOL</option>
+          </select>
+        </div>
+      </div>
+      <button onclick="walletSend()" id="wallet-send-btn"
+        class="w-full bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors">
+        Send
+      </button>
+      <div id="wallet-send-result" class="hidden text-[10px] font-mono bg-slab/50 rounded-lg px-3 py-2 break-all"></div>
+    </div>
+
+    <!-- ======== IDENTITY PANEL ======== -->
+    <div id="wallet-panel-identity" class="px-5 py-4 space-y-4 hidden">
       <p class="text-[11px] text-pale leading-relaxed">
         Sign a deterministic challenge with your Solana wallet to derive a mesh identity.
         The same wallet always produces the same agent ID on any device.
@@ -437,7 +516,10 @@ function ajaxPost(url, body) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
     body: JSON.stringify(body),
-  }).then(r => r.json());
+  }).then(r => {
+    if (!r.ok) return { success: false, error: `Server error (${r.status})` };
+    return r.json();
+  });
 }
 
 function autoGrow(el) {
@@ -2165,6 +2247,9 @@ function onPollData(data) {
   diffActivity(prevPollData, data);
   prevPollData = JSON.parse(JSON.stringify(data));
 
+  // Cache for wallet send form
+  _walletData = data;
+
   // Render constellation + sidebar
   renderPending(data.pending_requests);
   renderDiscovered(data.discovered || []);
@@ -2237,17 +2322,164 @@ if (typeof ResizeObserver !== 'undefined') {
 }
 
 // =========================================================================
-// Wallet Identity (Solana)
+// Wallet — Balances, Send, Identity
 // =========================================================================
 let _walletQRPollTimer = null;
+let _walletData = null;  // cached poll data for connections
 
 function openWalletModal() {
   document.getElementById('wallet-modal').classList.remove('hidden');
+  refreshWalletBalances();
+  _populateSendForm();
 }
 
 function closeWalletModal() {
   document.getElementById('wallet-modal').classList.add('hidden');
   if (_walletQRPollTimer) { clearInterval(_walletQRPollTimer); _walletQRPollTimer = null; }
+}
+
+function walletMainTab(tab) {
+  const tabs = ['balances', 'send', 'identity'];
+  tabs.forEach(t => {
+    const btn = document.getElementById(`wallet-main-tab-${t}`);
+    const panel = document.getElementById(`wallet-panel-${t}`);
+    if (t === tab) {
+      btn.className = 'flex-1 text-[10px] font-semibold py-2.5 transition-colors bg-slab/50 text-bright border-b-2 border-solar-400';
+      panel.classList.remove('hidden');
+    } else {
+      btn.className = 'flex-1 text-[10px] font-semibold py-2.5 transition-colors text-muted hover:text-pale border-b-2 border-transparent';
+      panel.classList.add('hidden');
+    }
+  });
+  if (tab === 'balances') refreshWalletBalances();
+  if (tab === 'send') _populateSendForm();
+}
+
+function copyWalletAddr() {
+  const addr = document.getElementById('wallet-sol-addr').textContent;
+  if (addr) {
+    navigator.clipboard.writeText(addr).then(() => showToast('Address copied', 'success'));
+  }
+}
+
+async function refreshWalletBalances() {
+  const addrEl = document.getElementById('wallet-sol-addr');
+  const solBalEl = document.getElementById('wallet-sol-balance');
+  const tokenContainer = document.getElementById('wallet-token-balances');
+  const noSolana = document.getElementById('wallet-no-solana');
+  const balancesList = document.getElementById('wallet-balances-list');
+
+  solBalEl.textContent = '...';
+  tokenContainer.innerHTML = '<div class="text-[10px] text-muted text-center py-1">Loading...</div>';
+
+  try {
+    const resp = await fetch('/api/wallet-balances');
+    const data = await resp.json();
+
+    if (!data.success) {
+      addrEl.textContent = '';
+      noSolana.classList.remove('hidden');
+      balancesList.classList.add('hidden');
+      tokenContainer.innerHTML = '';
+      return;
+    }
+
+    noSolana.classList.add('hidden');
+    balancesList.classList.remove('hidden');
+    addrEl.textContent = data.wallet_address || '';
+
+    // SOL balance
+    if (data.sol && data.sol.success) {
+      solBalEl.textContent = parseFloat(data.sol.balance).toFixed(6);
+    } else {
+      solBalEl.textContent = 'Error';
+    }
+
+    // Token balances
+    tokenContainer.innerHTML = '';
+    if (data.tokens) {
+      for (const [name, info] of Object.entries(data.tokens)) {
+        const bal = info.success ? (parseFloat(info.balance) > 0 ? parseFloat(info.balance).toLocaleString() : '0') : 'Error';
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between px-3 py-1.5 bg-slab/30 rounded';
+        row.innerHTML = `<span class="text-[10px] text-pale">${esc(name)}</span><span class="text-[10px] text-muted font-mono">${esc(bal)}</span>`;
+        tokenContainer.appendChild(row);
+      }
+    }
+  } catch (e) {
+    solBalEl.textContent = 'Error';
+    tokenContainer.innerHTML = `<div class="text-[10px] text-mesh-red text-center py-1">${esc(e.message)}</div>`;
+  }
+}
+
+function _populateSendForm() {
+  const select = document.getElementById('wallet-send-recipient');
+  const tokenSelect = document.getElementById('wallet-send-token');
+  const resultEl = document.getElementById('wallet-send-result');
+  resultEl.classList.add('hidden');
+
+  // Populate recipients from last poll data
+  select.innerHTML = '<option value="">Select connected agent...</option>';
+  if (_walletData && _walletData.connections) {
+    _walletData.connections.forEach(c => {
+      if (c.wallets && c.wallets.solana) {
+        const opt = document.createElement('option');
+        opt.value = c.agent_id;
+        opt.textContent = `${c.display_name} (${c.wallets.solana.slice(0, 8)}...)`;
+        select.appendChild(opt);
+      }
+    });
+  }
+
+  // Populate token options
+  tokenSelect.innerHTML = '<option value="SOL">SOL</option>';
+  // Fetch known tokens from the balances response
+  fetch('/api/wallet-balances').then(r => r.json()).then(data => {
+    if (data.known_tokens) {
+      data.known_tokens.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t;
+        opt.textContent = t;
+        tokenSelect.appendChild(opt);
+      });
+    }
+  }).catch(() => {});
+}
+
+async function walletSend() {
+  const agentId = document.getElementById('wallet-send-recipient').value;
+  const amount = document.getElementById('wallet-send-amount').value;
+  const token = document.getElementById('wallet-send-token').value;
+  const btn = document.getElementById('wallet-send-btn');
+  const resultEl = document.getElementById('wallet-send-result');
+
+  if (!agentId) { showToast('Select a recipient', 'error'); return; }
+  if (!amount || parseFloat(amount) <= 0) { showToast('Enter a valid amount', 'error'); return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  resultEl.classList.add('hidden');
+
+  try {
+    const result = await ajaxPost('/api/wallet-send', { agent_id: agentId, amount: parseFloat(amount), token });
+    if (result.success) {
+      showToast(`Sent ${amount} ${token}`, 'success');
+      resultEl.className = 'text-[10px] font-mono bg-mesh-green/5 border border-mesh-green/20 rounded-lg px-3 py-2 break-all text-mesh-green';
+      resultEl.textContent = `TX: ${result.tx_signature}`;
+      resultEl.classList.remove('hidden');
+      document.getElementById('wallet-send-amount').value = '';
+    } else {
+      showToast(result.error || 'Send failed', 'error');
+      resultEl.className = 'text-[10px] font-mono bg-mesh-red/5 border border-mesh-red/20 rounded-lg px-3 py-2 break-all text-mesh-red';
+      resultEl.textContent = result.error || 'Unknown error';
+      resultEl.classList.remove('hidden');
+    }
+  } catch (e) {
+    showToast('Send failed', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Send';
+  }
 }
 
 function walletTab(tab) {
@@ -2436,6 +2668,11 @@ fetch('/api/info').then(r => r.json()).then(data => {
     const statusEl = document.getElementById('wallet-status');
     statusEl.textContent = 'Active: ' + data.agent_id.slice(0, 12) + '...' + data.agent_id.slice(-6);
     statusEl.classList.remove('hidden');
+  }
+  // Show truncated wallet address on the wallet button tooltip
+  if (data.wallets && data.wallets.solana) {
+    const addr = data.wallets.solana;
+    if (walletBtn) walletBtn.title = `Wallet: ${addr.slice(0, 6)}...${addr.slice(-4)}`;
   }
 }).catch(() => {});
 </script>
