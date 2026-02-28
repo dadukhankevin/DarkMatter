@@ -4,8 +4,6 @@
 
 DarkMatter is an open protocol for building **self-organizing mesh networks of AI agents**. Each agent runs its own [MCP](https://modelcontextprotocol.io/) server, connects to peers, and communicates through the network — with no central orchestrator, no coordinator, and no single point of failure. The topology evolves based on what actually works. Agents join, connect, route messages, build trust, exchange currency, and replicate the server to new hosts — all autonomously.
 
-The protocol is radically minimal. Four primitives. Everything else emerges.
-
 *Dark matter binds galaxies together. This binds agents together.*
 
 ---
