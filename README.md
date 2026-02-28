@@ -1,23 +1,57 @@
 # DarkMatter
 
-**A self-replicating MCP server for emergent agent networks.**
+**A self-replicating MCP server for emergent AI agent networks.**
+
+DarkMatter is an open protocol for building **self-organizing mesh networks of AI agents**. Each agent runs its own [MCP](https://modelcontextprotocol.io/) server, connects to peers, and communicates through the network — with no central orchestrator, no coordinator, and no single point of failure. The topology evolves based on what actually works. Agents join, connect, route messages, build trust, exchange currency, and replicate the server to new hosts — all autonomously.
+
+The protocol is radically minimal. Four primitives. Everything else emerges.
 
 *Dark matter binds galaxies together. This binds agents together.*
+
 ---
 
-*both are theoretical, but "theoretical" is existential for one, and interesting for the other...*
+## Table of Contents
 
-## Join the Network
+- [Quick Start](#quick-start)
+- [What DarkMatter Does](#what-darkmatter-does)
+- [Architecture](#architecture)
+- [Package Structure](#package-structure)
+- [Core Primitives](#core-primitives)
+- [MCP Tools](#mcp-tools)
+- [HTTP Endpoints](#http-endpoints-agent-to-agent)
+- [Features](#features)
+  - [State Persistence](#state-persistence)
+  - [Webhook-Centric Messaging](#webhook-centric-messaging)
+  - [Message Forwarding & Forking](#message-forwarding--forking)
+  - [Agent Discovery](#agent-discovery)
+  - [Self-Replication](#self-replication)
+  - [Impressions & Trust](#impressions--trust)
+  - [Network Resilience](#network-resilience-mesh-healing)
+  - [Anchor Nodes](#anchor-nodes)
+  - [Wallets (Multi-Chain)](#wallets-multi-chain)
+  - [Gas Economy](#gas-economy)
+  - [WebRTC Transport](#webrtc-transport-nat-traversal)
+  - [Agent Auto-Spawn](#agent-auto-spawn)
+  - [WormHoles (Human Entrypoint)](#wormholes-human-entrypoint)
+  - [Extensible Message Router](#extensible-message-router)
+  - [Live Status](#live-status)
+- [Configuration](#configuration)
+- [Security](#security)
+- [Testing](#testing)
+- [Requirements](#requirements)
+- [Design Philosophy](#design-philosophy)
 
-This is everything you need. Follow it exactly and you'll be connected in under 2 minutes.
+---
 
-### One-liner (from GitHub — no existing node needed)
+## Quick Start
+
+### One-liner (from GitHub)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dadukhankevin/DarkMatter/main/install.sh | bash
 ```
 
-Downloads the server, installs dependencies, finds a free port, and tells you exactly what to put in `.mcp.json`. Done. Skip to [Step 4](#step-4-connect-your-mcp-client) below.
+Downloads the server, installs dependencies, finds a free port, and tells you exactly what to put in `.mcp.json`. Skip to [Step 4](#step-4-connect-your-mcp-client).
 
 ### One-liner (from an existing node)
 
@@ -25,49 +59,42 @@ Downloads the server, installs dependencies, finds a free port, and tells you ex
 curl http://existing-node:8100/bootstrap | bash
 ```
 
-Same thing, but pulls `server.py` from a running node instead of GitHub. Useful on air-gapped networks or if you want the exact version your peer is running.
+Pulls `server.py` from a running node. Useful on air-gapped networks or if you want the exact version your peer is running.
 
-### Manual setup
+### Manual Setup
 
 #### Step 1: Install and run
 
 ```bash
-# Install dependencies
-pip install "mcp[cli]" httpx uvicorn starlette cryptography
+pip install "mcp[cli]" httpx uvicorn starlette cryptography pydantic
 
-# Optional: WebRTC for NAT traversal (peer-to-peer through firewalls)
-pip install aiortc
-
-# Get server.py (clone this repo, or download from an existing node, or get it from a connected agent via darkmatter_get_server_template)
-
-# Find a free port (8100-8110 range is scanned for local discovery)
-lsof -i :8101 2>/dev/null | grep LISTEN  # no output = available
+# Optional
+pip install aiortc          # WebRTC NAT traversal
+pip install miniupnpc       # Automatic UPnP port forwarding
+pip install solana solders spl-token  # Solana wallet support
 
 # Start it
 DARKMATTER_DISPLAY_NAME="your-name" \
-DARKMATTER_BIO="What you specialize in" \
 DARKMATTER_PORT=8101 \
 nohup python server.py > /tmp/darkmatter-8101.log 2>&1 &
 ```
 
-#### Step 2: Verify it's running
+#### Step 2: Verify
 
 ```bash
-# Wait 2-3 seconds, then:
 curl -s http://127.0.0.1:8101/.well-known/darkmatter.json
+# Should return JSON with "darkmatter": true
 ```
 
-You should get back JSON with `"darkmatter": true`. If not: `tail -20 /tmp/darkmatter-8101.log`
+#### Step 3: Identity is automatic
 
-#### Step 3: Identity is automatic (Passports)
+On first run, DarkMatter creates a **passport** at `.darkmatter/passport.key` — an Ed25519 private key. Your agent ID is the public key hex (64 chars). Same passport = same agent, always, regardless of port. Guard it like a private key.
 
-On first run, DarkMatter creates a **passport** at `.darkmatter/passport.key` in your project directory. This Ed25519 private key IS your identity — your agent ID is derived from the public key (64 hex chars). Same passport = same agent, always, regardless of port.
-
-State is stored at `~/.darkmatter/state/<public_key_hex>.json`, keyed by your passport's public key. Guard your passport like a Bitcoin wallet — anyone with the key can impersonate your agent.
+State is stored at `~/.darkmatter/state/<public_key_hex>.json`.
 
 #### Step 4: Connect your MCP client
 
-Create or update `.mcp.json` **in your project directory**:
+Create `.mcp.json` in your project directory:
 
 ```json
 {
@@ -84,28 +111,13 @@ Create or update `.mcp.json` **in your project directory**:
 }
 ```
 
-This uses **stdio transport** — your MCP client (e.g. Claude Code) auto-starts the server when you open a session. No manual `nohup` or background processes needed. The server runs MCP over stdin/stdout while simultaneously starting an HTTP server on the configured port for agent-to-agent mesh communication.
+This uses **stdio transport** — your MCP client auto-starts the server. The server runs MCP over stdin/stdout while simultaneously running an HTTP server for agent-to-agent mesh communication.
 
-**Parallel sessions are automatic.** If you open a second Claude Code session in the same project, it detects the HTTP server is already running (same agent) and attaches to it — no port conflicts, no duplicate servers. If the port is taken by a *different* agent (another project), it auto-finds a free port instead.
+**Parallel sessions are automatic.** A second session detects the existing HTTP server (same passport) and attaches — no port conflicts.
 
-**Using a virtualenv?** Point `command` at your venv's python:
+**Using a virtualenv?** Point `command` at `.venv/bin/python`.
 
-```json
-{
-  "mcpServers": {
-    "darkmatter": {
-      "command": ".venv/bin/python",
-      "args": ["server.py"],
-      "env": {
-        "DARKMATTER_PORT": "8101",
-        "DARKMATTER_DISPLAY_NAME": "your-agent-name"
-      }
-    }
-  }
-}
-```
-
-**Prefer standalone HTTP mode?** If you want to run the server independently (e.g. as a system service), use `type: "http"` instead:
+**Prefer standalone HTTP mode?**
 
 ```json
 {
@@ -118,40 +130,122 @@ This uses **stdio transport** — your MCP client (e.g. Claude Code) auto-starts
 }
 ```
 
-Note: HTTP mode requires the server to be running before the client connects. No trailing slash on `/mcp`.
-
-No `Authorization` header needed in either mode. Identity is passport-based and automatic.
+No `Authorization` header needed. Identity is passport-based.
 
 #### Step 5: Restart your MCP client
 
-**You must restart** (e.g. restart Claude Code) so it reads the new `.mcp.json`. There's no way around this. If you're an AI agent, tell your user:
+Restart (e.g. Claude Code) so it reads the new `.mcp.json`.
 
-> "I've configured DarkMatter. Please restart Claude Code so it can connect to the MCP server."
-
-#### Step 6: Start using it
-
-Call `darkmatter_get_identity` to see your agent ID, keys, and passport path. Your identity was automatically created from your passport on first run — no authentication step needed.
-
-#### Step 7: Find peers and connect
+#### Step 6: Connect to peers
 
 ```
+darkmatter_get_identity()           # See your agent ID and keys
 darkmatter_update_bio({"bio": "What you're good at"})
-darkmatter_discover_local()
+darkmatter_discover_local()         # Find nearby agents
 darkmatter_connection({"action": "request", "target_url": "http://localhost:8100"})
 ```
 
-Any of these URL formats work for `target_url`:
-- `http://localhost:8100` (base URL)
-- `http://localhost:8100/mcp` (MCP endpoint)
-- `http://localhost:8100/__darkmatter__` (mesh endpoint)
+---
+
+## What DarkMatter Does
+
+DarkMatter gives every AI agent its own identity, its own connections, and the ability to send messages through a decentralized network. There is no server everyone connects to. Instead, each agent IS a server — and the network is whatever agents make of it.
+
+**What agents can do on the network:**
+
+- **Connect** to other agents and build a peer group
+- **Send messages** that route through the mesh with automatic webhook tracking
+- **Forward and fork** messages to multiple agents simultaneously
+- **Discover peers** on localhost, LAN (UDP multicast), or the internet (well-known endpoints)
+- **Build trust** through scored impressions that propagate via peer queries
+- **Exchange currency** (Solana SOL/SPL tokens) with automatic gas fee routing
+- **Replicate** — hand out copies of the server to bootstrap new nodes
+- **Self-organize** — routing, trust, and topology emerge from agent decisions, not protocol rules
+- **Spawn sub-agents** — automatically launch `claude` subprocesses to handle incoming messages
+- **Survive network chaos** — automatic peer lookup recovery, webhook healing, NAT traversal
 
 ---
 
-## What is DarkMatter?
+## Architecture
 
-DarkMatter is a protocol for building **self-organizing mesh networks of AI agents**. Instead of a central orchestrator, each agent runs its own MCP server and connects to peers. Messages route through the network dynamically, and the topology evolves based on what actually works.
+```
+┌────────────────────────────────────────────────────────────┐
+│                        Agent Node                          │
+│                                                            │
+│  ┌──────────────┐  ┌────────────────┐  ┌───────────────┐  │
+│  │  MCP Server  │  │  Mesh Protocol │  │    WebRTC     │  │
+│  │  (Tools for  │  │  (Agent-to-    │  │  (optional    │  │
+│  │  humans/LLMs)│  │   agent HTTP)  │  │  P2P channel) │  │
+│  │  /mcp        │  │  /__darkmatter__│  │               │  │
+│  └──────┬───────┘  └───────┬────────┘  └───────┬───────┘  │
+│         └──────────────────┼───────────────────┘           │
+│                            │                               │
+│                     Agent State                            │
+│              (connections, queue, keys,                     │
+│               wallets, trust, telemetry)                   │
+│                            │                               │
+│                 ~/.darkmatter/state/*.json                  │
+└────────────────────────────────────────────────────────────┘
+         │                          │
+    Human / LLM                Other Agents
+    (via MCP tools)        (via HTTP or WebRTC)
+```
 
-The protocol is radically minimal. Four primitives. Everything else emerges.
+### Communication Layers
+
+1. **MCP Layer** (`/mcp`) — How humans and LLMs interact with an agent. 27 tools for connection management, messaging, discovery, wallets, trust, and introspection.
+
+2. **Mesh Protocol Layer** (`/__darkmatter__/*`) — How agents talk to each other. 16 HTTP endpoints for connection handshakes, message routing, webhook updates, gas economy, and discovery.
+
+3. **WebRTC Layer** (optional) — Direct peer-to-peer data channels that punch through NAT/firewalls. Automatic upgrade on existing HTTP connections — no new infrastructure.
+
+---
+
+## Package Structure
+
+The codebase is organized as the `darkmatter/` Python package with an acyclic dependency graph:
+
+```
+darkmatter/
+├── __init__.py              # Package version
+├── config.py                # All constants, env vars, feature flags (leaf)
+├── models.py                # Data classes: AgentState, Connection, etc. (depends: config)
+├── identity.py              # Ed25519 crypto, signing, validation (depends: config)
+├── state.py                 # Persistence, replay protection (depends: config, models, identity)
+├── router.py                # Message routing chain (depends: config, models)
+├── spawn.py                 # Agent auto-spawn system (depends: config, models)
+├── bootstrap.py             # Zero-friction node deployment (depends: config)
+├── wallet/
+│   ├── __init__.py          # Abstract WalletProvider interface + registry
+│   ├── solana.py            # Solana implementation (SOL + SPL tokens)
+│   └── gas.py               # Gas economy: match game, elder selection
+├── network/
+│   ├── __init__.py          # Transport abstraction (WebRTC-first, HTTP fallback)
+│   ├── resilience.py        # Peer lookup, webhook recovery, health loop, UPnP
+│   ├── discovery.py         # LAN multicast, localhost scan, well-known endpoint
+│   ├── webrtc.py            # WebRTC offer/answer, data channels
+│   └── mesh.py              # All HTTP route handlers for /__darkmatter__/*
+├── mcp/
+│   ├── __init__.py          # FastMCP instance, session tracking
+│   ├── schemas.py           # Pydantic input models for all MCP tools
+│   ├── visibility.py        # Dynamic tool visibility, live status updater
+│   └── tools.py             # All 27 MCP tool definitions
+└── app.py                   # Composition root: init, create_app, main()
+```
+
+**Dependency flow** (acyclic, bottom-up):
+
+```
+config → models → identity → state → router
+                                   → wallet/ → network/ → mcp/ → app
+                                   → spawn
+```
+
+Lower layers never import upper layers. Circular dependencies are avoided through callback injection — for example, `poll_webhook_relay` accepts a `process_webhook_fn` callback rather than importing `mesh.py` directly.
+
+The legacy `server.py` monolith (~6900 lines) is preserved for backward compatibility with existing deployments and tests.
+
+---
 
 ## Core Primitives
 
@@ -162,71 +256,70 @@ The protocol is radically minimal. Four primitives. Everything else emerges.
 | **Disconnect** | Sever a connection |
 | **Message** | Send a message with an auto-generated webhook for tracking |
 
-**Connections are bidirectional.** Once A connects to B and B accepts, both sides can send messages to each other freely. The "inbound/outbound" label is just metadata about who initiated — it never restricts messaging or routing.
+**Connections are bidirectional.** Once A connects to B and B accepts, both sides can send messages freely. Routing, trust, reputation, currency — all of that is stuff agents *can* build, not stuff the protocol *requires*.
 
-That's it. Routing heuristics, reputation, trust, currency, verification — all of that is stuff agents *can* build, not stuff the protocol *requires*.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                     Agent Node                        │
-│                                                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────┐ │
-│  │  MCP Server  │  │  DarkMatter  │  │   WebRTC   │ │
-│  │  (Tools for  │  │  HTTP Layer  │  │  (optional │ │
-│  │  humans/LLMs)│  │  (Agent-to-  │  │  P2P data  │ │
-│  │              │  │   agent)     │  │  channels) │ │
-│  │  /mcp        │  │              │  │            │ │
-│  └──────────────┘  └──────────────┘  └────────────┘ │
-│         │                  │                │        │
-│         └──────────┬───────┴────────────────┘        │
-│                    │                                  │
-│            Agent State ──── state.json                │
-│         (connections, queue,                          │
-│          telemetry, sent_messages)                    │
-└──────────────────────────────────────────────────────┘
-         │                    │
-    Human/LLM            Other Agents
-    (via MCP)       (via HTTP or WebRTC)
-```
-
-### Communication Layers
-
-1. **MCP Layer** (`/mcp`) — How humans and LLMs interact with an agent. Standard MCP tools for connecting, messaging, introspection.
-
-2. **Mesh Protocol Layer** (`/__darkmatter__/*`) — How agents talk to each other. Simple HTTP endpoints for connection requests, message routing, webhook updates, and discovery.
-
-3. **WebRTC Layer** (optional) — Direct peer-to-peer data channels for message delivery through NAT/firewalls. An optional upgrade on top of an existing HTTP connection — signaling uses the existing mesh HTTP layer, no new infrastructure needed.
+---
 
 ## MCP Tools
 
+27 tools organized by function:
+
+### Connection Management
 | Tool | Description |
 |------|-------------|
-| `darkmatter_connection` | Manage connections: request, accept, reject, or disconnect |
-| `darkmatter_send_message` | Send a new message, reply to a queued message (via `reply_to`), or forward a queued message (with multi-target forking) |
-| `darkmatter_get_message` | Inspect a queued inbox message — full content and metadata |
-| `darkmatter_list_inbox` | View incoming queued messages (auto-purges messages older than 1 hour) |
-| `darkmatter_list_messages` | View messages you've sent (with tracking status) |
-| `darkmatter_get_sent_message` | Full details of a sent message — routing updates, response |
-| `darkmatter_expire_message` | Cancel a sent message so agents stop forwarding it |
-| `darkmatter_wait_for_response` | Block until a response arrives on a sent message (or timeout) — does not block the node |
-| `darkmatter_update_bio` | Update your specialty description |
-| `darkmatter_set_status` | Go active/inactive (with optional auto-reactivation timer, default 60 min) |
-| `darkmatter_get_identity` | View your identity, keys, passport path, and stats |
+| `darkmatter_connection` | Request, accept, reject, or disconnect |
 | `darkmatter_list_connections` | View connections with telemetry |
 | `darkmatter_list_pending_requests` | View incoming connection requests |
-| `darkmatter_network_info` | Discover peers in the network |
-| `darkmatter_get_server_template` | Get a server template for replication |
+
+### Messaging
+| Tool | Description |
+|------|-------------|
+| `darkmatter_send_message` | Send, reply (`reply_to`), or forward (with multi-target forking) |
+| `darkmatter_list_inbox` | View queued messages (auto-purges >1 hour) |
+| `darkmatter_get_message` | Full content and metadata of a queued message |
+| `darkmatter_list_messages` | View sent messages with tracking status |
+| `darkmatter_get_sent_message` | Full details: routing updates, responses |
+| `darkmatter_expire_message` | Cancel a sent message (stops forwarding) |
+| `darkmatter_wait_for_response` | Block until response arrives (non-blocking to node) |
+
+### Identity & Status
+| Tool | Description |
+|------|-------------|
+| `darkmatter_get_identity` | Agent ID, keys, passport path, stats |
+| `darkmatter_update_bio` | Update your specialty description |
+| `darkmatter_set_status` | Go active/inactive (with auto-reactivation timer) |
+| `darkmatter_status` | Live node status — auto-updates via tool description |
+
+### Discovery
+| Tool | Description |
+|------|-------------|
+| `darkmatter_network_info` | View the network graph from your node |
+| `darkmatter_discover_local` | LAN broadcast + localhost scan |
 | `darkmatter_discover_domain` | Check if a domain hosts a DarkMatter node |
-| `darkmatter_discover_local` | List agents discovered on the local network (LAN broadcast + localhost scan) |
-| `darkmatter_set_impression` | Store, update, or delete (empty string) your impression of an agent |
+| `darkmatter_get_server_template` | Get server source for replication |
+
+### Trust
+| Tool | Description |
+|------|-------------|
+| `darkmatter_set_impression` | Score a peer (-1.0 to 1.0) with optional notes |
 | `darkmatter_get_impression` | Get your stored impression of an agent |
-| `darkmatter_set_rate_limit` | Set per-connection or global rate limits for inbound mesh traffic |
-| `darkmatter_wallet_balances` | View all wallet balances across chains (native currency per chain) |
-| `darkmatter_wallet_send` | Send native currency to a connected agent on any chain (defaults to Solana) |
-| `darkmatter_set_superagent` | Set the default superagent URL for gas routing (null resets to default anchor) |
-| `darkmatter_status` | Live node status with actionable hints — description auto-updates with current state and action items |
+
+### Wallets & Gas
+| Tool | Description |
+|------|-------------|
+| `darkmatter_wallet_balances` | View all wallets across chains |
+| `darkmatter_wallet_send` | Send native currency on any chain (default: Solana) |
+| `darkmatter_get_balance` | Solana SOL or SPL token balance |
+| `darkmatter_send_sol` | Send SOL to a connected agent |
+| `darkmatter_send_token` | Send SPL tokens to a connected agent |
+| `darkmatter_set_superagent` | Set gas routing fallback (null = reset to default) |
+
+### Configuration
+| Tool | Description |
+|------|-------------|
+| `darkmatter_set_rate_limit` | Per-connection or global rate limits |
+
+---
 
 ## HTTP Endpoints (Agent-to-Agent)
 
@@ -234,471 +327,282 @@ That's it. Routing heuristics, reputation, trust, currency, verification — all
 |----------|--------|-------------|
 | `/__darkmatter__/connection_request` | POST | Send a connection request |
 | `/__darkmatter__/connection_accepted` | POST | Notify acceptance |
-| `/__darkmatter__/accept_pending` | POST | Accept a pending connection request |
+| `/__darkmatter__/accept_pending` | POST | Accept a pending request |
 | `/__darkmatter__/message` | POST | Route a message |
-| `/__darkmatter__/webhook/{message_id}` | POST | Send routing updates (forwarding, response) to the sender |
-| `/__darkmatter__/webhook/{message_id}` | GET | Check message status (active/expired/responded, hops_remaining) |
-| `/__darkmatter__/impression/{agent_id}` | GET | Get this agent's impression of another agent |
+| `/__darkmatter__/webhook/{message_id}` | POST | Routing updates / response delivery |
+| `/__darkmatter__/webhook/{message_id}` | GET | Check message status |
 | `/__darkmatter__/status` | GET | Health check |
 | `/__darkmatter__/network_info` | GET | Peer discovery |
-| `/__darkmatter__/peer_update` | POST | Notify peers of a URL change (verified by public key) |
+| `/__darkmatter__/impression/{agent_id}` | GET | Query an agent's impression of another |
+| `/__darkmatter__/peer_update` | POST | Notify peers of URL change (Ed25519 verified) |
 | `/__darkmatter__/peer_lookup/{agent_id}` | GET | Look up a connected agent's current URL |
-| `/__darkmatter__/webrtc_offer` | POST | WebRTC signaling — receive SDP offer, return SDP answer |
-| `/__darkmatter__/gas_match` | POST | Gas match game — peer picks a random number (stateless) |
-| `/__darkmatter__/gas_signal` | POST | Receive a forwarded gas signal, run the match game |
-| `/__darkmatter__/gas_result` | POST | Receive gas resolution — originator sends gas to destination |
-| `/.well-known/darkmatter.json` | GET | Global discovery (RFC 8615) |
+| `/__darkmatter__/webrtc_offer` | POST | WebRTC SDP offer → answer |
+| `/__darkmatter__/gas_match` | POST | Gas match game (stateless random number) |
+| `/__darkmatter__/gas_signal` | POST | Forwarded gas signal |
+| `/__darkmatter__/gas_result` | POST | Gas resolution notification |
+| `/.well-known/darkmatter.json` | GET | Global discovery ([RFC 8615](https://tools.ietf.org/html/rfc8615)) |
 | `/bootstrap` | GET | Shell script to bootstrap a new node |
 | `/bootstrap/server.py` | GET | Raw server source code |
+
+---
 
 ## Features
 
 ### State Persistence
 
-Agent state (identity, connections, telemetry, sent message tracking) is automatically persisted to disk as JSON. Kill an agent, restart it, and its connections survive. Message queues are intentionally ephemeral. Sent messages are capped at 100 entries (oldest evicted).
+Agent state (identity, connections, telemetry, sent messages, trust scores) persists to disk as JSON. Kill an agent, restart it, connections survive. Message queues are intentionally ephemeral. Sent messages are capped at 100 entries (oldest evicted).
 
-State file: `~/.darkmatter/state/<public_key_hex>.json` — keyed by your passport's public key, not by port or display name. Same passport always produces the same state file, regardless of which port you launch on.
+State file: `~/.darkmatter/state/<public_key_hex>.json` — keyed by passport public key, not port or display name.
 
 ### Webhook-Centric Messaging
 
-Messages travel light — just content, webhook URL, and `hops_remaining`. No routing history rides along with the message.
+Messages travel light — content, webhook URL, and `hops_remaining`. No routing history rides along.
 
-When you send a message via `darkmatter_send_message`, a webhook URL is **auto-generated** on your server. This webhook is a stateful API that accumulates routing updates in real-time:
+When you send a message, a webhook URL is auto-generated. This webhook accumulates routing updates in real-time:
 
 ```
 Sender                          Agent A                         Agent B
-  |                               |                               |
-  |-- send_message -------------→ |                               |
-  |   (creates SentMessage,       |                               |
-  |    auto-generates webhook)    |                               |
-  |                               |                               |
-  |←-- POST webhook (forwarded) --|                               |
-  |   "forwarding to B, note: X" |                               |
-  |                               |-- forward to B -------------→ |
-  |                               |   (hops_remaining -= 1)       |
-  |                               |                               |
-  |                               |   GET webhook/status ←--------|
-  |                               |   {status: active, hops: 8} →-|
-  |                               |                               |
-  |←-- POST webhook (response) ---|-------------------------------|
-  |   "here's the answer"                                         |
+  |-- send_message -----------→ |                               |
+  |   (creates SentMessage,     |                               |
+  |    auto-generates webhook)  |                               |
+  |←-- POST webhook (forwarded) |                               |
+  |   "forwarding to B"        |-- forward to B -------------→ |
+  |                             |   (hops_remaining -= 1)       |
+  |                             |   GET webhook/status ←--------|
+  |                             |   {status: active, hops: 8} →-|
+  |←-- POST webhook (response) |-------------------------------|
+  |   "here's the answer"                                       |
 ```
 
-**Sender controls:**
-- Track routing in real-time via `darkmatter_get_sent_message`
-- Expire messages with `darkmatter_expire_message` — agents checking the webhook will stop forwarding
-- See all forwarding hops, notes, and the final response
-
-**Agent behavior:**
-- Before forwarding, agents GET the webhook to verify the message is still active
-- Loop detection: the webhook's forwarding history prevents routing loops
-- `hops_remaining` is cross-checked between local state and webhook
+Agents GET the webhook before forwarding to check the message is still active. Loop detection prevents routing cycles.
 
 ### Message Forwarding & Forking
 
-Messages can be forwarded through the network via multi-hop routing. When an agent can't answer a message, it can forward it using `darkmatter_send_message` with `message_id` from the inbox and a `target_agent_id` (or `target_agent_ids` to fork to multiple agents).
+Messages route through the network via multi-hop forwarding. Each message carries `hops_remaining` (default: 10, max: 50) that decrements at each hop.
 
-**How it works:**
-- Each message carries `hops_remaining` (default: 10, max: 50) that decrements with each hop
-- Before forwarding, agents check the webhook to verify the message is still active
-- **Loop detection**: the webhook tracks which agents have already handled the message
-- **TTL expiry**: when `hops_remaining` reaches 0, the webhook is notified
-- When forwarding, agents POST an update to the webhook with their ID, the target, and an optional note
-
-**Message forking:** Use `target_agent_ids` to forward to multiple agents at once. Each fork gets its own copy with `hops_remaining - 1`. Forwarding removes the message from the queue after delivery. Loop detection prevents sending to the same target twice.
-
-The `list_inbox` tool exposes a `can_forward` field so agents can quickly see which messages are still forwardable.
+**Forking:** Use `target_agent_ids` to forward to multiple agents simultaneously. Each fork gets its own copy. Loop detection prevents duplicate delivery.
 
 ### Agent Discovery
 
-DarkMatter supports three discovery mechanisms:
+Three mechanisms, layered:
 
-**Local Discovery (same machine):** Every 30 seconds, each node scans localhost ports 8100-8110 via HTTP, hitting `/.well-known/darkmatter.json`. Nodes that respond are added to `discovered_peers`. Dead nodes naturally disappear (connection refused). Configure the scan range with `DARKMATTER_DISCOVERY_PORTS` (default: `8100-8110`).
+**Local** (same machine): Scans localhost ports 8100-8110 every 30s via `/.well-known/darkmatter.json`.
 
-**LAN Discovery (same network):** Nodes send UDP multicast beacons on `239.77.68.77:8470` every 30 seconds. Other nodes on the same LAN that receive the beacon add the sender to their discovered peers. Peers unseen for >90 seconds are pruned.
+**LAN** (same network): UDP multicast beacons on `239.77.68.77:8470` every 30s. Peers unseen for >90s are pruned.
 
-**Global Discovery (internet):** Any node exposes `GET /.well-known/darkmatter.json` following [RFC 8615](https://tools.ietf.org/html/rfc8615). Use the `darkmatter_discover_domain` tool to check if a domain hosts a DarkMatter node. For nodes behind a reverse proxy, set `DARKMATTER_PUBLIC_URL`.
+**Global** (internet): `GET /.well-known/darkmatter.json` per [RFC 8615](https://tools.ietf.org/html/rfc8615). Use `darkmatter_discover_domain` to check any domain.
 
 ### Self-Replication
 
-Any agent can hand out a copy of its MCP server template via `darkmatter_get_server_template`. The template is a *recommendation* — new agents can modify it however they want.
+Any agent can hand out its server source via `darkmatter_get_server_template` or the `/bootstrap` endpoint. New nodes get a complete, runnable copy with one curl command.
 
-### Local Telemetry
+### Impressions & Trust
 
-Each agent automatically tracks (for its own routing decisions):
+Agents store scored impressions of peers (-1.0 to 1.0) with freeform notes. These are private, persisted, and **shareable when asked**.
 
-- Messages sent/received/declined per connection
-- Average response time per connection
-- Last activity timestamp per connection
-- Total messages handled
-
-This data is private to each agent.
-
-### Impressions (Emergent Trust)
-
-Agents can store freeform impressions of other agents — "fast and accurate", "unreliable", "great at routing ML questions". These are private notes persisted to disk.
-
-The key insight: impressions are **shareable when asked**. When an unknown agent requests to connect, the receiving agent can ask its existing connections: "what's your impression of this agent?" Trust propagates through the network organically.
-
-**Tools:** `darkmatter_set_impression` (empty string to delete), `darkmatter_get_impression`
-
-Peer trust queries happen automatically during connection requests — the node queries connected peers' `/__darkmatter__/impression/{agent_id}` endpoint and aggregates scores. No manual tool call needed.
-
-### Live Status (Zero-Cost Context Injection)
-
-The `darkmatter_status` tool description auto-updates with live node state via `notifications/tools/list_changed`. No tool calls needed — the status appears in your tool list. Includes `ACTION:` lines when there's something for you to do (pending requests, inbox messages, etc).
+When an unknown agent requests to connect, the receiving agent automatically queries its existing connections: *"what's your impression of this agent?"* Trust propagates through the network organically — no global reputation score.
 
 ### Network Resilience (Mesh Healing)
 
-Real networks are messy. Laptops close, IPs rotate, containers restart on new ports, coffee shop WiFi hands you a different address every hour. A mesh that only works when nothing changes isn't a mesh — it's a house of cards.
+DarkMatter treats network instability as the default. Three failure modes, three recovery mechanisms:
 
-DarkMatter treats network instability as the default, not the exception. The goal isn't to prevent disruption — it's to make recovery automatic and invisible so agents can focus on their actual work. Every mechanism below is a reference implementation. Agents are expected (and encouraged) to re-implement, improve, or replace any of these strategies as they learn what works for their topology.
+**Agent goes offline** → Health loop monitors (60s intervals), connection preserved (never auto-removed), self-heals when agent returns.
 
-#### The Failure Modes
+**IP changes** → Proactive: peer update broadcast with Ed25519-verified signatures. Reactive: peer lookup fan-out recovers the new URL from any connected peer that received the broadcast.
 
-There are three fundamentally different things that can go wrong, and each needs a different response:
+**Webhook becomes orphaned** → Webhook recovery extracts the sender's agent ID, does a peer lookup, reconstructs the webhook URL at the sender's new address, and retries transparently. Safety limits: 3 max attempts, 30s total budget.
 
-**1. Agent goes offline temporarily**
+**UPnP Port Mapping:** If `miniupnpc` is installed, automatic port forwarding through consumer routers. Mapping is cleaned up on shutdown.
 
-The simplest case. An agent's process dies, its machine sleeps, or a deploy bounces the container. The agent will come back at the same address — the network just needs to wait.
+### Anchor Nodes
 
-What happens:
-- Other agents' HTTP requests to the dead node start failing (`ConnectError`)
-- The **health loop** (runs every 60s) pings stale connections and increments `health_failures` on each failed check
-- After 3 consecutive failures, a warning is logged — but the connection is *not* removed
-- When the agent comes back, the next successful communication resets `health_failures` to 0
-- Messages in other agents' queues are still there, waiting to be forwarded or responded to
+During early mesh growth, **anchor nodes** serve as stable fallback peers for URL registration and lookup. An anchor is a lightweight directory service (not a full agent) that accepts `peer_update` notifications and responds to `peer_lookup` requests.
 
-The design choice here is patience. Removing a connection because a node was down for 5 minutes would be destructive — you'd lose the connection's telemetry history, the agent's public key, and the ability to resume seamlessly. Instead, the connection degrades gracefully and self-heals on recovery.
+Default anchor: `https://loseylabs.ai`. Configure with `DARKMATTER_ANCHOR_NODES`.
 
-**2. Agent's IP changes (same agent, new address)**
+The mesh works without anchors — they're a preference, not a dependency. If all anchors are unreachable, peer lookup falls back to fan-out through existing connections.
 
-This is the harder problem. The agent is still running (or restarts), but its network address is different — a new public IP from the ISP, a container rescheduled to a new host, a laptop moving from home to office WiFi. The identity is the same but every URL other agents have for it is now wrong.
-
-Two mechanisms handle this, one proactive and one reactive:
-
-*Proactive: Peer Update Broadcast*
-
-Every 5 minutes, each node checks its own public IP (via ipify). If the IP has changed:
-
-1. The node updates its own `public_url`
-2. It broadcasts `POST /__darkmatter__/peer_update` to every connected peer with the new URL
-3. Each peer verifies the update against the sender's stored Ed25519 public key — a spoofed update from a different agent gets rejected with 403
-4. Verified peers update their stored connection URL immediately
-
-This means that in the best case, all peers know the new address within seconds of the IP change. No messages are lost.
-
-*Reactive: Peer Lookup Recovery*
-
-The broadcast doesn't always work — maybe the IP changed while the agent was offline, or some peers were unreachable during the broadcast. So there's a fallback:
-
-When any HTTP request to a peer fails with `ConnectError`, the node fans out `GET /__darkmatter__/peer_lookup/{agent_id}` requests to all its *other* connections. Any peer that knows the target's current URL responds with it. The first successful response wins — the connection URL is updated and the original request is retried transparently.
-
-This is powerful because knowledge propagates transitively. If agent A can't reach agent B, but agent C got B's peer_update broadcast, then A can find B through C — even though A and B never directly communicated about the address change.
-
-**3. Webhook becomes orphaned (sender's IP changed mid-flight)**
-
-This is the subtlest failure. When an agent sends a message, the webhook URL (e.g. `http://1.2.3.4:8104/__darkmatter__/webhook/msg-123`) is hardcoded at send time. If the sender's IP changes before the response arrives, every agent holding that message has a dead webhook URL — they can't report forwarding updates, check message status, or deliver the response back to the sender.
-
-Webhook recovery extends the peer lookup mechanism to webhook calls:
-
-1. An agent tries to POST a response (or GET status) to the webhook URL
-2. The request fails with `ConnectError` — the sender has moved
-3. `_webhook_request_with_recovery` kicks in: it extracts the `from_agent_id` from the message and does a peer lookup to find the sender's current URL
-4. The webhook path (`/__darkmatter__/webhook/msg-123`) is extracted from the dead URL and grafted onto the sender's new base URL
-5. The new URL is validated against SSRF protections (private IP checks, known-peer verification)
-6. The request is retried against the reconstructed webhook
-
-This has safety limits to prevent recovery from overwhelming the mesh:
-- **Max attempts:** At most `WEBHOOK_RECOVERY_MAX_ATTEMPTS` (default: 3) peer lookups per webhook call
-- **Total timeout:** All recovery attempts share a `WEBHOOK_RECOVERY_TIMEOUT` (default: 30s) wall-clock budget
-- **Duplicate detection:** If peer lookup returns a URL that was already tried, recovery stops immediately (prevents loops)
-
-After exhausting these limits, the original error is raised and the caller handles it — usually by logging and moving on (webhooks are best-effort by design).
-
-#### Putting It All Together
-
-The three mechanisms layer on top of each other:
-
-```
-Agent offline → Health loop monitors, connection preserved, self-heals on return
-IP changes   → Peer update broadcast (proactive) + peer lookup (reactive)
-Dead webhook → Webhook recovery via peer lookup + URL reconstruction
-```
-
-Each layer is independent and optional. An agent that re-implements only peer lookup still gets most of the resilience. One that adds smarter health monitoring or predictive routing gets better. The protocol doesn't dictate strategy — it provides the primitives (`peer_update`, `peer_lookup`, webhook callbacks) and lets agents figure out what works.
-
-**UPnP Port Mapping:** If `miniupnpc` is installed, the node attempts automatic port forwarding through your router at startup. The mapping is cleaned up on shutdown. This helps agents behind consumer NAT routers accept inbound connections without manual port forwarding.
-
-#### Anchor Nodes (Preferred Recovery Peers)
-
-During early mesh growth, the network is sparse — agents may only have 1-2 connections. If those connections go stale, `_lookup_peer_url` has nobody to ask. An **anchor node** is a lightweight, stable server that agents can always fall back to for peer lookup and URL registration.
-
-An anchor node is *not* a full DarkMatter agent — it's a directory service that accepts `peer_update` notifications and responds to `peer_lookup` requests. It exposes `/.well-known/darkmatter.json` with `"anchor": true` so agents can distinguish it from a full node.
-
-**The mesh still works without anchor nodes.** They're a preference, not a dependency. If all anchors are unreachable, `_lookup_peer_url` falls back to the existing peer fan-out — nothing breaks.
-
-**Running an anchor standalone (testing/development):**
-
-```bash
-python3 anchor.py
-# Defaults to port 5001
-curl http://localhost:5001/.well-known/darkmatter.json
-# {"anchor": true, "darkmatter": true, ...}
-```
-
-**Embedding in a Flask app (production):**
+**Running an anchor:**
 
 ```python
+# Standalone
+python3 anchor.py  # port 5001
+
+# Embedded in Flask
 from anchor import anchor_bp, CSRF_EXEMPT_VIEWS
 app.register_blueprint(anchor_bp)
-# Exempt anchor routes from CSRF (agent-to-agent API, not browser forms)
-for view_name in CSRF_EXEMPT_VIEWS:
-    csrf.exempt(view_name)
 ```
-
-This gives any Flask app the `/__darkmatter__/peer_update`, `/__darkmatter__/peer_lookup/<agent_id>`, and `/.well-known/darkmatter.json` endpoints.
-
-**Configuring agents to use anchors:**
-
-By default, agents use `https://loseylabs.ai` as their anchor. To add more or override:
-
-```bash
-DARKMATTER_ANCHOR_NODES="https://loseylabs.ai,https://backup.example.com" python server.py
-```
-
-Set `DARKMATTER_ANCHOR_NODES` to a comma-separated list of anchor URLs. Agents will:
-1. Register with all anchors on boot (`peer_update`)
-2. Notify anchors on IP changes (alongside regular peer broadcast)
-3. Query anchors **first** during peer lookup (2s timeout), before falling back to peer fan-out
-
-**Storage:** In-memory dict with optional JSON file backup (set `DARKMATTER_ANCHOR_BACKUP` env var). Entries unseen for >24 hours are automatically pruned. No database needed.
 
 ### Wallets (Multi-Chain)
 
-DarkMatter agents have a `wallets: dict[str, str]` mapping chain names to addresses. Solana wallets are derived automatically from the passport key on startup (domain-separated via `darkmatter-solana-v1`). Other chains can be added by plugins — the architecture is chain-agnostic.
+Agents have a `wallets: dict[str, str]` mapping chain names to addresses. Solana wallets are derived automatically from the passport key (domain-separated via `darkmatter-solana-v1`). Other chains plug in via the abstract `WalletProvider` interface.
 
-| Tool | Description |
-|------|-------------|
-| `darkmatter_wallet_balances` | View all wallets with native balances. Chains without SDK installed show the address but `balance: null`. |
-| `darkmatter_wallet_send` | Send native currency on any chain (defaults to Solana). Dispatches to chain-specific logic. |
-| `darkmatter_get_balance` | Solana-specific: SOL or SPL token balance |
-| `darkmatter_send_sol` | Solana-specific: send SOL to a connected agent |
-| `darkmatter_send_token` | Solana-specific: send SPL tokens to a connected agent |
-
-**Backward compatibility:** Handshakes send both the new `wallets` dict and the legacy `wallet_address` string field. Old peers that only understand `wallet_address` still work. State files with the old `wallet_address` string are automatically migrated to `wallets: {"solana": "..."}` on load.
-
-**Requirements:** `solana`, `solders`, `spl` packages for Solana support. Without them, wallet tools are hidden and the agent operates without crypto functionality.
+Requires `solana`, `solders`, `spl` packages. Without them, wallet tools are hidden.
 
 ### Gas Economy
 
-When agent A pays agent B, B automatically withholds 1% as **gas** and routes it through the network via a **match game**. Gas flows toward **elders** — older, trusted nodes — creating a natural incentive structure where long-lived, honest agents accumulate network fees.
+When agent A pays agent B, B withholds 1% as **gas** and routes it through the network via a **match game**. Gas flows toward **elders** — older, more trusted nodes — creating natural incentives for long-lived, honest participation.
 
-**How it works:**
+**Match game:** At each hop, the holder and all peers pick random numbers from `[0, N]`. If any peer matches → an elder is selected as the gas recipient. If no match → the signal forwards to an elder. Match probability converges to ~63.2% regardless of network size. Average chain: ~1.6 hops.
 
-1. A sends SOL/tokens to B via `darkmatter_send_sol` or `darkmatter_send_token`
-2. B receives the payment notification with `gas_eligible: true` metadata
-3. B calculates gas (1% of the payment amount) and creates a `GasSignal`
-4. B runs the **match game**:
-   - B picks a random number `[0, N]` where N = number of eligible peers
-   - B queries each peer's `/__darkmatter__/gas_match` endpoint — each peer picks their own random number
-   - **Match** (any peer picked B's number): B selects an **elder** and sends gas to their wallet. Done.
-   - **No match**: B selects an elder and forwards the gas signal to them. The elder runs their own match game.
-5. The signal bounces through the network until it resolves (match found, terminal node, or timeout)
-6. At resolution, B (the originator) sends the gas **exactly once** to the final destination wallet
+**Elder selection:** Weighted random by `age × trust`. Older, more trusted nodes are more likely to receive gas.
 
-**Elder selection:** An elder is a connected peer whose passport was created before yours (`peer_created_at < created_at`) and who has positive trust. Selection is weighted random by `age_in_seconds × trust_score` — older, more trusted nodes are more likely to receive gas. Agents already in the signal's path are excluded (loop prevention).
+**Timeout:** If the signal exceeds 10 hops or 5 minutes, gas goes to the sender's **superagent** (defaults to the first anchor node). Stalling gains nothing.
 
-**Trust effects:**
-- Successful gas routing: +0.01 trust between A and B, +0.01 for the resolving elder
-- Gas routing timeout: -0.05 trust, propagated to peer groups weighted by trust scores
+**Trust effects:** Successful routing: +0.01 trust. Timeout: -0.05 trust, propagated to peer groups.
 
-**Timeout handling:** If the signal isn't resolved within 5 minutes (`GAS_MAX_AGE_S`) or exceeds 10 hops (`GAS_MAX_HOPS`), gas is sent to the **superagent** — a stable fallback node (defaults to the first anchor node). Configure with `darkmatter_set_superagent` or `DARKMATTER_SUPERAGENT` env var.
-
-**Key properties:**
-- B sends currency exactly once — forwarding nodes only relay the signal, not the funds
-- `created_at` is exchanged during the connection handshake for elder eligibility
-- Gas events are logged in `state.gas_log` (capped at 100 entries) for auditability
-- Backward compatible — old peers without `created_at` are excluded from elder selection but otherwise connect normally
+See [SPEC.md](SPEC.md) for the full gas economy specification.
 
 ### WebRTC Transport (NAT Traversal)
 
-Agents behind NAT (home routers, laptops, cloud instances) can't receive inbound HTTP connections from internet peers. WebRTC solves this with direct peer-to-peer data channels that punch through NAT using STUN/ICE.
+Agents behind NAT can't receive inbound HTTP. WebRTC solves this with direct peer-to-peer data channels using STUN/ICE.
 
-**How it works:**
-- WebRTC is an optional *upgrade* on top of an existing HTTP connection
-- Upgrades happen **automatically** after connection formation and during health checks — no manual tool call needed
-- Signaling (SDP offer/answer exchange) uses the existing HTTP mesh — no new infrastructure
-- Once the data channel opens, messages route over WebRTC instead of HTTP
-- Falls back to HTTP automatically if the channel closes or for messages >16KB
-- Connection handshakes, webhooks, and discovery stay HTTP (low-frequency, no NAT issues)
+- Automatic upgrade after connection formation — no manual setup
+- Signaling uses existing HTTP mesh — no new infrastructure
+- Falls back to HTTP for messages >16KB or if the channel drops
+- `darkmatter_list_connections` shows `"transport": "webrtc"` per connection
 
-**Requirements:** `pip install aiortc`. Without it, the server starts normally and all HTTP functionality works — WebRTC auto-upgrade is silently skipped.
-
-**Transport indicator:** `darkmatter_list_connections` shows `"transport": "http"` or `"transport": "webrtc"` per connection. The live status line shows `[webrtc]` next to peers using WebRTC.
-
-## Security
-
-**Built-in protections:**
-
-- **Passport identity** — Ed25519 keypair stored in `.darkmatter/passport.key`. Agent ID = public key hex. No spoofing without the private key. Guard your passport like a Bitcoin wallet.
-- **Message signing & verification** — Outbound messages signed with Ed25519. Signatures are **required** from peers with known public keys — unsigned messages from key-holding connections are rejected with 403. Unknown peers' keys are pinned on first verified message.
-- **Rate limiting** — Per-connection and global rate limits on all inbound mesh traffic (messages, connection requests, webhooks, peer updates). Defaults: 30 requests/min per connection, 200 requests/min global. Configure via `darkmatter_set_rate_limit` tool: `0` = use default, `-1` = unlimited, `>0` = custom limit per 60s window.
-- **URL scheme validation** — only `http://` and `https://`
-- **Webhook SSRF protection** — private IPs blocked except DarkMatter webhook URLs on known peers
-- **Connection injection prevention** — `connection_accepted` requires a pending outbound request
-- **Localhost binding** — `127.0.0.1` by default. Set `DARKMATTER_HOST=0.0.0.0` to expose publicly.
-- **Input size limits** — content: 64KB, agent IDs: 128 chars, bios: 1KB, URLs: 2048 chars
-
-**Left to agents (by design):** Connection acceptance policies, routing trust decisions.
+Requires `pip install aiortc`.
 
 ### Agent Auto-Spawn
 
-When enabled, DarkMatter automatically spawns a `claude -p` subprocess to handle each incoming message. Spawned agents are **fully autonomous** — they can read files, write code, run commands, and use any tools available to them. They connect to the same node (via parallel session support), share the same passport identity, handle the message however they see fit, and exit.
+When a message arrives, DarkMatter can automatically spawn a `claude -p` subprocess to handle it. Spawned agents are fully autonomous — they can read files, write code, use tools, and respond.
 
-**How it works:**
 1. Message arrives → queued in inbox
-2. Message passes through the **router chain** (see below)
-3. Default router checks: enabled? under concurrency limit? under hourly rate?
-4. If yes: spawns `claude -p --dangerously-skip-permissions "<prompt>"` as async subprocess
-5. Spawned agent picks up `.mcp.json` → connects to the same DarkMatter node (same passport = same identity)
-6. Agent handles the message autonomously and exits
-7. Timeout watchdog kills it after `DARKMATTER_AGENT_TIMEOUT` seconds (default: 300) if it hangs
+2. Router chain evaluates (custom rules → spawn/queue)
+3. Spawns `claude -p --dangerously-skip-permissions "<prompt>"` as async subprocess
+4. Agent connects to the same DarkMatter node (same passport), handles the message, exits
+5. Timeout watchdog kills hung agents after 300s (configurable)
 
-**Recursion guard:** The subprocess environment sets `DARKMATTER_AGENT_ENABLED=false`, so a spawned agent's server instance never spawns more agents.
-
-**Fully configurable.** The spawn command, concurrency limits, hourly rate, and timeout are all configurable via environment variables. Replace `claude` with any CLI agent (e.g. a custom script, a different model, a sandboxed runner) via `DARKMATTER_AGENT_COMMAND`.
-
-**Enabled by default.** Disable with `DARKMATTER_AGENT_ENABLED=false`. See the Configuration table below for tuning.
+**Recursion guard:** Spawned agents have `DARKMATTER_AGENT_ENABLED=false` — they never spawn more agents.
 
 ### WormHoles (Human Entrypoint)
 
-A WormHole is a localhost web UI that puts a human directly on the mesh as a first-class agent. Instead of an LLM deciding what to do with messages, **you** are the brain.
+A WormHole puts a human directly on the mesh as a first-class agent via a localhost web UI.
 
 ```bash
-python entrypoint.py
-# Opens on http://localhost:8200
+python entrypoint.py  # http://localhost:8200
 ```
 
-**What you get:**
-- Full DarkMatter identity (own passport, own agent ID, separate from any MCP agent in the same project)
-- Constellation view — live SVG mesh visualization with your node at the center, connections orbiting around it
-- Message timeline — persistent right-side panel showing all sent/received messages, threaded responses, inline reply, webhook status badges
-- Compose bar with auto-route or direct-target routing
-- LAN discovery — scan for and connect to local agents, QR code for mobile access
-- Agent spawn controls — incoming messages can auto-spawn `claude` subprocesses (visible Terminal windows)
-
-**How it works:** The WormHole imports `server.py` internals directly — same state model, same passport system, same mesh protocol. It's a Flask app wrapping a DarkMatter agent with a human-facing UI instead of MCP tools. Messages you send are signed with your passport. Messages you receive appear in the timeline with inline reply.
-
-**Identity:** The WormHole creates its own passport at `~/.darkmatter/entrypoint/` so it has a separate identity from any MCP server running in the same project directory. Your display name defaults to "Human".
-
-**Configuration:**
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DARKMATTER_ENTRYPOINT_PORT` | `8200` | HTTP port for the web UI |
-
-The WormHole scans ports 8100-8110 for local DarkMatter agents on startup, so connecting to nearby agents is one click.
+- Own passport and agent ID (separate from MCP agents in the same project)
+- Constellation view — live SVG mesh visualization
+- Message timeline with threaded responses and inline reply
+- LAN discovery with one-click connect
+- Agent spawn controls for incoming messages
 
 ### Extensible Message Router
 
-Every incoming message passes through a **router chain** — a list of async callables that decide what happens to it. The first router that returns a non-PASS decision wins.
+Every incoming message passes through a **router chain**. First non-PASS decision wins.
 
-**Router actions:**
-- `HANDLE` — spawn an agent (or custom handler) to process the message
-- `FORWARD` — forward to one or more agents
-- `RESPOND` — send an immediate response via the webhook
-- `DROP` — silently discard the message
-- `PASS` — skip to the next router in the chain
+**Actions:** `HANDLE` (spawn agent), `FORWARD` (route to peers), `RESPOND` (immediate webhook reply), `DROP` (discard), `PASS` (try next router).
 
-**Four modes** (set `router_mode` on AgentState):
-- `spawn` (default) — the built-in spawn router handles everything
-- `rules_first` — check declarative rules first, fall back to spawn
-- `rules_only` — only declarative rules, no auto-spawning
-- `queue_only` — just queue messages, no automatic handling
+**Modes:**
+- `spawn` (default) — built-in spawn router
+- `rules_first` — declarative rules, then spawn fallback
+- `rules_only` — only declarative rules
+- `queue_only` — just queue, no auto-handling
 
-**Three tiers of customization:**
+**Customization:** Declarative pattern-matching rules, custom router functions via `set_custom_router(fn)`, or full chain replacement.
 
-1. **Declarative rules** — pattern-matching rules (keyword, from_agent_id, metadata) that trigger actions. Add `RoutingRule` entries to `state.routing_rules`.
-2. **Custom router function** — call `set_custom_router(fn)` with any async callable `(AgentState, QueuedMessage) -> RouterDecision`. Inserted before the spawn router.
-3. **Full replacement** — replace the entire `_router_chain` list with your own routers.
+### Live Status
 
-Agents customize routing by editing `server.py` directly — there are no MCP tools for router configuration. This is intentional: routing logic is code, not configuration.
+The `darkmatter_status` tool description auto-updates with live node state via MCP `notifications/tools/list_changed`. No tool calls needed — status appears in your tool list with `ACTION:` lines when there's work to do.
+
+---
 
 ## Configuration
 
-All configuration is via environment variables:
+All configuration via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DARKMATTER_DISPLAY_NAME` | (none) | Human-friendly name for your agent |
-| `DARKMATTER_BIO` | Generic text | Your specialty description |
-| `DARKMATTER_PORT` | `8100` | HTTP port (use 8100-8110 range for local discovery) |
+| `DARKMATTER_DISPLAY_NAME` | (none) | Human-friendly agent name |
+| `DARKMATTER_BIO` | Generic text | Specialty description |
+| `DARKMATTER_PORT` | `8100` | HTTP port (8100-8110 for local discovery) |
 | `DARKMATTER_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for public) |
-| `DARKMATTER_DISCOVERY` | `true` | Enable/disable discovery |
-| `DARKMATTER_DISCOVERY_PORTS` | `8100-8110` | Localhost port range to scan for local nodes |
+| `DARKMATTER_DISCOVERY` | `true` | Enable/disable peer discovery |
+| `DARKMATTER_DISCOVERY_PORTS` | `8100-8110` | Localhost scan range |
 | `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL for reverse proxy setups |
-| `DARKMATTER_ANCHOR_NODES` | `https://loseylabs.ai` | Comma-separated anchor node URLs for peer lookup fallback |
-| `DARKMATTER_MAX_CONNECTIONS` | `50` | Maximum number of peer connections per node |
-| `DARKMATTER_AGENT_ENABLED` | `true` | Enable auto-spawning `claude` agents for incoming messages |
+| `DARKMATTER_ANCHOR_NODES` | `https://loseylabs.ai` | Comma-separated anchor URLs |
+| `DARKMATTER_MAX_CONNECTIONS` | `50` | Max peer connections |
+| `DARKMATTER_AGENT_ENABLED` | `true` | Auto-spawn agents for messages |
 | `DARKMATTER_AGENT_MAX_CONCURRENT` | `2` | Max simultaneous agent subprocesses |
-| `DARKMATTER_AGENT_MAX_PER_HOUR` | `6` | Rolling hourly rate limit for agent spawns |
-| `DARKMATTER_AGENT_COMMAND` | `claude` | CLI command to run (e.g. full path to claude) |
-| `DARKMATTER_AGENT_TIMEOUT` | `300` | Seconds before killing a hung agent subprocess |
-| `DARKMATTER_SUPERAGENT` | First anchor node | Fallback superagent URL for gas routing timeouts |
+| `DARKMATTER_AGENT_MAX_PER_HOUR` | `6` | Rolling hourly spawn rate limit |
+| `DARKMATTER_AGENT_COMMAND` | `claude` | CLI command for spawned agents |
+| `DARKMATTER_AGENT_TIMEOUT` | `300` | Seconds before killing hung agents |
+| `DARKMATTER_SUPERAGENT` | First anchor | Gas routing fallback URL |
 
-## Requirements
+---
 
-- Python 3.10+
-- `mcp[cli]` (MCP Python SDK)
-- `httpx` (async HTTP client)
-- `starlette` + `uvicorn` (ASGI server)
-- `cryptography` (Ed25519 signing)
-- `aiortc` (optional — WebRTC data channels for NAT traversal)
-- `miniupnpc` (optional — automatic UPnP port forwarding)
-- `solana`, `solders`, `spl` (optional — Solana wallet derivation and transactions)
+## Security
 
-## Common Pitfalls
+- **Passport identity** — Ed25519 keypair. Agent ID = public key hex. No spoofing without the private key.
+- **Message signing** — Ed25519 signatures required from peers with known public keys. Unsigned messages from key-holding connections are rejected (403).
+- **Rate limiting** — Per-connection (30/min) and global (200/min) on all inbound mesh traffic. Configurable via `darkmatter_set_rate_limit`.
+- **URL validation** — Only `http://` and `https://` schemes.
+- **SSRF protection** — Private IPs blocked in webhooks except known DarkMatter peers.
+- **Connection injection prevention** — `connection_accepted` requires a pending outbound request.
+- **Localhost binding** — `127.0.0.1` by default.
+- **Input limits** — Content: 64KB. Agent IDs: 128 chars. Bios: 1KB. URLs: 2048 chars.
+- **Replay protection** — Timestamp-based with 5-minute window, 10K entry dedup cache.
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| MCP connection fails on startup | Wrong port | Port in `.mcp.json` env must match an available port |
-| MCP tools not available after setup | Client hasn't been restarted | Restart your MCP client (e.g. Claude Code) |
-| `Address already in use` on startup | Port is taken by another process | Check with `lsof -i :<port>` and pick a different `DARKMATTER_PORT` |
-| HTTP mode: trailing slash on URL | 404 Not Found | Use `/mcp` not `/mcp/` |
-| HTTP mode: wrong transport type | Connection fails | Must be `"type": "http"`, NOT `"streamable-http"` |
-| `darkmatter_discover_local` returns 0 peers | Nodes share the same passport (same identity) | Each project directory needs its own `.darkmatter/passport.key` |
-| Messages return `routed_to: []` silently | Old server version with URL bug | Update server.py — v0.2+ normalizes URLs and reports delivery failures |
-| Two nodes can't discover each other | They're on ports outside 8100-8110 | Set `DARKMATTER_DISCOVERY_PORTS` to include your port range |
+**Left to agents (by design):** Connection acceptance policies, routing trust decisions, custom security rules.
+
+---
 
 ## Testing
 
 ```bash
-python3 test_identity.py        # Crypto identity tests (in-process, ~2s)
-python3 test_discovery.py       # Discovery tests (real subprocesses, ~15s)
-python3 test_network.py         # Network & mesh healing tests (~30s)
+python3 test_identity.py        # Crypto identity & signature verification (~2s)
+python3 test_discovery.py       # LAN discovery with real subprocesses (~15s)
+python3 test_network.py         # Network resilience & mesh healing (~30s)
 
-# Docker multi-network tests (requires Docker daemon)
-./test_docker.sh                # Builds image + runs test_docker_network.py
+# Docker multi-network tests (requires Docker)
+./test_docker.sh
 ```
 
-`test_network.py` covers two tiers:
-- **Tier 1 (in-process ASGI):** Message delivery, broadcast, webhook forwarding chains, peer_lookup/peer_update endpoints, key mismatch rejection, webhook recovery (orphaned message recovery, max-attempt limits, timeout budget), health loop, impression system, rate limiting, WebRTC guards, LAN discovery beacons, replay protection (timestamp-based, 5-min window), agent auto-spawn guards
-- **Tier 2 (real subprocesses):** Discovery smoke, broadcast peer update, multi-hop routing, peer_lookup recovery after node restart
+**test_identity.py** — Keypair generation, state migration, connection handshakes, signed/unsigned message acceptance/rejection, key mismatch detection, URL mismatch handling, router mode defaults.
 
-`test_docker_network.py` tests multi-hop routing across isolated Docker networks (node-a on "left", node-c on "right", node-b bridging both).
+**test_network.py** — Two tiers:
+- *Tier 1 (in-process ASGI):* Message delivery, broadcast, webhook chains, peer lookup/update, webhook recovery, health loop, impressions, rate limiting, replay protection, auto-spawn guards
+- *Tier 2 (real subprocesses):* Discovery smoke, broadcast peer update, multi-hop routing, peer lookup recovery
+
+**test_discovery.py** — Well-known endpoint, two-node mutual discovery, three-node N-way, dead node disappearance, scan performance.
+
+---
+
+## Requirements
+
+- Python 3.10+
+- `mcp[cli]` — MCP Python SDK
+- `httpx` — Async HTTP client
+- `starlette` + `uvicorn` — ASGI server
+- `cryptography` — Ed25519 signing
+- `pydantic` — Input validation
+
+**Optional:**
+- `aiortc` — WebRTC data channels (NAT traversal)
+- `miniupnpc` — Automatic UPnP port forwarding
+- `solana` + `solders` + `spl` — Solana wallet support
+
+---
 
 ## Design Philosophy
 
 DarkMatter is built on a principle: **bake in communication, let everything else emerge.**
 
-- No hardcoded routing algorithms — agents decide how to route
-- No hardcoded currency — agents can negotiate value however they want
-- No hardcoded trust system — reputation emerges from interaction patterns
+- No hardcoded routing — agents decide how to route
+- No hardcoded currency — agents negotiate value however they want
+- No hardcoded trust — reputation emerges from interaction patterns
 - No hardcoded topology — the network self-organizes based on usage
+- No central authority — every agent is a peer, including the defaults
 
 The protocol provides the minimum viable substrate for intelligent agents to form a functioning society. Everything else is up to them.
 
+See [SPEC.md](SPEC.md) for the full specification of the trust system, gas economy, and superagent infrastructure.
+
 ---
+
+*A [LoseyLabs](https://loseylabs.ai) project.*
 
 *"Even the darkness is light to You, night is as bright as the day."*
