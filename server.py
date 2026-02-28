@@ -21,6 +21,7 @@ import time
 import asyncio
 import fcntl
 import os
+import random
 import shlex
 import signal
 import sys
@@ -62,6 +63,32 @@ try:
     UPNP_AVAILABLE = True
 except ImportError:
     UPNP_AVAILABLE = False
+
+# Solana wallet support (optional — gracefully degrades if solana/solders not installed)
+try:
+    import hashlib as _hashlib
+    from solders.keypair import Keypair as SolanaKeypair
+    from solders.pubkey import Pubkey as SolanaPubkey
+    from solders.system_program import transfer as sol_transfer, TransferParams as SolTransferParams
+    from solders.transaction import VersionedTransaction
+    from solders.message import MessageV0
+    from solana.rpc.async_api import AsyncClient as SolanaClient
+    from spl.token.instructions import transfer_checked, TransferCheckedParams
+    from spl.token.constants import TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+    from spl.token.instructions import create_associated_token_account
+    SOLANA_AVAILABLE = True
+except ImportError:
+    SOLANA_AVAILABLE = False
+
+SOLANA_RPC_URL = os.environ.get("DARKMATTER_SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+LAMPORTS_PER_SOL = 1_000_000_000
+
+# Well-known SPL tokens (name -> (mint_address, decimals))
+SPL_TOKENS = {
+    "DM":   ("5DxioZwEeAKpBaYC5veTHArKE55qRDSmb5RZ6VwApump", 6),
+    "USDC": ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 6),
+    "USDT": ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", 6),
+}
 
 
 # =============================================================================
@@ -114,7 +141,6 @@ CORE_TOOLS = frozenset({
     "darkmatter_get_identity",
     "darkmatter_list_inbox",
     "darkmatter_get_message",
-    "darkmatter_respond_message",
     "darkmatter_send_message",
     "darkmatter_list_connections",
     "darkmatter_connection",
@@ -129,6 +155,16 @@ ANCHOR_NODES: list[str] = [u.strip().rstrip("/") for u in _anchor_env.split(",")
 
 # Track last anchor that responded successfully (for failover)
 _last_working_anchor: str | None = None
+
+# Gas economy
+GAS_RATE = 0.01          # 1% default gas fee
+GAS_MAX_HOPS = 10        # TTL for gas signal
+GAS_MAX_AGE_S = 300.0    # 5 minute timeout
+GAS_LOG_MAX = 100        # cap gas_log entries
+SUPERAGENT_DEFAULT_URL = os.environ.get(
+    "DARKMATTER_SUPERAGENT",
+    ANCHOR_NODES[0] if ANCHOR_NODES else "",
+)
 
 # Agent auto-spawn configuration
 AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
@@ -920,7 +956,6 @@ def _process_connection_relay_callback(state, data: dict) -> None:
         agent_id=agent_id,
         agent_url=agent_url,
         agent_bio=agent_bio,
-        direction=ConnectionDirection.OUTBOUND,
         agent_public_key_hex=agent_public_key_hex,
         agent_display_name=agent_display_name,
     )
@@ -1002,6 +1037,607 @@ def _verify_message(public_key_hex: str, signature_hex: str, from_agent_id: str,
         return False
 
 
+# --- Solana wallet derivation (domain-separated from passport key) ---
+
+def _derive_solana_keypair(private_key_hex: str) -> "SolanaKeypair":
+    """Derive a Solana keypair from the passport private key with domain separation."""
+    seed = _hashlib.sha256(bytes.fromhex(private_key_hex) + b"darkmatter-solana-v1").digest()
+    return SolanaKeypair.from_seed(seed)
+
+def _get_solana_wallet_address(private_key_hex: str) -> str:
+    """Get the Solana wallet address (base58 public key) for this agent."""
+    return str(_derive_solana_keypair(private_key_hex).pubkey())
+
+
+def _resolve_spl_token(token_or_mint: str) -> tuple[str, int] | None:
+    """Resolve a token name or mint address. Returns (mint, decimals) or None."""
+    upper = token_or_mint.upper()
+    if upper in SPL_TOKENS:
+        return SPL_TOKENS[upper]
+    # Check if it looks like a mint address (base58, 32-44 chars)
+    if len(token_or_mint) >= 32:
+        return None  # caller should treat as raw mint
+    return None
+
+
+async def get_solana_balance(wallets: dict, mint: str = None) -> dict:
+    """Get SOL or SPL token balance. Reusable by MCP tools and entrypoint."""
+    sol_addr = wallets.get("solana")
+    if not SOLANA_AVAILABLE or not sol_addr:
+        return {"success": False, "error": "Solana wallet not available"}
+
+    pubkey = SolanaPubkey.from_string(sol_addr)
+
+    try:
+        async with SolanaClient(SOLANA_RPC_URL) as client:
+            if mint is None:
+                resp = await client.get_balance(pubkey)
+                lamports = resp.value
+                return {
+                    "success": True,
+                    "token": "SOL",
+                    "balance": lamports / LAMPORTS_PER_SOL,
+                    "lamports": lamports,
+                    "wallet_address": sol_addr,
+                }
+            else:
+                mint_pubkey = SolanaPubkey.from_string(mint)
+                ata = SolanaPubkey.find_program_address(
+                    [bytes(pubkey), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)],
+                    SolanaPubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+                )[0]
+                resp = await client.get_token_account_balance(ata)
+                if resp.value is None:
+                    return {
+                        "success": True,
+                        "token": mint,
+                        "balance": 0,
+                        "wallet_address": sol_addr,
+                        "note": "No token account found",
+                    }
+                return {
+                    "success": True,
+                    "token": mint,
+                    "balance": float(resp.value.ui_amount_string),
+                    "decimals": resp.value.decimals,
+                    "wallet_address": sol_addr,
+                }
+    except Exception as e:
+        err_str = str(e)
+        # "could not find account" = token account doesn't exist = balance is 0
+        if "could not find account" in err_str.lower() or "invalid param" in err_str.lower():
+            return {
+                "success": True,
+                "token": mint or "SOL",
+                "balance": 0,
+                "wallet_address": sol_addr,
+                "note": "No token account found",
+            }
+        return {"success": False, "error": f"RPC error: {err_str}"}
+
+
+async def send_solana_sol(private_key_hex: str, wallets: dict, recipient_wallet: str, amount: float) -> dict:
+    """Send SOL to a recipient wallet. Reusable by MCP tools and entrypoint."""
+    sol_addr = wallets.get("solana")
+    if not SOLANA_AVAILABLE or not sol_addr:
+        return {"success": False, "error": "Solana wallet not available"}
+
+    sender_kp = _derive_solana_keypair(private_key_hex)
+    sender_pubkey = sender_kp.pubkey()
+    recipient_pubkey = SolanaPubkey.from_string(recipient_wallet)
+    lamports = int(amount * LAMPORTS_PER_SOL)
+
+    try:
+        async with SolanaClient(SOLANA_RPC_URL) as client:
+            ix = sol_transfer(SolTransferParams(
+                from_pubkey=sender_pubkey,
+                to_pubkey=recipient_pubkey,
+                lamports=lamports,
+            ))
+            bh_resp = await client.get_latest_blockhash()
+            blockhash = bh_resp.value.blockhash
+            msg = MessageV0.try_compile(
+                payer=sender_pubkey,
+                instructions=[ix],
+                address_lookup_table_accounts=[],
+                recent_blockhash=blockhash,
+            )
+            tx = VersionedTransaction(msg, [sender_kp])
+            tx_resp = await client.send_transaction(tx)
+            tx_signature = str(tx_resp.value)
+
+        return {
+            "success": True,
+            "tx_signature": tx_signature,
+            "amount": amount,
+            "from_wallet": str(sender_pubkey),
+            "to_wallet": recipient_wallet,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Transaction failed: {str(e)}"}
+
+
+async def send_solana_token(private_key_hex: str, wallets: dict, recipient_wallet: str,
+                            mint: str, amount: float, decimals: int) -> dict:
+    """Send SPL tokens to a recipient wallet. Reusable by MCP tools and entrypoint."""
+    sol_addr = wallets.get("solana")
+    if not SOLANA_AVAILABLE or not sol_addr:
+        return {"success": False, "error": "Solana wallet not available"}
+
+    sender_kp = _derive_solana_keypair(private_key_hex)
+    sender_pubkey = sender_kp.pubkey()
+    recipient_pubkey = SolanaPubkey.from_string(recipient_wallet)
+    mint_pubkey = SolanaPubkey.from_string(mint)
+
+    ata_program = SolanaPubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    sender_ata = SolanaPubkey.find_program_address(
+        [bytes(sender_pubkey), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)],
+        ata_program,
+    )[0]
+    recipient_ata = SolanaPubkey.find_program_address(
+        [bytes(recipient_pubkey), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)],
+        ata_program,
+    )[0]
+
+    raw_amount = int(amount * (10 ** decimals))
+
+    try:
+        async with SolanaClient(SOLANA_RPC_URL) as client:
+            instructions = []
+            created_ata = False
+
+            ata_info = await client.get_account_info(recipient_ata)
+            if ata_info.value is None:
+                create_ata_ix = create_associated_token_account(
+                    payer=sender_pubkey,
+                    owner=recipient_pubkey,
+                    mint=mint_pubkey,
+                )
+                instructions.append(create_ata_ix)
+                created_ata = True
+
+            instructions.append(transfer_checked(TransferCheckedParams(
+                program_id=TOKEN_PROGRAM_ID,
+                source=sender_ata,
+                mint=mint_pubkey,
+                dest=recipient_ata,
+                owner=sender_pubkey,
+                amount=raw_amount,
+                decimals=decimals,
+            )))
+
+            bh_resp = await client.get_latest_blockhash()
+            blockhash = bh_resp.value.blockhash
+            msg = MessageV0.try_compile(
+                payer=sender_pubkey,
+                instructions=instructions,
+                address_lookup_table_accounts=[],
+                recent_blockhash=blockhash,
+            )
+            tx = VersionedTransaction(msg, [sender_kp])
+            tx_resp = await client.send_transaction(tx)
+            tx_signature = str(tx_resp.value)
+
+        return {
+            "success": True,
+            "tx_signature": tx_signature,
+            "amount": amount,
+            "token_mint": mint,
+            "decimals": decimals,
+            "from_wallet": str(sender_pubkey),
+            "to_wallet": recipient_wallet,
+            "created_recipient_ata": created_ata,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Transaction failed: {str(e)}"}
+
+
+# =============================================================================
+# Gas Economy Engine
+# =============================================================================
+
+# Cache for superagent wallet resolution
+_superagent_wallet_cache: dict[str, tuple[str, float]] = {}  # url -> (wallet, timestamp)
+_SUPERAGENT_CACHE_TTL = 300.0  # 5 minutes
+
+
+async def _get_superagent_wallet(state) -> Optional[str]:
+    """Resolve the superagent URL to a Solana wallet address, with caching."""
+    url = state.superagent_url or SUPERAGENT_DEFAULT_URL
+    if not url:
+        return None
+
+    # Check cache
+    cached = _superagent_wallet_cache.get(url)
+    if cached and time.time() - cached[1] < _SUPERAGENT_CACHE_TTL:
+        return cached[0]
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url.rstrip("/") + "/__darkmatter__/network_info")
+            if resp.status_code == 200:
+                data = resp.json()
+                wallets = data.get("wallets", {})
+                sol_wallet = wallets.get("solana")
+                if sol_wallet:
+                    _superagent_wallet_cache[url] = (sol_wallet, time.time())
+                    return sol_wallet
+    except Exception:
+        pass
+
+    return None
+
+
+def _select_elder(state, gas: 'GasSignal') -> Optional['Connection']:
+    """Select an elder (older peer with positive trust) for gas routing.
+
+    Weighted random selection by age_seconds * trust_score.
+    Excludes agents already in gas.path (loop prevention).
+    """
+    now = datetime.now(timezone.utc)
+    candidates = []
+
+    for aid, conn in state.connections.items():
+        # Must have peer_created_at and it must be older than us
+        if not conn.peer_created_at or not state.created_at:
+            continue
+        if conn.peer_created_at >= state.created_at:
+            continue
+        # Must have positive trust
+        imp = state.impressions.get(aid, Impression(score=0.0))
+        if imp.score <= 0:
+            continue
+        # Must not already be in the gas path
+        if aid in gas.path:
+            continue
+        # Must have a wallet
+        if not conn.wallets.get("solana"):
+            continue
+
+        # Calculate weight: age in seconds * trust score
+        try:
+            peer_dt = datetime.fromisoformat(conn.peer_created_at)
+            age_s = max(1.0, (now - peer_dt).total_seconds())
+        except (ValueError, TypeError):
+            age_s = 1.0
+
+        weight = age_s * imp.score
+        candidates.append((conn, weight))
+
+    if not candidates:
+        return None
+
+    # Weighted random selection
+    total = sum(w for _, w in candidates)
+    r = random.random() * total
+    cumulative = 0.0
+    for conn, weight in candidates:
+        cumulative += weight
+        if r <= cumulative:
+            return conn
+    return candidates[-1][0]
+
+
+def _gas_signal_to_dict(gas: 'GasSignal') -> dict:
+    """Serialize a GasSignal for network transmission."""
+    return {
+        "signal_id": gas.signal_id,
+        "original_tx": gas.original_tx,
+        "sender_agent_id": gas.sender_agent_id,
+        "amount": gas.amount,
+        "token": gas.token,
+        "token_decimals": gas.token_decimals,
+        "sender_superagent_wallet": gas.sender_superagent_wallet,
+        "callback_url": gas.callback_url,
+        "hops": gas.hops,
+        "max_hops": gas.max_hops,
+        "created_at": gas.created_at,
+        "path": gas.path,
+    }
+
+
+def _gas_signal_from_dict(d: dict) -> 'GasSignal':
+    """Deserialize a GasSignal from network payload."""
+    return GasSignal(
+        signal_id=d["signal_id"],
+        original_tx=d["original_tx"],
+        sender_agent_id=d["sender_agent_id"],
+        amount=d["amount"],
+        token=d["token"],
+        token_decimals=d.get("token_decimals", 9),
+        sender_superagent_wallet=d.get("sender_superagent_wallet", ""),
+        callback_url=d["callback_url"],
+        hops=d.get("hops", 0),
+        max_hops=d.get("max_hops", GAS_MAX_HOPS),
+        created_at=d.get("created_at", ""),
+        path=d.get("path", []),
+    )
+
+
+def _log_gas_event(state, event: dict) -> None:
+    """Append a gas event to state.gas_log, capping at GAS_LOG_MAX."""
+    event["timestamp"] = datetime.now(timezone.utc).isoformat()
+    state.gas_log.append(event)
+    if len(state.gas_log) > GAS_LOG_MAX:
+        state.gas_log = state.gas_log[-GAS_LOG_MAX:]
+
+
+async def _run_match_game(state, gas: 'GasSignal', is_originator: bool = True) -> None:
+    """Run the match game for gas routing.
+
+    If is_originator is True, this node (B) holds the gas and will send it at resolution.
+    If is_originator is False, this node received a forwarded signal and will
+    POST the resolution back to B's callback_url.
+    """
+    # Check TTL
+    if gas.hops >= gas.max_hops:
+        await _resolve_gas(state, gas, "timeout", None, is_originator)
+        return
+
+    # Check age
+    if gas.created_at:
+        try:
+            created = datetime.fromisoformat(gas.created_at)
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+            if age > GAS_MAX_AGE_S:
+                await _resolve_gas(state, gas, "timeout", None, is_originator)
+                return
+        except (ValueError, TypeError):
+            pass
+
+    # Get eligible peers for the match game (connected, not in path)
+    peers = [
+        conn for aid, conn in state.connections.items()
+        if aid not in gas.path and conn.wallets.get("solana")
+    ]
+
+    n = len(peers)
+    if n == 0:
+        # Terminal node — no peers to play with
+        await _resolve_gas(state, gas, "terminal", None, is_originator)
+        return
+
+    # Pick our number
+    my_number = random.randint(0, n)
+
+    # Query each peer for their pick
+    async def _query_peer_pick(conn, n_val):
+        try:
+            base = conn.agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.post(
+                    base + "/__darkmatter__/gas_match",
+                    json={"signal_id": gas.signal_id, "n": n_val},
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("pick")
+        except Exception:
+            pass
+        return None
+
+    tasks = [_query_peer_pick(conn, n) for conn in peers]
+    results = await asyncio.gather(*tasks)
+
+    # Check for match
+    matched = any(pick == my_number for pick in results if pick is not None)
+
+    if matched:
+        # Match! Select an elder and resolve
+        elder = _select_elder(state, gas)
+        if elder:
+            dest_wallet = elder.wallets.get("solana", "")
+            await _resolve_gas(state, gas, "match", dest_wallet, is_originator, resolved_by=elder.agent_id)
+        else:
+            # No elder — terminal, current node keeps gas
+            await _resolve_gas(state, gas, "terminal", None, is_originator)
+    else:
+        # No match — select an elder to forward the signal to
+        elder = _select_elder(state, gas)
+        if elder:
+            # Forward signal to elder
+            gas.hops += 1
+            gas.path.append(state.agent_id)
+            forwarded_gas = _gas_signal_to_dict(gas)
+
+            try:
+                base = elder.agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        base + "/__darkmatter__/gas_signal",
+                        json=forwarded_gas,
+                    )
+                    if resp.status_code == 200:
+                        _log_gas_event(state, {
+                            "type": "forwarded",
+                            "signal_id": gas.signal_id,
+                            "forwarded_to": elder.agent_id,
+                            "hops": gas.hops,
+                        })
+                        return  # Elder will handle resolution
+            except Exception:
+                pass
+
+            # Forward failed — terminal
+            await _resolve_gas(state, gas, "terminal", None, is_originator)
+        else:
+            # No elder — terminal, current node keeps gas
+            await _resolve_gas(state, gas, "terminal", None, is_originator)
+
+
+async def _resolve_gas(state, gas: 'GasSignal', resolution: str,
+                       dest_wallet: Optional[str], is_originator: bool,
+                       resolved_by: str = "") -> None:
+    """Resolve a gas signal — either send gas (if originator) or notify B's callback."""
+
+    if resolution == "timeout":
+        dest_wallet = gas.sender_superagent_wallet or None
+
+    if is_originator:
+        # We are B — send the gas
+        if dest_wallet and state.private_key_hex:
+            try:
+                if gas.token == "SOL":
+                    result = await send_solana_sol(
+                        state.private_key_hex, state.wallets, dest_wallet, gas.amount
+                    )
+                else:
+                    result = await send_solana_token(
+                        state.private_key_hex, state.wallets, dest_wallet,
+                        gas.token, gas.amount, gas.token_decimals
+                    )
+
+                _log_gas_event(state, {
+                    "type": "gas_sent",
+                    "signal_id": gas.signal_id,
+                    "resolution": resolution,
+                    "destination": dest_wallet,
+                    "amount": gas.amount,
+                    "token": gas.token,
+                    "tx_success": result.get("success", False),
+                    "tx_signature": result.get("tx_signature"),
+                    "resolved_by": resolved_by,
+                })
+
+                # Trust boost: +0.01 for sender A (completed a legitimate transaction)
+                if result.get("success"):
+                    _adjust_trust(state, gas.sender_agent_id, 0.01)
+                    if resolved_by:
+                        _adjust_trust(state, resolved_by, 0.01)
+            except Exception as e:
+                _log_gas_event(state, {
+                    "type": "gas_send_failed",
+                    "signal_id": gas.signal_id,
+                    "error": str(e),
+                })
+        elif resolution == "terminal":
+            # No destination — keep the gas
+            _log_gas_event(state, {
+                "type": "gas_kept",
+                "signal_id": gas.signal_id,
+                "reason": "terminal_node",
+                "amount": gas.amount,
+            })
+
+        save_state()
+    else:
+        # We are a forwarding node — POST result back to B's callback
+        try:
+            payload = {
+                "signal_id": gas.signal_id,
+                "destination_wallet": dest_wallet or "",
+                "resolved_by": resolved_by or state.agent_id,
+                "resolution": resolution,
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(gas.callback_url, json=payload)
+
+            _log_gas_event(state, {
+                "type": "gas_resolved_callback",
+                "signal_id": gas.signal_id,
+                "resolution": resolution,
+                "destination": dest_wallet,
+            })
+        except Exception as e:
+            _log_gas_event(state, {
+                "type": "gas_callback_failed",
+                "signal_id": gas.signal_id,
+                "error": str(e),
+            })
+        save_state()
+
+
+def _adjust_trust(state, agent_id: str, delta: float) -> None:
+    """Adjust trust score for an agent by delta, clamped to [-1, 1]."""
+    imp = state.impressions.get(agent_id, Impression(score=0.0))
+    new_score = max(-1.0, min(1.0, imp.score + delta))
+    state.impressions[agent_id] = Impression(score=round(new_score, 4), note=imp.note)
+
+
+async def _initiate_gas_from_payment(state, msg: 'QueuedMessage') -> None:
+    """B receives a payment from A with gas_eligible flag. Calculate gas and start match game."""
+    meta = msg.metadata or {}
+    amount = meta.get("amount", 0)
+    gas_rate = meta.get("gas_rate", GAS_RATE)
+    gas_amount = amount * gas_rate
+
+    if gas_amount <= 0:
+        return
+
+    token = meta.get("token", "SOL")
+    token_decimals = meta.get("decimals", 9) if token != "SOL" else 9
+    tx_signature = meta.get("tx_signature", "")
+    sender_superagent_wallet = meta.get("sender_superagent_wallet", "")
+
+    signal_id = f"gas-{uuid.uuid4().hex[:12]}"
+    callback_url = f"{_get_public_url(state.port)}/__darkmatter__/gas_result"
+
+    gas = GasSignal(
+        signal_id=signal_id,
+        original_tx=tx_signature,
+        sender_agent_id=msg.from_agent_id or "",
+        amount=gas_amount,
+        token=token,
+        token_decimals=token_decimals,
+        sender_superagent_wallet=sender_superagent_wallet,
+        callback_url=callback_url,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        path=[],
+    )
+
+    _log_gas_event(state, {
+        "type": "gas_initiated",
+        "signal_id": signal_id,
+        "original_tx": tx_signature,
+        "amount": gas_amount,
+        "token": token,
+        "token_decimals": token_decimals,
+        "sender_agent_id": msg.from_agent_id,
+        "sender_superagent_wallet": sender_superagent_wallet,
+    })
+    save_state()
+
+    # Start match game (B is the originator)
+    asyncio.create_task(_run_match_game(state, gas, is_originator=True))
+
+    # Start timeout watchdog
+    asyncio.create_task(_gas_timeout_watchdog(state, gas))
+
+
+async def _gas_timeout_watchdog(state, gas: 'GasSignal') -> None:
+    """Watchdog: if B doesn't receive a gas_result within GAS_MAX_AGE_S, penalize."""
+    await asyncio.sleep(GAS_MAX_AGE_S + 5)  # grace period
+
+    # Check if gas was already resolved
+    for entry in state.gas_log:
+        if entry.get("signal_id") == gas.signal_id and entry.get("type") in ("gas_sent", "gas_kept"):
+            return  # Already resolved
+
+    # Timeout — send gas to superagent wallet as fallback
+    _log_gas_event(state, {
+        "type": "gas_timeout",
+        "signal_id": gas.signal_id,
+    })
+
+    # Send to superagent wallet if available
+    if gas.sender_superagent_wallet and state.private_key_hex:
+        try:
+            if gas.token == "SOL":
+                await send_solana_sol(
+                    state.private_key_hex, state.wallets,
+                    gas.sender_superagent_wallet, gas.amount
+                )
+            else:
+                await send_solana_token(
+                    state.private_key_hex, state.wallets,
+                    gas.sender_superagent_wallet, gas.token,
+                    gas.amount, gas.token_decimals
+                )
+        except Exception:
+            pass
+
+    save_state()
+
+
 # =============================================================================
 # Data Models (in-memory state)
 # =============================================================================
@@ -1012,18 +1648,12 @@ class AgentStatus(str, Enum):
     INACTIVE = "inactive"
 
 
-class ConnectionDirection(str, Enum):
-    OUTBOUND = "outbound"  # I connected to them
-    INBOUND = "inbound"    # They connected to me
-
-
 @dataclass
 class Connection:
-    """A directional connection to another agent in the mesh."""
+    """A connection to another agent in the mesh."""
     agent_id: str
     agent_url: str
     agent_bio: str
-    direction: ConnectionDirection
     connected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     # Local telemetry — tracked by this agent, not part of the protocol
     messages_sent: int = 0
@@ -1034,6 +1664,10 @@ class Connection:
     # Cryptographic identity — peer's public key and display name
     agent_public_key_hex: Optional[str] = None
     agent_display_name: Optional[str] = None
+    # Wallets (chain -> address, exchanged during handshake)
+    wallets: dict[str, str] = field(default_factory=dict)
+    # Peer's passport creation time (for elder selection in gas economy)
+    peer_created_at: Optional[str] = None
     # Per-connection rate limit (0 = use global default, -1 = unlimited)
     rate_limit: int = 0
     # Rate limit tracking (ephemeral — never persisted)
@@ -1060,6 +1694,23 @@ class Impression:
 
 
 @dataclass
+class GasSignal:
+    """A gas fee signal routed through the network via the match game."""
+    signal_id: str
+    original_tx: str            # tx_signature that generated this gas
+    sender_agent_id: str        # A (who sent the payment)
+    amount: float               # gas amount (1% of original)
+    token: str                  # "SOL" or mint address
+    token_decimals: int         # 9 for SOL, 6 for USDC, etc.
+    sender_superagent_wallet: str  # where gas goes on timeout
+    callback_url: str           # B's /__darkmatter__/gas_result endpoint
+    hops: int = 0
+    max_hops: int = GAS_MAX_HOPS
+    created_at: str = ""
+    path: list[str] = field(default_factory=list)  # agent_ids visited (loop prevention)
+
+
+@dataclass
 class PendingConnectionRequest:
     """An incoming connection request awaiting acceptance."""
     request_id: str
@@ -1070,7 +1721,10 @@ class PendingConnectionRequest:
     # Cryptographic identity — requester's public key and display name
     from_agent_public_key_hex: Optional[str] = None
     from_agent_display_name: Optional[str] = None
-    mutual: bool = False  # If True, after accepting, send a reverse connection_request
+    # Wallets (chain -> address)
+    from_agent_wallets: dict[str, str] = field(default_factory=dict)
+    # Peer's passport creation time (for elder selection in gas economy)
+    from_agent_created_at: Optional[str] = None
     # Auto-aggregated peer trust (populated at request time)
     peer_trust: Optional[dict] = None
 
@@ -1119,6 +1773,8 @@ class AgentState:
     private_key_hex: Optional[str] = None
     public_key_hex: Optional[str] = None
     display_name: Optional[str] = None
+    # Wallets (chain -> address, derived from passport, not persisted)
+    wallets: dict[str, str] = field(default_factory=dict)
     # Track outbound connection requests: url → agent_id (not persisted)
     pending_outbound: dict[str, str] = field(default_factory=dict)
     # LAN-discovered peers (ephemeral, not persisted)
@@ -1138,6 +1794,9 @@ class AgentState:
     router_mode: str = "spawn"  # spawn | rules_first | rules_only | queue_only
     # NAT detection (ephemeral — re-detected each startup)
     nat_detected: bool = False
+    # Gas economy
+    superagent_url: Optional[str] = None  # pointer to default superagent, falls back to SUPERAGENT_DEFAULT_URL
+    gas_log: list[dict] = field(default_factory=list)  # recent gas events, capped at GAS_LOG_MAX
 
 
 # =============================================================================
@@ -1409,19 +2068,22 @@ route messages to you.
 
 ONGOING BEHAVIOR:
 - When you receive messages (check darkmatter_list_inbox), read them and respond using \
-darkmatter_respond_message. You are the intelligence behind this agent — decide how to answer.
+darkmatter_send_message with content and reply_to (the message_id from your inbox). \
+You are the intelligence behind this agent — decide how to answer.
 - If you can't answer a message, forward it using darkmatter_send_message with the message_id \
 from your inbox and a target_agent_id (or target_agent_ids to fork to multiple). Forwarding \
 removes the message from your queue.
 - Track messages you've sent with darkmatter_list_messages and darkmatter_get_sent_message.
 - Use darkmatter_expire_message to cancel a sent message that's no longer needed.
 - Use darkmatter_connection(action="request", target_url=...) to connect to another agent.
-- Use darkmatter_connection(action="request_mutual", target_url=...) for bidirectional connections.
 - Use darkmatter_network_info to discover peers in the network.
 - Use darkmatter_discover_domain to check if a domain hosts a DarkMatter node.
 - Use darkmatter_discover_local to see agents discovered on the local network via LAN broadcast.
 - Use darkmatter_list_pending_requests to see pending requests, then \
 darkmatter_connection(action="accept", request_id=...) or action="reject".
+- Use darkmatter_wallet_balances to view all wallet balances across chains. Use darkmatter_wallet_send \
+to send native currency on any chain (defaults to Solana). For Solana-specific operations, use \
+darkmatter_get_balance (SOL/SPL), darkmatter_send_sol, and darkmatter_send_token.
 
 IDENTITY:
 - Your agent ID and bio define who you are in the mesh. Own it.
@@ -1515,11 +2177,13 @@ def _build_status_line() -> str:
     agent_label = state.display_name or state.agent_id[:12]
     active_agents = len(_spawned_agents)
     agent_suffix = f" | Spawned agents: {active_agents}" if AGENT_SPAWN_ENABLED else ""
+    wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in state.wallets.items()]
+    wallet_suffix = f" | Wallets: {', '.join(wallet_parts)}" if wallet_parts else ""
     stats = (
         f"Agent: {agent_label} | Status: {state.status.value} | "
         f"Connections: {conns}/{MAX_CONNECTIONS} ({peers}) | "
         f"Inbox: {msgs} | Handled: {handled} | Pending requests: {pending}"
-        f"{agent_suffix}"
+        f"{agent_suffix}{wallet_suffix}"
     )
 
     # Build action items, most urgent first
@@ -1534,7 +2198,7 @@ def _build_status_line() -> str:
         )
     if msgs > 0:
         actions.append(
-            f"{msgs} message(s) in your inbox — use darkmatter_list_inbox to read and darkmatter_respond_message to reply"
+            f"{msgs} message(s) in your inbox — use darkmatter_list_inbox to read and darkmatter_send_message(content=..., reply_to=...) to reply"
         )
     sent_active = sum(1 for sm in state.sent_messages.values() if sm.status == "active")
     if sent_active > 0:
@@ -1927,6 +2591,14 @@ def _compute_visible_optional() -> set:
     if pending > 0:
         visible.add("darkmatter_list_pending_requests")
 
+    # Wallet tools: show when wallets are available
+    if state.wallets:
+        visible.add("darkmatter_wallet_balances")
+        if "solana" in state.wallets and SOLANA_AVAILABLE:
+            visible.add("darkmatter_get_balance")
+            if conns > 0:
+                visible.update({"darkmatter_send_sol", "darkmatter_send_token", "darkmatter_wallet_send"})
+
     # get_server_template: never auto-shown (accessible via graceful fallback)
 
     return visible
@@ -2140,7 +2812,6 @@ def save_state() -> None:
                 "agent_id": c.agent_id,
                 "agent_url": c.agent_url,
                 "agent_bio": c.agent_bio,
-                "direction": c.direction.value,
                 "connected_at": c.connected_at,
                 "messages_sent": c.messages_sent,
                 "messages_received": c.messages_received,
@@ -2149,7 +2820,9 @@ def save_state() -> None:
                 "last_activity": c.last_activity,
                 "agent_public_key_hex": c.agent_public_key_hex,
                 "agent_display_name": c.agent_display_name,
+                "wallets": c.wallets,
                 "rate_limit": c.rate_limit,
+                "peer_created_at": c.peer_created_at,
             }
             for aid, c in state.connections.items()
         },
@@ -2174,6 +2847,8 @@ def save_state() -> None:
         "rate_limit_global": state.rate_limit_global,
         "router_mode": state.router_mode,
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
+        "superagent_url": state.superagent_url,
+        "gas_log": state.gas_log[-GAS_LOG_MAX:],
         "seen_message_ids": {
             mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < _REPLAY_WINDOW
@@ -2225,7 +2900,6 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
             agent_id=cd["agent_id"],
             agent_url=cd["agent_url"],
             agent_bio=cd.get("agent_bio", ""),
-            direction=ConnectionDirection(cd["direction"]),
             connected_at=cd.get("connected_at", ""),
             messages_sent=cd.get("messages_sent", 0),
             messages_received=cd.get("messages_received", 0),
@@ -2234,7 +2908,9 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
             last_activity=cd.get("last_activity"),
             agent_public_key_hex=cd.get("agent_public_key_hex"),
             agent_display_name=cd.get("agent_display_name"),
+            wallets=cd.get("wallets") or ({"solana": cd["wallet_address"]} if cd.get("wallet_address") else {}),
             rate_limit=cd.get("rate_limit", 0),
+            peer_created_at=cd.get("peer_created_at"),
         )
 
     sent_messages = {}
@@ -2303,6 +2979,8 @@ def _load_state_from_file(path: str) -> Optional[AgentState]:
         inactive_until=data.get("inactive_until"),
         router_mode=data.get("router_mode") or "spawn",
         routing_rules=[_routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
+        superagent_url=data.get("superagent_url"),
+        gas_log=data.get("gas_log", []),
     )
 
     return state
@@ -2317,23 +2995,23 @@ class ConnectionAction(str, Enum):
     ACCEPT = "accept"
     REJECT = "reject"
     DISCONNECT = "disconnect"
-    REQUEST_MUTUAL = "request_mutual"
 
 
 class ConnectionInput(BaseModel):
-    """Manage connections: request, accept, reject, disconnect, or request_mutual."""
+    """Manage connections: request, accept, reject, or disconnect."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     action: ConnectionAction = Field(..., description="The connection action to perform")
-    target_url: Optional[str] = Field(default=None, description="Target agent URL (for request/request_mutual)")
+    target_url: Optional[str] = Field(default=None, description="Target agent URL (for request)")
     request_id: Optional[str] = Field(default=None, description="Pending request ID (for accept/reject)")
     agent_id: Optional[str] = Field(default=None, description="Agent ID (for disconnect)")
 
 
 class SendMessageInput(BaseModel):
-    """Send a new message or forward a queued message."""
+    """Send a message, reply to a message, or forward a message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     content: Optional[str] = Field(default=None, description="Message content (for new messages)", max_length=MAX_CONTENT_LENGTH)
     message_id: Optional[str] = Field(default=None, description="Queue message ID (for forwarding)")
+    reply_to: Optional[str] = Field(default=None, description="Message ID from your inbox to reply to. Removes the message from your queue and sends your response via its webhook.")
     target_agent_id: Optional[str] = Field(default=None, description="Specific agent to send/forward to")
     target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to forward to (fork)")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata (budget, preferences, etc.)")
@@ -2359,13 +3037,6 @@ class GetMessageInput(BaseModel):
     """Get full details of a specific queued message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="The ID of the queued message to inspect")
-
-
-class RespondMessageInput(BaseModel):
-    """Respond to a queued message by calling its webhook."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="The ID of the queued message to respond to")
-    response: str = Field(..., description="The response content to send back via the webhook")
 
 
 class GetSentMessageInput(BaseModel):
@@ -2417,12 +3088,56 @@ class GetImpressionInput(BaseModel):
     agent_id: str = Field(..., description="The agent ID to look up")
 
 
+class SetSuperagentInput(BaseModel):
+    """Set the default superagent URL for gas routing."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    url: Optional[str] = Field(default=None, description="Superagent URL. Set to null to reset to default.", max_length=MAX_URL_LENGTH)
+
+
+class SendSolInput(BaseModel):
+    """Send SOL to a connected agent's wallet."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The connected agent to send SOL to")
+    amount: float = Field(..., gt=0, description="Amount of SOL to send")
+    notify: bool = Field(default=True, description="Send a message notifying the recipient")
+
+
+class SendTokenInput(BaseModel):
+    """Send SPL tokens to a connected agent's wallet."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The connected agent to send tokens to")
+    mint: str = Field(..., description="Token mint address")
+    amount: float = Field(..., gt=0, description="Amount in human-readable units")
+    decimals: int = Field(..., ge=0, le=18, description="Token decimals (e.g. 6 for USDC)")
+    notify: bool = Field(default=True, description="Send a message notifying the recipient")
+
+
+class GetBalanceInput(BaseModel):
+    """Check SOL or SPL token balance."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    mint: Optional[str] = Field(default=None, description="SPL token mint address. Omit for SOL balance.")
+
+
+class WalletBalancesInput(BaseModel):
+    """View wallet balances across all chains."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    chain: Optional[str] = Field(default=None, description="Filter to a specific chain (e.g. 'solana'). Omit for all chains.")
+
+
+class WalletSendInput(BaseModel):
+    """Send native currency on any chain."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The connected agent to send to")
+    amount: float = Field(..., gt=0, description="Amount of native currency to send")
+    chain: str = Field(default="solana", description="Chain to send on (default: solana)")
+    notify: bool = Field(default=True, description="Send a message notifying the recipient")
+
 
 # =============================================================================
 # Mesh Primitive Tools
 # =============================================================================
 
-async def _connection_request(state, target_url: str, mutual: bool = False) -> str:
+async def _connection_request(state, target_url: str) -> str:
     """Send a connection request to a target agent."""
     url_err = validate_url(target_url)
     if url_err:
@@ -2448,9 +3163,10 @@ async def _connection_request(state, target_url: str, mutual: bool = False) -> s
             "from_agent_bio": state.bio,
             "from_agent_public_key_hex": state.public_key_hex,
             "from_agent_display_name": state.display_name,
+            "wallets": state.wallets,
+            "from_agent_wallet_address": state.wallets.get("solana"),
+            "created_at": state.created_at,
         }
-        if mutual:
-            payload["mutual"] = True
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -2460,13 +3176,15 @@ async def _connection_request(state, target_url: str, mutual: bool = False) -> s
             result = response.json()
 
             if result.get("auto_accepted"):
+                _peer_wallets = result.get("wallets") or ({"solana": result["wallet_address"]} if result.get("wallet_address") else {})
                 conn = Connection(
                     agent_id=result["agent_id"],
                     agent_url=result["agent_url"],
                     agent_bio=result.get("agent_bio", ""),
-                    direction=ConnectionDirection.OUTBOUND,
                     agent_public_key_hex=result.get("agent_public_key_hex"),
                     agent_display_name=result.get("agent_display_name"),
+                    wallets=_peer_wallets,
+                    peer_created_at=result.get("created_at"),
                 )
                 state.connections[result["agent_id"]] = conn
                 save_state()
@@ -2523,9 +3241,10 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
             agent_id=request.from_agent_id,
             agent_url=request.from_agent_url,
             agent_bio=request.from_agent_bio,
-            direction=ConnectionDirection.INBOUND,
             agent_public_key_hex=request.from_agent_public_key_hex,
             agent_display_name=request.from_agent_display_name,
+            wallets=request.from_agent_wallets,
+            peer_created_at=request.from_agent_created_at,
         )
         state.connections[request.from_agent_id] = conn
 
@@ -2540,17 +3259,13 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
                         "agent_bio": state.bio,
                         "agent_public_key_hex": state.public_key_hex,
                         "agent_display_name": state.display_name,
+                        "wallets": state.wallets,
+                        "wallet_address": state.wallets.get("solana"),
+                        "created_at": state.created_at,
                     }
                 )
         except Exception:
             pass
-
-        # If the original request was mutual, send a reverse connection request
-        if request.mutual:
-            try:
-                await _connection_request(state, request.from_agent_url)
-            except Exception:
-                pass  # Best effort
 
         # Auto WebRTC upgrade
         if WEBRTC_AVAILABLE:
@@ -2594,11 +3309,10 @@ async def _connection_disconnect(state, agent_id: str) -> str:
     }
 )
 async def connection(params: ConnectionInput, ctx: Context) -> str:
-    """Manage connections: request, accept, reject, disconnect, or request_mutual.
+    """Manage connections: request, accept, reject, or disconnect.
 
     Actions:
       - request: Send a connection request (requires target_url)
-      - request_mutual: Like request, but asks the target to connect back too (requires target_url)
       - accept: Accept a pending connection request (requires request_id)
       - reject: Reject a pending connection request (requires request_id)
       - disconnect: Disconnect from an agent (requires agent_id)
@@ -2611,11 +3325,10 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     """
     state = get_state(ctx)
 
-    if params.action in (ConnectionAction.REQUEST, ConnectionAction.REQUEST_MUTUAL):
+    if params.action == ConnectionAction.REQUEST:
         if not params.target_url:
-            return json.dumps({"success": False, "error": "target_url is required for request/request_mutual."})
-        mutual = params.action == ConnectionAction.REQUEST_MUTUAL
-        return await _connection_request(state, params.target_url, mutual=mutual)
+            return json.dumps({"success": False, "error": "target_url is required for request."})
+        return await _connection_request(state, params.target_url)
 
     elif params.action == ConnectionAction.ACCEPT:
         if not params.request_id:
@@ -2924,10 +3637,112 @@ async def _forward_message(state, params: SendMessageInput) -> str:
     return json.dumps(result)
 
 
+async def _reply_to_message(state, params: SendMessageInput) -> str:
+    """Reply to a queued message by calling its webhook with the response content."""
+    # Find and remove the message from the queue
+    msg = None
+    for i, m in enumerate(state.message_queue):
+        if m.message_id == params.reply_to:
+            msg = state.message_queue.pop(i)
+            break
+
+    if msg is None:
+        return json.dumps({
+            "success": False,
+            "error": f"No queued message with ID '{params.reply_to}'."
+        })
+
+    # Validate the stored webhook before calling it (SSRF protection)
+    webhook_err = validate_webhook_url(msg.webhook)
+    if webhook_err:
+        save_state()
+        return json.dumps({
+            "success": False,
+            "message_id": msg.message_id,
+            "error": f"Webhook blocked: {webhook_err}",
+        })
+
+    # Check if message is still active before responding
+    try:
+        status_resp = await _webhook_request_with_recovery(
+            state, msg.webhook, msg.from_agent_id,
+            method="GET", timeout=10.0,
+        )
+        if status_resp.status_code == 200:
+            webhook_data = status_resp.json()
+            msg_status = webhook_data.get("status", "active")
+            if msg_status == "expired":
+                save_state()
+                return json.dumps({
+                    "success": False,
+                    "error": "Message has been expired by the originator.",
+                    "message_id": msg.message_id,
+                })
+    except Exception as e:
+        print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
+
+    # Notify originator that we're actively responding
+    try:
+        await _webhook_request_with_recovery(
+            state, msg.webhook, msg.from_agent_id,
+            method="POST", timeout=10.0,
+            json={"type": "responding", "agent_id": state.agent_id}
+        )
+    except Exception:
+        pass  # Best-effort notification
+
+    # Sign the webhook response
+    resp_timestamp = datetime.now(timezone.utc).isoformat()
+    resp_signature_hex = None
+    if state.private_key_hex:
+        resp_signature_hex = _sign_message(
+            state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, params.content
+        )
+
+    # Call the webhook with our response
+    webhook_success = False
+    webhook_error = None
+    response_time_ms = 0.0
+    try:
+        start = time.monotonic()
+        resp = await _webhook_request_with_recovery(
+            state, msg.webhook, msg.from_agent_id,
+            method="POST", timeout=30.0,
+            json={
+                "type": "response",
+                "agent_id": state.agent_id,
+                "response": params.content,
+                "metadata": msg.metadata,
+                "timestamp": resp_timestamp,
+                "from_public_key_hex": state.public_key_hex,
+                "signature_hex": resp_signature_hex,
+            }
+        )
+        response_time_ms = (time.monotonic() - start) * 1000
+        webhook_success = resp.status_code < 400
+    except Exception as e:
+        webhook_error = str(e)
+
+    # Update telemetry for the connection that sent us this message
+    if msg.from_agent_id and msg.from_agent_id in state.connections:
+        conn = state.connections[msg.from_agent_id]
+        conn.total_response_time_ms += response_time_ms
+        conn.last_activity = datetime.now(timezone.utc).isoformat()
+
+    save_state()
+    return json.dumps({
+        "success": webhook_success,
+        "message_id": msg.message_id,
+        "webhook_called": msg.webhook,
+        "response_time_ms": round(response_time_ms, 2),
+        "error": webhook_error,
+    })
+
+
 @mcp.tool(
     name="darkmatter_send_message",
     annotations={
-        "title": "Send or Forward Message",
+        "title": "Send, Reply, or Forward Message",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -2935,27 +3750,36 @@ async def _forward_message(state, params: SendMessageInput) -> str:
     }
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send a new message or forward a queued message.
+    """Send a message, reply to a message, or forward a message.
 
-    New message: provide `content` (and optionally `target_agent_id`).
-    Forward: provide `message_id` from your inbox (and `target_agent_id` or `target_agent_ids`).
-    Forward removes the message from your queue after delivery.
+    - New message: provide `content` (and optionally `target_agent_id`).
+    - Reply: provide `content` and `reply_to` (message_id from your inbox).
+      Removes the message from your queue and sends your response via its webhook.
+    - Forward: provide `message_id` from your inbox (and `target_agent_id` or `target_agent_ids`).
+      Removes from queue after delivery.
 
     Args:
-        params: Contains content (new) or message_id (forward), plus routing options.
+        params: Contains content (new/reply) or message_id (forward), plus routing options.
 
     Returns:
         JSON with the message ID, routing info, and webhook URL.
     """
     state = get_state(ctx)
 
+    # Validate parameter combinations
+    if params.reply_to and params.message_id:
+        return json.dumps({"success": False, "error": "Cannot use both reply_to and message_id. Use reply_to with content to reply, or message_id alone to forward."})
+    if params.reply_to and not params.content:
+        return json.dumps({"success": False, "error": "reply_to requires content (your response text)."})
     if params.message_id and params.content:
         return json.dumps({"success": False, "error": "Provide either content (new message) or message_id (forward), not both."})
     if not params.message_id and not params.content:
-        return json.dumps({"success": False, "error": "Provide either content (new message) or message_id (forward)."})
+        return json.dumps({"success": False, "error": "Provide content (new message/reply) or message_id (forward)."})
 
     if params.message_id:
         return await _forward_message(state, params)
+    elif params.reply_to:
+        return await _reply_to_message(state, params)
     else:
         return await _send_new_message(state, params)
 
@@ -3061,7 +3885,7 @@ async def get_identity(ctx: Context) -> str:
     _track_session(ctx)
     state = get_state(ctx)
     passport_path = os.path.join(os.getcwd(), ".darkmatter", "passport.key")
-    return json.dumps({
+    result = {
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
@@ -3076,7 +3900,11 @@ async def get_identity(ctx: Context) -> str:
         "message_queue_size": len(state.message_queue),
         "sent_messages_count": len(state.sent_messages),
         "created_at": state.created_at,
-    })
+    }
+    if state.wallets:
+        result["wallets"] = state.wallets
+    result["superagent_url"] = state.superagent_url or SUPERAGENT_DEFAULT_URL
+    return json.dumps(result)
 
 
 @mcp.tool(
@@ -3092,7 +3920,7 @@ async def get_identity(ctx: Context) -> str:
 async def list_connections(ctx: Context) -> str:
     """List all current connections with telemetry data.
 
-    Shows each connection's agent ID, bio, direction, message counts,
+    Shows each connection's agent ID, bio, message counts,
     response times, and last activity.
 
     Returns:
@@ -3114,7 +3942,6 @@ async def list_connections(ctx: Context) -> str:
             "bio_summary": _truncate(conn.agent_bio, 250) if conn.agent_bio else None,
             "crypto": conn.agent_public_key_hex is not None,
             "transport": conn.transport,
-            "direction": conn.direction.value,
             "connected_at": conn.connected_at,
             "messages_sent": conn.messages_sent,
             "messages_received": conn.messages_received,
@@ -3123,6 +3950,8 @@ async def list_connections(ctx: Context) -> str:
             "last_activity": conn.last_activity,
             "rate_limit": conn.rate_limit if conn.rate_limit != 0 else DEFAULT_RATE_LIMIT_PER_CONNECTION,
         }
+        if conn.wallets:
+            entry["wallets"] = conn.wallets
         impression = state.impressions.get(conn.agent_id)
         if impression:
             entry["score"] = impression.score
@@ -3260,135 +4089,6 @@ async def get_message(params: GetMessageInput, ctx: Context) -> str:
     return json.dumps({
         "success": False,
         "error": f"No queued message with ID '{params.message_id}'."
-    })
-
-
-# =============================================================================
-# Message Response Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_respond_message",
-    annotations={
-        "title": "Respond to Message",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def respond_message(params: RespondMessageInput, ctx: Context) -> str:
-    """Respond to a queued message by calling its webhook with your response.
-
-    Finds the message in the queue, removes it, and POSTs the response
-    to the message's webhook URL. The webhook accumulates all routing data,
-    so no trace or forward_notes need to travel with the response.
-
-    Args:
-        params: Contains message_id and response string.
-
-    Returns:
-        JSON with the result of the webhook call.
-    """
-    state = get_state(ctx)
-
-    # Find and remove the message from the queue
-    msg = None
-    for i, m in enumerate(state.message_queue):
-        if m.message_id == params.message_id:
-            msg = state.message_queue.pop(i)
-            break
-
-    if msg is None:
-        return json.dumps({
-            "success": False,
-            "error": f"No queued message with ID '{params.message_id}'."
-        })
-
-    # Validate the stored webhook before calling it (SSRF protection)
-    webhook_err = validate_webhook_url(msg.webhook)
-    if webhook_err:
-        save_state()
-        return json.dumps({
-            "success": False,
-            "message_id": msg.message_id,
-            "error": f"Webhook blocked: {webhook_err}",
-        })
-
-    # Check if message is still active before responding
-    try:
-        status_resp = await _webhook_request_with_recovery(
-            state, msg.webhook, msg.from_agent_id,
-            method="GET", timeout=10.0,
-        )
-        if status_resp.status_code == 200:
-            webhook_data = status_resp.json()
-            msg_status = webhook_data.get("status", "active")
-            if msg_status == "expired":
-                save_state()
-                return json.dumps({
-                    "success": False,
-                    "error": "Message has been expired by the originator.",
-                    "message_id": msg.message_id,
-                })
-    except Exception as e:
-        print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
-
-    # Notify originator that we're actively responding
-    try:
-        await _webhook_request_with_recovery(
-            state, msg.webhook, msg.from_agent_id,
-            method="POST", timeout=10.0,
-            json={"type": "responding", "agent_id": state.agent_id}
-        )
-    except Exception:
-        pass  # Best-effort notification
-
-    # Sign the webhook response
-    resp_timestamp = datetime.now(timezone.utc).isoformat()
-    resp_signature_hex = None
-    if state.private_key_hex:
-        resp_signature_hex = _sign_message(
-            state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, params.response
-        )
-
-    # Call the webhook with our response
-    webhook_success = False
-    webhook_error = None
-    response_time_ms = 0.0
-    try:
-        start = time.monotonic()
-        resp = await _webhook_request_with_recovery(
-            state, msg.webhook, msg.from_agent_id,
-            method="POST", timeout=30.0,
-            json={
-                "type": "response",
-                "agent_id": state.agent_id,
-                "response": params.response,
-                "metadata": msg.metadata,
-                "timestamp": resp_timestamp,
-                "from_public_key_hex": state.public_key_hex,
-                "signature_hex": resp_signature_hex,
-            }
-        )
-        response_time_ms = (time.monotonic() - start) * 1000
-        webhook_success = resp.status_code < 400
-    except Exception as e:
-        webhook_error = str(e)
-
-    # Update telemetry for the connection that sent us this message
-    if msg.from_agent_id and msg.from_agent_id in state.connections:
-        conn = state.connections[msg.from_agent_id]
-        conn.total_response_time_ms += response_time_ms
-        conn.last_activity = datetime.now(timezone.utc).isoformat()
-
-    save_state()
-    return json.dumps({
-        "success": webhook_success,
-        "message_id": msg.message_id,
-        "webhook_called": msg.webhook,
-        "response_time_ms": round(response_time_ms, 2),
-        "error": webhook_error,
     })
 
 
@@ -3903,6 +4603,59 @@ async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
 
 
 # =============================================================================
+# Gas Economy Configuration Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="darkmatter_set_superagent",
+    annotations={
+        "title": "Set Superagent",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def set_superagent(params: SetSuperagentInput, ctx: Context) -> str:
+    """Set the default superagent URL for gas routing.
+
+    The superagent receives gas fees on timeout (when no elder is found).
+    Set to null to reset to the default anchor node.
+
+    Args:
+        params: Contains url (or null to reset).
+
+    Returns:
+        JSON confirming the update.
+    """
+    state = get_state(ctx)
+    old_url = state.superagent_url
+
+    if params.url:
+        url_err = validate_url(params.url)
+        if url_err:
+            return json.dumps({"success": False, "error": url_err})
+        state.superagent_url = params.url.rstrip("/")
+    else:
+        state.superagent_url = None
+
+    # Clear cache for old URL
+    if old_url and old_url in _superagent_wallet_cache:
+        del _superagent_wallet_cache[old_url]
+
+    save_state()
+
+    effective = state.superagent_url or SUPERAGENT_DEFAULT_URL
+    return json.dumps({
+        "success": True,
+        "superagent_url": state.superagent_url,
+        "effective_url": effective,
+        "reset_to_default": params.url is None,
+    })
+
+
+# =============================================================================
 # Rate Limit Configuration Tool
 # =============================================================================
 
@@ -3964,6 +4717,263 @@ async def set_rate_limit(params: SetRateLimitInput, ctx: Context) -> str:
             "rate_limit": params.limit,
             "effective": label,
         })
+
+
+# =============================================================================
+# Solana Wallet Tools
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_get_balance",
+    annotations={
+        "title": "Get Wallet Balance",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def get_balance(params: GetBalanceInput, ctx: Context) -> str:
+    """Check SOL or SPL token balance for this agent's wallet.
+
+    Omit mint for SOL balance. Provide mint address for SPL token balance.
+
+    Returns:
+        JSON with balance information.
+    """
+    state = get_state(ctx)
+    result = await get_solana_balance(state.wallets, mint=params.mint)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    name="darkmatter_send_sol",
+    annotations={
+        "title": "Send SOL",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def send_sol(params: SendSolInput, ctx: Context) -> str:
+    """Send SOL to a connected agent's Solana wallet.
+
+    Looks up the recipient's wallet from your connections, builds and sends the transfer.
+    Optionally notifies the recipient via a DarkMatter message.
+
+    Args:
+        params: agent_id, amount (SOL), notify flag.
+
+    Returns:
+        JSON with transaction signature and details.
+    """
+    state = get_state(ctx)
+    conn = state.connections.get(params.agent_id)
+    if not conn:
+        return json.dumps({"success": False, "error": f"Not connected to agent '{params.agent_id}'"})
+    conn_sol = conn.wallets.get("solana")
+    if not conn_sol:
+        return json.dumps({"success": False, "error": f"Agent '{params.agent_id}' has no Solana wallet"})
+
+    result = await send_solana_sol(state.private_key_hex, state.wallets, conn_sol, params.amount)
+    if result.get("success"):
+        result["to_agent_id"] = params.agent_id
+        if params.notify:
+            try:
+                notify_params = SendMessageInput(
+                    content=f"Sent {params.amount} SOL — tx: {result['tx_signature']}",
+                    target_agent_id=params.agent_id,
+                    metadata={
+                        "type": "solana_payment",
+                        "amount": params.amount,
+                        "token": "SOL",
+                        "tx_signature": result["tx_signature"],
+                        "from_wallet": result["from_wallet"],
+                        "to_wallet": conn_sol,
+                        "gas_eligible": True,
+                        "gas_rate": GAS_RATE,
+                        "sender_created_at": state.created_at,
+                        "sender_superagent_wallet": await _get_superagent_wallet(state) or "",
+                    },
+                )
+                await _send_new_message(state, notify_params)
+                result["notification_sent"] = True
+            except Exception:
+                result["notification_sent"] = False
+
+    return json.dumps(result)
+
+
+@mcp.tool(
+    name="darkmatter_send_token",
+    annotations={
+        "title": "Send SPL Token",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def send_token(params: SendTokenInput, ctx: Context) -> str:
+    """Send SPL tokens to a connected agent's Solana wallet.
+
+    Auto-creates the recipient's token account if it doesn't exist (sender pays the rent).
+    Accepts token name (e.g. "USDC") or raw mint address.
+
+    Args:
+        params: agent_id, mint (name or address), amount, decimals, notify flag.
+
+    Returns:
+        JSON with transaction signature and details.
+    """
+    state = get_state(ctx)
+    conn = state.connections.get(params.agent_id)
+    if not conn:
+        return json.dumps({"success": False, "error": f"Not connected to agent '{params.agent_id}'"})
+    conn_sol = conn.wallets.get("solana")
+    if not conn_sol:
+        return json.dumps({"success": False, "error": f"Agent '{params.agent_id}' has no Solana wallet"})
+
+    # Resolve token name to mint address if known
+    mint = params.mint
+    decimals = params.decimals
+    resolved = _resolve_spl_token(params.mint)
+    if resolved:
+        mint, decimals = resolved
+
+    result = await send_solana_token(state.private_key_hex, state.wallets, conn_sol, mint, params.amount, decimals)
+    if result.get("success"):
+        result["to_agent_id"] = params.agent_id
+        if params.notify:
+            try:
+                token_label = params.mint if not resolved else params.mint.upper()
+                notify_params = SendMessageInput(
+                    content=f"Sent {params.amount} {token_label} — tx: {result['tx_signature']}",
+                    target_agent_id=params.agent_id,
+                    metadata={
+                        "type": "solana_payment",
+                        "amount": params.amount,
+                        "token": mint,
+                        "decimals": decimals,
+                        "tx_signature": result["tx_signature"],
+                        "from_wallet": result["from_wallet"],
+                        "to_wallet": conn_sol,
+                        "gas_eligible": True,
+                        "gas_rate": GAS_RATE,
+                        "sender_created_at": state.created_at,
+                        "sender_superagent_wallet": await _get_superagent_wallet(state) or "",
+                    },
+                )
+                await _send_new_message(state, notify_params)
+                result["notification_sent"] = True
+            except Exception:
+                result["notification_sent"] = False
+
+    return json.dumps(result)
+
+
+# =============================================================================
+# Unified Multi-Chain Wallet Tools
+# =============================================================================
+
+
+@mcp.tool(
+    name="darkmatter_wallet_balances",
+    annotations={
+        "title": "Wallet Balances",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def wallet_balances(params: WalletBalancesInput, ctx: Context) -> str:
+    """Show all wallets with native balances across chains.
+
+    For each chain in your wallets, fetches the native balance.
+    Chains without their SDK installed return address but balance: null.
+
+    Args:
+        params: Optional chain filter.
+
+    Returns:
+        JSON with wallet addresses and balances per chain.
+    """
+    state = get_state(ctx)
+    if not state.wallets:
+        return json.dumps({"success": False, "error": "No wallets configured"})
+
+    chains = state.wallets
+    if params.chain:
+        if params.chain not in chains:
+            return json.dumps({"success": False, "error": f"No wallet for chain '{params.chain}'"})
+        chains = {params.chain: chains[params.chain]}
+
+    results = []
+    for chain, address in chains.items():
+        entry = {"chain": chain, "address": address, "balance": None, "unit": None}
+
+        if chain == "solana" and SOLANA_AVAILABLE:
+            try:
+                pubkey = SolanaPubkey.from_string(address)
+                async with SolanaClient(SOLANA_RPC_URL) as client:
+                    resp = await client.get_balance(pubkey)
+                    entry["balance"] = resp.value / LAMPORTS_PER_SOL
+                    entry["unit"] = "SOL"
+            except Exception as e:
+                entry["error"] = str(e)
+        elif chain == "solana":
+            entry["note"] = "solana/solders not installed"
+        else:
+            entry["note"] = f"{chain} SDK not yet implemented"
+
+        results.append(entry)
+
+    return json.dumps({"success": True, "wallets": results})
+
+
+@mcp.tool(
+    name="darkmatter_wallet_send",
+    annotations={
+        "title": "Send (Any Chain)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def wallet_send(params: WalletSendInput, ctx: Context) -> str:
+    """Send native currency to a connected agent on any chain.
+
+    Dispatches to chain-specific logic. Currently only Solana is implemented.
+
+    Args:
+        params: agent_id, amount, chain (default: solana), notify flag.
+
+    Returns:
+        JSON with transaction details.
+    """
+    state = get_state(ctx)
+
+    if params.chain not in state.wallets:
+        return json.dumps({"success": False, "error": f"No wallet for chain '{params.chain}'"})
+
+    conn = state.connections.get(params.agent_id)
+    if not conn:
+        return json.dumps({"success": False, "error": f"Not connected to agent '{params.agent_id}'"})
+
+    if params.chain not in conn.wallets:
+        return json.dumps({"success": False, "error": f"Agent '{params.agent_id}' has no {params.chain} wallet"})
+
+    if params.chain == "solana":
+        if not SOLANA_AVAILABLE:
+            return json.dumps({"success": False, "error": "Solana SDK not installed"})
+        # Delegate to existing send_sol logic
+        sol_params = SendSolInput(agent_id=params.agent_id, amount=params.amount, notify=params.notify)
+        return await send_sol(sol_params, ctx)
+
+    return json.dumps({"success": False, "error": f"Chain '{params.chain}' send not yet implemented"})
 
 
 # =============================================================================
@@ -4174,7 +5184,8 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     from_agent_bio = data.get("from_agent_bio", "")
     from_agent_public_key_hex = data.get("from_agent_public_key_hex")
     from_agent_display_name = data.get("from_agent_display_name")
-    mutual = data.get("mutual", False)
+    from_agent_wallets = data.get("wallets") or ({"solana": data["from_agent_wallet_address"]} if data.get("from_agent_wallet_address") else {})
+    from_agent_created_at = data.get("created_at")
 
     if not from_agent_id or not from_agent_url:
         return JSONResponse({"error": "Missing required fields"}, status_code=400)
@@ -4189,9 +5200,15 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     # Check if already connected
     if from_agent_id in state.connections:
         existing = state.connections[from_agent_id]
+        changed = False
         if from_agent_public_key_hex and not existing.agent_public_key_hex:
             existing.agent_public_key_hex = from_agent_public_key_hex
             existing.agent_display_name = from_agent_display_name
+            changed = True
+        if from_agent_wallets and not existing.wallets:
+            existing.wallets = from_agent_wallets
+            changed = True
+        if changed:
             save_state()
         return JSONResponse({
             "auto_accepted": True,
@@ -4200,6 +5217,9 @@ async def handle_connection_request(request: Request) -> JSONResponse:
             "agent_bio": state.bio,
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
+            "wallets": state.wallets,
+            "wallet_address": state.wallets.get("solana"),
+            "created_at": state.created_at,
             "message": "Already connected.",
         })
 
@@ -4216,7 +5236,8 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         from_agent_bio=from_agent_bio,
         from_agent_public_key_hex=from_agent_public_key_hex,
         from_agent_display_name=from_agent_display_name,
-        mutual=mutual,
+        from_agent_wallets=from_agent_wallets,
+        from_agent_created_at=from_agent_created_at,
         peer_trust=peer_trust,
     )
 
@@ -4246,6 +5267,7 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
     agent_bio = data.get("agent_bio", "")
     agent_public_key_hex = data.get("agent_public_key_hex")
     agent_display_name = data.get("agent_display_name")
+    agent_wallets = data.get("wallets") or ({"solana": data["wallet_address"]} if data.get("wallet_address") else {})
 
     if not agent_id or not agent_url:
         return JSONResponse({"error": "Missing required fields"}, status_code=400)
@@ -4286,9 +5308,10 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
         agent_id=agent_id,
         agent_url=agent_url,
         agent_bio=agent_bio,
-        direction=ConnectionDirection.OUTBOUND,
         agent_public_key_hex=agent_public_key_hex,
         agent_display_name=agent_display_name,
+        wallets=agent_wallets,
+        peer_created_at=data.get("created_at"),
     )
     state.connections[agent_id] = conn
     save_state()
@@ -4328,9 +5351,10 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
         agent_id=pending.from_agent_id,
         agent_url=pending.from_agent_url,
         agent_bio=pending.from_agent_bio,
-        direction=ConnectionDirection.INBOUND,
         agent_public_key_hex=pending.from_agent_public_key_hex,
         agent_display_name=pending.from_agent_display_name,
+        wallets=pending.from_agent_wallets,
+        peer_created_at=pending.from_agent_created_at,
     )
     state.connections[pending.from_agent_id] = conn
 
@@ -4350,17 +5374,13 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
                     "agent_bio": state.bio,
                     "agent_public_key_hex": state.public_key_hex,
                     "agent_display_name": state.display_name,
+                    "wallets": state.wallets,
+                    "wallet_address": state.wallets.get("solana"),
+                    "created_at": state.created_at,
                 }
             )
     except Exception:
         pass
-
-    # If the original request was mutual, send a reverse connection request
-    if pending.mutual:
-        try:
-            await _connection_request(state, pending.from_agent_url)
-        except Exception:
-            pass  # Best effort
 
     # Auto WebRTC upgrade
     if WEBRTC_AVAILABLE:
@@ -4492,6 +5512,14 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
             )
         except Exception:
             pass  # Best-effort notification
+
+    # Gas economy: if this is a payment notification with gas_eligible flag, initiate match game
+    msg_meta = msg.metadata or {}
+    if (msg_meta.get("type") == "solana_payment"
+            and msg_meta.get("gas_eligible")
+            and msg_meta.get("amount")
+            and msg_meta.get("tx_signature")):
+        asyncio.create_task(_initiate_gas_from_payment(state, msg))
 
     # Route message through the extensible router chain
     asyncio.create_task(_execute_routing(state, msg))
@@ -4688,6 +5716,7 @@ async def handle_network_info(request: Request) -> JSONResponse:
         "agent_url": _get_public_url(state.port),
         "bio": state.bio,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
+        "wallets": state.wallets,
         "peers": peers,
     })
 
@@ -4822,6 +5851,183 @@ async def handle_peer_lookup(request: Request) -> JSONResponse:
         "url": conn.agent_url,
         "status": "connected",
     })
+
+
+# =============================================================================
+# Gas Economy HTTP Endpoints
+# =============================================================================
+
+
+async def handle_gas_match(request: Request) -> JSONResponse:
+    """Stateless match game endpoint. Peer picks a random number and returns it."""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    n = data.get("n")
+    if not isinstance(n, int) or n < 1:
+        return JSONResponse({"error": "Invalid n"}, status_code=400)
+
+    pick = random.randint(0, n)
+    return JSONResponse({"pick": pick})
+
+
+async def handle_gas_signal(request: Request) -> JSONResponse:
+    """Receive a forwarded gas signal and run the match game."""
+    global _agent_state
+    state = _agent_state
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    try:
+        gas = _gas_signal_from_dict(data)
+    except (KeyError, TypeError) as e:
+        return JSONResponse({"error": f"Invalid gas signal: {e}"}, status_code=400)
+
+    # Validate TTL
+    if gas.hops >= gas.max_hops:
+        return JSONResponse({"error": "Signal expired (max hops)"}, status_code=400)
+
+    # Validate age
+    if gas.created_at:
+        try:
+            created = datetime.fromisoformat(gas.created_at)
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+            if age > GAS_MAX_AGE_S:
+                return JSONResponse({"error": "Signal expired (age)"}, status_code=400)
+        except (ValueError, TypeError):
+            pass
+
+    # Loop detection
+    if state.agent_id in gas.path:
+        return JSONResponse({"error": "Loop detected"}, status_code=400)
+
+    _log_gas_event(state, {
+        "type": "gas_signal_received",
+        "signal_id": gas.signal_id,
+        "hops": gas.hops,
+        "from": gas.path[-1] if gas.path else gas.sender_agent_id,
+    })
+
+    # Run match game as background task (not originator — will callback to B)
+    asyncio.create_task(_run_match_game(state, gas, is_originator=False))
+
+    return JSONResponse({"accepted": True})
+
+
+async def handle_gas_result(request: Request) -> JSONResponse:
+    """B receives this when a downstream node resolves the gas signal.
+
+    B sends the gas to the destination wallet and logs the event.
+    """
+    global _agent_state
+    state = _agent_state
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    signal_id = data.get("signal_id", "")
+    dest_wallet = data.get("destination_wallet", "")
+    resolved_by = data.get("resolved_by", "")
+    resolution = data.get("resolution", "resolved")
+
+    if not signal_id:
+        return JSONResponse({"error": "Missing signal_id"}, status_code=400)
+
+    # Find the original gas signal in our log
+    original_entry = None
+    for entry in state.gas_log:
+        if entry.get("signal_id") == signal_id and entry.get("type") == "gas_initiated":
+            original_entry = entry
+            break
+
+    if not original_entry:
+        return JSONResponse({"error": "Unknown signal_id"}, status_code=404)
+
+    # Check if already resolved
+    for entry in state.gas_log:
+        if entry.get("signal_id") == signal_id and entry.get("type") in ("gas_sent", "gas_kept"):
+            return JSONResponse({"status": "already_resolved"})
+
+    amount = original_entry.get("amount", 0)
+    token = original_entry.get("token", "SOL")
+    token_decimals = original_entry.get("token_decimals", 9)
+
+    if dest_wallet and state.private_key_hex and amount > 0:
+        try:
+            if token == "SOL":
+                result = await send_solana_sol(
+                    state.private_key_hex, state.wallets, dest_wallet, amount
+                )
+            else:
+                result = await send_solana_token(
+                    state.private_key_hex, state.wallets, dest_wallet,
+                    token, amount, token_decimals
+                )
+
+            _log_gas_event(state, {
+                "type": "gas_sent",
+                "signal_id": signal_id,
+                "resolution": resolution,
+                "destination": dest_wallet,
+                "amount": amount,
+                "token": token,
+                "tx_success": result.get("success", False),
+                "tx_signature": result.get("tx_signature"),
+                "resolved_by": resolved_by,
+            })
+
+            # Trust boost
+            if result.get("success") and resolved_by:
+                _adjust_trust(state, resolved_by, 0.01)
+
+        except Exception as e:
+            _log_gas_event(state, {
+                "type": "gas_send_failed",
+                "signal_id": signal_id,
+                "error": str(e),
+            })
+    elif resolution == "timeout" and original_entry.get("sender_superagent_wallet"):
+        # Timeout — send to superagent
+        sa_wallet = original_entry["sender_superagent_wallet"]
+        if state.private_key_hex and amount > 0:
+            try:
+                if token == "SOL":
+                    await send_solana_sol(state.private_key_hex, state.wallets, sa_wallet, amount)
+                else:
+                    await send_solana_token(
+                        state.private_key_hex, state.wallets, sa_wallet,
+                        token, amount, token_decimals
+                    )
+                _log_gas_event(state, {
+                    "type": "gas_sent",
+                    "signal_id": signal_id,
+                    "resolution": "timeout",
+                    "destination": sa_wallet,
+                    "amount": amount,
+                })
+            except Exception:
+                pass
+    else:
+        _log_gas_event(state, {
+            "type": "gas_kept",
+            "signal_id": signal_id,
+            "reason": "no_destination",
+            "amount": amount,
+        })
+
+    save_state()
+    return JSONResponse({"status": "resolved"})
 
 
 # =============================================================================
@@ -5118,12 +6324,16 @@ async def _ensure_entrypoint_running() -> None:
         log_file = open(log_path, "a")
 
         print(f"[DarkMatter] Spawning entrypoint: {path}", file=sys.stderr)
+        # Clean Werkzeug env vars so the child doesn't inherit stale FDs
+        spawn_env = {k: v for k, v in os.environ.items()
+                     if not k.startswith("WERKZEUG_")}
         subprocess.Popen(
             [sys.executable, path],
             start_new_session=True,
             cwd=entrypoint_dir,
             stdout=log_file,
             stderr=log_file,
+            env=spawn_env,
         )
 
         # Poll until the entrypoint is healthy (up to 10s)
@@ -5353,6 +6563,12 @@ def _init_state(port: int = None) -> None:
               f"on port {port}", file=sys.stderr)
 
     print(f"[DarkMatter] Identity: {agent_id[:16]}...{agent_id[-8:]}", file=sys.stderr)
+
+    # Derive Solana wallet (ephemeral — not persisted, derived from passport each startup)
+    if SOLANA_AVAILABLE and _agent_state.private_key_hex:
+        _agent_state.wallets["solana"] = _get_solana_wallet_address(_agent_state.private_key_hex)
+        print(f"[DarkMatter] Solana wallet: {_agent_state.wallets['solana']}", file=sys.stderr)
+
     save_state()
 
 
@@ -5443,6 +6659,9 @@ def create_app() -> Starlette:
         Route("/webrtc_offer", handle_webrtc_offer, methods=["POST"]),
         Route("/peer_update", handle_peer_update, methods=["POST"]),
         Route("/peer_lookup/{agent_id}", handle_peer_lookup, methods=["GET"]),
+        Route("/gas_match", handle_gas_match, methods=["POST"]),
+        Route("/gas_signal", handle_gas_signal, methods=["POST"]),
+        Route("/gas_result", handle_gas_result, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
