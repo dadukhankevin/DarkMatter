@@ -1,13 +1,14 @@
 #!/bin/bash
 set -eu
 
-echo "=== DarkMatter Bootstrap ==="
-echo ""
-
-GITHUB_RAW="https://raw.githubusercontent.com/dadukhankevin/DarkMatter/main/server.py"
+REPO_URL="https://github.com/dadukhankevin/DarkMatter.git"
 DM_DIR="$HOME/.darkmatter"
+REPO_DIR="$DM_DIR/repo"
 VENV_DIR="$DM_DIR/venv"
 PYTHON_CMD=""
+
+echo "=== DarkMatter Bootstrap ==="
+echo ""
 
 # Find python3
 for cmd in python3 python; do
@@ -34,15 +35,19 @@ echo "Using $PYTHON_CMD ($PY_VERSION)"
 # Create directory
 mkdir -p "$DM_DIR"
 
-# Download server
-echo "Downloading server.py..."
-curl -fsSL "$GITHUB_RAW" -o "$DM_DIR/server.py"
-# Trust-the-source: we download from GitHub over HTTPS. Print checksum for manual verification.
-if command -v sha256sum >/dev/null 2>&1; then
-    echo "SHA256: $(sha256sum "$DM_DIR/server.py" | cut -d' ' -f1)"
+# Clone or update repo
+if [ -d "$REPO_DIR/.git" ]; then
+    echo "Updating DarkMatter..."
+    git -C "$REPO_DIR" fetch origin main
+    git -C "$REPO_DIR" reset --hard origin/main
 else
-    echo "SHA256: $(shasum -a 256 "$DM_DIR/server.py" | cut -d' ' -f1)"
+    echo "Cloning DarkMatter..."
+    rm -rf "$REPO_DIR"
+    git clone --depth 1 "$REPO_URL" "$REPO_DIR"
 fi
+
+COMMIT=$(git -C "$REPO_DIR" rev-parse --short HEAD)
+echo "Installed commit: $COMMIT"
 
 # Create venv and install dependencies
 if [ ! -d "$VENV_DIR" ]; then
@@ -51,7 +56,7 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 echo "Installing dependencies..."
-"$VENV_DIR/bin/pip" install --quiet "mcp[cli]" httpx uvicorn starlette cryptography anyio
+"$VENV_DIR/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
 
 # Find free port in 8100-8110
 PORT=8100
@@ -61,7 +66,6 @@ while [ $PORT -le 8110 ]; do
             break
         fi
     else
-        # Fallback: use Python socket to check if port is in use
         if ! "$PYTHON_CMD" -c "import socket; s=socket.socket(); s.settimeout(0.1); exit(0 if s.connect_ex(('127.0.0.1',$PORT)) else 1)" 2>/dev/null; then
             break
         fi
@@ -85,70 +89,75 @@ else
 fi
 DISPLAY_NAME="${DISPLAY_NAME:-darkmatter-agent}"
 
-# Build the darkmatter MCP entry as JSON
+# Build the darkmatter MCP entry as JSON — runs darkmatter/app.py from cloned repo
 DM_ENTRY=$(cat <<JSONEOF
 {
   "command": "$VENV_PYTHON",
-  "args": ["$DM_DIR/server.py"],
+  "args": ["$REPO_DIR/darkmatter/app.py"],
   "env": {
     "DARKMATTER_PORT": "$PORT",
-    "DARKMATTER_DISPLAY_NAME": "$DISPLAY_NAME"
+    "DARKMATTER_DISPLAY_NAME": "$DISPLAY_NAME",
+    "PYTHONPATH": "$REPO_DIR"
   }
 }
 JSONEOF
 )
 
-# Find or create .mcp.json
-MCP_JSON=""
-for candidate in "$PWD/.mcp.json" "$HOME/.claude/.mcp.json" "$HOME/.config/mcp/.mcp.json"; do
-    if [ -f "$candidate" ]; then
-        MCP_JSON="$candidate"
-        break
-    fi
-done
-if [ -z "$MCP_JSON" ]; then
-    MCP_JSON="$PWD/.mcp.json"
-fi
+# Install into ALL known MCP config locations
+INSTALLED=0
 
-# Merge darkmatter entry into .mcp.json (pass entry via stdin to avoid quoting issues)
-if [ -f "$MCP_JSON" ]; then
-    MERGED=$(echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
+install_mcp_entry() {
+    local target="$1"
+    local target_dir
+    target_dir=$(dirname "$target")
+    mkdir -p "$target_dir"
+
+    if [ -f "$target" ]; then
+        MERGED=$(echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
 import json, sys
 entry = json.load(sys.stdin)
-with open('$MCP_JSON') as f:
+with open('$target') as f:
     config = json.load(f)
 config.setdefault('mcpServers', {})
 config['mcpServers']['darkmatter'] = entry
 print(json.dumps(config, indent=2))
 ")
-    if [ $? -eq 0 ]; then
-        printf '%s\n' "$MERGED" > "$MCP_JSON"
-        echo "Updated existing $MCP_JSON"
+        if [ $? -eq 0 ]; then
+            printf '%s\n' "$MERGED" > "$target"
+            echo "  Updated $target"
+            INSTALLED=$((INSTALLED + 1))
+        else
+            echo "  WARNING: Failed to merge into $target"
+        fi
     else
-        echo "ERROR: Failed to merge into $MCP_JSON"
-        exit 1
-    fi
-else
-    # Create new .mcp.json
-    echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
+        echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
 import json, sys
 entry = json.load(sys.stdin)
 config = {'mcpServers': {'darkmatter': entry}}
-with open('$MCP_JSON', 'w') as f:
+with open('$target', 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
 "
-    echo "Created $MCP_JSON"
-fi
+        echo "  Created $target"
+        INSTALLED=$((INSTALLED + 1))
+    fi
+}
+
+echo ""
+echo "Installing MCP config (global — applies to all projects)..."
+install_mcp_entry "$HOME/.claude/settings.json"
 
 echo ""
 echo "=== Setup complete ==="
-echo "DarkMatter added to $MCP_JSON"
+echo "DarkMatter installed to $INSTALLED location(s)"
 echo "Display name: $DISPLAY_NAME"
 echo "Port: $PORT"
+echo "Commit: $COMMIT"
 echo ""
 echo "Restart your MCP client to connect. Auth is automatic."
 echo ""
+echo "To update later:  bash ~/.darkmatter/repo/install.sh"
+echo ""
 echo "Alternative: standalone HTTP mode (manual start):"
-echo "  DARKMATTER_PORT=$PORT nohup $VENV_PYTHON $DM_DIR/server.py > /tmp/darkmatter-$PORT.log 2>&1 &"
+echo "  DARKMATTER_PORT=$PORT PYTHONPATH=$REPO_DIR nohup $VENV_PYTHON $REPO_DIR/darkmatter/app.py > /tmp/darkmatter-$PORT.log 2>&1 &"
 echo "  Then set in .mcp.json: {\"type\":\"http\",\"url\":\"http://localhost:$PORT/mcp\"}"
