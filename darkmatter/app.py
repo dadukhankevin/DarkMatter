@@ -32,6 +32,7 @@ from darkmatter.models import AgentState, AgentStatus
 from darkmatter.identity import load_or_create_passport
 from darkmatter.state import set_state, get_state, save_state, state_file_path, load_state_from_file
 from darkmatter.mcp import mcp
+import darkmatter.mcp.tools  # noqa: F401 — registers @mcp.tool() decorators
 from darkmatter.mcp.visibility import initialize_tool_visibility, status_updater
 from darkmatter.network.manager import NetworkManager, set_network_manager, get_network_manager
 from darkmatter.network.transports.http import HttpTransport
