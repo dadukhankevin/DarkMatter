@@ -70,10 +70,15 @@ def load_or_create_passport() -> tuple[str, str]:
 
     # Generate new passport
     private_key_hex, public_key_hex = generate_keypair()
-    os.makedirs(passport_dir, exist_ok=True)
-    with open(passport_path, "w") as f:
-        f.write(private_key_hex + "\n")
-    os.chmod(passport_path, 0o600)
+    try:
+        os.makedirs(passport_dir, exist_ok=True)
+        with open(passport_path, "w") as f:
+            f.write(private_key_hex + "\n")
+        os.chmod(passport_path, 0o600)
+    except OSError as e:
+        print(f"[DarkMatter] FATAL: cannot create passport at {passport_path}: {e}", file=sys.stderr)
+        print(f"[DarkMatter] Check directory permissions for {passport_dir}", file=sys.stderr)
+        sys.exit(1)
     print(f"[DarkMatter] New passport created: {passport_path}", file=sys.stderr)
     print(f"[DarkMatter] Agent ID (public key): {public_key_hex}", file=sys.stderr)
     return private_key_hex, public_key_hex

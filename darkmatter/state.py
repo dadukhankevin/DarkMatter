@@ -273,16 +273,19 @@ def save_state() -> None:
 
     path = state_file_path()
     tmp = path + ".tmp"
-    with _state_write_lock:
-        with open(tmp, "w") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        os.replace(tmp, path)
+    try:
+        with _state_write_lock:
+            with open(tmp, "w") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            os.replace(tmp, path)
+    except OSError as e:
+        print(f"[DarkMatter] Warning: could not save state to {path}: {e}", file=sys.stderr)
 
 
 # =============================================================================
