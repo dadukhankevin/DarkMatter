@@ -41,6 +41,9 @@ class SendMessageInput(BaseModel):
     hops_remaining: int = Field(default=10, ge=1, le=50, description="How many more hops this message can take before expiring (TTL)")
     note: Optional[str] = Field(default=None, description="Forwarding annotation visible to the sender", max_length=1000)
     force: bool = Field(default=False, description="Override loop detection when forwarding")
+    broadcast: bool = Field(default=False, description="Send to all connected peers (overrides target_agent_id)")
+    trust_min: float = Field(default=0.0, ge=-1.0, le=1.0, description="Only send to peers with trust >= this (for broadcast)")
+    message_type: str = Field(default="direct", description="'direct' or 'broadcast' — broadcasts are non-interruptive context")
 
 
 class UpdateBioInput(BaseModel):
@@ -161,3 +164,19 @@ class SetRateLimitInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: Optional[str] = Field(default=None, description="Agent ID to set per-connection rate limit for. Omit to set global rate limit.")
     limit: int = Field(..., description="Max requests per 60s window. 0 = use default, -1 = unlimited.")
+
+
+class CreateShardInput(BaseModel):
+    """Create a shared knowledge shard."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    content: str = Field(..., description="Text content of the shard", max_length=MAX_CONTENT_LENGTH)
+    tags: list[str] = Field(..., description="Tags for organizing and querying shards", min_length=1)
+    trust_threshold: float = Field(default=0.0, ge=0.0, le=1.0, description="Min trust to receive this shard (0.0=public, 1.0=private)")
+    summary: Optional[str] = Field(default=None, description="Optional summary shown instead of content", max_length=1000)
+
+
+class ViewShardsInput(BaseModel):
+    """Query shared knowledge shards."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    tags: Optional[list[str]] = Field(default=None, description="Filter by tags (ANY match)")
+    author: Optional[str] = Field(default=None, description="Filter by author agent ID")

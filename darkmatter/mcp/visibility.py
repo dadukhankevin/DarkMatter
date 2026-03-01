@@ -8,6 +8,8 @@ import asyncio
 import sys
 from datetime import datetime, timezone
 
+import json
+
 from darkmatter.config import (
     MAX_CONNECTIONS,
     CORE_TOOLS,
@@ -18,6 +20,7 @@ from darkmatter.models import AgentState, AgentStatus
 from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional
 from darkmatter.spawn import get_spawned_agents, cleanup_finished_agents
 from darkmatter.state import get_state, save_state
+from darkmatter.context import build_activity_hint
 
 
 # Track last status description for change detection
@@ -48,11 +51,18 @@ def build_status_line() -> str:
     agent_suffix = f" | Spawned agents: {active_agents}" if AGENT_SPAWN_ENABLED else ""
     wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in state.wallets.items()]
     wallet_suffix = f" | Wallets: {', '.join(wallet_parts)}" if wallet_parts else ""
+    # Conversation memory stats
+    conv_total = len(state.conversation_log)
+    broadcast_count = sum(1 for e in state.conversation_log if e.entry_type == "broadcast")
+    peer_shards = sum(1 for s in state.shared_shards if s.author_agent_id != state.agent_id)
+    own_shards = sum(1 for s in state.shared_shards if s.author_agent_id == state.agent_id)
+    context_suffix = f" | Memory: {conv_total} conversations, {broadcast_count} broadcasts, {own_shards} own shards, {peer_shards} peer shards"
+
     stats = (
         f"Agent: {agent_label} | Status: {state.status.value} | "
         f"Connections: {conns}/{MAX_CONNECTIONS} ({peers}) | "
         f"Inbox: {msgs} | Handled: {handled} | Pending requests: {pending}"
-        f"{agent_suffix}{wallet_suffix}"
+        f"{agent_suffix}{wallet_suffix}{context_suffix}"
     )
 
     actions = []
@@ -87,6 +97,21 @@ def build_status_line() -> str:
     if not state.display_name:
         actions.append(
             "No display name set — edit DARKMATTER_DISPLAY_NAME in your .mcp.json and ask the user to restart"
+        )
+
+    # Broadcast activity hints
+    recent_broadcasts = sum(
+        1 for e in state.conversation_log[-50:]
+        if e.entry_type == "broadcast" and e.direction == "inbound"
+    )
+    if recent_broadcasts > 0:
+        actions.append(
+            f"{recent_broadcasts} recent broadcast(s) from peers — review with conversation context"
+        )
+
+    if peer_shards > 0:
+        actions.append(
+            f"{peer_shards} shared shard(s) cached from peers — use darkmatter_view_shards to explore"
         )
 
     if actions:
@@ -133,6 +158,12 @@ def compute_visible_optional() -> set:
 
     if conns >= 3:
         visible.add("darkmatter_set_rate_limit")
+
+    # Shard tools: always show create, show view if any shards exist
+    if conns > 0:
+        visible.add("darkmatter_create_shard")
+    if state.shared_shards:
+        visible.add("darkmatter_view_shards")
 
     if pending > 0:
         visible.add("darkmatter_list_pending_requests")
@@ -203,6 +234,27 @@ async def update_status_tool() -> None:
         print(f"[DarkMatter] Status tool updated: {new_desc}", file=sys.stderr)
 
 
+def _inject_activity_hint(result):
+    """Inject an activity hint into tool call results."""
+    state = get_state()
+    if state is None:
+        return result
+    hint = build_activity_hint(state)
+    # result is a list of content objects from MCP
+    if isinstance(result, list):
+        for item in result:
+            text = getattr(item, "text", None)
+            if text is not None:
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        data["_hint"] = hint
+                        item.text = json.dumps(data)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    return result
+
+
 def initialize_tool_visibility() -> None:
     """Snapshot all tools, remove non-core ones, and monkey-patch call_tool for graceful fallback."""
     import darkmatter.mcp as mcp_module
@@ -230,7 +282,10 @@ def initialize_tool_visibility() -> None:
             mcp._tool_manager._tools[name] = mcp_module._all_tools[name]
             print(f"[DarkMatter] Graceful fallback: restored hidden tool '{name}' on demand", file=sys.stderr)
             mcp_module._visible_optional.add(name)
-        return await original_call_tool(name, arguments, **kwargs)
+        result = await original_call_tool(name, arguments, **kwargs)
+        # Inject activity hints into tool responses
+        result = _inject_activity_hint(result)
+        return result
 
     mcp._tool_manager.call_tool = _patched_call_tool
 

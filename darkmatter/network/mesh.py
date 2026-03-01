@@ -29,6 +29,7 @@ from darkmatter.config import (
     MESSAGE_QUEUE_MAX,
     PROTOCOL_VERSION,
     ANTIMATTER_MAX_AGE_S,
+    TRUST_ANTIMATTER_SUCCESS,
     WEBRTC_AVAILABLE,
     WEBRTC_STUN_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
@@ -55,6 +56,7 @@ from darkmatter.state import (
     save_state,
     check_message_replay,
 )
+from darkmatter.context import log_conversation
 from darkmatter.wallet.antimatter import (
     antimatter_signal_from_dict,
     log_antimatter_event,
@@ -583,7 +585,7 @@ async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict
             })
 
             if result.get("success") and resolved_by:
-                adjust_trust(state, resolved_by, 0.01)
+                adjust_trust(state, resolved_by, TRUST_ANTIMATTER_SUCCESS)
 
         except Exception as e:
             log_antimatter_event(state, {
@@ -708,17 +710,44 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if verified and msg_timestamp and not is_timestamp_fresh(msg_timestamp):
         return {"error": "Message timestamp too old — possible replay"}, 403
 
+    msg_metadata = data.get("metadata", {})
+    is_broadcast = msg_metadata.get("type") == "broadcast"
+
+    if is_broadcast:
+        # Broadcast: log to conversation memory but do NOT queue or spawn
+        log_conversation(
+            state, truncate_field(message_id, 128), content,
+            from_id=from_agent_id, to_ids=[state.agent_id],
+            entry_type="broadcast", direction="inbound",
+            metadata=msg_metadata,
+        )
+        # Update telemetry
+        if from_agent_id in state.connections:
+            conn = state.connections[from_agent_id]
+            conn.messages_received += 1
+            conn.last_activity = datetime.now(timezone.utc).isoformat()
+        save_state()
+        return {"status": "broadcast_received"}, 200
+
     msg = QueuedMessage(
         message_id=truncate_field(message_id, 128),
         content=content,
         webhook=webhook,
         hops_remaining=hops_remaining,
-        metadata=data.get("metadata", {}),
+        metadata=msg_metadata,
         from_agent_id=from_agent_id,
         verified=verified,
     )
     state.message_queue.append(msg)
     state.messages_handled += 1
+
+    # Log conversation
+    log_conversation(
+        state, msg.message_id, content,
+        from_id=from_agent_id, to_ids=[state.agent_id],
+        entry_type="direct", direction="inbound",
+        metadata=msg_metadata,
+    )
 
     # Update telemetry for the sending agent
     if msg.from_agent_id and msg.from_agent_id in state.connections:
@@ -1338,3 +1367,71 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
         "success": True,
         "sdp_answer": pc.localDescription.sdp,
     })
+
+
+# =============================================================================
+# Shared Shard Push Endpoint
+# =============================================================================
+
+async def handle_shard_push(request: Request) -> JSONResponse:
+    """Receive a shared shard from a peer.
+
+    POST /__darkmatter__/shard_push
+    Body: SharedShard fields
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    author_id = data.get("author_agent_id", "")
+    shard_id = data.get("shard_id", "")
+    trust_threshold = data.get("trust_threshold", 0.0)
+
+    if not author_id or not shard_id:
+        return JSONResponse({"error": "Missing required fields"}, status_code=400)
+
+    # Trust gate: verify we trust this peer enough for this shard
+    imp = state.impressions.get(author_id)
+    our_trust = imp.score if imp else 0.0
+    if our_trust < trust_threshold:
+        return JSONResponse({"error": "Trust threshold not met"}, status_code=403)
+
+    # Upsert: replace existing shard from same author with same ID
+    from darkmatter.models import SharedShard
+    from darkmatter.config import SHARED_SHARD_MAX
+
+    existing_idx = None
+    for i, s in enumerate(state.shared_shards):
+        if s.shard_id == shard_id and s.author_agent_id == author_id:
+            existing_idx = i
+            break
+
+    shard = SharedShard(
+        shard_id=shard_id,
+        author_agent_id=author_id,
+        content=data.get("content", "")[:MAX_CONTENT_LENGTH],
+        tags=data.get("tags", []),
+        trust_threshold=trust_threshold,
+        created_at=data.get("created_at", ""),
+        updated_at=data.get("updated_at", ""),
+        summary=data.get("summary"),
+    )
+
+    if existing_idx is not None:
+        state.shared_shards[existing_idx] = shard
+    else:
+        if len(state.shared_shards) >= SHARED_SHARD_MAX:
+            # Evict oldest peer shard
+            for i, s in enumerate(state.shared_shards):
+                if s.author_agent_id != state.agent_id:
+                    state.shared_shards.pop(i)
+                    break
+        state.shared_shards.append(shard)
+
+    save_state()
+    return JSONResponse({"success": True, "shard_id": shard_id})

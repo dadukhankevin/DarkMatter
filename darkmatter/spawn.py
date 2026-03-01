@@ -167,9 +167,16 @@ def cleanup_finished_agents() -> None:
 # =============================================================================
 
 def build_agent_prompt(state: AgentState, msg: QueuedMessage) -> str:
-    """Build the prompt for a spawned agent."""
+    """Build the prompt for a spawned agent with conversation context."""
+    from darkmatter.context import build_context_feed, format_feed_for_prompt
+    feed = build_context_feed(state, responding_to=msg.message_id)
+    context = format_feed_for_prompt(feed, state)
     return f"""\
-DARKMATTER: You have received a new message, check message {msg.message_id} and respond or forward accordingly.
+DARKMATTER: You have received a message. Here is your conversation context:
+
+{context}
+
+Check message {msg.message_id} and respond or forward accordingly.
 """
 
 

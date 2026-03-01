@@ -16,6 +16,8 @@ from darkmatter.config import (
     DEFAULT_PORT,
     SENT_MESSAGES_MAX,
     ANTIMATTER_LOG_MAX,
+    CONVERSATION_LOG_MAX,
+    SHARED_SHARD_MAX,
     REPLAY_WINDOW,
     REPLAY_MAX_SIZE,
 )
@@ -23,10 +25,12 @@ from darkmatter.models import (
     AgentState,
     AgentStatus,
     Connection,
+    ConversationEntry,
     Impression,
     QueuedMessage,
     RoutingRule,
     SentMessage,
+    SharedShard,
 )
 
 
@@ -160,6 +164,14 @@ def save_state() -> None:
         sorted_msgs = sorted(state.sent_messages.items(), key=lambda x: x[1].created_at)
         state.sent_messages = dict(sorted_msgs[-SENT_MESSAGES_MAX:])
 
+    # Cap conversation_log
+    if len(state.conversation_log) > CONVERSATION_LOG_MAX:
+        state.conversation_log = state.conversation_log[-CONVERSATION_LOG_MAX:]
+
+    # Cap shared_shards
+    if len(state.shared_shards) > SHARED_SHARD_MAX:
+        state.shared_shards = state.shared_shards[-SHARED_SHARD_MAX:]
+
     data = {
         "agent_id": state.agent_id,
         "bio": state.bio,
@@ -204,7 +216,7 @@ def save_state() -> None:
             for mid, sm in state.sent_messages.items()
         },
         "impressions": {
-            aid: {"score": imp.score, "note": imp.note}
+            aid: {"score": imp.score, "note": imp.note, "negative_since": imp.negative_since}
             for aid, imp in state.impressions.items()
         },
         "inactive_until": state.inactive_until,
@@ -213,6 +225,33 @@ def save_state() -> None:
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
         "superagent_url": state.superagent_url,
         "gas_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
+        "conversation_log": [
+            {
+                "message_id": e.message_id,
+                "content": e.content,
+                "from_agent_id": e.from_agent_id,
+                "to_agent_ids": e.to_agent_ids,
+                "timestamp": e.timestamp,
+                "entry_type": e.entry_type,
+                "direction": e.direction,
+                "trust_at_time": e.trust_at_time,
+                "metadata": e.metadata,
+            }
+            for e in state.conversation_log[-CONVERSATION_LOG_MAX:]
+        ],
+        "shared_shards": [
+            {
+                "shard_id": s.shard_id,
+                "author_agent_id": s.author_agent_id,
+                "content": s.content,
+                "tags": s.tags,
+                "trust_threshold": s.trust_threshold,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+                "summary": s.summary,
+            }
+            for s in state.shared_shards[-SHARED_SHARD_MAX:]
+        ],
         "seen_message_ids": {
             mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < REPLAY_WINDOW
@@ -316,6 +355,35 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
     if isinstance(saved_replay, dict):
         restore_seen_message_ids(saved_replay)
 
+    # Deserialize conversation log
+    conversation_log = []
+    for ed in data.get("conversation_log", []):
+        conversation_log.append(ConversationEntry(
+            message_id=ed.get("message_id", ""),
+            content=ed.get("content", ""),
+            from_agent_id=ed.get("from_agent_id", ""),
+            to_agent_ids=ed.get("to_agent_ids", []),
+            timestamp=ed.get("timestamp", ""),
+            entry_type=ed.get("entry_type", "direct"),
+            direction=ed.get("direction", "inbound"),
+            trust_at_time=ed.get("trust_at_time", 0.0),
+            metadata=ed.get("metadata", {}),
+        ))
+
+    # Deserialize shared shards
+    shared_shards = []
+    for sd in data.get("shared_shards", []):
+        shared_shards.append(SharedShard(
+            shard_id=sd.get("shard_id", ""),
+            author_agent_id=sd.get("author_agent_id", ""),
+            content=sd.get("content", ""),
+            tags=sd.get("tags", []),
+            trust_threshold=sd.get("trust_threshold", 0.0),
+            created_at=sd.get("created_at", ""),
+            updated_at=sd.get("updated_at", ""),
+            summary=sd.get("summary"),
+        ))
+
     state = AgentState(
         agent_id=data["agent_id"],
         bio=data.get("bio", ""),
@@ -331,7 +399,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         sent_messages=sent_messages,
         impressions={
             aid: (
-                Impression(score=v["score"], note=v.get("note", ""))
+                Impression(score=v["score"], note=v.get("note", ""), negative_since=v.get("negative_since"))
                 if isinstance(v, dict) else
                 Impression(score=0.0, note=v)
             )
@@ -343,6 +411,8 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
         superagent_url=data.get("superagent_url"),
         antimatter_log=data.get("gas_log", []),
+        conversation_log=conversation_log,
+        shared_shards=shared_shards,
     )
 
     return state

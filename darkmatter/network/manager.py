@@ -32,6 +32,7 @@ from darkmatter.config import (
     WEBRTC_AVAILABLE,
     WEBHOOK_RECOVERY_MAX_ATTEMPTS,
     WEBHOOK_RECOVERY_TIMEOUT,
+    TRUST_NEGATIVE_TIMEOUT,
 )
 from darkmatter.identity import (
     validate_webhook_url,
@@ -545,6 +546,12 @@ class NetworkManager:
                 # Connection health checks
                 await self._check_connection_health()
 
+                # Trust-based auto-disconnect
+                await self._check_trust_disconnects()
+
+                # Shard cache cleanup
+                self._prune_stale_shards()
+
                 # NAT relay polling
                 state = self._get_state()
                 if state.nat_detected and ANCHOR_NODES and state.private_key_hex:
@@ -593,6 +600,74 @@ class NetworkManager:
                         f"({conn.health_failures} failures, url={conn.agent_url})",
                         file=sys.stderr,
                     )
+
+    async def _check_trust_disconnects(self) -> None:
+        """Auto-disconnect peers with sustained negative trust scores."""
+        from darkmatter.wallet.antimatter import auto_disconnect_peer
+        from darkmatter.state import save_state
+
+        state = self._get_state()
+        now = datetime.now(timezone.utc)
+        to_disconnect = []
+
+        for agent_id, imp in list(state.impressions.items()):
+            if agent_id not in state.connections:
+                continue
+            if not imp.negative_since:
+                continue
+            try:
+                neg_dt = datetime.fromisoformat(imp.negative_since)
+                elapsed = (now - neg_dt).total_seconds()
+                if elapsed >= TRUST_NEGATIVE_TIMEOUT:
+                    to_disconnect.append(agent_id)
+            except (ValueError, TypeError):
+                continue
+
+        for agent_id in to_disconnect:
+            try:
+                if await auto_disconnect_peer(state, agent_id):
+                    save_state()
+            except Exception as e:
+                print(f"[DarkMatter] Trust disconnect failed for {agent_id[:16]}...: {e}",
+                      file=sys.stderr)
+
+    def _prune_stale_shards(self) -> None:
+        """Remove cached peer shards from disconnected peers or older than SHARD_CACHE_TTL."""
+        from darkmatter.config import SHARD_CACHE_TTL
+        from darkmatter.state import save_state
+
+        state = self._get_state()
+        now = datetime.now(timezone.utc)
+        keep = []
+        pruned = 0
+
+        for shard in state.shared_shards:
+            # Keep our own shards always
+            if shard.author_agent_id == state.agent_id:
+                keep.append(shard)
+                continue
+
+            # Prune if author is disconnected
+            if shard.author_agent_id not in state.connections:
+                pruned += 1
+                continue
+
+            # Prune if older than TTL
+            try:
+                updated = datetime.fromisoformat(shard.updated_at.replace("Z", "+00:00"))
+                age = (now - updated).total_seconds()
+                if age > SHARD_CACHE_TTL:
+                    pruned += 1
+                    continue
+            except Exception:
+                pass
+
+            keep.append(shard)
+
+        if pruned:
+            state.shared_shards = keep
+            save_state()
+            print(f"[DarkMatter] Pruned {pruned} stale peer shard(s)", file=sys.stderr)
 
     async def _poll_webhook_relay(self) -> None:
         """Poll anchor nodes for buffered webhook callbacks (NAT relay)."""

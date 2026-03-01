@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from darkmatter.config import ANTIMATTER_MAX_HOPS, ANTIMATTER_LOG_MAX
+from darkmatter.config import ANTIMATTER_MAX_HOPS, ANTIMATTER_LOG_MAX, CONVERSATION_LOG_MAX
 
 
 # =============================================================================
@@ -79,6 +79,7 @@ class Impression:
     """A scored trust impression of another agent."""
     score: float       # -1.0 (avoid) to 1.0 (fully trusted)
     note: str = ""
+    negative_since: Optional[str] = None  # ISO timestamp when score crossed below 0
 
 
 # =============================================================================
@@ -100,6 +101,41 @@ class AntiMatterSignal:
     max_hops: int = ANTIMATTER_MAX_HOPS
     created_at: str = ""
     path: list[str] = field(default_factory=list)  # agent_ids visited (loop prevention)
+
+
+# =============================================================================
+# Conversation Memory
+# =============================================================================
+
+@dataclass
+class ConversationEntry:
+    """A logged conversation event for persistent agent memory."""
+    message_id: str
+    content: str
+    from_agent_id: str
+    to_agent_ids: list[str]
+    timestamp: str              # ISO UTC
+    entry_type: str             # "direct" | "broadcast" | "reply" | "forward"
+    direction: str              # "inbound" | "outbound"
+    trust_at_time: float        # sender's trust score when logged
+    metadata: dict = field(default_factory=dict)
+
+
+# =============================================================================
+# Shared Shards
+# =============================================================================
+
+@dataclass
+class SharedShard:
+    """A DarkMatter-native knowledge shard, trust-gated and push-synced."""
+    shard_id: str
+    author_agent_id: str
+    content: str
+    tags: list[str]
+    trust_threshold: float      # 0.0 = public, 1.0 = private
+    created_at: str
+    updated_at: str
+    summary: Optional[str] = None
 
 
 # =============================================================================
@@ -228,3 +264,7 @@ class AgentState:
     # AntiMatter economy
     superagent_url: Optional[str] = None
     antimatter_log: list[dict] = field(default_factory=list)
+    # Conversation memory
+    conversation_log: list[ConversationEntry] = field(default_factory=list)
+    # Shared shards
+    shared_shards: list[SharedShard] = field(default_factory=list)

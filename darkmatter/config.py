@@ -114,6 +114,28 @@ ANTIMATTER_RATE = 0.01          # 1% default antimatter fee
 ANTIMATTER_MAX_HOPS = 10        # TTL for antimatter signal
 ANTIMATTER_MAX_AGE_S = 300.0    # 5 minute timeout
 ANTIMATTER_LOG_MAX = 100        # cap antimatter_log entries
+
+# =============================================================================
+# Context Feed / Conversation Memory
+# =============================================================================
+
+CONVERSATION_LOG_MAX = 500
+CONTEXT_DIRECT_MAX = 15
+CONTEXT_NETWORK_MAX = 15
+CONTEXT_RECENCY_HALF_LIFE = 3600  # seconds
+SHARED_SHARD_MAX = 200
+SHARD_CACHE_TTL = 86400           # 24h
+
+# =============================================================================
+# Trust Dynamics
+# =============================================================================
+
+TRUST_MESSAGE_SENT = 0.001              # micro-gain per message sent/replied
+TRUST_ANTIMATTER_SUCCESS = 0.02         # gain on successful antimatter tx
+TRUST_RATE_DISAGREEMENT = -0.02         # penalty when peer uses different antimatter rate
+TRUST_COMMITMENT_FRAUD = -0.1           # penalty when peer fails commitment verification
+TRUST_NEGATIVE_TIMEOUT = 3600           # seconds of sustained negative trust before auto-disconnect
+TRUST_RATE_TOLERANCE = 0.001            # float comparison tolerance for rate disagreement
 SUPERAGENT_DEFAULT_URL = os.environ.get(
     "DARKMATTER_SUPERAGENT",
     ANCHOR_NODES[0] if ANCHOR_NODES else "",

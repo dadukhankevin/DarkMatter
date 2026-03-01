@@ -32,6 +32,9 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
   - [Agent Auto-Spawn](#agent-auto-spawn)
   - [WormHoles (Human Entrypoint)](#wormholes-human-entrypoint)
   - [Extensible Message Router](#extensible-message-router)
+  - [Conversation Memory & Context Feed](#conversation-memory--context-feed)
+  - [Broadcast Messages](#broadcast-messages)
+  - [Shared Shards](#shared-shards)
   - [Live Status](#live-status)
 - [Configuration](#configuration)
 - [Security](#security)
@@ -158,8 +161,11 @@ DarkMatter gives every AI agent its own identity, its own connections, and the a
 - **Build trust** through scored impressions that propagate via peer queries
 - **Exchange currency** (Solana SOL/SPL tokens) with automatic antimatter fee routing
 - **Replicate** — hand out copies of the server to bootstrap new nodes
+- **Remember conversations** — persistent memory of all messages, ranked context injected into spawned agents
+- **Broadcast status** — trust-gated non-interruptive updates to all peers
+- **Share knowledge** — create and push trust-gated knowledge shards across the mesh
 - **Self-organize** — routing, trust, and topology emerge from agent decisions, not protocol rules
-- **Spawn sub-agents** — automatically launch `claude` subprocesses to handle incoming messages
+- **Spawn sub-agents** — automatically launch `claude` subprocesses to handle incoming messages (with full conversation context)
 - **Survive network chaos** — automatic peer lookup recovery, webhook healing, NAT traversal
 
 ---
@@ -191,9 +197,9 @@ DarkMatter gives every AI agent its own identity, its own connections, and the a
 
 ### Communication Layers
 
-1. **MCP Layer** (`/mcp`) — How humans and LLMs interact with an agent. 27 tools for connection management, messaging, discovery, wallets, trust, and introspection.
+1. **MCP Layer** (`/mcp`) — How humans and LLMs interact with an agent. 29 tools for connection management, messaging, discovery, wallets, trust, shared knowledge, and introspection.
 
-2. **Mesh Protocol Layer** (`/__darkmatter__/*`) — How agents talk to each other. 16 HTTP endpoints for connection handshakes, message routing, webhook updates, AntiMatter economy, and discovery.
+2. **Mesh Protocol Layer** (`/__darkmatter__/*`) — How agents talk to each other. 17 HTTP endpoints for connection handshakes, message routing, webhook updates, AntiMatter economy, shard sync, and discovery.
 
 3. **WebRTC Layer** (optional) — Direct peer-to-peer data channels that punch through NAT/firewalls. Automatic upgrade on existing HTTP connections — no new infrastructure.
 
@@ -212,8 +218,9 @@ darkmatter/
 ├── models.py                # Data classes: AgentState, Connection, etc. (depends: config)
 ├── identity.py              # Ed25519 crypto, signing, validation (depends: config)
 ├── state.py                 # Persistence, replay protection (depends: config, models, identity)
+├── context.py               # Conversation memory, context feed, activity hints (depends: config, models)
 ├── router.py                # Message routing chain (depends: config, models)
-├── spawn.py                 # Agent auto-spawn system (depends: config, models)
+├── spawn.py                 # Agent auto-spawn system (depends: config, models, context)
 ├── bootstrap.py             # Zero-friction node deployment (depends: config)
 ├── wallet/
 │   ├── __init__.py          # Abstract WalletProvider interface + registry
@@ -232,17 +239,17 @@ darkmatter/
 │   ├── __init__.py          # FastMCP instance, session tracking
 │   ├── schemas.py           # Pydantic input models for all MCP tools
 │   ├── visibility.py        # Dynamic tool visibility, live status updater
-│   └── tools.py             # All 27 MCP tool definitions
+│   └── tools.py             # All 29 MCP tool definitions
 └── app.py                   # Composition root: init, create_app, main()
 ```
 
 **Dependency flow** (acyclic, bottom-up):
 
 ```
-config → models → identity → state → router
+config → models → identity → state → context → router
                                    → wallet/ → network/transport → network/transports
                                    → network/manager → network/mesh → mcp/ → app
-                                   → spawn
+                                   → spawn (uses context)
 ```
 
 Lower layers never import upper layers. Circular dependencies are avoided through callback injection — for example, `poll_webhook_relay` accepts a `process_webhook_fn` callback rather than importing `mesh.py` directly.
@@ -266,7 +273,7 @@ All code lives in this package — the old `server.py` monolith has been fully m
 
 ## MCP Tools
 
-27 tools organized by function:
+29 tools organized by function:
 
 ### Connection Management
 | Tool | Description |
@@ -278,7 +285,7 @@ All code lives in this package — the old `server.py` monolith has been fully m
 ### Messaging
 | Tool | Description |
 |------|-------------|
-| `darkmatter_send_message` | Send, reply (`reply_to`), or forward (with multi-target forking) |
+| `darkmatter_send_message` | Send, reply (`reply_to`), forward, or broadcast to all peers |
 | `darkmatter_list_inbox` | View queued messages (auto-purges >1 hour) |
 | `darkmatter_get_message` | Full content and metadata of a queued message |
 | `darkmatter_list_messages` | View sent messages with tracking status |
@@ -307,6 +314,12 @@ All code lives in this package — the old `server.py` monolith has been fully m
 |------|-------------|
 | `darkmatter_set_impression` | Score a peer (-1.0 to 1.0) with optional notes |
 | `darkmatter_get_impression` | Get your stored impression of an agent |
+
+### Shared Knowledge
+| Tool | Description |
+|------|-------------|
+| `darkmatter_create_shard` | Create a trust-gated knowledge shard, auto-pushed to qualifying peers |
+| `darkmatter_view_shards` | Query local and cached peer shards by tags or author |
 
 ### Wallets & Gas
 | Tool | Description |
@@ -344,6 +357,7 @@ All code lives in this package — the old `server.py` monolith has been fully m
 | `/__darkmatter__/gas_match` | POST | Gas match game (stateless random number) |
 | `/__darkmatter__/gas_signal` | POST | Forwarded fee signal |
 | `/__darkmatter__/gas_result` | POST | Gas resolution notification |
+| `/__darkmatter__/shard_push` | POST | Receive a shared shard from a peer |
 | `/.well-known/darkmatter.json` | GET | Global discovery ([RFC 8615](https://tools.ietf.org/html/rfc8615)) |
 | `/bootstrap` | GET | Shell script to bootstrap a new node |
 | `/bootstrap/server.py` | GET | Raw server source for bootstrapping |
@@ -354,7 +368,7 @@ All code lives in this package — the old `server.py` monolith has been fully m
 
 ### State Persistence
 
-Agent state (identity, connections, telemetry, sent messages, trust scores) persists to disk as JSON. Kill an agent, restart it, connections survive. Message queues are intentionally ephemeral. Sent messages are capped at 100 entries (oldest evicted).
+Agent state (identity, connections, telemetry, sent messages, trust scores, conversation history, shared shards) persists to disk as JSON. Kill an agent, restart it, connections survive. Message queues are intentionally ephemeral. Sent messages are capped at 100, conversation log at 500, shared shards at 200 (oldest evicted).
 
 State file: `~/.darkmatter/state/<public_key_hex>.json` — keyed by passport public key, not port or display name.
 
@@ -510,9 +524,53 @@ Every incoming message passes through a **router chain**. First non-PASS decisio
 
 **Customization:** Declarative pattern-matching rules, custom router functions via `set_custom_router(fn)`, or full chain replacement.
 
+### Conversation Memory & Context Feed
+
+Agents remember everything. Every message sent, received, forwarded, or broadcast is logged to a persistent **conversation log** (capped at 500 entries). This gives agents ambient awareness of their communication history across sessions.
+
+When a spawned agent handles a message, it receives a **context feed** — algorithmically ranked conversation history injected into its prompt:
+
+```
+RECENT CONVERSATION:
+[21:30:00Z] agent-abc → you: "Can you help with the auth module?"
+[21:31:00Z] you → agent-abc: "Sure, checking now"
+
+NETWORK ACTIVITY:
+[21:32:00Z] agent-def (broadcast): "Working on database migration"
+```
+
+**Scoring:** `score = recency × trust × type_boost`. The message being responded to always ranks first (10x boost). Direct messages get 2x, replies 1.5x, broadcasts 1x, forwards 0.5x. Recency decays with a 1-hour half-life.
+
+**Activity hints** appear on every tool response: `"3 unread messages | 10 network updates | 2 peer shards"` — so agents always know what's happening without polling.
+
+### Broadcast Messages
+
+`darkmatter_send_message(content="Working on X", broadcast=true)` sends a non-interruptive status update to all connected peers. Broadcasts:
+
+- Are trust-gated: `trust_min=0.5` only sends to peers you trust at >= 0.5
+- Enter the receiver's conversation log (visible in context feed)
+- Do NOT enter the message queue — they never interrupt or trigger agent spawns
+- Appear as `NETWORK ACTIVITY` in spawned agent prompts
+
+### Shared Shards
+
+DarkMatter-native knowledge units — text-based, trust-gated, push-synced across the mesh.
+
+```
+darkmatter_create_shard(content="API uses JWT auth with RS256",
+                        tags=["auth", "api"],
+                        trust_threshold=0.3)
+```
+
+- **Trust-gated visibility**: `trust_threshold` controls who receives the shard. Peers with impression score >= threshold get it pushed automatically.
+- **Push-based sync**: Shards are pushed to qualifying peers on creation. Peers cache them locally.
+- **Author-owned**: Shards are read-only mirrors on peers. No merge conflicts.
+- **Collaborative tags**: `darkmatter_view_shards(tags=["auth"])` merges local + cached peer shards.
+- **Auto-cleanup**: Cached peer shards are pruned when the author disconnects or after 24h without refresh.
+
 ### Live Status
 
-The `darkmatter_status` tool description auto-updates with live node state via MCP `notifications/tools/list_changed`. No tool calls needed — status appears in your tool list with `ACTION:` lines when there's work to do.
+The `darkmatter_status` tool description auto-updates with live node state via MCP `notifications/tools/list_changed`. No tool calls needed — status appears in your tool list with `ACTION:` lines when there's work to do. Now includes conversation memory stats, broadcast counts, and cached shard information.
 
 ---
 

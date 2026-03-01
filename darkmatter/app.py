@@ -58,6 +58,7 @@ from darkmatter.network.mesh import (
     handle_antimatter_match,
     handle_antimatter_signal,
     handle_antimatter_result,
+    handle_shard_push,
 )
 from darkmatter.bootstrap import handle_bootstrap, handle_bootstrap_source
 from darkmatter.spawn import spawn_agent_for_message
@@ -236,6 +237,7 @@ def create_app() -> Router:
         Route("/antimatter_match", handle_antimatter_match, methods=["POST"]),
         Route("/antimatter_signal", handle_antimatter_signal, methods=["POST"]),
         Route("/antimatter_result", handle_antimatter_result, methods=["POST"]),
+        Route("/shard_push", handle_shard_push, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.

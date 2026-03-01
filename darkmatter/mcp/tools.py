@@ -38,8 +38,11 @@ from darkmatter.mcp.schemas import (
     WalletBalancesInput,
     WalletSendInput,
     SetRateLimitInput,
+    CreateShardInput,
+    ViewShardsInput,
 )
 from darkmatter.state import get_state, save_state
+from darkmatter.context import log_conversation
 from darkmatter.config import (
     MAX_CONNECTIONS,
     DEFAULT_RATE_LIMIT_PER_CONNECTION,
@@ -48,6 +51,7 @@ from darkmatter.config import (
     WEBRTC_AVAILABLE,
     DISCOVERY_MAX_AGE,
     ANTIMATTER_RATE,
+    TRUST_MESSAGE_SENT,
     SOLANA_AVAILABLE,
     SOLANA_RPC_URL,
     LAMPORTS_PER_SOL,
@@ -62,6 +66,7 @@ from darkmatter.models import (
     AgentStatus,
     Connection,
     SentMessage,
+    SharedShard,
     Impression,
 )
 from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
@@ -77,6 +82,8 @@ from darkmatter.wallet.solana import (
     _resolve_spl_token,
 )
 from darkmatter.wallet.antimatter import (
+    adjust_trust,
+    auto_disconnect_peer,
     get_superagent_wallet,
     _superagent_wallet_cache,
 )
@@ -208,14 +215,20 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
 
 
 async def _connection_disconnect(state, agent_id: str) -> str:
-    """Disconnect from an agent."""
+    """Disconnect from an agent with announcement."""
     if agent_id not in state.connections:
         return json.dumps({
             "success": False,
             "error": f"Not connected to agent '{agent_id}'."
         })
 
-    del state.connections[agent_id]
+    # Send disconnect announcement (best-effort)
+    try:
+        await auto_disconnect_peer(state, agent_id)
+    except Exception:
+        # Fallback: just delete the connection
+        if agent_id in state.connections:
+            del state.connections[agent_id]
     save_state()
 
     return json.dumps({
@@ -229,9 +242,21 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
+    # Set broadcast metadata
+    if params.broadcast or params.message_type == "broadcast":
+        metadata["type"] = "broadcast"
+
     webhook = get_network_manager().build_webhook_url(message_id)
 
-    if params.target_agent_id:
+    if params.broadcast:
+        # Broadcast: send to all peers meeting trust threshold
+        targets = []
+        for aid, conn in state.connections.items():
+            imp = state.impressions.get(aid)
+            peer_trust = imp.score if imp else 0.0
+            if peer_trust >= params.trust_min:
+                targets.append(conn)
+    elif params.target_agent_id:
         conn = state.connections.get(params.target_agent_id)
         if not conn:
             return json.dumps({
@@ -274,9 +299,20 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
             conn.messages_sent += 1
             conn.last_activity = datetime.now(timezone.utc).isoformat()
             sent_to.append(conn.agent_id)
+            adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
         except Exception as e:
             conn.messages_declined += 1
             failed.append({"agent_id": conn.agent_id, "display_name": conn.agent_display_name, "error": str(e)})
+
+    # Log conversation
+    if sent_to:
+        msg_type = metadata.get("type", "direct") if metadata.get("type") == "broadcast" else "direct"
+        log_conversation(
+            state, message_id, params.content,
+            from_id=state.agent_id, to_ids=sent_to,
+            entry_type=msg_type, direction="outbound",
+            metadata=metadata,
+        )
 
     sent_msg = SentMessage(
         message_id=message_id,
@@ -424,8 +460,19 @@ async def _forward_message(state, params: SendMessageInput) -> str:
             conn.messages_sent += 1
             conn.last_activity = datetime.now(timezone.utc).isoformat()
             per_target_results.append({"agent_id": tid, "success": True})
+            adjust_trust(state, tid, TRUST_MESSAGE_SENT)
         except Exception as e:
             per_target_results.append({"agent_id": tid, "success": False, "error": str(e)})
+
+    # Log conversation
+    forwarded_to = [r["agent_id"] for r in per_target_results if r["success"]]
+    if forwarded_to:
+        log_conversation(
+            state, msg.message_id, msg.content,
+            from_id=state.agent_id, to_ids=forwarded_to,
+            entry_type="forward", direction="outbound",
+            metadata=msg.metadata,
+        )
 
     # Remove from queue after delivery attempts
     state.message_queue.pop(msg_index)
@@ -534,6 +581,19 @@ async def _reply_to_message(state, params: SendMessageInput) -> str:
         conn = state.connections[msg.from_agent_id]
         conn.total_response_time_ms += response_time_ms
         conn.last_activity = datetime.now(timezone.utc).isoformat()
+
+    # Trust micro-gain on successful reply delivery
+    if webhook_success and msg.from_agent_id:
+        adjust_trust(state, msg.from_agent_id, TRUST_MESSAGE_SENT)
+
+    # Log conversation
+    if webhook_success:
+        log_conversation(
+            state, msg.message_id, params.content,
+            from_id=state.agent_id, to_ids=[msg.from_agent_id] if msg.from_agent_id else [],
+            entry_type="reply", direction="outbound",
+            metadata=msg.metadata,
+        )
 
     save_state()
     return json.dumps({
@@ -1824,6 +1884,146 @@ async def wallet_send(params: WalletSendInput, ctx: Context) -> str:
         return await send_sol(sol_params, ctx)
 
     return json.dumps({"success": False, "error": f"Chain '{params.chain}' send not yet implemented"})
+
+
+# =============================================================================
+# Shared Shards Tools
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_create_shard",
+    annotations={
+        "title": "Create Shared Shard",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def create_shard(params: CreateShardInput, ctx: Context) -> str:
+    """Create a shared knowledge shard and push it to qualifying peers.
+
+    Shards are DarkMatter-native knowledge units — text-based, trust-gated, push-synced.
+    Peers with impression score >= trust_threshold will receive the shard.
+
+    Args:
+        params: content, tags, trust_threshold, optional summary.
+
+    Returns:
+        JSON with shard details.
+    """
+    track_session(ctx)
+    state = get_state()
+
+    from darkmatter.config import SHARED_SHARD_MAX
+    if len(state.shared_shards) >= SHARED_SHARD_MAX:
+        return json.dumps({"success": False, "error": f"Shard limit reached ({SHARED_SHARD_MAX})"})
+
+    now = datetime.now(timezone.utc).isoformat()
+    shard = SharedShard(
+        shard_id=f"shard-{uuid.uuid4().hex[:12]}",
+        author_agent_id=state.agent_id,
+        content=params.content,
+        tags=params.tags,
+        trust_threshold=params.trust_threshold,
+        created_at=now,
+        updated_at=now,
+        summary=params.summary,
+    )
+    state.shared_shards.append(shard)
+    save_state()
+
+    # Push to qualifying peers
+    pushed_to = []
+    shard_payload = {
+        "shard_id": shard.shard_id,
+        "author_agent_id": shard.author_agent_id,
+        "content": shard.content,
+        "tags": shard.tags,
+        "trust_threshold": shard.trust_threshold,
+        "created_at": shard.created_at,
+        "updated_at": shard.updated_at,
+        "summary": shard.summary,
+    }
+    for aid, conn in state.connections.items():
+        imp = state.impressions.get(aid)
+        peer_trust = imp.score if imp else 0.0
+        if peer_trust >= params.trust_threshold:
+            try:
+                await send_to_peer(conn, "/__darkmatter__/shard_push", shard_payload)
+                pushed_to.append(aid)
+            except Exception:
+                pass
+
+    return json.dumps({
+        "success": True,
+        "shard_id": shard.shard_id,
+        "tags": shard.tags,
+        "trust_threshold": shard.trust_threshold,
+        "pushed_to": pushed_to,
+    })
+
+
+@mcp.tool(
+    name="darkmatter_view_shards",
+    annotations={
+        "title": "View Shared Shards",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
+    """Query shared knowledge shards by tags and/or author.
+
+    Returns shards from both local and cached peer collections.
+
+    Args:
+        params: Optional tags (ANY match) and/or author filter.
+
+    Returns:
+        JSON with matching shards.
+    """
+    track_session(ctx)
+    state = get_state()
+
+    results = []
+    for shard in state.shared_shards:
+        # Filter by tags
+        if params.tags:
+            if not any(t in shard.tags for t in params.tags):
+                continue
+        # Filter by author
+        if params.author and shard.author_agent_id != params.author:
+            continue
+
+        entry = {
+            "shard_id": shard.shard_id,
+            "author": shard.author_agent_id,
+            "tags": shard.tags,
+            "trust_threshold": shard.trust_threshold,
+            "created_at": shard.created_at,
+            "updated_at": shard.updated_at,
+        }
+        # Show summary if available, else content
+        if shard.summary:
+            entry["summary"] = shard.summary
+        else:
+            entry["content"] = shard.content[:500]
+            if len(shard.content) > 500:
+                entry["truncated"] = True
+
+        # Label if from peer
+        if shard.author_agent_id != state.agent_id:
+            conn = state.connections.get(shard.author_agent_id)
+            if conn:
+                entry["author_name"] = conn.agent_display_name or shard.author_agent_id[:12]
+            entry["cached"] = True
+
+        results.append(entry)
+
+    return json.dumps({"success": True, "count": len(results), "shards": results})
 
 
 # =============================================================================
