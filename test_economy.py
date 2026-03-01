@@ -184,21 +184,28 @@ async def test_adjust_trust_preserves_note() -> None:
         adjust_trust(state, "peer-1", 0.1)
         imp = state.impressions["peer-1"]
         report("note preserved", imp.note == "good peer", f"got: {imp.note!r}")
-        report("score updated", imp.score == 0.6, f"got: {imp.score}")
+        # Non-linear: effective = 0.1 * (1.0 - 0.5) = 0.05, new = 0.55
+        report("score updated (diminishing)", imp.score == 0.55, f"got: {imp.score}")
     finally:
         if os.path.exists(path):
             os.unlink(path)
 
 
 async def test_adjust_trust_clamps_upper() -> None:
-    """adjust_trust clamps to 1.0."""
+    """adjust_trust approaches but doesn't exceed 1.0 (diminishing returns)."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
         state.impressions["peer-1"] = Impression(score=0.95)
         adjust_trust(state, "peer-1", 0.1)
-        report("clamped to 1.0", state.impressions["peer-1"].score == 1.0,
-               f"got: {state.impressions['peer-1'].score}")
+        # Non-linear: effective = 0.1 * (1.0 - 0.95) = 0.005, new = 0.955
+        score = state.impressions["peer-1"].score
+        report("diminishing near 1.0", score == 0.955,
+               f"got: {score}")
+        # Even with extreme delta, can't exceed 1.0
+        adjust_trust(state, "peer-1", 100.0)
+        score = state.impressions["peer-1"].score
+        report("clamped to 1.0", score == 1.0, f"got: {score}")
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -211,8 +218,14 @@ async def test_adjust_trust_clamps_lower() -> None:
         _, state = create_agent(path)
         state.impressions["peer-1"] = Impression(score=-0.95)
         adjust_trust(state, "peer-1", -0.1)
-        report("clamped to -1.0", state.impressions["peer-1"].score == -1.0,
-               f"got: {state.impressions['peer-1'].score}")
+        # Non-linear penalty: effective = -0.1 * (1.0 + (-0.95)) = -0.005, new = -0.955
+        score = state.impressions["peer-1"].score
+        report("diminishing near -1.0", score == -0.955,
+               f"got: {score}")
+        # Even with extreme delta, can't go below -1.0
+        adjust_trust(state, "peer-1", -100.0)
+        score = state.impressions["peer-1"].score
+        report("clamped to -1.0", score == -1.0, f"got: {score}")
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -1383,11 +1396,12 @@ async def test_trust_boost_on_successful_gas() -> None:
 
             sender_imp = state.impressions.get("sender-trust")
             elder_imp = state.impressions.get("elder-trust")
-            report("sender trust boosted +0.01",
-                   sender_imp is not None and sender_imp.score == 0.01,
+            # Non-linear: from 0, effective = 0.02 * (1.0 - 0.0) = 0.02
+            report("sender trust boosted +0.02",
+                   sender_imp is not None and sender_imp.score == 0.02,
                    f"got: {sender_imp}")
-            report("elder trust boosted +0.01",
-                   elder_imp is not None and elder_imp.score == 0.01,
+            report("elder trust boosted +0.02",
+                   elder_imp is not None and elder_imp.score == 0.02,
                    f"got: {elder_imp}")
         finally:
             _sol.send_solana_sol = orig_send

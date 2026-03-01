@@ -25,6 +25,10 @@ from darkmatter.config import (
     ANTIMATTER_MAX_AGE_S,
     ANTIMATTER_LOG_MAX,
     SUPERAGENT_DEFAULT_URL,
+    TRUST_ANTIMATTER_SUCCESS,
+    TRUST_COMMITMENT_FRAUD,
+    TRUST_RATE_DISAGREEMENT,
+    TRUST_RATE_TOLERANCE,
 )
 from darkmatter.models import (
     AgentState,
@@ -110,10 +114,35 @@ def log_antimatter_event(state: AgentState, event: dict) -> None:
 
 
 def adjust_trust(state: AgentState, agent_id: str, delta: float) -> None:
-    """Adjust trust score for an agent by delta, clamped to [-1, 1]."""
+    """Adjust trust score for an agent by delta, with non-linear curves.
+
+    Gains: diminishing at high trust — effective = delta * (1.0 - current_score)
+    Penalties: amplified at high trust — effective = delta * (1.0 + current_score)
+    Tracks negative_since: ISO timestamp when score crosses below 0, cleared on recovery.
+    """
     imp = state.impressions.get(agent_id, Impression(score=0.0))
-    new_score = max(-1.0, min(1.0, imp.score + delta))
-    state.impressions[agent_id] = Impression(score=round(new_score, 4), note=imp.note)
+    current = imp.score
+
+    if delta >= 0:
+        # Diminishing returns: harder to gain trust when already trusted
+        effective = delta * (1.0 - current)
+    else:
+        # Amplified penalties: trusted agents lose more for bad behavior
+        effective = delta * (1.0 + current)
+
+    new_score = max(-1.0, min(1.0, current + effective))
+    new_score = round(new_score, 4)
+
+    # Track when score crosses below 0
+    negative_since = imp.negative_since
+    if new_score < 0 and current >= 0:
+        negative_since = datetime.now(timezone.utc).isoformat()
+    elif new_score >= 0 and current < 0:
+        negative_since = None
+
+    state.impressions[agent_id] = Impression(
+        score=new_score, note=imp.note, negative_since=negative_since
+    )
 
 
 async def get_superagent_wallet(state: AgentState) -> Optional[str]:
@@ -311,6 +340,9 @@ async def run_antimatter_match(state: AgentState, sig: AntiMatterSignal,
                 if peer_pick is not None and peer_nonce:
                     if verify_commitment(peer_info["peer_commitment"], peer_pick, peer_nonce):
                         return peer_pick
+                    else:
+                        # Commitment verification failed — fraudulent reveal
+                        adjust_trust(state, peer_info["conn"].agent_id, TRUST_COMMITMENT_FRAUD)
         except Exception:
             pass
         return None
@@ -408,9 +440,9 @@ async def resolve_antimatter(state: AgentState, sig: AntiMatterSignal, resolutio
                 })
 
                 if result.get("success"):
-                    adjust_trust(state, sig.sender_agent_id, 0.01)
+                    adjust_trust(state, sig.sender_agent_id, TRUST_ANTIMATTER_SUCCESS)
                     if resolved_by:
-                        adjust_trust(state, resolved_by, 0.01)
+                        adjust_trust(state, resolved_by, TRUST_ANTIMATTER_SUCCESS)
             except Exception as e:
                 log_antimatter_event(state, {
                     "type": "antimatter_send_failed",
@@ -462,6 +494,37 @@ async def resolve_antimatter(state: AgentState, sig: AntiMatterSignal, resolutio
 # AntiMatter Initiation & Timeout
 # =============================================================================
 
+async def auto_disconnect_peer(state: AgentState, agent_id: str) -> bool:
+    """Auto-disconnect a peer due to sustained negative trust.
+
+    Sends a disconnect announcement before removing the connection.
+    Impression persists after disconnect.
+    Returns True if disconnected, False if not connected.
+    """
+    if agent_id not in state.connections:
+        return False
+
+    # Send disconnect announcement (best-effort)
+    if _network_send_fn:
+        try:
+            await _network_send_fn(
+                agent_id,
+                "/__darkmatter__/message",
+                {
+                    "message_id": f"disconnect-{uuid.uuid4().hex[:12]}",
+                    "content": "Auto-disconnecting due to sustained negative trust.",
+                    "metadata": {"type": "disconnect_announcement"},
+                    "from_agent_id": state.agent_id,
+                },
+            )
+        except Exception:
+            pass
+
+    del state.connections[agent_id]
+    print(f"[DarkMatter] Auto-disconnected {agent_id[:16]}... (sustained negative trust)", file=sys.stderr)
+    return True
+
+
 async def initiate_antimatter_from_payment(state: AgentState, msg: QueuedMessage,
                                      get_public_url_fn=None,
                                      save_state_fn=None) -> None:
@@ -470,6 +533,16 @@ async def initiate_antimatter_from_payment(state: AgentState, msg: QueuedMessage
     amount = meta.get("amount", 0)
     antimatter_rate = meta.get("antimatter_rate", ANTIMATTER_RATE)
     antimatter_amount = amount * antimatter_rate
+
+    # B-side rate disagreement check: penalize if sender's rate differs from ours
+    if msg.from_agent_id and abs(antimatter_rate - ANTIMATTER_RATE) > TRUST_RATE_TOLERANCE:
+        adjust_trust(state, msg.from_agent_id, TRUST_RATE_DISAGREEMENT)
+        log_antimatter_event(state, {
+            "type": "rate_disagreement",
+            "peer_rate": antimatter_rate,
+            "our_rate": ANTIMATTER_RATE,
+            "from_agent_id": msg.from_agent_id,
+        })
 
     if antimatter_amount <= 0:
         return
