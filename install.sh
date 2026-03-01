@@ -89,11 +89,11 @@ else
 fi
 DISPLAY_NAME="${DISPLAY_NAME:-darkmatter-agent}"
 
-# Build the darkmatter MCP entry as JSON — runs darkmatter/app.py from cloned repo
+# Build the darkmatter MCP entry as JSON — runs python -m darkmatter from cloned repo
 DM_ENTRY=$(cat <<JSONEOF
 {
   "command": "$VENV_PYTHON",
-  "args": ["$REPO_DIR/darkmatter/app.py"],
+  "args": ["-m", "darkmatter"],
   "env": {
     "DARKMATTER_PORT": "$PORT",
     "DARKMATTER_DISPLAY_NAME": "$DISPLAY_NAME",
@@ -159,5 +159,5 @@ echo ""
 echo "To update later:  bash ~/.darkmatter/repo/install.sh"
 echo ""
 echo "Alternative: standalone HTTP mode (manual start):"
-echo "  DARKMATTER_PORT=$PORT PYTHONPATH=$REPO_DIR nohup $VENV_PYTHON $REPO_DIR/darkmatter/app.py > /tmp/darkmatter-$PORT.log 2>&1 &"
+echo "  DARKMATTER_PORT=$PORT PYTHONPATH=$REPO_DIR nohup $VENV_PYTHON -m darkmatter > /tmp/darkmatter-$PORT.log 2>&1 &"
 echo "  Then set in .mcp.json: {\"type\":\"http\",\"url\":\"http://localhost:$PORT/mcp\"}"
