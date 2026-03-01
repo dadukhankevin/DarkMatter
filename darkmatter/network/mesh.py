@@ -9,7 +9,9 @@ import asyncio
 import json
 import os
 import random
+import secrets
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -58,20 +60,15 @@ from darkmatter.wallet.antimatter import (
     log_antimatter_event,
     adjust_trust,
     run_antimatter_match,
+    make_commitment,
+    verify_commitment,
     initiate_antimatter_from_payment,
 )
 from darkmatter.wallet.solana import (
     send_solana_sol,
     send_solana_token,
 )
-from darkmatter.network.resilience import (
-    get_public_url,
-    webhook_request_with_recovery,
-)
-from darkmatter.network.webrtc import (
-    cleanup_webrtc,
-    attempt_webrtc_upgrade,
-)
+from darkmatter.network.manager import get_network_manager
 from darkmatter.spawn import get_spawned_agents
 
 if WEBRTC_AVAILABLE:
@@ -419,13 +416,84 @@ def build_connection_from_accepted(result_data: dict) -> Connection:
     )
 
 
+# ---------------------------------------------------------------------------
+# Commit-Reveal Session Store
+# ---------------------------------------------------------------------------
+_pending_match_sessions: dict[str, dict] = {}
+_MATCH_SESSION_TTL = 10.0  # seconds
+
+
+def _gc_expired_sessions() -> None:
+    """Remove expired commit-reveal sessions."""
+    now = time.monotonic()
+    expired = [k for k, v in _pending_match_sessions.items() if now - v["created"] > _MATCH_SESSION_TTL]
+    for k in expired:
+        del _pending_match_sessions[k]
+
+
 def process_antimatter_match(data: dict) -> tuple[dict, int]:
-    """Stateless match game endpoint. Returns (response_dict, status_code)."""
-    n = data.get("n")
-    if not isinstance(n, int) or n < 1:
-        return {"error": "Invalid n"}, 400
-    pick = random.randint(0, n)
-    return {"pick": pick}, 200
+    """Commit-reveal match game endpoint with backward compatibility.
+
+    Phase 1 (commit): peer generates pick/nonce/commitment, stores session, returns commitment.
+    Phase 2 (reveal): peer verifies orchestrator commitment, returns its pick+nonce.
+    Legacy (no phase): stateless random pick for mixed-version networks.
+    """
+    _gc_expired_sessions()
+
+    phase = data.get("phase")
+
+    # --- Legacy path (backward compatibility) ---
+    if phase is None:
+        n = data.get("n")
+        if not isinstance(n, int) or n < 1:
+            return {"error": "Invalid n"}, 400
+        pick = random.randint(0, n)
+        return {"pick": pick}, 200
+
+    # --- Phase 1: Commit ---
+    if phase == "commit":
+        n = data.get("n")
+        if not isinstance(n, int) or n < 1:
+            return {"error": "Invalid n"}, 400
+        orchestrator_commitment = data.get("orchestrator_commitment")
+        if not orchestrator_commitment:
+            return {"error": "Missing orchestrator_commitment"}, 400
+
+        pick, nonce, commitment = make_commitment(n)
+        session_token = secrets.token_hex(16)
+        _pending_match_sessions[session_token] = {
+            "pick": pick,
+            "nonce": nonce,
+            "commitment": commitment,
+            "orchestrator_commitment": orchestrator_commitment,
+            "n": n,
+            "created": time.monotonic(),
+        }
+        return {"peer_commitment": commitment, "session_token": session_token}, 200
+
+    # --- Phase 2: Reveal ---
+    if phase == "reveal":
+        session_token = data.get("session_token")
+        if not session_token or session_token not in _pending_match_sessions:
+            return {"error": "Unknown or expired session"}, 400
+
+        session = _pending_match_sessions.pop(session_token)
+
+        # Verify orchestrator's commitment
+        orch_pick = data.get("orchestrator_pick")
+        orch_nonce = data.get("orchestrator_nonce")
+        if orch_pick is None or not orch_nonce:
+            return {"error": "Missing orchestrator reveal data"}, 400
+
+        if not verify_commitment(session["orchestrator_commitment"], orch_pick, orch_nonce):
+            return {"error": "Orchestrator commitment verification failed"}, 400
+
+        return {
+            "peer_pick": session["pick"],
+            "peer_nonce": session["nonce"].hex(),
+        }, 200
+
+    return {"error": f"Unknown phase: {phase}"}, 400
 
 
 async def process_antimatter_signal(state: AgentState, data: dict) -> tuple[dict, int]:
@@ -661,11 +729,11 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     save_state()
 
     # Notify originator that message was received
-    webhook_err = validate_webhook_url(msg.webhook, get_state_fn=get_state, get_public_url_fn=get_public_url)
+    webhook_err = validate_webhook_url(msg.webhook, get_state_fn=get_state, get_public_url_fn=lambda port: get_network_manager().get_public_url())
     if not webhook_err:
         try:
-            await webhook_request_with_recovery(
-                state, msg.webhook, msg.from_agent_id,
+            await get_network_manager().webhook_request(
+                msg.webhook, msg.from_agent_id,
                 method="POST", timeout=10.0,
                 json={"type": "received", "agent_id": state.agent_id}
             )
@@ -680,7 +748,7 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
             and msg_meta.get("tx_signature")):
         asyncio.create_task(initiate_antimatter_from_payment(
             state, msg,
-            get_public_url_fn=lambda port: get_public_url(port, state),
+            get_public_url_fn=lambda port: get_network_manager().get_public_url(),
             save_state_fn=save_state,
         ))
 
@@ -780,7 +848,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    public_url = f"{get_public_url(state.port)}/mcp"
+    public_url = f"{get_network_manager().get_public_url()}/mcp"
     result, status = await process_connection_request(state, data, public_url)
     return JSONResponse(result, status_code=status)
 
@@ -801,7 +869,9 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
         agent_id = data.get("agent_id", "")
         conn = state.connections.get(agent_id)
         if conn:
-            asyncio.create_task(attempt_webrtc_upgrade(state, conn))
+            webrtc_t = get_network_manager().get_transport("webrtc")
+            if webrtc_t and webrtc_t.available:
+                asyncio.create_task(webrtc_t.upgrade(state, conn))
     return JSONResponse(result, status_code=status)
 
 
@@ -820,7 +890,7 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
     if not request_id:
         return JSONResponse({"error": "Missing request_id"}, status_code=400)
 
-    public_url = f"{get_public_url(state.port)}/mcp"
+    public_url = f"{get_network_manager().get_public_url()}/mcp"
     result, status, notify_payload = process_accept_pending(state, request_id, public_url)
 
     if status == 200 and notify_payload:
@@ -844,7 +914,9 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
 
             # Auto WebRTC upgrade
             if WEBRTC_AVAILABLE:
-                asyncio.create_task(attempt_webrtc_upgrade(state, conn))
+                webrtc_t = get_network_manager().get_transport("webrtc")
+                if webrtc_t and webrtc_t.available:
+                    asyncio.create_task(webrtc_t.upgrade(state, conn))
 
     return JSONResponse(result, status_code=status)
 
@@ -961,7 +1033,7 @@ async def handle_network_info(request: Request) -> JSONResponse:
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
-        "agent_url": get_public_url(state.port),
+        "agent_url": get_network_manager().get_public_url(),
         "bio": state.bio,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "wallets": state.wallets,
@@ -1062,6 +1134,13 @@ async def handle_peer_update(request: Request) -> JSONResponse:
     old_url = conn.agent_url
     conn.agent_url = new_url
 
+    # Update transport-aware addresses
+    addresses = body.get("addresses")
+    if addresses and isinstance(addresses, dict):
+        conn.addresses = addresses
+    elif new_url:
+        conn.addresses["http"] = new_url
+
     # Update bio if included in the peer_update payload
     new_bio = body.get("bio")
     if new_bio is not None and isinstance(new_bio, str):
@@ -1094,6 +1173,7 @@ async def handle_peer_lookup(request: Request) -> JSONResponse:
     return JSONResponse({
         "agent_id": conn.agent_id,
         "url": conn.agent_url,
+        "addresses": conn.addresses,
         "status": "connected",
     })
 
@@ -1197,9 +1277,12 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
 
     conn = state.connections[from_agent_id]
 
+    # Grab the registered WebRTC transport for cleanup calls
+    _webrtc_t = get_network_manager().get_transport("webrtc")
+
     # Clean up any existing WebRTC state for this connection
-    if conn.webrtc_pc is not None:
-        cleanup_webrtc(conn)
+    if conn.webrtc_pc is not None and _webrtc_t:
+        _webrtc_t.cleanup_sync(conn)
 
     pc = RTCPeerConnection(configuration=_make_rtc_config())
     channel_ready = asyncio.Event()
@@ -1228,7 +1311,8 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
         @channel.on("close")
         def on_close():
             print(f"[DarkMatter] WebRTC data channel closed (peer: {from_agent_id})", file=sys.stderr)
-            cleanup_webrtc(conn)
+            if _webrtc_t:
+                _webrtc_t.cleanup_sync(conn)
 
         channel_ready.set()
 
@@ -1236,7 +1320,8 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     async def on_connection_state_change():
         if pc.connectionState in ("failed", "closed"):
             print(f"[DarkMatter] WebRTC connection {pc.connectionState} (peer: {from_agent_id})", file=sys.stderr)
-            cleanup_webrtc(conn)
+            if _webrtc_t:
+                _webrtc_t.cleanup_sync(conn)
 
     # Set remote offer and create answer
     offer = RTCSessionDescription(sdp=sdp_offer, type="offer")

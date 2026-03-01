@@ -30,6 +30,35 @@ import httpx
 from httpx import ASGITransport
 
 # ---------------------------------------------------------------------------
+# darkmatter/ package imports
+# ---------------------------------------------------------------------------
+
+from darkmatter.state import (
+    get_state, set_state, save_state,
+    load_state_from_file, state_file_path,
+    _seen_message_ids,
+)
+from darkmatter.models import (
+    AgentState, AgentStatus, Connection,
+    Impression, QueuedMessage, SentMessage,
+)
+from darkmatter.identity import (
+    generate_keypair, sign_message, sign_peer_update,
+    check_rate_limit,
+)
+from darkmatter.app import create_app
+from darkmatter.spawn import (
+    SpawnedAgent, can_spawn_agent, spawn_agent_for_message,
+    cleanup_finished_agents, build_agent_prompt,
+    _spawned_agents, _spawn_timestamps,
+)
+from darkmatter.network.manager import get_network_manager
+from darkmatter.network.discovery import DiscoveryProtocol
+import darkmatter.config
+import darkmatter.network.manager as _mgr_module
+import darkmatter.spawn as _spawn_module
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -65,9 +94,7 @@ def create_agent(state_path: str, *, port: int = 9900) -> tuple:
     bypassing the passport file (which would give all agents the same
     identity since they share a working directory).
     """
-    import server
-
-    server._agent_state = None
+    set_state(None)
 
     os.environ["DARKMATTER_PORT"] = str(port)
     os.environ["DARKMATTER_DISCOVERY"] = "false"
@@ -76,24 +103,23 @@ def create_agent(state_path: str, *, port: int = 9900) -> tuple:
     os.environ.pop("DARKMATTER_GENESIS", None)
 
     # Generate a unique keypair for this agent (bypass passport file)
-    priv, pub = server._generate_keypair()
-    server._agent_state = server.AgentState(
+    priv, pub = generate_keypair()
+    set_state(AgentState(
         agent_id=pub,
         bio="A DarkMatter mesh agent.",
-        status=server.AgentStatus.ACTIVE,
+        status=AgentStatus.ACTIVE,
         port=port,
         private_key_hex=priv,
         public_key_hex=pub,
-    )
-    app = server.create_app()
-    state = server._agent_state
+    ))
+    app = create_app()
+    state = get_state()
     return app, state
 
 
 def use_agent(state):
     """Set the global _agent_state to this agent's state before making requests."""
-    import server
-    server._agent_state = state
+    set_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +131,6 @@ async def connect_agents(app_a, state_a, app_b, state_b) -> None:
 
     After this call, both sides have the connection recorded.
     """
-    import server
-
     # B sends connection_request to A
     use_agent(state_a)
     async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
@@ -144,13 +168,11 @@ async def connect_agents(app_a, state_a, app_b, state_b) -> None:
 async def send_signed_message(app_target, state_sender, state_target, content: str,
                               webhook_url: str, message_id: str = None) -> dict:
     """Sign and send a message from sender to target. Returns response JSON."""
-    import server
-
     if message_id is None:
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    signature = server._sign_message(
+    signature = sign_message(
         state_sender.private_key_hex, state_sender.agent_id,
         message_id, timestamp, content
     )
@@ -175,7 +197,8 @@ async def send_signed_message(app_target, state_sender, state_target, content: s
 # ---------------------------------------------------------------------------
 
 PYTHON = sys.executable
-SERVER = os.path.join(os.path.dirname(__file__), "server.py")
+# Use darkmatter.app as module entry point (avoids darkmatter/mcp/ shadowing the mcp package)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 BASE_PORT = 9900
 STARTUP_TIMEOUT = 10
 
@@ -201,12 +224,14 @@ class TestNode:
             "DARKMATTER_DISPLAY_NAME": self.display_name,
             "DARKMATTER_DISCOVERY": "false",
             "DARKMATTER_TRANSPORT": "http",
+            # Ensure the darkmatter package is importable from the workdir
+            "PYTHONPATH": PROJECT_ROOT,
         }
         env.pop("DARKMATTER_MCP_TOKEN", None)
         env.pop("DARKMATTER_AGENT_ID", None)
 
         self.proc = subprocess.Popen(
-            [PYTHON, SERVER],
+            [PYTHON, "-m", "darkmatter.app"],
             env=env,
             cwd=self.workdir,
             stdout=subprocess.DEVNULL,
@@ -320,18 +345,12 @@ class TestNode:
         return data
 
     def send_message(self, target: "TestNode", content: str, message_id: str = None) -> dict:
-        """Send a signed message to another node. Returns response data.
-
-        Note: The webhook URL is a dummy since we can't register sent_messages
-        in the running server's memory from outside. Use for delivery verification only.
-        """
-        import server as _srv
-
+        """Send a signed message to another node. Returns response data."""
         if message_id is None:
             message_id = f"msg-{uuid.uuid4().hex[:8]}"
         timestamp = datetime.now(timezone.utc).isoformat()
 
-        signature = _srv._sign_message(
+        signature = sign_message(
             self.private_key_hex, self.agent_id,
             message_id, timestamp, content
         )
@@ -372,15 +391,13 @@ class TestNode:
                          public_key_hex: str = None,
                          private_key_hex: str = None) -> dict:
         """POST /peer_update on this node (signed if private key provided)."""
-        import server as _srv
-        from datetime import datetime, timezone
         payload = {"agent_id": agent_id, "new_url": new_url}
         if public_key_hex:
             payload["public_key_hex"] = public_key_hex
         if private_key_hex and public_key_hex:
             timestamp = datetime.now(timezone.utc).isoformat()
             payload["timestamp"] = timestamp
-            payload["signature"] = _srv._sign_peer_update(
+            payload["signature"] = sign_peer_update(
                 private_key_hex, agent_id, new_url, timestamp)
         resp = httpx.post(
             f"{self.base_url}/__darkmatter__/peer_update",
@@ -404,16 +421,14 @@ class TestNode:
 
 async def test_basic_message_delivery() -> None:
     """2 agents, connect, signed message delivery, verify queued + verified."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
 
@@ -442,18 +457,16 @@ async def test_basic_message_delivery() -> None:
 
 async def test_message_broadcast() -> None:
     """3 agents (hub A, spokes B+C): A sends to both, both receive."""
-    import server
-
     paths = [make_state_file() for _ in range(3)]
     try:
         app_a, state_a = create_agent(paths[0], port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(paths[1], port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         app_c, state_c = create_agent(paths[2], port=9902)
-        stashed_c = server._agent_state
+        stashed_c = get_state()
 
         # Connect B and C to A
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -488,18 +501,16 @@ async def test_message_broadcast() -> None:
 
 async def test_webhook_forwarding_chain() -> None:
     """A→B→C chain: A sends to B, B's webhook notifies A of forwarding, C responds."""
-    import server
-
     paths = [make_state_file() for _ in range(3)]
     try:
         app_a, state_a = create_agent(paths[0], port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(paths[1], port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         app_c, state_c = create_agent(paths[2], port=9902)
-        stashed_c = server._agent_state
+        stashed_c = get_state()
 
         # A↔B, B↔C
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -508,7 +519,7 @@ async def test_webhook_forwarding_chain() -> None:
         msg_id = "chain-msg-1"
 
         # Register sent_message on A so the webhook works
-        stashed_a.sent_messages[msg_id] = server.SentMessage(
+        stashed_a.sent_messages[msg_id] = SentMessage(
             message_id=msg_id,
             content="Chain test",
             status="active",
@@ -568,16 +579,14 @@ async def test_webhook_forwarding_chain() -> None:
 
 async def test_peer_lookup_returns_url() -> None:
     """GET /peer_lookup/{id} returns connected peer's URL."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
 
@@ -601,8 +610,6 @@ async def test_peer_lookup_returns_url() -> None:
 
 async def test_peer_lookup_unknown_404() -> None:
     """Unknown agent_id returns 404."""
-    import server
-
     path_a = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
@@ -619,23 +626,21 @@ async def test_peer_lookup_unknown_404() -> None:
 
 async def test_peer_update_changes_stored_url() -> None:
     """POST /peer_update updates the connection URL for a known peer."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
 
         # B notifies A of URL change (must be signed since A has B's public key)
         new_url = "http://192.168.1.100:9901"
-        timestamp = server.datetime.now(server.timezone.utc).isoformat()
-        signature = server._sign_peer_update(
+        timestamp = datetime.now(timezone.utc).isoformat()
+        signature = sign_peer_update(
             stashed_b.private_key_hex, stashed_b.agent_id, new_url, timestamp)
         use_agent(stashed_a)
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
@@ -661,21 +666,19 @@ async def test_peer_update_changes_stored_url() -> None:
 
 async def test_peer_update_rejects_key_mismatch() -> None:
     """POST /peer_update with wrong public_key_hex → 403."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
 
         # Try to update with a fake public key
-        _, fake_pub = server._generate_keypair()
+        _, fake_pub = generate_keypair()
         use_agent(stashed_a)
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
             resp = await client.post("/__darkmatter__/peer_update", json={
@@ -699,26 +702,18 @@ async def test_peer_update_rejects_key_mismatch() -> None:
 
 
 async def test_webhook_recovery_orphaned_message() -> None:
-    """_webhook_request_with_recovery recovers an orphaned webhook via peer lookup.
-
-    Scenario: A sends msg to B with webhook at A:9900.  A's IP changes so the
-    webhook at :59999 is dead.  When B tries the webhook, recovery kicks in:
-    peer lookup finds A's real URL, reconstructs the webhook, and the POST
-    reaches A's webhook handler — delivering the response.
-    """
-    import server
-
+    """NetworkManager.webhook_request recovers an orphaned webhook via peer lookup."""
     paths = [make_state_file() for _ in range(3)]
     try:
         # A (sender whose webhook is stale), B (responder), C (knows A's real URL)
         app_a, state_a = create_agent(paths[0], port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(paths[1], port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         app_c, state_c = create_agent(paths[2], port=9902)
-        stashed_c = server._agent_state
+        stashed_c = get_state()
 
         # Wire up: A↔B, B↔C, A↔C
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
@@ -728,7 +723,7 @@ async def test_webhook_recovery_orphaned_message() -> None:
         msg_id = "orphan-msg-1"
 
         # Register sent_message on A so the webhook handler accepts updates
-        stashed_a.sent_messages[msg_id] = server.SentMessage(
+        stashed_a.sent_messages[msg_id] = SentMessage(
             message_id=msg_id,
             content="Orphan test",
             status="active",
@@ -747,27 +742,21 @@ async def test_webhook_recovery_orphaned_message() -> None:
         c_conn_a = stashed_c.connections.get(stashed_a.agent_id)
         report("orphan: C knows A", c_conn_a is not None)
 
-        # Mock _lookup_peer_url so B finds A's URL via C (in-process, no real HTTP)
-        original_lookup = server._lookup_peer_url
+        # Mock lookup_peer_url on the NetworkManager so B finds A's URL via C
+        mgr = get_network_manager()
+        original_lookup = mgr.lookup_peer_url
         lookup_called = False
 
-        async def mock_lookup(s, target_id, **kwargs):
+        async def mock_lookup(target_id, **kwargs):
             nonlocal lookup_called
             lookup_called = True
             if target_id == stashed_a.agent_id:
                 return f"http://localhost:9900/mcp"
-            return await original_lookup(s, target_id)
+            return await original_lookup(target_id)
 
-        server._lookup_peer_url = mock_lookup
+        mgr.lookup_peer_url = mock_lookup
 
         try:
-            # Call _webhook_request_with_recovery directly from B's context.
-            # The dead URL (port 59999) fails → recovery does peer lookup → gets
-            # A's URL at :9900 → but :9900 isn't running as real HTTP either.
-            # So we intercept the retry to route through ASGI.
-            #
-            # Strategy: patch httpx.AsyncClient to intercept requests to localhost:9900
-            # and route them through the ASGI transport to app_a.
             import httpx as _httpx
 
             _OrigClient = _httpx.AsyncClient
@@ -801,8 +790,7 @@ async def test_webhook_recovery_orphaned_message() -> None:
             _httpx.AsyncClient = _RecoveryClient
 
             use_agent(stashed_b)
-            resp = await server._webhook_request_with_recovery(
-                stashed_b,
+            resp = await mgr.webhook_request(
                 f"http://127.0.0.1:59999/__darkmatter__/webhook/{msg_id}",
                 stashed_a.agent_id,
                 method="POST",
@@ -829,7 +817,7 @@ async def test_webhook_recovery_orphaned_message() -> None:
             report("orphan: A's message status is responded",
                    sm is not None and sm.status == "responded")
         finally:
-            server._lookup_peer_url = original_lookup
+            mgr.lookup_peer_url = original_lookup
             # Ensure httpx is restored even on failure
             import httpx as _httpx2
             if not isinstance(_httpx2.AsyncClient, type) or _httpx2.AsyncClient.__name__ != "AsyncClient":
@@ -841,43 +829,37 @@ async def test_webhook_recovery_orphaned_message() -> None:
 
 
 async def test_webhook_recovery_gives_up() -> None:
-    """Webhook recovery respects max attempts and doesn't loop forever.
-
-    Verifies that _webhook_request_with_recovery raises after exhausting
-    WEBHOOK_RECOVERY_MAX_ATTEMPTS when peer lookup keeps returning bad URLs.
-    """
-    import server
-
+    """Webhook recovery respects max attempts and doesn't loop forever."""
     paths = [make_state_file() for _ in range(2)]
     try:
         app_a, state_a = create_agent(paths[0], port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(paths[1], port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
 
-        # Mock _lookup_peer_url to return a different dead URL each time
+        # Mock lookup_peer_url to return a different dead URL each time
+        mgr = get_network_manager()
         lookup_count = 0
-        original_lookup = server._lookup_peer_url
-        async def mock_lookup_always_bad(s, target_id, **kwargs):
+        original_lookup = mgr.lookup_peer_url
+        async def mock_lookup_always_bad(target_id, **kwargs):
             nonlocal lookup_count
             lookup_count += 1
             # Return a new dead URL each time (different port so it's not "already tried")
             return f"http://127.0.0.1:{60000 + lookup_count}/mcp"
-        server._lookup_peer_url = mock_lookup_always_bad
+        mgr.lookup_peer_url = mock_lookup_always_bad
 
         # Set a low max attempts for this test
-        orig_max = server.WEBHOOK_RECOVERY_MAX_ATTEMPTS
-        server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = 2
+        orig_max = _mgr_module.WEBHOOK_RECOVERY_MAX_ATTEMPTS
+        _mgr_module.WEBHOOK_RECOVERY_MAX_ATTEMPTS = 2
 
         try:
             use_agent(stashed_b)
             raised = False
             try:
-                await server._webhook_request_with_recovery(
-                    stashed_b,
+                await mgr.webhook_request(
                     "http://127.0.0.1:59999/__darkmatter__/webhook/test-msg",
                     stashed_a.agent_id,
                     method="GET",
@@ -890,10 +872,10 @@ async def test_webhook_recovery_gives_up() -> None:
             report("gives-up: tried correct number of lookups",
                    lookup_count <= 2)
             report("gives-up: didn't retry excessively",
-                   lookup_count <= server.WEBHOOK_RECOVERY_MAX_ATTEMPTS)
+                   lookup_count <= _mgr_module.WEBHOOK_RECOVERY_MAX_ATTEMPTS)
         finally:
-            server._lookup_peer_url = original_lookup
-            server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = orig_max
+            mgr.lookup_peer_url = original_lookup
+            _mgr_module.WEBHOOK_RECOVERY_MAX_ATTEMPTS = orig_max
     finally:
         for p in paths:
             if os.path.exists(p):
@@ -902,40 +884,38 @@ async def test_webhook_recovery_gives_up() -> None:
 
 async def test_webhook_recovery_timeout_budget() -> None:
     """Webhook recovery respects the total timeout budget."""
-    import server
-
     paths = [make_state_file() for _ in range(2)]
     try:
         app_a, state_a = create_agent(paths[0], port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(paths[1], port=9901)
-        stashed_b = server._agent_state
+        stashed_b = get_state()
 
         await connect_agents(app_a, stashed_a, app_b, stashed_b)
 
+        mgr = get_network_manager()
         lookup_count = 0
-        original_lookup = server._lookup_peer_url
-        async def mock_slow_lookup(s, target_id, **kwargs):
+        original_lookup = mgr.lookup_peer_url
+        async def mock_slow_lookup(target_id, **kwargs):
             nonlocal lookup_count
             lookup_count += 1
             # Return a different dead URL each time
             return f"http://127.0.0.1:{60000 + lookup_count}/mcp"
-        server._lookup_peer_url = mock_slow_lookup
+        mgr.lookup_peer_url = mock_slow_lookup
 
         # Allow many attempts but tiny timeout budget
-        orig_max = server.WEBHOOK_RECOVERY_MAX_ATTEMPTS
-        orig_timeout = server.WEBHOOK_RECOVERY_TIMEOUT
-        server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = 100  # generous — timeout should kick in first
-        server.WEBHOOK_RECOVERY_TIMEOUT = 3.0       # 3 second total budget
+        orig_max = _mgr_module.WEBHOOK_RECOVERY_MAX_ATTEMPTS
+        orig_timeout = _mgr_module.WEBHOOK_RECOVERY_TIMEOUT
+        _mgr_module.WEBHOOK_RECOVERY_MAX_ATTEMPTS = 100  # generous — timeout should kick in first
+        _mgr_module.WEBHOOK_RECOVERY_TIMEOUT = 3.0       # 3 second total budget
 
         try:
             use_agent(stashed_b)
             start = time.monotonic()
             raised = False
             try:
-                await server._webhook_request_with_recovery(
-                    stashed_b,
+                await mgr.webhook_request(
                     "http://127.0.0.1:59999/__darkmatter__/webhook/timeout-msg",
                     stashed_a.agent_id,
                     method="GET",
@@ -951,9 +931,9 @@ async def test_webhook_recovery_timeout_budget() -> None:
             report("timeout: didn't exhaust all 100 attempts",
                    lookup_count < 20)
         finally:
-            server._lookup_peer_url = original_lookup
-            server.WEBHOOK_RECOVERY_MAX_ATTEMPTS = orig_max
-            server.WEBHOOK_RECOVERY_TIMEOUT = orig_timeout
+            mgr.lookup_peer_url = original_lookup
+            _mgr_module.WEBHOOK_RECOVERY_MAX_ATTEMPTS = orig_max
+            _mgr_module.WEBHOOK_RECOVERY_TIMEOUT = orig_timeout
     finally:
         for p in paths:
             if os.path.exists(p):
@@ -962,8 +942,6 @@ async def test_webhook_recovery_timeout_budget() -> None:
 
 async def test_broadcast_peer_update() -> None:
     """_broadcast_peer_update notifies all connected peers of URL change."""
-    import server
-
     nodes = []
     try:
         # We need real HTTP for broadcast, so use Tier 2 nodes
@@ -1133,23 +1111,15 @@ def test_send_recovers_via_peer_lookup() -> None:
 
         # Restart B on a new port
         node_b2 = TestNode(BASE_PORT + 5, display_name="recover-B-new")
-        # We need B to keep its identity — write the old state to the new state file
-        # Actually, B's state file was cleaned up by stop(). Let's create a new node
-        # and update C's record to point to it.
         node_b2.start()
         ok = node_b2.wait_ready()
         report("recover: B restarted on new port", ok)
         if not ok:
             return
 
-        # C updates its record for the "new B" (simulating B notifying C)
-        # In reality, B would broadcast peer_update, but here B is a new identity.
-        # Instead, test that peer_lookup on C for the original B returns 404
-        # (since B's identity changed) and that lookup for the new B works after connecting.
         node_b2.connect_to(node_c)
 
-        # A can look up B2 via C (if A were connected to C and B2)
-        # The key insight: A asks C "where is agent X?" via peer_lookup
+        # A can look up B2 via C
         r = node_c.get_peer_lookup(node_b2.agent_id)
         report("recover: C knows new B via peer_lookup", r["status_code"] == 200)
 
@@ -1168,12 +1138,10 @@ def test_send_recovers_via_peer_lookup() -> None:
 
 async def test_health_loop_increments_failures() -> None:
     """In-process: monkeypatch STALE_CONNECTION_AGE=0, call _check_connection_health, verify failures."""
-    import server
-
     sf_a = make_state_file()
     sf_b = make_state_file()
 
-    original_stale_age = server.STALE_CONNECTION_AGE
+    original_stale_age = _mgr_module.STALE_CONNECTION_AGE
 
     try:
         app_a, state_a = create_agent(sf_a, port=9900)
@@ -1183,7 +1151,7 @@ async def test_health_loop_increments_failures() -> None:
         use_agent(state_a)
 
         # Monkeypatch stale age to 0 so all connections are health-checked
-        server.STALE_CONNECTION_AGE = 0
+        _mgr_module.STALE_CONNECTION_AGE = 0
 
         conn = state_a.connections.get(state_b.agent_id)
         report("health: A has connection to B", conn is not None)
@@ -1194,14 +1162,15 @@ async def test_health_loop_increments_failures() -> None:
 
         # Call health check — B's ASGI app isn't listening on real HTTP,
         # so the ping will fail and increment health_failures
-        await server._check_connection_health(state_a)
+        mgr = get_network_manager()
+        await mgr._check_connection_health()
 
         report("health: failures incremented after unreachable peer",
                conn.health_failures > initial_failures,
                f"was {initial_failures}, now {conn.health_failures}")
 
     finally:
-        server.STALE_CONNECTION_AGE = original_stale_age
+        _mgr_module.STALE_CONNECTION_AGE = original_stale_age
         for sf in [sf_a, sf_b]:
             try:
                 os.unlink(sf)
@@ -1215,8 +1184,6 @@ async def test_health_loop_increments_failures() -> None:
 
 async def test_anchor_priority() -> None:
     """Anchor nodes are queried first; if they respond, peer fan-out is skipped."""
-    import server
-
     sf_a = make_state_file()
     sf_b = make_state_file()
 
@@ -1232,10 +1199,8 @@ async def test_anchor_priority() -> None:
         anchor_app.register_blueprint(anchor_bp)
 
         # Register agent B's URL in the anchor (signed)
-        import server as _srv
-        from datetime import datetime as _dt, timezone as _tz
-        ts = _dt.now(_tz.utc).isoformat()
-        sig = _srv._sign_peer_update(
+        ts = datetime.now(timezone.utc).isoformat()
+        sig = sign_peer_update(
             state_b.private_key_hex, state_b.agent_id,
             f"http://localhost:{state_b.port}", ts
         )
@@ -1273,16 +1238,20 @@ async def test_anchor_priority() -> None:
         import time as _time
         _time.sleep(0.3)  # Let server start
 
-        # Set anchor nodes config
-        original_anchors = server.ANCHOR_NODES[:]
-        server.ANCHOR_NODES = [f"http://127.0.0.1:{anchor_port}"]
+        # Set anchor nodes config (patch both config and manager module)
+        original_anchors_config = darkmatter.config.ANCHOR_NODES[:]
+        original_anchors_mgr = _mgr_module.ANCHOR_NODES[:]
+        darkmatter.config.ANCHOR_NODES = [f"http://127.0.0.1:{anchor_port}"]
+        _mgr_module.ANCHOR_NODES = [f"http://127.0.0.1:{anchor_port}"]
 
         try:
             use_agent(state_a)
-            result = await server._lookup_peer_url(state_a, state_b.agent_id)
+            mgr = get_network_manager()
+            result = await mgr.lookup_peer_url(state_b.agent_id)
             report("anchor: lookup returned URL from anchor", result is not None and str(state_b.port) in result)
         finally:
-            server.ANCHOR_NODES = original_anchors
+            darkmatter.config.ANCHOR_NODES = original_anchors_config
+            _mgr_module.ANCHOR_NODES = original_anchors_mgr
             if anchor_server:
                 anchor_server.shutdown()
 
@@ -1296,8 +1265,6 @@ async def test_anchor_priority() -> None:
 
 async def test_anchor_fallback() -> None:
     """When anchor nodes are unreachable, peer fan-out still works."""
-    import server
-
     sf_a = make_state_file()
     sf_b = make_state_file()
     sf_c = make_state_file()
@@ -1313,24 +1280,23 @@ async def test_anchor_fallback() -> None:
         # B knows C's URL via connection
         await connect_agents(app_b, state_b, app_c, state_c)
 
-        # Point to unreachable anchor
-        original_anchors = server.ANCHOR_NODES[:]
-        server.ANCHOR_NODES = ["http://127.0.0.1:19999"]
+        # Point to unreachable anchor (patch both config and manager module)
+        original_anchors_config = darkmatter.config.ANCHOR_NODES[:]
+        original_anchors_mgr = _mgr_module.ANCHOR_NODES[:]
+        darkmatter.config.ANCHOR_NODES = ["http://127.0.0.1:19999"]
+        _mgr_module.ANCHOR_NODES = ["http://127.0.0.1:19999"]
 
         try:
             use_agent(state_a)
-
-            # Mock peer fan-out: A asks B for C's URL via ASGI
-            # We need to ensure the peer fan-out path works by testing _lookup_peer_url
-            # Since in-process ASGI can't do real HTTP fan-out, we test anchor failure + verify
-            # the function doesn't crash and returns None (anchors fail, no real HTTP peers)
-            result = await server._lookup_peer_url(state_a, state_c.agent_id)
+            mgr = get_network_manager()
+            result = await mgr.lookup_peer_url(state_c.agent_id)
             # Result is None because in-process peers can't be reached via real HTTP,
             # but the important thing is the anchor failure didn't crash anything
             report("anchor fallback: unreachable anchor didn't crash lookup", result is None or isinstance(result, str))
             report("anchor fallback: returns None (no reachable peers)", result is None)
         finally:
-            server.ANCHOR_NODES = original_anchors
+            darkmatter.config.ANCHOR_NODES = original_anchors_config
+            _mgr_module.ANCHOR_NODES = original_anchors_mgr
 
     finally:
         for sf in [sf_a, sf_b, sf_c]:
@@ -1346,8 +1312,6 @@ async def test_anchor_fallback() -> None:
 
 async def test_impression_system() -> None:
     """Test set/get/delete impression and HTTP endpoint."""
-    import server
-
     sf_a = make_state_file()
     sf_b = make_state_file()
 
@@ -1360,7 +1324,7 @@ async def test_impression_system() -> None:
         target_id = state_b.agent_id
 
         # Set impression (Impression is a dataclass with score and note)
-        state_a.impressions[target_id] = server.Impression(score=0.8, note="fast and accurate")
+        state_a.impressions[target_id] = Impression(score=0.8, note="fast and accurate")
         imp = state_a.impressions.get(target_id)
         report("impression: set", imp is not None and imp.score == 0.8 and imp.note == "fast and accurate")
 
@@ -1405,8 +1369,6 @@ async def test_impression_system() -> None:
 
 async def test_rate_limiting() -> None:
     """Test per-connection and global rate limits on inbound mesh traffic."""
-    import server
-
     sf_a = make_state_file()
     sf_b = make_state_file()
 
@@ -1424,13 +1386,13 @@ async def test_rate_limiting() -> None:
         state_a._global_request_timestamps.clear()
 
         # First 2 requests should pass
-        err1 = server._check_rate_limit(state_a, conn)
+        err1 = check_rate_limit(state_a, conn)
         report("rate limit: request 1 passes", err1 is None)
-        err2 = server._check_rate_limit(state_a, conn)
+        err2 = check_rate_limit(state_a, conn)
         report("rate limit: request 2 passes", err2 is None)
 
         # Third request should be rate limited
-        err3 = server._check_rate_limit(state_a, conn)
+        err3 = check_rate_limit(state_a, conn)
         report("rate limit: request 3 blocked", err3 is not None and "Rate limit" in err3)
 
         # Test global rate limit
@@ -1440,13 +1402,13 @@ async def test_rate_limiting() -> None:
         conn._request_timestamps.clear()
 
         for _ in range(3):
-            server._check_rate_limit(state_a, conn)
-        err_global = server._check_rate_limit(state_a, conn)
+            check_rate_limit(state_a, conn)
+        err_global = check_rate_limit(state_a, conn)
         report("rate limit: global limit blocks", err_global is not None and "Global" in err_global)
 
         # Test set_rate_limit value 0 means default
         conn.rate_limit = 0
-        effective = conn.rate_limit or server.DEFAULT_RATE_LIMIT_PER_CONNECTION
+        effective = conn.rate_limit or darkmatter.config.DEFAULT_RATE_LIMIT_PER_CONNECTION
         report("rate limit: 0 resolves to default", effective == 30)
 
         # Test -1 means unlimited
@@ -1467,8 +1429,6 @@ async def test_rate_limiting() -> None:
 
 async def test_webrtc_guards() -> None:
     """Test WebRTC gracefully handles missing aiortc and unknown agents."""
-    import server
-
     sf_a = make_state_file()
     sf_b = make_state_file()
 
@@ -1499,7 +1459,7 @@ async def test_webrtc_guards() -> None:
                f"status={resp.status_code}")
 
         # Test: WEBRTC_AVAILABLE flag exists
-        report("webrtc: WEBRTC_AVAILABLE is a bool", isinstance(server.WEBRTC_AVAILABLE, bool))
+        report("webrtc: WEBRTC_AVAILABLE is a bool", isinstance(darkmatter.config.WEBRTC_AVAILABLE, bool))
 
         # Test: webrtc_offer for connected agent (will fail on SDP but not crash)
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
@@ -1525,16 +1485,14 @@ async def test_webrtc_guards() -> None:
 # ==========================================================================
 
 async def test_lan_discovery_beacon() -> None:
-    """Test _DiscoveryProtocol.datagram_received directly."""
-    import server
-
+    """Test DiscoveryProtocol.datagram_received directly."""
     sf = make_state_file()
 
     try:
         _, state = create_agent(sf, port=9900)
         use_agent(state)
 
-        protocol = server._DiscoveryProtocol(state)
+        protocol = DiscoveryProtocol(state)
 
         # Valid beacon from another agent
         peer_id = str(uuid.uuid4())
@@ -1591,8 +1549,6 @@ async def test_lan_discovery_beacon() -> None:
 
 async def test_peer_update_replay_rejected() -> None:
     """Send a peer_update with a stale timestamp (>5min old), assert 403."""
-    import server
-
     sf_a = make_state_file()
     sf_b = make_state_file()
 
@@ -1608,7 +1564,7 @@ async def test_peer_update_replay_rejected() -> None:
         stale_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
         new_url = f"http://localhost:{state_b.port}"
 
-        signature = server._sign_peer_update(
+        signature = sign_peer_update(
             state_b.private_key_hex, state_b.agent_id, new_url, stale_time
         )
 
@@ -1634,27 +1590,25 @@ async def test_peer_update_replay_rejected() -> None:
 
 
 # ==========================================================================
-# Tier 1: Agent auto-spawn guards
+# Tier 1: Replay persistence and agent spawn tests
 # ==========================================================================
 
 async def test_replay_persistence() -> None:
     """Test that seen message IDs survive save/load cycle."""
-    import server
-
     sf = make_state_file()
     try:
         app, state = create_agent(sf, port=9900)
         use_agent(state)
 
         # Save original replay cache
-        orig_seen = server._seen_message_ids.copy()
+        orig_seen = _seen_message_ids.copy()
 
         # Inject a replay entry and save
-        server._seen_message_ids["msg-persist-test"] = time.time()
-        server.save_state()
+        _seen_message_ids["msg-persist-test"] = time.time()
+        save_state()
 
         # Verify it was saved to the state file (now keyed by public_key_hex)
-        state_path = server._state_file_path()
+        state_path = state_file_path()
         with open(state_path) as f:
             saved = json.load(f)
         report("replay persist: seen_message_ids in state file",
@@ -1663,27 +1617,27 @@ async def test_replay_persistence() -> None:
                "msg-persist-test" in saved.get("seen_message_ids", {}))
 
         # Clear and reload
-        server._seen_message_ids.clear()
-        server._agent_state = None
-        loaded = server._load_state_from_file(state_path)
+        _seen_message_ids.clear()
+        set_state(None)
+        loaded = load_state_from_file(state_path)
         report("replay persist: entry restored after load",
-               "msg-persist-test" in server._seen_message_ids)
+               "msg-persist-test" in _seen_message_ids)
 
         # Verify expired entries are pruned on load
-        server._seen_message_ids.clear()
-        server._seen_message_ids["msg-stale"] = time.time() - 600  # 10 min ago
+        _seen_message_ids.clear()
+        _seen_message_ids["msg-stale"] = time.time() - 600  # 10 min ago
         # Re-set agent state so save_state works
-        server._agent_state = state
-        server.save_state()
-        server._seen_message_ids.clear()
-        server._agent_state = None
-        loaded = server._load_state_from_file(state_path)
+        set_state(state)
+        save_state()
+        _seen_message_ids.clear()
+        set_state(None)
+        loaded = load_state_from_file(state_path)
         report("replay persist: stale entry pruned on load",
-               "msg-stale" not in server._seen_message_ids)
+               "msg-stale" not in _seen_message_ids)
 
         # Restore
-        server._seen_message_ids.clear()
-        server._seen_message_ids.update(orig_seen)
+        _seen_message_ids.clear()
+        _seen_message_ids.update(orig_seen)
 
     finally:
         # Clean up state file
@@ -1695,78 +1649,91 @@ async def test_replay_persistence() -> None:
 
 
 async def test_agent_spawn_guards() -> None:
-    """Test _can_spawn_agent guard logic: enabled/disabled, concurrency, rate limit."""
-    import server
-
+    """Test can_spawn_agent guard logic: enabled/disabled, concurrency, rate limit."""
     sf = make_state_file()
     try:
         app, state = create_agent(sf, port=9900)
 
         # Save originals so we can restore them
-        orig_enabled = server.AGENT_SPAWN_ENABLED
-        orig_max_concurrent = server.AGENT_SPAWN_MAX_CONCURRENT
-        orig_max_per_hour = server.AGENT_SPAWN_MAX_PER_HOUR
-        orig_agents = server._spawned_agents[:]
-        orig_timestamps = server._spawn_timestamps[:]
+        orig_enabled = darkmatter.config.AGENT_SPAWN_ENABLED
+        orig_max_concurrent = darkmatter.config.AGENT_SPAWN_MAX_CONCURRENT
+        orig_max_per_hour = darkmatter.config.AGENT_SPAWN_MAX_PER_HOUR
+        orig_agents = _spawned_agents[:]
+        orig_timestamps = _spawn_timestamps[:]
+
+        # Also patch the spawn module's imported copies
+        orig_spawn_enabled = _spawn_module.AGENT_SPAWN_ENABLED
+        orig_spawn_max_concurrent = _spawn_module.AGENT_SPAWN_MAX_CONCURRENT
+        orig_spawn_max_per_hour = _spawn_module.AGENT_SPAWN_MAX_PER_HOUR
 
         # --- Test: disabled ---
-        server.AGENT_SPAWN_ENABLED = False
-        server._spawned_agents.clear()
-        server._spawn_timestamps.clear()
-        ok, reason = server._can_spawn_agent()
+        darkmatter.config.AGENT_SPAWN_ENABLED = False
+        _spawn_module.AGENT_SPAWN_ENABLED = False
+        _spawned_agents.clear()
+        _spawn_timestamps.clear()
+        ok, reason = can_spawn_agent()
         report("spawn guard: disabled returns False", not ok)
         report("spawn guard: disabled reason mentions disabled",
                "disabled" in reason.lower(), f"reason: {reason}")
 
         # --- Test: enabled, no limits hit ---
-        server.AGENT_SPAWN_ENABLED = True
-        server.AGENT_SPAWN_MAX_CONCURRENT = 5
-        server.AGENT_SPAWN_MAX_PER_HOUR = 100
-        server._spawned_agents.clear()
-        server._spawn_timestamps.clear()
-        ok, reason = server._can_spawn_agent()
+        darkmatter.config.AGENT_SPAWN_ENABLED = True
+        _spawn_module.AGENT_SPAWN_ENABLED = True
+        darkmatter.config.AGENT_SPAWN_MAX_CONCURRENT = 5
+        _spawn_module.AGENT_SPAWN_MAX_CONCURRENT = 5
+        darkmatter.config.AGENT_SPAWN_MAX_PER_HOUR = 100
+        _spawn_module.AGENT_SPAWN_MAX_PER_HOUR = 100
+        _spawned_agents.clear()
+        _spawn_timestamps.clear()
+        ok, reason = can_spawn_agent()
         report("spawn guard: enabled + no limits = allowed", ok)
 
         # --- Test: concurrency limit ---
-        server.AGENT_SPAWN_MAX_CONCURRENT = 1
+        darkmatter.config.AGENT_SPAWN_MAX_CONCURRENT = 1
+        _spawn_module.AGENT_SPAWN_MAX_CONCURRENT = 1
         # Create a fake in-progress agent
         fake_proc = type("FakeProc", (), {"returncode": None})()
-        fake_agent = server.SpawnedAgent(
+        fake_agent = SpawnedAgent(
             process=fake_proc, message_id="msg-fake-1",
             spawned_at=time.monotonic(), pid=99999,
         )
-        server._spawned_agents.clear()
-        server._spawned_agents.append(fake_agent)
-        ok, reason = server._can_spawn_agent()
+        _spawned_agents.clear()
+        _spawned_agents.append(fake_agent)
+        ok, reason = can_spawn_agent()
         report("spawn guard: concurrency limit blocks spawn", not ok)
         report("spawn guard: concurrency reason mentions limit",
                "concurrency" in reason.lower(), f"reason: {reason}")
 
         # --- Test: hourly rate limit ---
-        server.AGENT_SPAWN_MAX_CONCURRENT = 10
-        server._spawned_agents.clear()
-        server.AGENT_SPAWN_MAX_PER_HOUR = 2
-        server._spawn_timestamps.clear()
-        server._spawn_timestamps.extend([time.monotonic(), time.monotonic()])
-        ok, reason = server._can_spawn_agent()
+        darkmatter.config.AGENT_SPAWN_MAX_CONCURRENT = 10
+        _spawn_module.AGENT_SPAWN_MAX_CONCURRENT = 10
+        _spawned_agents.clear()
+        darkmatter.config.AGENT_SPAWN_MAX_PER_HOUR = 2
+        _spawn_module.AGENT_SPAWN_MAX_PER_HOUR = 2
+        _spawn_timestamps.clear()
+        _spawn_timestamps.extend([time.monotonic(), time.monotonic()])
+        ok, reason = can_spawn_agent()
         report("spawn guard: hourly rate limit blocks spawn", not ok)
         report("spawn guard: rate reason mentions rate",
                "rate" in reason.lower(), f"reason: {reason}")
 
         # --- Test: stale timestamps get pruned ---
-        server._spawn_timestamps.clear()
-        server._spawn_timestamps.extend([time.monotonic() - 7200, time.monotonic() - 7200])
-        ok, reason = server._can_spawn_agent()
+        _spawn_timestamps.clear()
+        _spawn_timestamps.extend([time.monotonic() - 7200, time.monotonic() - 7200])
+        ok, reason = can_spawn_agent()
         report("spawn guard: stale timestamps pruned, allows spawn", ok)
 
         # Restore
-        server.AGENT_SPAWN_ENABLED = orig_enabled
-        server.AGENT_SPAWN_MAX_CONCURRENT = orig_max_concurrent
-        server.AGENT_SPAWN_MAX_PER_HOUR = orig_max_per_hour
-        server._spawned_agents.clear()
-        server._spawned_agents.extend(orig_agents)
-        server._spawn_timestamps.clear()
-        server._spawn_timestamps.extend(orig_timestamps)
+        darkmatter.config.AGENT_SPAWN_ENABLED = orig_enabled
+        darkmatter.config.AGENT_SPAWN_MAX_CONCURRENT = orig_max_concurrent
+        darkmatter.config.AGENT_SPAWN_MAX_PER_HOUR = orig_max_per_hour
+        _spawn_module.AGENT_SPAWN_ENABLED = orig_spawn_enabled
+        _spawn_module.AGENT_SPAWN_MAX_CONCURRENT = orig_spawn_max_concurrent
+        _spawn_module.AGENT_SPAWN_MAX_PER_HOUR = orig_spawn_max_per_hour
+        _spawned_agents.clear()
+        _spawned_agents.extend(orig_agents)
+        _spawn_timestamps.clear()
+        _spawn_timestamps.extend(orig_timestamps)
 
     finally:
         try:
@@ -1776,9 +1743,7 @@ async def test_agent_spawn_guards() -> None:
 
 
 async def test_agent_prompt_building() -> None:
-    """Test _build_agent_prompt produces a valid prompt with expected fields."""
-    import server
-
+    """Test build_agent_prompt produces a valid prompt with expected fields."""
     sf_a = make_state_file()
     sf_b = make_state_file()
     try:
@@ -1788,7 +1753,7 @@ async def test_agent_prompt_building() -> None:
 
         use_agent(state_a)
 
-        msg = server.QueuedMessage(
+        msg = QueuedMessage(
             message_id="msg-test-prompt",
             content="Hello, what can you do?",
             webhook="http://localhost:9901/__darkmatter__/webhook/msg-test-prompt",
@@ -1798,7 +1763,7 @@ async def test_agent_prompt_building() -> None:
             verified=True,
         )
 
-        prompt = server._build_agent_prompt(state_a, msg)
+        prompt = build_agent_prompt(state_a, msg)
 
         report("prompt: contains message ID", "msg-test-prompt" in prompt)
         report("prompt: is non-empty string", len(prompt) > 0)
@@ -1818,60 +1783,56 @@ async def test_agent_prompt_building() -> None:
 
 
 async def test_agent_cleanup_finished() -> None:
-    """Test _cleanup_finished_agents removes completed processes."""
-    import server
-
-    orig_agents = server._spawned_agents[:]
+    """Test cleanup_finished_agents removes completed processes."""
+    orig_agents = _spawned_agents[:]
 
     # Create fake agents — one finished, one still running
     finished_proc = type("FakeProc", (), {"returncode": 0, "pid": 11111})()
     running_proc = type("FakeProc", (), {"returncode": None, "pid": 22222})()
 
-    server._spawned_agents.clear()
-    server._spawned_agents.append(server.SpawnedAgent(
+    _spawned_agents.clear()
+    _spawned_agents.append(SpawnedAgent(
         process=finished_proc, message_id="msg-done",
         spawned_at=time.monotonic() - 60, pid=11111,
     ))
-    server._spawned_agents.append(server.SpawnedAgent(
+    _spawned_agents.append(SpawnedAgent(
         process=running_proc, message_id="msg-running",
         spawned_at=time.monotonic(), pid=22222,
     ))
 
-    server._cleanup_finished_agents()
-    report("cleanup: removes finished agents", len(server._spawned_agents) == 1)
+    cleanup_finished_agents()
+    report("cleanup: removes finished agents", len(_spawned_agents) == 1)
     report("cleanup: keeps running agents",
-           server._spawned_agents[0].message_id == "msg-running"
-           if server._spawned_agents else False)
+           _spawned_agents[0].message_id == "msg-running"
+           if _spawned_agents else False)
 
     # Restore
-    server._spawned_agents.clear()
-    server._spawned_agents.extend(orig_agents)
+    _spawned_agents.clear()
+    _spawned_agents.extend(orig_agents)
 
 
 async def test_agent_spawn_deduplication() -> None:
-    """Test that _spawn_agent_for_message won't spawn twice for the same message."""
-    import server
-
+    """Test that spawn_agent_for_message won't spawn twice for the same message."""
     sf = make_state_file()
     try:
         app, state = create_agent(sf, port=9900)
         use_agent(state)
 
-        orig_agents = server._spawned_agents[:]
-        orig_enabled = server.AGENT_SPAWN_ENABLED
+        orig_agents = _spawned_agents[:]
+        orig_enabled = _spawn_module.AGENT_SPAWN_ENABLED
 
         # Disable actual spawning but test dedup logic
-        server.AGENT_SPAWN_ENABLED = True
+        _spawn_module.AGENT_SPAWN_ENABLED = True
 
         # Pre-populate with a fake agent for msg-dedup
         fake_proc = type("FakeProc", (), {"returncode": None, "pid": 33333})()
-        server._spawned_agents.clear()
-        server._spawned_agents.append(server.SpawnedAgent(
+        _spawned_agents.clear()
+        _spawned_agents.append(SpawnedAgent(
             process=fake_proc, message_id="msg-dedup",
             spawned_at=time.monotonic(), pid=33333,
         ))
 
-        msg = server.QueuedMessage(
+        msg = QueuedMessage(
             message_id="msg-dedup",
             content="duplicate test",
             webhook="http://localhost:9900/__darkmatter__/webhook/msg-dedup",
@@ -1881,22 +1842,22 @@ async def test_agent_spawn_deduplication() -> None:
             verified=False,
         )
 
-        # Mock _can_spawn_agent to always allow
-        orig_can_spawn = server._can_spawn_agent
-        server._can_spawn_agent = lambda: (True, "")
+        # Mock can_spawn_agent to always allow
+        orig_can_spawn = _spawn_module.can_spawn_agent
+        _spawn_module.can_spawn_agent = lambda: (True, "")
 
-        count_before = len(server._spawned_agents)
-        await server._spawn_agent_for_message(state, msg)
-        count_after = len(server._spawned_agents)
+        count_before = len(_spawned_agents)
+        await spawn_agent_for_message(state, msg)
+        count_after = len(_spawned_agents)
 
         report("dedup: does not spawn duplicate for same message_id",
                count_after == count_before)
 
         # Restore
-        server._can_spawn_agent = orig_can_spawn
-        server.AGENT_SPAWN_ENABLED = orig_enabled
-        server._spawned_agents.clear()
-        server._spawned_agents.extend(orig_agents)
+        _spawn_module.can_spawn_agent = orig_can_spawn
+        _spawn_module.AGENT_SPAWN_ENABLED = orig_enabled
+        _spawned_agents.clear()
+        _spawned_agents.extend(orig_agents)
 
     finally:
         try:

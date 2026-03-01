@@ -54,6 +54,8 @@ class Connection:
     agent_display_name: Optional[str] = None
     # Wallets (chain -> address, exchanged during handshake)
     wallets: dict[str, str] = field(default_factory=dict)
+    # Transport-aware addresses (transport_name -> address)
+    addresses: dict[str, str] = field(default_factory=dict)
     # Peer's passport creation time (for elder selection)
     peer_created_at: Optional[str] = None
     # Per-connection rate limit (0 = use global default, -1 = unlimited)

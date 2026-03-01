@@ -64,20 +64,12 @@ from darkmatter.models import (
     SentMessage,
     Impression,
 )
-from darkmatter.network.resilience import (
-    get_public_url,
-    build_webhook_url,
-    webhook_request_with_recovery,
-    lookup_peer_url,
-    broadcast_peer_update,
-)
-from darkmatter.network import send_to_peer, strip_base_url
+from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
 from darkmatter.network.mesh import (
     build_outbound_request_payload,
     build_connection_from_accepted,
     process_accept_pending,
 )
-from darkmatter.network.webrtc import attempt_webrtc_upgrade
 from darkmatter.wallet.solana import (
     get_solana_balance,
     send_solana_sol,
@@ -118,7 +110,7 @@ async def _connection_request(state, target_url: str) -> str:
             break
 
     try:
-        payload = build_outbound_request_payload(state, get_public_url(state.port))
+        payload = build_outbound_request_payload(state, get_network_manager().get_public_url())
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -181,7 +173,7 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
             "agent_id": request.from_agent_id,
         })
 
-    public_url = f"{get_public_url(state.port)}/mcp"
+    public_url = f"{get_network_manager().get_public_url()}/mcp"
     result, status, notify_payload = process_accept_pending(state, request_id, public_url)
 
     if status != 200:
@@ -208,7 +200,9 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
 
             # Auto WebRTC upgrade
             if WEBRTC_AVAILABLE:
-                asyncio.create_task(attempt_webrtc_upgrade(state, conn))
+                webrtc_t = get_network_manager().get_transport("webrtc")
+                if webrtc_t and webrtc_t.available:
+                    asyncio.create_task(webrtc_t.upgrade(state, conn))
 
     return json.dumps(result)
 
@@ -235,7 +229,7 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
-    webhook = build_webhook_url(state, message_id)
+    webhook = get_network_manager().build_webhook_url(message_id)
 
     if params.target_agent_id:
         conn = state.connections.get(params.target_agent_id)
@@ -348,8 +342,8 @@ async def _forward_message(state, params: SendMessageInput) -> str:
     webhook_err = validate_webhook_url(msg.webhook)
     if not webhook_err:
         try:
-            status_resp = await webhook_request_with_recovery(
-                state, msg.webhook, msg.from_agent_id,
+            status_resp = await get_network_manager().webhook_request(
+                msg.webhook, msg.from_agent_id,
                 method="GET", timeout=10.0,
             )
             if status_resp.status_code == 200:
@@ -380,8 +374,8 @@ async def _forward_message(state, params: SendMessageInput) -> str:
         state.message_queue.pop(msg_index)
         if not webhook_err:
             try:
-                await webhook_request_with_recovery(
-                    state, msg.webhook, msg.from_agent_id,
+                await get_network_manager().webhook_request(
+                    msg.webhook, msg.from_agent_id,
                     method="POST", timeout=30.0,
                     json={"type": "expired", "agent_id": state.agent_id, "note": "Message expired — no hops remaining."}
                 )
@@ -406,8 +400,8 @@ async def _forward_message(state, params: SendMessageInput) -> str:
         # POST forwarding update to webhook
         if not webhook_err:
             try:
-                await webhook_request_with_recovery(
-                    state, msg.webhook, msg.from_agent_id,
+                await get_network_manager().webhook_request(
+                    msg.webhook, msg.from_agent_id,
                     method="POST", timeout=10.0,
                     json={"type": "forwarded", "agent_id": state.agent_id, "target_agent_id": tid, "note": params.note}
                 )
@@ -476,8 +470,8 @@ async def _reply_to_message(state, params: SendMessageInput) -> str:
 
     # Check if message is still active before responding
     try:
-        status_resp = await webhook_request_with_recovery(
-            state, msg.webhook, msg.from_agent_id,
+        status_resp = await get_network_manager().webhook_request(
+            msg.webhook, msg.from_agent_id,
             method="GET", timeout=10.0,
         )
         if status_resp.status_code == 200:
@@ -495,8 +489,8 @@ async def _reply_to_message(state, params: SendMessageInput) -> str:
 
     # Notify originator that we're actively responding
     try:
-        await webhook_request_with_recovery(
-            state, msg.webhook, msg.from_agent_id,
+        await get_network_manager().webhook_request(
+            msg.webhook, msg.from_agent_id,
             method="POST", timeout=10.0,
             json={"type": "responding", "agent_id": state.agent_id}
         )
@@ -517,8 +511,8 @@ async def _reply_to_message(state, params: SendMessageInput) -> str:
     response_time_ms = 0.0
     try:
         start = time.monotonic()
-        resp = await webhook_request_with_recovery(
-            state, msg.webhook, msg.from_agent_id,
+        resp = await get_network_manager().webhook_request(
+            msg.webhook, msg.from_agent_id,
             method="POST", timeout=30.0,
             json={
                 "type": "response",
@@ -682,7 +676,7 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     # Broadcast bio change to all connected peers
     if state.public_url:
         try:
-            await broadcast_peer_update(state)
+            await get_network_manager().broadcast_peer_update()
         except Exception as e:
             print(f"[DarkMatter] Failed to broadcast bio update: {e}", file=sys.stderr)
 
@@ -1277,7 +1271,7 @@ async def network_info(ctx: Context) -> str:
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
-        "agent_url": get_public_url(state.port),
+        "agent_url": get_network_manager().get_public_url(),
         "bio": state.bio,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "peers": peers,

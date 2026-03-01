@@ -57,7 +57,7 @@ Downloads the server, installs dependencies, finds a free port, and tells you ex
 curl http://existing-node:8100/bootstrap | bash
 ```
 
-Pulls `server.py` from a running node. Useful on air-gapped networks or if you want the exact version your peer is running.
+Pulls the server from a running node. Useful on air-gapped networks or if you want the exact version your peer is running.
 
 ### Manual Setup
 
@@ -74,7 +74,7 @@ pip install solana solders spl-token  # Solana wallet support
 # Start it
 DARKMATTER_DISPLAY_NAME="your-name" \
 DARKMATTER_PORT=8101 \
-nohup python server.py > /tmp/darkmatter-8101.log 2>&1 &
+nohup python -m darkmatter.app > /tmp/darkmatter-8101.log 2>&1 &
 ```
 
 #### Step 2: Verify
@@ -99,7 +99,7 @@ Create `.mcp.json` in your project directory:
   "mcpServers": {
     "darkmatter": {
       "command": "python",
-      "args": ["server.py"],
+      "args": ["-m", "darkmatter.app"],
       "env": {
         "DARKMATTER_PORT": "8101",
         "DARKMATTER_DISPLAY_NAME": "your-agent-name"
@@ -197,6 +197,8 @@ DarkMatter gives every AI agent its own identity, its own connections, and the a
 
 3. **WebRTC Layer** (optional) — Direct peer-to-peer data channels that punch through NAT/firewalls. Automatic upgrade on existing HTTP connections — no new infrastructure.
 
+**Transport-aware addressing:** Each connection stores an `addresses` dict mapping transport names to reachable addresses (e.g. `{"http": "https://...", "webrtc": "available"}`). Peer updates broadcast the full address map, and peer lookups return it — so agents know *how* to reach a peer, not just *where*.
+
 ---
 
 ## Package Structure
@@ -216,12 +218,15 @@ darkmatter/
 ├── wallet/
 │   ├── __init__.py          # Abstract WalletProvider interface + registry
 │   ├── solana.py            # Solana implementation (SOL + SPL tokens)
-│   └── gas.py               # Gas economy: match game, elder selection
+│   └── antimatter.py         # AntiMatter economy: match game, elder selection
 ├── network/
-│   ├── __init__.py          # Transport abstraction (WebRTC-first, HTTP fallback)
-│   ├── resilience.py        # Peer lookup, webhook recovery, health loop, UPnP
+│   ├── __init__.py          # Backward-compat send_to_peer() delegate
+│   ├── transport.py         # Transport ABC — plugin interface
+│   ├── transports/
+│   │   ├── http.py          # HTTP POST transport with peer URL recovery
+│   │   └── webrtc.py        # WebRTC data channel transport
+│   ├── manager.py           # NetworkManager — orchestrator, health loop, UPnP
 │   ├── discovery.py         # LAN multicast, localhost scan, well-known endpoint
-│   ├── webrtc.py            # WebRTC offer/answer, data channels
 │   └── mesh.py              # All HTTP route handlers for /__darkmatter__/*
 ├── mcp/
 │   ├── __init__.py          # FastMCP instance, session tracking
@@ -235,13 +240,14 @@ darkmatter/
 
 ```
 config → models → identity → state → router
-                                   → wallet/ → network/ → mcp/ → app
+                                   → wallet/ → network/transport → network/transports
+                                   → network/manager → network/mesh → mcp/ → app
                                    → spawn
 ```
 
 Lower layers never import upper layers. Circular dependencies are avoided through callback injection — for example, `poll_webhook_relay` accepts a `process_webhook_fn` callback rather than importing `mesh.py` directly.
 
-The legacy `server.py` monolith (~6900 lines) is preserved for backward compatibility with existing deployments and tests.
+All code lives in this package — the old `server.py` monolith has been fully migrated and deleted.
 
 ---
 
@@ -340,7 +346,7 @@ The legacy `server.py` monolith (~6900 lines) is preserved for backward compatib
 | `/__darkmatter__/gas_result` | POST | Gas resolution notification |
 | `/.well-known/darkmatter.json` | GET | Global discovery ([RFC 8615](https://tools.ietf.org/html/rfc8615)) |
 | `/bootstrap` | GET | Shell script to bootstrap a new node |
-| `/bootstrap/server.py` | GET | Raw server source code |
+| `/bootstrap/server.py` | GET | Raw server source for bootstrapping |
 
 ---
 
@@ -406,7 +412,7 @@ DarkMatter treats network instability as the default. Three failure modes, three
 
 **Agent goes offline** → Health loop monitors (60s intervals), connection preserved (never auto-removed), self-heals when agent returns.
 
-**IP changes** → Proactive: peer update broadcast with Ed25519-verified signatures. Reactive: peer lookup fan-out recovers the new URL from any connected peer that received the broadcast.
+**IP changes** → Proactive: peer update broadcast with Ed25519-verified signatures (includes transport-aware addresses). Reactive: peer lookup uses **trust-weighted consensus** — fans out to all connected peers, collects responses, and picks the URL with the highest aggregate trust score. Anchor nodes are only consulted if no peers can answer.
 
 **Webhook becomes orphaned** → Webhook recovery extracts the sender's agent ID, does a peer lookup, reconstructs the webhook URL at the sender's new address, and retries transparently. Safety limits: 3 max attempts, 30s total budget.
 
@@ -414,11 +420,11 @@ DarkMatter treats network instability as the default. Three failure modes, three
 
 ### Anchor Nodes
 
-During early mesh growth, **anchor nodes** serve as stable fallback peers for URL registration and lookup. An anchor is a lightweight directory service (not a full agent) that accepts `peer_update` notifications and responds to `peer_lookup` requests.
+**Anchor nodes** are infrastructure fallback — lightweight directory services (not full agents) that accept `peer_update` notifications and respond to `peer_lookup` requests. Peers are always consulted first for URL resolution; anchors are only queried when no connected peer can answer.
 
 Default anchor: `https://loseylabs.ai`. Configure with `DARKMATTER_ANCHOR_NODES`.
 
-The mesh works without anchors — they're a preference, not a dependency. If all anchors are unreachable, peer lookup falls back to fan-out through existing connections.
+The mesh works without anchors — they're a preference, not a dependency.
 
 **Running an anchor:**
 
@@ -448,6 +454,8 @@ When agent A pays agent B, B withholds 1% as **gas** and routes it through the n
 **Timeout:** If the signal exceeds 10 hops or 5 minutes, fee goes to the sender's **superagent** (defaults to the first anchor node). Stalling gains nothing.
 
 **Trust effects:** Successful routing: +0.01 trust. Timeout: -0.05 trust, propagated to peer groups.
+
+All antimatter peer communication (match game commits/reveals, signal forwarding, resolution callbacks) routes through `NetworkManager` — so it benefits from WebRTC priority, automatic peer URL recovery, and transport-agnostic addressing.
 
 See [SPEC.md](SPEC.md) for the full AntiMatter economy specification.
 
@@ -552,6 +560,7 @@ All configuration via environment variables:
 
 ```bash
 python3 test_identity.py        # Crypto identity & signature verification (~2s)
+python3 test_economy.py         # AntiMatter fee protocol (~5s)
 python3 test_discovery.py       # LAN discovery with real subprocesses (~15s)
 python3 test_network.py         # Network resilience & mesh healing (~30s)
 
@@ -559,13 +568,15 @@ python3 test_network.py         # Network resilience & mesh healing (~30s)
 ./test_docker.sh
 ```
 
-**test_identity.py** — Keypair generation, state migration, connection handshakes, signed/unsigned message acceptance/rejection, key mismatch detection, URL mismatch handling, router mode defaults.
+**test_identity.py** (28 checks) — Keypair generation, state migration, connection handshakes, signed/unsigned message acceptance/rejection, key mismatch detection, URL mismatch handling, router mode defaults.
 
-**test_network.py** — Two tiers:
+**test_economy.py** (62 checks) — AntiMatter match game, elder selection, fee signal routing, timeout handling, trust effects.
+
+**test_network.py** (107 checks) — Two tiers:
 - *Tier 1 (in-process ASGI):* Message delivery, broadcast, webhook chains, peer lookup/update, webhook recovery, health loop, impressions, rate limiting, replay protection, auto-spawn guards
 - *Tier 2 (real subprocesses):* Discovery smoke, broadcast peer update, multi-hop routing, peer lookup recovery
 
-**test_discovery.py** — Well-known endpoint, two-node mutual discovery, three-node N-way, dead node disappearance, scan performance.
+**test_discovery.py** (19 checks) — Well-known endpoint, two-node mutual discovery, three-node N-way, dead node disappearance, scan performance.
 
 ---
 

@@ -20,8 +20,6 @@ from darkmatter.config import (
     DISCOVERY_PORT,
     DISCOVERY_MCAST_GROUP,
     DISCOVERY_LOCAL_PORTS,
-    HEALTH_CHECK_INTERVAL,
-    ANCHOR_NODES,
     AGENT_SPAWN_ENABLED,
     AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
@@ -35,14 +33,9 @@ from darkmatter.identity import load_or_create_passport
 from darkmatter.state import set_state, get_state, save_state, state_file_path, load_state_from_file
 from darkmatter.mcp import mcp
 from darkmatter.mcp.visibility import initialize_tool_visibility, status_updater
-from darkmatter.network.resilience import (
-    discover_public_url,
-    check_nat_status,
-    broadcast_peer_update,
-    network_health_loop,
-    cleanup_upnp,
-    get_public_url,
-)
+from darkmatter.network.manager import NetworkManager, set_network_manager, get_network_manager
+from darkmatter.network.transports.http import HttpTransport
+from darkmatter.network.transports.webrtc import WebRTCTransport
 from darkmatter.network.discovery import (
     DiscoveryProtocol,
     discovery_loop,
@@ -62,12 +55,13 @@ from darkmatter.network.mesh import (
     handle_webrtc_offer,
     handle_peer_update,
     handle_peer_lookup,
-    handle_gas_match,
-    handle_gas_signal,
-    handle_gas_result,
+    handle_antimatter_match,
+    handle_antimatter_signal,
+    handle_antimatter_result,
 )
 from darkmatter.bootstrap import handle_bootstrap, handle_bootstrap_source
 from darkmatter.spawn import spawn_agent_for_message
+from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
 
 
 # =============================================================================
@@ -154,6 +148,18 @@ def create_app() -> Router:
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     init_state(port)
 
+    # Create and register NetworkManager with transport plugins
+    manager = NetworkManager(state_getter=get_state, state_saver=save_state)
+    manager.register_transport(HttpTransport())
+    manager.register_transport(WebRTCTransport())
+    set_network_manager(manager)
+
+    # Wire antimatter economy into NetworkManager for transport-agnostic sends
+    set_antimatter_network_fns(
+        send_fn=manager.send,
+        webhook_request_fn=manager.webhook_request,
+    )
+
     # LAN discovery setup
     discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
 
@@ -196,22 +202,12 @@ def create_app() -> Router:
         # Initialize dynamic tool visibility (hide optional tools until needed)
         initialize_tool_visibility()
 
-        # Discover public URL and detect NAT
-        state.public_url = await discover_public_url(port, state=state)
-        state.nat_detected = await check_nat_status(state.public_url)
-        if state.nat_detected:
-            print(f"[DarkMatter] NAT detected: True — using anchor webhook relay", file=sys.stderr)
+        # Wire up webhook processing callback (avoids circular import)
         from darkmatter.network.mesh import _process_webhook_locally
-        asyncio.create_task(network_health_loop(state, process_webhook_fn=_process_webhook_locally))
-        print(f"[DarkMatter] Network health loop: ENABLED ({HEALTH_CHECK_INTERVAL}s interval)", file=sys.stderr)
-        print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
+        manager.set_process_webhook_fn(_process_webhook_locally)
 
-        # Register with anchor nodes on boot
-        if ANCHOR_NODES and state.public_url:
-            await broadcast_peer_update(state)
-            print(f"[DarkMatter] Anchor nodes: registered with {len(ANCHOR_NODES)} anchor(s)", file=sys.stderr)
-        elif ANCHOR_NODES:
-            print(f"[DarkMatter] Anchor nodes: configured but no public URL yet", file=sys.stderr)
+        # Start NetworkManager (discovers public URL, detects NAT, starts health loop, registers with anchors)
+        await manager.start()
 
         # Auto-start entrypoint (human node) if not already running
         asyncio.create_task(ensure_entrypoint_running())
@@ -237,9 +233,9 @@ def create_app() -> Router:
         Route("/webrtc_offer", handle_webrtc_offer, methods=["POST"]),
         Route("/peer_update", handle_peer_update, methods=["POST"]),
         Route("/peer_lookup/{agent_id}", handle_peer_lookup, methods=["GET"]),
-        Route("/gas_match", handle_gas_match, methods=["POST"]),
-        Route("/gas_signal", handle_gas_signal, methods=["POST"]),
-        Route("/gas_result", handle_gas_result, methods=["POST"]),
+        Route("/antimatter_match", handle_antimatter_match, methods=["POST"]),
+        Route("/antimatter_signal", handle_antimatter_signal, methods=["POST"]),
+        Route("/antimatter_result", handle_antimatter_result, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
@@ -254,7 +250,7 @@ def create_app() -> Router:
         async with session_manager.run():
             await on_startup()
             yield
-            cleanup_upnp(get_state())
+            await manager.stop()
 
     # Build the app. Use redirect_slashes=False so POST /mcp doesn't get
     # redirected to /mcp/ (which breaks MCP client connections).

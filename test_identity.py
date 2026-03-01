@@ -19,6 +19,15 @@ import httpx
 from httpx import ASGITransport
 
 # ---------------------------------------------------------------------------
+# darkmatter/ package imports
+# ---------------------------------------------------------------------------
+
+from darkmatter.state import get_state, set_state, load_state_from_file
+from darkmatter.models import AgentState, AgentStatus
+from darkmatter.identity import generate_keypair, sign_message
+from darkmatter.app import create_app
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -55,9 +64,7 @@ def create_agent(state_path: str, *, port: int = 9900) -> tuple:
 
     Returns (app, state) tuple.
     """
-    import server
-
-    server._agent_state = None
+    set_state(None)
 
     os.environ["DARKMATTER_PORT"] = str(port)
     os.environ["DARKMATTER_DISCOVERY"] = "false"
@@ -66,24 +73,23 @@ def create_agent(state_path: str, *, port: int = 9900) -> tuple:
     os.environ.pop("DARKMATTER_GENESIS", None)
 
     # Generate a unique keypair for this agent (bypass passport file)
-    priv, pub = server._generate_keypair()
-    server._agent_state = server.AgentState(
+    priv, pub = generate_keypair()
+    set_state(AgentState(
         agent_id=pub,
         bio="A DarkMatter mesh agent.",
-        status=server.AgentStatus.ACTIVE,
+        status=AgentStatus.ACTIVE,
         port=port,
         private_key_hex=priv,
         public_key_hex=pub,
-    )
-    app = server.create_app()
-    state = server._agent_state
+    ))
+    app = create_app()
+    state = get_state()
     return app, state
 
 
 def use_agent(state):
     """Set the global _agent_state to this agent's state before making requests."""
-    import server
-    server._agent_state = state
+    set_state(state)
 
 
 async def connect_agents(app_a, state_a, app_b, state_b) -> None:
@@ -126,8 +132,6 @@ async def connect_agents(app_a, state_a, app_b, state_b) -> None:
 
 async def test_fresh_agent_gets_keypair() -> None:
     """Fresh agent gets Ed25519 keypair (agent_id = public_key_hex)."""
-    import server
-
     path = make_state_file()
     try:
         app, state = create_agent(path)
@@ -167,8 +171,6 @@ async def test_fresh_agent_gets_keypair() -> None:
 
 async def test_state_migration() -> None:
     """Legacy state (no crypto fields) loads; keys come from passport, not state file."""
-    import server
-
     path = make_state_file()
     try:
         # Write a legacy state file without crypto fields
@@ -186,7 +188,7 @@ async def test_state_migration() -> None:
         with open(path, "w") as f:
             json.dump(legacy, f)
 
-        state = server._load_state_from_file(path)
+        state = load_state_from_file(path)
 
         report("state loaded", state is not None)
         if state:
@@ -206,14 +208,12 @@ async def test_state_migration() -> None:
 
 async def test_connection_handshake_exchanges_keys() -> None:
     """Connection request with manual accept exchanges public keys."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         # Agent A
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         # Agent B
         app_b, state_b = create_agent(path_b, port=9901)
@@ -254,14 +254,12 @@ async def test_connection_handshake_exchanges_keys() -> None:
 
 async def test_signed_message_verified() -> None:
     """Properly signed message from connected peer → verified: true."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         # Set up two connected agents
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
 
@@ -273,7 +271,7 @@ async def test_signed_message_verified() -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
         content = "Hello from B"
 
-        signature = server._sign_message(
+        signature = sign_message(
             state_b.private_key_hex, state_b.agent_id, message_id, timestamp, content
         )
 
@@ -303,13 +301,11 @@ async def test_signed_message_verified() -> None:
 
 async def test_key_mismatch_rejected() -> None:
     """Message with wrong public key → 403 'Public key mismatch'."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
 
@@ -317,13 +313,13 @@ async def test_key_mismatch_rejected() -> None:
         await connect_agents(app_a, stashed_a, app_b, state_b)
 
         # Generate a different keypair (impersonator)
-        fake_priv, fake_pub = server._generate_keypair()
+        fake_priv, fake_pub = generate_keypair()
 
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
         timestamp = datetime.now(timezone.utc).isoformat()
         content = "Spoofed message"
 
-        signature = server._sign_message(fake_priv, state_b.agent_id, message_id, timestamp, content)
+        signature = sign_message(fake_priv, state_b.agent_id, message_id, timestamp, content)
 
         use_agent(stashed_a)
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
@@ -348,13 +344,11 @@ async def test_key_mismatch_rejected() -> None:
 
 async def test_invalid_signature_rejected() -> None:
     """Correct public key but garbage signature → 403."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
 
@@ -391,21 +385,19 @@ async def test_invalid_signature_rejected() -> None:
 
 async def test_signed_unknown_sender_accepted() -> None:
     """Signed message from non-connected agent → accepted (signatures prove identity)."""
-    import server
-
     path_a = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         # Send signed message from an agent that's NOT connected
-        unknown_priv, unknown_pub = server._generate_keypair()
+        unknown_priv, unknown_pub = generate_keypair()
         unknown_id = "unknown-agent-999"
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
         timestamp = datetime.now(timezone.utc).isoformat()
         content = "Who am I?"
 
-        signature = server._sign_message(unknown_priv, unknown_id, message_id, timestamp, content)
+        signature = sign_message(unknown_priv, unknown_id, message_id, timestamp, content)
 
         async with httpx.AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
             resp = await client.post("/__darkmatter__/message", json={
@@ -431,12 +423,10 @@ async def test_signed_unknown_sender_accepted() -> None:
 
 async def test_unsigned_unknown_sender_rejected() -> None:
     """Unsigned message from non-connected agent → 403."""
-    import server
-
     path_a = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         message_id = f"msg-{uuid.uuid4().hex[:8]}"
 
@@ -462,13 +452,11 @@ async def test_unsigned_unknown_sender_rejected() -> None:
 
 async def test_connection_accepted_url_mismatch() -> None:
     """connection_accepted with different URL (public IP) matches by agent_id."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         app_b, state_b = create_agent(path_b, port=9901)
 
@@ -503,12 +491,10 @@ async def test_connection_accepted_url_mismatch() -> None:
 
 async def test_router_mode_null_in_state() -> None:
     """State file with router_mode: null loads as 'spawn' (not None)."""
-    import server
-
     path = make_state_file()
     try:
         # Write a state file with explicit null router_mode (legacy)
-        priv, pub = server._generate_keypair()
+        priv, pub = generate_keypair()
         state_data = {
             "agent_id": pub,
             "bio": "Test agent",
@@ -527,7 +513,7 @@ async def test_router_mode_null_in_state() -> None:
         with open(path, "w") as f:
             json.dump(state_data, f)
 
-        state = server._load_state_from_file(path)
+        state = load_state_from_file(path)
 
         report("state loaded successfully", state is not None)
         if state:

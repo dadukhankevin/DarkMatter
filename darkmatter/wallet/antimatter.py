@@ -3,10 +3,14 @@ AntiMatter economy — match game, elder selection, antimatter signals, timeout 
 
 Depends on: config, models, wallet/solana (at runtime)
 Uses callbacks for network operations to avoid circular imports.
+Network sends go through injected _network_send_fn / _webhook_request_fn
+(wired to NetworkManager by app.py at startup).
 """
 
 import asyncio
+import hashlib
 import random
+import secrets
 import sys
 import time
 import uuid
@@ -29,6 +33,23 @@ from darkmatter.models import (
     Impression,
     QueuedMessage,
 )
+
+
+# =============================================================================
+# Network function slots (injected by app.py to avoid circular imports)
+# =============================================================================
+
+# async (agent_id, path, payload) -> SendResult-like object (.success, .response)
+_network_send_fn = None
+# async (url, from_agent_id, method="POST", **kwargs) -> httpx.Response
+_webhook_request_fn = None
+
+
+def set_network_fns(send_fn, webhook_request_fn) -> None:
+    """Wire up network functions. Called by app.py after NetworkManager is created."""
+    global _network_send_fn, _webhook_request_fn
+    _network_send_fn = send_fn
+    _webhook_request_fn = webhook_request_fn
 
 
 # Cache for superagent wallet resolution
@@ -106,15 +127,21 @@ async def get_superagent_wallet(state: AgentState) -> Optional[str]:
         return cached[0]
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url.rstrip("/") + "/__darkmatter__/network_info")
-            if resp.status_code == 200:
-                data = resp.json()
-                wallets = data.get("wallets", {})
-                sol_wallet = wallets.get("solana")
-                if sol_wallet:
-                    _superagent_wallet_cache[url] = (sol_wallet, time.time())
-                    return sol_wallet
+        # Superagent may not be a connected peer — use webhook_request for
+        # recovery-capable HTTP, or fall back to raw httpx if not wired yet.
+        fetch_url = url.rstrip("/") + "/__darkmatter__/network_info"
+        if _webhook_request_fn:
+            resp = await _webhook_request_fn(fetch_url, from_agent_id=None, method="GET")
+        else:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(fetch_url)
+        if resp.status_code == 200:
+            data = resp.json()
+            wallets = data.get("wallets", {})
+            sol_wallet = wallets.get("solana")
+            if sol_wallet:
+                _superagent_wallet_cache[url] = (sol_wallet, time.time())
+                return sol_wallet
     except Exception:
         pass
 
@@ -170,15 +197,44 @@ def select_elder(state: AgentState, sig: AntiMatterSignal) -> Optional[Connectio
 
 
 # =============================================================================
+# Commit-Reveal Helpers
+# =============================================================================
+
+def make_commitment(n: int) -> tuple[int, bytes, str]:
+    """Generate pick, nonce, and SHA-256 commitment.
+    Returns (pick, nonce_bytes, commitment_hex).
+    """
+    pick = random.randint(0, n)
+    nonce = secrets.token_bytes(32)
+    commitment = hashlib.sha256(pick.to_bytes(4, "big") + nonce).hexdigest()
+    return pick, nonce, commitment
+
+
+def verify_commitment(commitment_hex: str, pick: int, nonce_hex: str) -> bool:
+    """Verify a commitment matches the revealed pick + nonce."""
+    try:
+        nonce_bytes = bytes.fromhex(nonce_hex)
+        expected = hashlib.sha256(pick.to_bytes(4, "big") + nonce_bytes).hexdigest()
+        return expected == commitment_hex
+    except (ValueError, OverflowError):
+        return False
+
+
+# =============================================================================
 # Match Game
 # =============================================================================
 
 async def run_antimatter_match(state: AgentState, sig: AntiMatterSignal,
                          is_originator: bool = True,
                          save_state_fn=None) -> None:
-    """Run the match game for antimatter routing.
+    """Run the commit-reveal match game for antimatter routing.
 
-    save_state_fn is injected to avoid circular import with state module.
+    Two-phase protocol:
+      Phase 1 (commit): send our commitment, collect peer commitments + session tokens
+      Phase 2 (reveal): send our pick+nonce, collect peer picks+nonces, verify commitments
+
+    Outcome: combined = orchestrator_pick XOR peer_pick_1 XOR ...
+             matched = (combined % (n + 1)) == 0
     """
     if sig.hops >= sig.max_hops:
         await resolve_antimatter(state, sig, "timeout", None, is_originator, save_state_fn=save_state_fn)
@@ -204,26 +260,77 @@ async def run_antimatter_match(state: AgentState, sig: AntiMatterSignal,
         await resolve_antimatter(state, sig, "terminal", None, is_originator, save_state_fn=save_state_fn)
         return
 
-    my_number = random.randint(0, n)
+    # Generate our commitment
+    my_pick, my_nonce, my_commitment = make_commitment(n)
 
-    async def _query_peer_pick(conn, n_val):
+    # --- Phase 1: Commit ---
+    async def _commit_peer(conn):
         try:
-            base = conn.agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.post(
-                    base + "/__darkmatter__/antimatter_match",
-                    json={"signal_id": sig.signal_id, "n": n_val},
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("pick")
+            result = await _network_send_fn(
+                conn.agent_id,
+                "/__darkmatter__/antimatter_match",
+                {
+                    "phase": "commit",
+                    "signal_id": sig.signal_id,
+                    "n": n,
+                    "orchestrator_commitment": my_commitment,
+                },
+            )
+            if result.success and result.response:
+                d = result.response
+                return {
+                    "conn": conn,
+                    "peer_commitment": d.get("peer_commitment"),
+                    "session_token": d.get("session_token"),
+                }
         except Exception:
             pass
         return None
 
-    tasks = [_query_peer_pick(conn, n) for conn in peers]
-    results = await asyncio.gather(*tasks)
+    commit_results = await asyncio.gather(*[_commit_peer(c) for c in peers])
+    committed_peers = [r for r in commit_results if r and r.get("peer_commitment") and r.get("session_token")]
 
-    matched = any(pick == my_number for pick in results if pick is not None)
+    # --- Phase 2: Reveal ---
+    async def _reveal_peer(peer_info):
+        try:
+            conn = peer_info["conn"]
+            result = await _network_send_fn(
+                conn.agent_id,
+                "/__darkmatter__/antimatter_match",
+                {
+                    "phase": "reveal",
+                    "session_token": peer_info["session_token"],
+                    "orchestrator_pick": my_pick,
+                    "orchestrator_nonce": my_nonce.hex(),
+                },
+            )
+            if result.success and result.response:
+                d = result.response
+                peer_pick = d.get("peer_pick")
+                peer_nonce = d.get("peer_nonce")
+                if peer_pick is not None and peer_nonce:
+                    if verify_commitment(peer_info["peer_commitment"], peer_pick, peer_nonce):
+                        return peer_pick
+        except Exception:
+            pass
+        return None
+
+    if committed_peers:
+        reveal_results = await asyncio.gather(*[_reveal_peer(p) for p in committed_peers])
+        valid_picks = [p for p in reveal_results if p is not None]
+    else:
+        valid_picks = []
+
+    # All peers failed → terminal
+    if not valid_picks and not committed_peers:
+        await resolve_antimatter(state, sig, "terminal", None, is_originator, save_state_fn=save_state_fn)
+        return
+
+    # Compute combined XOR
+    combined = my_pick
+    for p in valid_picks:
+        combined ^= p
+    matched = (combined % (n + 1)) == 0
 
     if matched:
         elder = select_elder(state, sig)
@@ -241,20 +348,19 @@ async def run_antimatter_match(state: AgentState, sig: AntiMatterSignal,
             forwarded_sig = antimatter_signal_to_dict(sig)
 
             try:
-                base = elder.agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.post(
-                        base + "/__darkmatter__/antimatter_signal",
-                        json=forwarded_sig,
-                    )
-                    if resp.status_code == 200:
-                        log_antimatter_event(state, {
-                            "type": "forwarded",
-                            "signal_id": sig.signal_id,
-                            "forwarded_to": elder.agent_id,
-                            "hops": sig.hops,
-                        })
-                        return
+                result = await _network_send_fn(
+                    elder.agent_id,
+                    "/__darkmatter__/antimatter_signal",
+                    forwarded_sig,
+                )
+                if result.success:
+                    log_antimatter_event(state, {
+                        "type": "forwarded",
+                        "signal_id": sig.signal_id,
+                        "forwarded_to": elder.agent_id,
+                        "hops": sig.hops,
+                    })
+                    return
             except Exception:
                 pass
 
@@ -329,8 +435,12 @@ async def resolve_antimatter(state: AgentState, sig: AntiMatterSignal, resolutio
                 "resolved_by": resolved_by or state.agent_id,
                 "resolution": resolution,
             }
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(sig.callback_url, json=payload)
+            await _webhook_request_fn(
+                sig.callback_url,
+                from_agent_id=sig.sender_agent_id,
+                method="POST",
+                json=payload,
+            )
 
             log_antimatter_event(state, {
                 "type": "antimatter_resolved_callback",

@@ -21,7 +21,7 @@ import httpx
 # ---------------------------------------------------------------------------
 
 PYTHON = sys.executable
-SERVER = os.path.join(os.path.dirname(__file__), "server.py")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 BASE_PORT = 9900
 STARTUP_TIMEOUT = 15  # seconds to wait for a server to come up
 DISCOVERY_WAIT = 5    # seconds to wait for discovery scan
@@ -70,13 +70,14 @@ class DarkMatterNode:
             "DARKMATTER_TRANSPORT": "http",
             # Override the scan range to cover our test ports
             "DARKMATTER_DISCOVERY_PORTS": f"{BASE_PORT}-{BASE_PORT + 10}",
+            "PYTHONPATH": PROJECT_ROOT,
         }
         # Remove any stale tokens
         env.pop("DARKMATTER_MCP_TOKEN", None)
         env.pop("DARKMATTER_AGENT_ID", None)
 
         self.proc = subprocess.Popen(
-            [PYTHON, SERVER],
+            [PYTHON, "-m", "darkmatter.app"],
             env=env,
             cwd=self.workdir,
             stdout=subprocess.DEVNULL,
@@ -128,6 +129,70 @@ class DarkMatterNode:
 
     def __repr__(self) -> str:
         return f"<Node {self.display_name} port={self.port} pid={self.proc.pid if self.proc else None}>"
+
+
+# ---------------------------------------------------------------------------
+# Inline scan script template (uses darkmatter/ package)
+# ---------------------------------------------------------------------------
+
+def _scan_script(agent_id: str, port: int, port_range_start: int, port_range_end: int) -> str:
+    """Generate an inline Python script that scans local ports using darkmatter."""
+    return f"""
+import asyncio, json, sys
+sys.path.insert(0, "{PROJECT_ROOT}")
+
+from darkmatter.models import AgentState, AgentStatus
+from darkmatter.network.discovery import scan_local_ports
+import darkmatter.config
+
+darkmatter.config.DISCOVERY_LOCAL_PORTS = range({port_range_start}, {port_range_end})
+import darkmatter.network.discovery as _disc
+_disc.DISCOVERY_LOCAL_PORTS = range({port_range_start}, {port_range_end})
+
+state = AgentState(
+    agent_id="{agent_id}",
+    bio="test",
+    status=AgentStatus.ACTIVE,
+    port={port},
+)
+
+async def main():
+    await scan_local_ports(state)
+    print(json.dumps({{
+        k: v["url"] for k, v in state.discovered_peers.items()
+    }}))
+
+asyncio.run(main())
+"""
+
+
+def _scan_script_keys(agent_id: str, port: int, port_range_start: int, port_range_end: int) -> str:
+    """Generate an inline Python script that scans and returns just peer IDs."""
+    return f"""
+import asyncio, json, sys
+sys.path.insert(0, "{PROJECT_ROOT}")
+
+from darkmatter.models import AgentState, AgentStatus
+from darkmatter.network.discovery import scan_local_ports
+import darkmatter.config
+
+darkmatter.config.DISCOVERY_LOCAL_PORTS = range({port_range_start}, {port_range_end})
+import darkmatter.network.discovery as _disc
+_disc.DISCOVERY_LOCAL_PORTS = range({port_range_start}, {port_range_end})
+
+state = AgentState(
+    agent_id="{agent_id}",
+    bio="test",
+    status=AgentStatus.ACTIVE,
+    port={port},
+)
+
+async def main():
+    await scan_local_ports(state)
+    print(json.dumps(list(state.discovered_peers.keys())))
+
+asyncio.run(main())
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -193,27 +258,7 @@ def test_two_nodes_discover_each_other() -> None:
 
         # Run a manual scan from A's perspective to find B
         result = subprocess.run(
-            [PYTHON, "-c", f"""
-import asyncio, json, sys, os
-sys.path.insert(0, os.path.dirname("{SERVER}"))
-import server
-
-state = server.AgentState(
-    agent_id="{node_a.agent_id}",
-    bio="test",
-    status=server.AgentStatus.ACTIVE,
-    port={node_a.port},
-)
-server.DISCOVERY_LOCAL_PORTS = range({BASE_PORT}, {BASE_PORT + 10})
-
-async def main():
-    await server._scan_local_ports(state)
-    print(json.dumps({{
-        k: v["url"] for k, v in state.discovered_peers.items()
-    }}))
-
-asyncio.run(main())
-"""],
+            [PYTHON, "-c", _scan_script(node_a.agent_id, node_a.port, BASE_PORT, BASE_PORT + 10)],
             capture_output=True, text=True, timeout=10,
         )
 
@@ -231,27 +276,7 @@ asyncio.run(main())
 
         # Same scan from B's perspective
         result = subprocess.run(
-            [PYTHON, "-c", f"""
-import asyncio, json, sys, os
-sys.path.insert(0, os.path.dirname("{SERVER}"))
-import server
-
-state = server.AgentState(
-    agent_id="{node_b.agent_id}",
-    bio="test",
-    status=server.AgentStatus.ACTIVE,
-    port={node_b.port},
-)
-server.DISCOVERY_LOCAL_PORTS = range({BASE_PORT}, {BASE_PORT + 10})
-
-async def main():
-    await server._scan_local_ports(state)
-    print(json.dumps({{
-        k: v["url"] for k, v in state.discovered_peers.items()
-    }}))
-
-asyncio.run(main())
-"""],
+            [PYTHON, "-c", _scan_script(node_b.agent_id, node_b.port, BASE_PORT, BASE_PORT + 10)],
             capture_output=True, text=True, timeout=10,
         )
 
@@ -285,25 +310,7 @@ def test_three_nodes_nway() -> None:
         # Run scan from each node's perspective
         for i, scanner in enumerate(nodes):
             result = subprocess.run(
-                [PYTHON, "-c", f"""
-import asyncio, json, sys, os
-sys.path.insert(0, os.path.dirname("{SERVER}"))
-import server
-
-state = server.AgentState(
-    agent_id="{scanner.agent_id}",
-    bio="test",
-    status=server.AgentStatus.ACTIVE,
-    port={scanner.port},
-)
-server.DISCOVERY_LOCAL_PORTS = range({BASE_PORT}, {BASE_PORT + 10})
-
-async def main():
-    await server._scan_local_ports(state)
-    print(json.dumps(list(state.discovered_peers.keys())))
-
-asyncio.run(main())
-"""],
+                [PYTHON, "-c", _scan_script_keys(scanner.agent_id, scanner.port, BASE_PORT, BASE_PORT + 10)],
                 capture_output=True, text=True, timeout=10,
             )
 
@@ -338,17 +345,7 @@ def test_dead_node_disappears() -> None:
 
         # Scan — should find B
         result = subprocess.run(
-            [PYTHON, "-c", f"""
-import asyncio, json, sys, os
-sys.path.insert(0, os.path.dirname("{SERVER}"))
-import server
-state = server.AgentState(agent_id="{node_a.agent_id}", bio="t", status=server.AgentStatus.ACTIVE, port={node_a.port})
-server.DISCOVERY_LOCAL_PORTS = range({BASE_PORT}, {BASE_PORT + 10})
-async def main():
-    await server._scan_local_ports(state)
-    print(json.dumps(list(state.discovered_peers.keys())))
-asyncio.run(main())
-"""],
+            [PYTHON, "-c", _scan_script_keys(node_a.agent_id, node_a.port, BASE_PORT, BASE_PORT + 10)],
             capture_output=True, text=True, timeout=10,
         )
         found_before = json.loads(result.stdout.strip())
@@ -360,17 +357,7 @@ asyncio.run(main())
 
         # Scan again — B should be gone
         result = subprocess.run(
-            [PYTHON, "-c", f"""
-import asyncio, json, sys, os
-sys.path.insert(0, os.path.dirname("{SERVER}"))
-import server
-state = server.AgentState(agent_id="{node_a.agent_id}", bio="t", status=server.AgentStatus.ACTIVE, port={node_a.port})
-server.DISCOVERY_LOCAL_PORTS = range({BASE_PORT}, {BASE_PORT + 10})
-async def main():
-    await server._scan_local_ports(state)
-    print(json.dumps(list(state.discovered_peers.keys())))
-asyncio.run(main())
-"""],
+            [PYTHON, "-c", _scan_script_keys(node_a.agent_id, node_a.port, BASE_PORT, BASE_PORT + 10)],
             capture_output=True, text=True, timeout=10,
         )
         found_after = json.loads(result.stdout.strip())
@@ -389,15 +376,24 @@ def test_scan_performance() -> None:
 
     result = subprocess.run(
         [PYTHON, "-c", f"""
-import asyncio, time, sys, os
-sys.path.insert(0, os.path.dirname("{SERVER}"))
-import server
-state = server.AgentState(agent_id="perf", bio="t", status=server.AgentStatus.ACTIVE, port=9999)
-server.DISCOVERY_LOCAL_PORTS = range(9800, 9810)
+import asyncio, time, sys
+sys.path.insert(0, "{PROJECT_ROOT}")
+
+from darkmatter.models import AgentState, AgentStatus
+from darkmatter.network.discovery import scan_local_ports
+import darkmatter.config
+
+darkmatter.config.DISCOVERY_LOCAL_PORTS = range(9800, 9810)
+import darkmatter.network.discovery as _disc
+_disc.DISCOVERY_LOCAL_PORTS = range(9800, 9810)
+
+state = AgentState(agent_id="perf", bio="t", status=AgentStatus.ACTIVE, port=9999)
+
 async def main():
     start = time.time()
-    await server._scan_local_ports(state)
+    await scan_local_ports(state)
     print(f"{{time.time() - start:.2f}}")
+
 asyncio.run(main())
 """],
         capture_output=True, text=True, timeout=15,

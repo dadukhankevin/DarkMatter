@@ -15,7 +15,7 @@ from typing import Optional
 from darkmatter.config import (
     DEFAULT_PORT,
     SENT_MESSAGES_MAX,
-    GAS_LOG_MAX,
+    ANTIMATTER_LOG_MAX,
     REPLAY_WINDOW,
     REPLAY_MAX_SIZE,
 )
@@ -184,6 +184,7 @@ def save_state() -> None:
                 "agent_public_key_hex": c.agent_public_key_hex,
                 "agent_display_name": c.agent_display_name,
                 "wallets": c.wallets,
+                "addresses": c.addresses,
                 "rate_limit": c.rate_limit,
                 "peer_created_at": c.peer_created_at,
             }
@@ -211,7 +212,7 @@ def save_state() -> None:
         "router_mode": state.router_mode,
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
         "superagent_url": state.superagent_url,
-        "gas_log": state.gas_log[-GAS_LOG_MAX:],
+        "gas_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
         "seen_message_ids": {
             mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < REPLAY_WINDOW
@@ -276,6 +277,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             agent_public_key_hex=cd.get("agent_public_key_hex"),
             agent_display_name=cd.get("agent_display_name"),
             wallets=cd.get("wallets") or ({"solana": cd["wallet_address"]} if cd.get("wallet_address") else {}),
+            addresses=cd.get("addresses") or ({"http": cd["agent_url"]} if cd.get("agent_url") else {}),
             rate_limit=cd.get("rate_limit", 0),
             peer_created_at=cd.get("peer_created_at"),
         )
@@ -340,7 +342,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         router_mode=data.get("router_mode") or "spawn",
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
         superagent_url=data.get("superagent_url"),
-        gas_log=data.get("gas_log", []),
+        antimatter_log=data.get("gas_log", []),
     )
 
     return state

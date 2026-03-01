@@ -18,8 +18,10 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import json
 import os
+import secrets
 import sys
 import tempfile
 import time
@@ -27,11 +29,44 @@ import uuid
 import random as _random
 from datetime import datetime, timezone, timedelta
 
-# Force devnet RPC before importing server
+# Force devnet RPC before importing darkmatter
 os.environ["DARKMATTER_SOLANA_RPC"] = "https://api.devnet.solana.com"
 
 import httpx
 from httpx import ASGITransport
+
+# ---------------------------------------------------------------------------
+# darkmatter/ package imports
+# ---------------------------------------------------------------------------
+
+from darkmatter.state import get_state, set_state, save_state
+from darkmatter.models import AgentState, AgentStatus, Connection, Impression, AntiMatterSignal, QueuedMessage
+from darkmatter.identity import generate_keypair
+from darkmatter.app import create_app
+from darkmatter.config import SOLANA_AVAILABLE, LAMPORTS_PER_SOL
+from darkmatter.wallet.solana import (
+    _resolve_spl_token,
+    _get_solana_wallet_address,
+    get_solana_balance,
+    send_solana_sol,
+    send_solana_token,
+)
+from darkmatter.wallet.antimatter import (
+    adjust_trust,
+    select_elder,
+    antimatter_signal_to_dict,
+    antimatter_signal_from_dict,
+    log_antimatter_event,
+    verify_commitment,
+    make_commitment,
+    run_antimatter_match,
+    resolve_antimatter,
+    initiate_antimatter_from_payment,
+    antimatter_timeout_watchdog,
+    set_network_fns,
+)
+from darkmatter.network.mesh import _gather_peer_trust
+from darkmatter.network.transport import SendResult
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,9 +102,7 @@ def create_agent(state_path: str, *, port: int = 9900) -> tuple:
 
     Returns (app, state) tuple.
     """
-    import server
-
-    server._agent_state = None
+    set_state(None)
 
     os.environ["DARKMATTER_PORT"] = str(port)
     os.environ["DARKMATTER_DISCOVERY"] = "false"
@@ -77,24 +110,23 @@ def create_agent(state_path: str, *, port: int = 9900) -> tuple:
     os.environ.pop("DARKMATTER_MCP_TOKEN", None)
     os.environ.pop("DARKMATTER_GENESIS", None)
 
-    priv, pub = server._generate_keypair()
-    server._agent_state = server.AgentState(
+    priv, pub = generate_keypair()
+    set_state(AgentState(
         agent_id=pub,
         bio="A DarkMatter mesh agent.",
-        status=server.AgentStatus.ACTIVE,
+        status=AgentStatus.ACTIVE,
         port=port,
         private_key_hex=priv,
         public_key_hex=pub,
-    )
-    app = server.create_app()
-    state = server._agent_state
+    ))
+    app = create_app()
+    state = get_state()
     return app, state
 
 
 def use_agent(state):
-    """Set the global _agent_state to this agent's state before making requests."""
-    import server
-    server._agent_state = state
+    """Set the global state to this agent's state before making requests."""
+    set_state(state)
 
 
 async def connect_agents(app_a, state_a, app_b, state_b) -> None:
@@ -130,13 +162,11 @@ async def connect_agents(app_a, state_a, app_b, state_b) -> None:
 
 
 async def test_adjust_trust_increment() -> None:
-    """_adjust_trust increments score from 0."""
-    import server
-
+    """adjust_trust increments score from 0."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
-        server._adjust_trust(state, "peer-1", 0.05)
+        adjust_trust(state, "peer-1", 0.05)
         imp = state.impressions.get("peer-1")
         report("score increases from 0", imp is not None and imp.score == 0.05,
                f"got: {imp}")
@@ -146,14 +176,12 @@ async def test_adjust_trust_increment() -> None:
 
 
 async def test_adjust_trust_preserves_note() -> None:
-    """_adjust_trust preserves existing note field."""
-    import server
-
+    """adjust_trust preserves existing note field."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
-        state.impressions["peer-1"] = server.Impression(score=0.5, note="good peer")
-        server._adjust_trust(state, "peer-1", 0.1)
+        state.impressions["peer-1"] = Impression(score=0.5, note="good peer")
+        adjust_trust(state, "peer-1", 0.1)
         imp = state.impressions["peer-1"]
         report("note preserved", imp.note == "good peer", f"got: {imp.note!r}")
         report("score updated", imp.score == 0.6, f"got: {imp.score}")
@@ -163,14 +191,12 @@ async def test_adjust_trust_preserves_note() -> None:
 
 
 async def test_adjust_trust_clamps_upper() -> None:
-    """_adjust_trust clamps to 1.0."""
-    import server
-
+    """adjust_trust clamps to 1.0."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
-        state.impressions["peer-1"] = server.Impression(score=0.95)
-        server._adjust_trust(state, "peer-1", 0.1)
+        state.impressions["peer-1"] = Impression(score=0.95)
+        adjust_trust(state, "peer-1", 0.1)
         report("clamped to 1.0", state.impressions["peer-1"].score == 1.0,
                f"got: {state.impressions['peer-1'].score}")
     finally:
@@ -179,14 +205,12 @@ async def test_adjust_trust_clamps_upper() -> None:
 
 
 async def test_adjust_trust_clamps_lower() -> None:
-    """_adjust_trust clamps to -1.0."""
-    import server
-
+    """adjust_trust clamps to -1.0."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
-        state.impressions["peer-1"] = server.Impression(score=-0.95)
-        server._adjust_trust(state, "peer-1", -0.1)
+        state.impressions["peer-1"] = Impression(score=-0.95)
+        adjust_trust(state, "peer-1", -0.1)
         report("clamped to -1.0", state.impressions["peer-1"].score == -1.0,
                f"got: {state.impressions['peer-1'].score}")
     finally:
@@ -195,14 +219,12 @@ async def test_adjust_trust_clamps_lower() -> None:
 
 
 async def test_adjust_trust_rounding() -> None:
-    """_adjust_trust rounds to 4 decimal places."""
-    import server
-
+    """adjust_trust rounds to 4 decimal places."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
-        server._adjust_trust(state, "peer-1", 0.00001)
-        server._adjust_trust(state, "peer-1", 0.00002)
+        adjust_trust(state, "peer-1", 0.00001)
+        adjust_trust(state, "peer-1", 0.00002)
         score = state.impressions["peer-1"].score
         # 0.00001 + 0.00002 = 0.00003, rounded to 4 dp = 0.0
         report("4 decimal places", len(str(score).split(".")[-1]) <= 4,
@@ -214,44 +236,38 @@ async def test_adjust_trust_rounding() -> None:
 
 async def test_wallet_derivation_determinism() -> None:
     """Same key produces same wallet address twice."""
-    import server
-
-    if not server.SOLANA_AVAILABLE:
+    if not SOLANA_AVAILABLE:
         report("wallet derivation determinism (skipped — solana not installed)", True)
         return
 
-    priv, _ = server._generate_keypair()
-    addr1 = server._get_solana_wallet_address(priv)
-    addr2 = server._get_solana_wallet_address(priv)
+    priv, _ = generate_keypair()
+    addr1 = _get_solana_wallet_address(priv)
+    addr2 = _get_solana_wallet_address(priv)
     report("deterministic derivation", addr1 == addr2, f"{addr1} vs {addr2}")
 
 
 async def test_wallet_derivation_different_keys() -> None:
     """Different keys produce different wallets."""
-    import server
-
-    if not server.SOLANA_AVAILABLE:
+    if not SOLANA_AVAILABLE:
         report("different keys -> different wallets (skipped)", True)
         return
 
-    priv1, _ = server._generate_keypair()
-    priv2, _ = server._generate_keypair()
-    addr1 = server._get_solana_wallet_address(priv1)
-    addr2 = server._get_solana_wallet_address(priv2)
+    priv1, _ = generate_keypair()
+    priv2, _ = generate_keypair()
+    addr1 = _get_solana_wallet_address(priv1)
+    addr2 = _get_solana_wallet_address(priv2)
     report("different keys -> different wallets", addr1 != addr2,
            f"both: {addr1}")
 
 
 async def test_wallet_address_valid_base58() -> None:
     """Wallet address is valid base58 format."""
-    import server
-
-    if not server.SOLANA_AVAILABLE:
+    if not SOLANA_AVAILABLE:
         report("valid base58 address (skipped)", True)
         return
 
-    priv, _ = server._generate_keypair()
-    addr = server._get_solana_wallet_address(priv)
+    priv, _ = generate_keypair()
+    addr = _get_solana_wallet_address(priv)
     valid_chars = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
     is_valid = 32 <= len(addr) <= 44 and all(c in valid_chars for c in addr)
     report("valid base58 address", is_valid, f"got: {addr!r} (len={len(addr)})")
@@ -259,12 +275,10 @@ async def test_wallet_address_valid_base58() -> None:
 
 async def test_resolve_spl_token_known() -> None:
     """_resolve_spl_token resolves DM, USDC, USDT; unknown returns None."""
-    import server
-
-    dm = server._resolve_spl_token("DM")
-    usdc = server._resolve_spl_token("usdc")
-    usdt = server._resolve_spl_token("USDT")
-    unknown = server._resolve_spl_token("NOPE")
+    dm = _resolve_spl_token("DM")
+    usdc = _resolve_spl_token("usdc")
+    usdt = _resolve_spl_token("USDT")
+    unknown = _resolve_spl_token("NOPE")
 
     report("DM resolves", dm is not None and dm[0] == "5DxioZwEeAKpBaYC5veTHArKE55qRDSmb5RZ6VwApump",
            f"got: {dm}")
@@ -275,10 +289,8 @@ async def test_resolve_spl_token_known() -> None:
 
 
 async def test_antimatter_signal_round_trip() -> None:
-    """_antimatter_signal_to_dict -> _antimatter_signal_from_dict preserves all fields."""
-    import server
-
-    sig = server.AntiMatterSignal(
+    """antimatter_signal_to_dict -> antimatter_signal_from_dict preserves all fields."""
+    sig = AntiMatterSignal(
         signal_id="am-test123",
         original_tx="tx-abc",
         sender_agent_id="sender-1",
@@ -293,8 +305,8 @@ async def test_antimatter_signal_round_trip() -> None:
         path=["a", "b", "c"],
     )
 
-    d = server._antimatter_signal_to_dict(sig)
-    restored = server._antimatter_signal_from_dict(d)
+    d = antimatter_signal_to_dict(sig)
+    restored = antimatter_signal_from_dict(d)
 
     checks = [
         ("signal_id", sig.signal_id, restored.signal_id),
@@ -318,9 +330,7 @@ async def test_antimatter_signal_round_trip() -> None:
 
 
 async def test_elder_selection_picks_qualified() -> None:
-    """_select_elder picks older peer with positive trust and wallet."""
-    import server
-
+    """select_elder picks older peer with positive trust and wallet."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
@@ -330,16 +340,16 @@ async def test_elder_selection_picks_qualified() -> None:
 
         # Add a qualified elder: older, positive trust, has wallet
         elder_id = "elder-" + uuid.uuid4().hex[:8]
-        state.connections[elder_id] = server.Connection(
+        state.connections[elder_id] = Connection(
             agent_id=elder_id,
             agent_url="http://localhost:9901/mcp",
             agent_bio="Elder agent",
             wallets={"solana": "FakeWallet1111111111111111111111111111111111"},
             peer_created_at=(now - timedelta(days=30)).isoformat(),
         )
-        state.impressions[elder_id] = server.Impression(score=0.5)
+        state.impressions[elder_id] = Impression(score=0.5)
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-test",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -351,7 +361,7 @@ async def test_elder_selection_picks_qualified() -> None:
             path=[],
         )
 
-        selected = server._select_elder(state, sig)
+        selected = select_elder(state, sig)
         report("elder selected", selected is not None and selected.agent_id == elder_id,
                f"got: {selected.agent_id if selected else None}")
     finally:
@@ -360,9 +370,7 @@ async def test_elder_selection_picks_qualified() -> None:
 
 
 async def test_elder_excludes_agents_in_path() -> None:
-    """_select_elder excludes agents already in sig.path (loop prevention)."""
-    import server
-
+    """select_elder excludes agents already in sig.path (loop prevention)."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
@@ -370,17 +378,17 @@ async def test_elder_excludes_agents_in_path() -> None:
         state.created_at = now.isoformat()
 
         elder_id = "elder-" + uuid.uuid4().hex[:8]
-        state.connections[elder_id] = server.Connection(
+        state.connections[elder_id] = Connection(
             agent_id=elder_id,
             agent_url="http://localhost:9901/mcp",
             agent_bio="Elder agent",
             wallets={"solana": "FakeWallet1111111111111111111111111111111111"},
             peer_created_at=(now - timedelta(days=30)).isoformat(),
         )
-        state.impressions[elder_id] = server.Impression(score=0.5)
+        state.impressions[elder_id] = Impression(score=0.5)
 
         # Elder is already in path
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-test",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -392,7 +400,7 @@ async def test_elder_excludes_agents_in_path() -> None:
             path=[elder_id],
         )
 
-        selected = server._select_elder(state, sig)
+        selected = select_elder(state, sig)
         report("elder excluded (in path)", selected is None,
                f"got: {selected.agent_id if selected else None}")
     finally:
@@ -401,9 +409,7 @@ async def test_elder_excludes_agents_in_path() -> None:
 
 
 async def test_elder_excludes_younger_peers() -> None:
-    """_select_elder excludes peers younger than us."""
-    import server
-
+    """select_elder excludes peers younger than us."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
@@ -411,16 +417,16 @@ async def test_elder_excludes_younger_peers() -> None:
         state.created_at = (now - timedelta(days=60)).isoformat()  # we are old
 
         young_id = "young-" + uuid.uuid4().hex[:8]
-        state.connections[young_id] = server.Connection(
+        state.connections[young_id] = Connection(
             agent_id=young_id,
             agent_url="http://localhost:9901/mcp",
             agent_bio="Young agent",
             wallets={"solana": "FakeWallet1111111111111111111111111111111111"},
             peer_created_at=(now - timedelta(days=1)).isoformat(),  # younger than us
         )
-        state.impressions[young_id] = server.Impression(score=0.5)
+        state.impressions[young_id] = Impression(score=0.5)
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-test",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -432,7 +438,7 @@ async def test_elder_excludes_younger_peers() -> None:
             path=[],
         )
 
-        selected = server._select_elder(state, sig)
+        selected = select_elder(state, sig)
         report("younger peer excluded", selected is None,
                f"got: {selected.agent_id if selected else None}")
     finally:
@@ -441,13 +447,11 @@ async def test_elder_excludes_younger_peers() -> None:
 
 
 async def test_elder_returns_none_when_empty() -> None:
-    """_select_elder returns None with no connections."""
-    import server
-
+    """select_elder returns None with no connections."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-test",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -458,7 +462,7 @@ async def test_elder_returns_none_when_empty() -> None:
             callback_url="http://localhost:9900/__darkmatter__/antimatter_result",
             path=[],
         )
-        selected = server._select_elder(state, sig)
+        selected = select_elder(state, sig)
         report("returns None (no connections)", selected is None,
                f"got: {selected}")
     finally:
@@ -468,8 +472,6 @@ async def test_elder_returns_none_when_empty() -> None:
 
 async def test_elder_weighted_selection() -> None:
     """High trust*age peer is selected more often (statistical, 200 runs)."""
-    import server
-
     path = make_state_file()
     try:
         _, state = create_agent(path)
@@ -478,27 +480,27 @@ async def test_elder_weighted_selection() -> None:
 
         # High weight elder: very old + high trust
         high_id = "high-" + uuid.uuid4().hex[:8]
-        state.connections[high_id] = server.Connection(
+        state.connections[high_id] = Connection(
             agent_id=high_id,
             agent_url="http://localhost:9901/mcp",
             agent_bio="High weight elder",
             wallets={"solana": "FakeWallet1111111111111111111111111111111111"},
             peer_created_at=(now - timedelta(days=365)).isoformat(),
         )
-        state.impressions[high_id] = server.Impression(score=0.9)
+        state.impressions[high_id] = Impression(score=0.9)
 
         # Low weight elder: slightly old + low trust
         low_id = "low-" + uuid.uuid4().hex[:8]
-        state.connections[low_id] = server.Connection(
+        state.connections[low_id] = Connection(
             agent_id=low_id,
             agent_url="http://localhost:9902/mcp",
             agent_bio="Low weight elder",
             wallets={"solana": "FakeWallet2222222222222222222222222222222222"},
             peer_created_at=(now - timedelta(days=2)).isoformat(),
         )
-        state.impressions[low_id] = server.Impression(score=0.1)
+        state.impressions[low_id] = Impression(score=0.1)
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-test",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -512,7 +514,7 @@ async def test_elder_weighted_selection() -> None:
 
         counts = {high_id: 0, low_id: 0}
         for _ in range(200):
-            selected = server._select_elder(state, sig)
+            selected = select_elder(state, sig)
             if selected:
                 counts[selected.agent_id] += 1
 
@@ -525,15 +527,13 @@ async def test_elder_weighted_selection() -> None:
 
 
 async def test_antimatter_log_caps_at_100() -> None:
-    """_log_antimatter_event evicts oldest entries when over ANTIMATTER_LOG_MAX."""
-    import server
-
+    """log_antimatter_event evicts oldest entries when over ANTIMATTER_LOG_MAX."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
         # Fill with 100 entries
         for i in range(105):
-            server._log_antimatter_event(state, {"type": "test", "index": i})
+            log_antimatter_event(state, {"type": "test", "index": i})
 
         report("antimatter_log capped at 100", len(state.antimatter_log) == 100,
                f"got: {len(state.antimatter_log)}")
@@ -546,14 +546,12 @@ async def test_antimatter_log_caps_at_100() -> None:
 
 
 async def test_antimatter_log_adds_timestamp() -> None:
-    """_log_antimatter_event adds ISO timestamp."""
-    import server
-
+    """log_antimatter_event adds ISO timestamp."""
     path = make_state_file()
     try:
         _, state = create_agent(path)
         event = {"type": "test"}
-        server._log_antimatter_event(state, event)
+        log_antimatter_event(state, event)
         report("timestamp added", "timestamp" in state.antimatter_log[-1],
                f"keys: {list(state.antimatter_log[-1].keys())}")
         # Verify it parses as ISO
@@ -575,8 +573,6 @@ async def test_antimatter_log_adds_timestamp() -> None:
 
 async def test_antimatter_match_valid() -> None:
     """POST antimatter_match with valid n returns pick in [0, n]."""
-    import server
-
     path = make_state_file()
     try:
         app, state = create_agent(path)
@@ -601,8 +597,6 @@ async def test_antimatter_match_valid() -> None:
 
 async def test_antimatter_match_rejects_invalid_n() -> None:
     """antimatter_match rejects n=0, n=-1, missing n."""
-    import server
-
     path = make_state_file()
     try:
         app, state = create_agent(path)
@@ -623,16 +617,16 @@ async def test_antimatter_match_rejects_invalid_n() -> None:
 
 async def test_antimatter_signal_accepts_valid() -> None:
     """antimatter_signal endpoint accepts valid signal (match game monkeypatched)."""
-    import server
+    import darkmatter.wallet.antimatter as _am
 
     path = make_state_file()
     try:
         app, state = create_agent(path)
         use_agent(state)
 
-        # Monkeypatch _run_antimatter_match to no-op
-        orig = server._run_antimatter_match
-        server._run_antimatter_match = lambda *a, **kw: asyncio.sleep(0)
+        # Monkeypatch run_antimatter_match to no-op
+        orig = _am.run_antimatter_match
+        _am.run_antimatter_match = lambda *a, **kw: asyncio.sleep(0)
         try:
             payload = {
                 "signal_id": "am-test-sig",
@@ -653,7 +647,7 @@ async def test_antimatter_signal_accepts_valid() -> None:
             report("antimatter_signal accepted (200)", resp.status_code == 200,
                    f"got: {resp.status_code}")
         finally:
-            server._run_antimatter_match = orig
+            _am.run_antimatter_match = orig
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -661,8 +655,6 @@ async def test_antimatter_signal_accepts_valid() -> None:
 
 async def test_antimatter_signal_rejects_expired_hops() -> None:
     """antimatter_signal rejects signal where hops >= max_hops."""
-    import server
-
     path = make_state_file()
     try:
         app, state = create_agent(path)
@@ -693,8 +685,6 @@ async def test_antimatter_signal_rejects_expired_hops() -> None:
 
 async def test_antimatter_signal_rejects_loop() -> None:
     """antimatter_signal rejects signal where our agent_id is in path."""
-    import server
-
     path = make_state_file()
     try:
         app, state = create_agent(path)
@@ -727,7 +717,8 @@ async def test_antimatter_signal_rejects_loop() -> None:
 
 async def test_antimatter_result_resolves_known_signal() -> None:
     """antimatter_result resolves a known antimatter_initiated signal -> antimatter_sent logged."""
-    import server
+    import darkmatter.wallet.solana as _sol
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
@@ -737,7 +728,7 @@ async def test_antimatter_result_resolves_known_signal() -> None:
         signal_id = "am-known-1"
 
         # Insert a antimatter_initiated log entry
-        server._log_antimatter_event(state, {
+        log_antimatter_event(state, {
             "type": "antimatter_initiated",
             "signal_id": signal_id,
             "amount": 0.005,
@@ -746,14 +737,14 @@ async def test_antimatter_result_resolves_known_signal() -> None:
         })
 
         # Mock send_solana_sol to succeed
-        orig = server.send_solana_sol
+        orig = _sol.send_solana_sol
         async def mock_send_success(*a, **kw):
             return {"success": True, "tx_signature": "mock-tx-123"}
-        server.send_solana_sol = mock_send_success
+        _sol.send_solana_sol = mock_send_success
 
         # Mock save_state to no-op
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
 
         try:
             async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -771,8 +762,8 @@ async def test_antimatter_result_resolves_known_signal() -> None:
             report("antimatter_sent logged", len(antimatter_sent) == 1,
                    f"antimatter_sent entries: {len(antimatter_sent)}")
         finally:
-            server.send_solana_sol = orig
-            server.save_state = orig_save
+            _sol.send_solana_sol = orig
+            _state_mod.save_state = orig_save
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -780,7 +771,7 @@ async def test_antimatter_result_resolves_known_signal() -> None:
 
 async def test_antimatter_result_idempotent() -> None:
     """Same signal_id twice -> already_resolved."""
-    import server
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
@@ -790,20 +781,20 @@ async def test_antimatter_result_idempotent() -> None:
         signal_id = "am-idem-1"
 
         # Insert antimatter_initiated + antimatter_sent (already resolved)
-        server._log_antimatter_event(state, {
+        log_antimatter_event(state, {
             "type": "antimatter_initiated",
             "signal_id": signal_id,
             "amount": 0.005,
             "token": "SOL",
         })
-        server._log_antimatter_event(state, {
+        log_antimatter_event(state, {
             "type": "antimatter_sent",
             "signal_id": signal_id,
             "resolution": "match",
         })
 
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
         try:
             async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 resp = await client.post("/__darkmatter__/antimatter_result", json={
@@ -816,7 +807,7 @@ async def test_antimatter_result_idempotent() -> None:
             report("idempotent -> already_resolved", resp.json().get("status") == "already_resolved",
                    f"got: {resp.json()}")
         finally:
-            server.save_state = orig_save
+            _state_mod.save_state = orig_save
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -824,7 +815,9 @@ async def test_antimatter_result_idempotent() -> None:
 
 async def test_match_game_guaranteed_match_resolves_to_elder() -> None:
     """Monkeypatch random to force match -> antimatter resolved via elder."""
-    import server
+    import darkmatter.wallet.antimatter as _am
+    import darkmatter.wallet.solana as _sol
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
@@ -835,18 +828,18 @@ async def test_match_game_guaranteed_match_resolves_to_elder() -> None:
 
         # Add elder connection
         elder_id = "elder-match-" + uuid.uuid4().hex[:8]
-        state.connections[elder_id] = server.Connection(
+        state.connections[elder_id] = Connection(
             agent_id=elder_id,
             agent_url="http://localhost:9901/mcp",
             agent_bio="Elder",
             wallets={"solana": "ElderWallet111111111111111111111111111111111"},
             peer_created_at=(now - timedelta(days=30)).isoformat(),
         )
-        state.impressions[elder_id] = server.Impression(score=0.5)
+        state.impressions[elder_id] = Impression(score=0.5)
 
         # Add a peer for the match game (not elder — just a participant)
         peer_id = "peer-" + uuid.uuid4().hex[:8]
-        state.connections[peer_id] = server.Connection(
+        state.connections[peer_id] = Connection(
             agent_id=peer_id,
             agent_url="http://localhost:9902/mcp",
             agent_bio="Peer",
@@ -854,7 +847,7 @@ async def test_match_game_guaranteed_match_resolves_to_elder() -> None:
             peer_created_at=(now + timedelta(days=1)).isoformat(),  # younger (not elder)
         )
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-match-force",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -867,48 +860,47 @@ async def test_match_game_guaranteed_match_resolves_to_elder() -> None:
             path=[],
         )
 
-        # Force random.randint to always return 0 (guaranteeing match)
+        # Force random.randint to always return 0
         orig_randint = _random.randint
         _random.randint = lambda a, b: 0
 
         # Mock send_solana_sol
         send_calls = []
-        orig_send = server.send_solana_sol
+        orig_send = _sol.send_solana_sol
         async def mock_send(*a, **kw):
             send_calls.append((a, kw))
             return {"success": True, "tx_signature": "mock-tx"}
-        server.send_solana_sol = mock_send
+        _sol.send_solana_sol = mock_send
 
         # Mock save_state
-        orig_save = server.save_state
-        server.save_state = lambda: None
-
-        # Mock the peer query (returns pick=0 -> match!)
-        orig_query = None  # We need to mock httpx calls from _run_antimatter_match
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
 
         try:
-            # Use process_antimatter_match directly to simulate peer response
-            # Instead, let's call _run_antimatter_match with mocked peer queries
-            # by monkeypatching httpx.AsyncClient
-            import httpx as _httpx
+            # Mock _network_send_fn to simulate commit-reveal peer
+            peer_pick = 0
+            peer_nonce = secrets.token_bytes(32)
+            peer_commitment = hashlib.sha256(peer_pick.to_bytes(4, "big") + peer_nonce).hexdigest()
 
-            class MockResponse:
-                status_code = 200
-                def json(self):
-                    return {"pick": 0}
+            async def mock_network_send(agent_id, path, payload):
+                if payload.get("phase") == "commit":
+                    return SendResult(
+                        success=True,
+                        transport_name="mock",
+                        response={"peer_commitment": peer_commitment, "session_token": "mock-session"},
+                    )
+                elif payload.get("phase") == "reveal":
+                    return SendResult(
+                        success=True,
+                        transport_name="mock",
+                        response={"peer_pick": peer_pick, "peer_nonce": peer_nonce.hex()},
+                    )
+                return SendResult(success=True, transport_name="mock", response={})
 
-            class MockClient:
-                async def __aenter__(self):
-                    return self
-                async def __aexit__(self, *a):
-                    pass
-                async def post(self, url, **kw):
-                    return MockResponse()
+            orig_network_send = _am._network_send_fn
+            _am._network_send_fn = mock_network_send
 
-            orig_async_client = _httpx.AsyncClient
-            _httpx.AsyncClient = lambda **kw: MockClient()
-
-            await server._run_antimatter_match(state, sig, is_originator=True)
+            await run_antimatter_match(state, sig, is_originator=True)
 
             antimatter_sent = [e for e in state.antimatter_log if e.get("type") == "antimatter_sent"]
             report("match resolves to elder",
@@ -916,9 +908,9 @@ async def test_match_game_guaranteed_match_resolves_to_elder() -> None:
                    f"antimatter_sent: {antimatter_sent}")
         finally:
             _random.randint = orig_randint
-            server.send_solana_sol = orig_send
-            server.save_state = orig_save
-            _httpx.AsyncClient = orig_async_client
+            _sol.send_solana_sol = orig_send
+            _state_mod.save_state = orig_save
+            _am._network_send_fn = orig_network_send
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -926,7 +918,8 @@ async def test_match_game_guaranteed_match_resolves_to_elder() -> None:
 
 async def test_match_game_no_match_forwards_to_elder() -> None:
     """Monkeypatch random to force no-match -> signal forwarded to elder."""
-    import server
+    import darkmatter.wallet.antimatter as _am
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
@@ -937,18 +930,18 @@ async def test_match_game_no_match_forwards_to_elder() -> None:
 
         # Add elder
         elder_id = "elder-fwd-" + uuid.uuid4().hex[:8]
-        state.connections[elder_id] = server.Connection(
+        state.connections[elder_id] = Connection(
             agent_id=elder_id,
             agent_url="http://localhost:9901/mcp",
             agent_bio="Elder",
             wallets={"solana": "ElderWallet111111111111111111111111111111111"},
             peer_created_at=(now - timedelta(days=30)).isoformat(),
         )
-        state.impressions[elder_id] = server.Impression(score=0.5)
+        state.impressions[elder_id] = Impression(score=0.5)
 
         # Add peer for match game
         peer_id = "peer-" + uuid.uuid4().hex[:8]
-        state.connections[peer_id] = server.Connection(
+        state.connections[peer_id] = Connection(
             agent_id=peer_id,
             agent_url="http://localhost:9902/mcp",
             agent_bio="Peer",
@@ -956,7 +949,7 @@ async def test_match_game_no_match_forwards_to_elder() -> None:
             peer_created_at=(now + timedelta(days=1)).isoformat(),
         )
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-nomatch-fwd",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -969,47 +962,49 @@ async def test_match_game_no_match_forwards_to_elder() -> None:
             path=[],
         )
 
-        # Force no match: our pick=0, peer pick=1
-        call_count = [0]
+        # Force no match via commit-reveal XOR protocol
+        # n=2 (elder + peer), orchestrator pick=0, peer pick=1
+        # Elder fails commit → excluded from XOR
+        # combined = 0 XOR 1 = 1, 1 % 3 != 0 → no match
         orig_randint = _random.randint
-        def rigged_randint(a, b):
-            call_count[0] += 1
-            return 0  # our pick is always 0
-        _random.randint = rigged_randint
+        _random.randint = lambda a, b: 0  # orchestrator pick = 0
 
-        # Mock httpx — peer returns pick=1 (no match), elder returns 200 for forward
-        import httpx as _httpx
+        # Pre-generate peer's commit with pick=1
+        peer_pick_val = 1
+        peer_nonce_bytes = secrets.token_bytes(32)
+        peer_commit_hex = hashlib.sha256(peer_pick_val.to_bytes(4, "big") + peer_nonce_bytes).hexdigest()
+
         forwarded_to = []
 
-        class MockResponse:
-            status_code = 200
-            def json(self):
-                return {"pick": 1}  # peer pick != 0 -> no match
+        async def mock_network_send(agent_id, path_str, payload):
+            if "antimatter_signal" in path_str:
+                forwarded_to.append(agent_id)
+                return SendResult(success=True, transport_name="mock", response={"accepted": True})
+            if payload.get("phase") == "commit":
+                # Elder (first in connections) fails commit to be excluded from XOR
+                if agent_id == elder_id:
+                    return SendResult(success=False, transport_name="mock", error="fail")
+                return SendResult(
+                    success=True,
+                    transport_name="mock",
+                    response={"peer_commitment": peer_commit_hex, "session_token": "mock-sess-fwd"},
+                )
+            elif payload.get("phase") == "reveal":
+                return SendResult(
+                    success=True,
+                    transport_name="mock",
+                    response={"peer_pick": peer_pick_val, "peer_nonce": peer_nonce_bytes.hex()},
+                )
+            return SendResult(success=True, transport_name="mock", response={})
 
-        class MockForwardResponse:
-            status_code = 200
-            def json(self):
-                return {"accepted": True}
+        orig_network_send = _am._network_send_fn
+        _am._network_send_fn = mock_network_send
 
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *a):
-                pass
-            async def post(self, url, **kw):
-                if "antimatter_signal" in url:
-                    forwarded_to.append(url)
-                    return MockForwardResponse()
-                return MockResponse()
-
-        orig_async_client = _httpx.AsyncClient
-        _httpx.AsyncClient = lambda **kw: MockClient()
-
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
 
         try:
-            await server._run_antimatter_match(state, sig, is_originator=True)
+            await run_antimatter_match(state, sig, is_originator=True)
 
             forwarded = [e for e in state.antimatter_log if e.get("type") == "forwarded"]
             report("no match -> forwarded to elder",
@@ -1017,8 +1012,8 @@ async def test_match_game_no_match_forwards_to_elder() -> None:
                    f"forwarded: {forwarded}")
         finally:
             _random.randint = orig_randint
-            _httpx.AsyncClient = orig_async_client
-            server.save_state = orig_save
+            _am._network_send_fn = orig_network_send
+            _state_mod.save_state = orig_save
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -1026,14 +1021,14 @@ async def test_match_game_no_match_forwards_to_elder() -> None:
 
 async def test_match_game_no_peers_terminal() -> None:
     """Zero connections -> antimatter_kept log entry (terminal)."""
-    import server
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
         _, state = create_agent(path)
         use_agent(state)
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-terminal",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -1046,15 +1041,15 @@ async def test_match_game_no_peers_terminal() -> None:
             path=[],
         )
 
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
         try:
-            await server._run_antimatter_match(state, sig, is_originator=True)
+            await run_antimatter_match(state, sig, is_originator=True)
             kept = [e for e in state.antimatter_log if e.get("type") == "antimatter_kept"]
             report("no peers -> antimatter_kept", len(kept) == 1,
                    f"antimatter_log types: {[e.get('type') for e in state.antimatter_log]}")
         finally:
-            server.save_state = orig_save
+            _state_mod.save_state = orig_save
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -1062,14 +1057,15 @@ async def test_match_game_no_peers_terminal() -> None:
 
 async def test_match_game_ttl_exceeded() -> None:
     """hops >= max_hops -> timeout resolution."""
-    import server
+    import darkmatter.wallet.solana as _sol
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
         _, state = create_agent(path)
         use_agent(state)
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-ttl",
             original_tx="tx-1",
             sender_agent_id="sender-1",
@@ -1085,21 +1081,219 @@ async def test_match_game_ttl_exceeded() -> None:
         )
 
         # Mock send_solana_sol (timeout sends to superagent wallet)
-        orig_send = server.send_solana_sol
+        orig_send = _sol.send_solana_sol
         async def mock_send(*a, **kw):
             return {"success": True, "tx_signature": "mock-tx"}
-        server.send_solana_sol = mock_send
+        _sol.send_solana_sol = mock_send
 
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
         try:
-            await server._run_antimatter_match(state, sig, is_originator=True)
+            await run_antimatter_match(state, sig, is_originator=True)
             sent = [e for e in state.antimatter_log if e.get("type") == "antimatter_sent" and e.get("resolution") == "timeout"]
             report("TTL exceeded -> timeout", len(sent) == 1,
                    f"antimatter_log types: {[e.get('type') for e in state.antimatter_log]}")
         finally:
-            server.send_solana_sol = orig_send
-            server.save_state = orig_save
+            _sol.send_solana_sol = orig_send
+            _state_mod.save_state = orig_save
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+async def test_commit_reveal_round_trip() -> None:
+    """Commit-reveal protocol: commit returns commitment+token, reveal returns pick+nonce."""
+    path = make_state_file()
+    try:
+        app, state = create_agent(path)
+        use_agent(state)
+
+        # Phase 1: Commit
+        orch_pick = 2
+        orch_nonce = secrets.token_bytes(32)
+        orch_commitment = hashlib.sha256(orch_pick.to_bytes(4, "big") + orch_nonce).hexdigest()
+
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            commit_resp = await client.post("/__darkmatter__/antimatter_match", json={
+                "phase": "commit",
+                "signal_id": "cr-test",
+                "n": 5,
+                "orchestrator_commitment": orch_commitment,
+            })
+
+        report("commit returns 200", commit_resp.status_code == 200,
+               f"got: {commit_resp.status_code}")
+        commit_data = commit_resp.json()
+        peer_commitment = commit_data.get("peer_commitment")
+        session_token = commit_data.get("session_token")
+        report("commit has peer_commitment", peer_commitment is not None, f"got: {commit_data}")
+        report("commit has session_token", session_token is not None, f"got: {commit_data}")
+
+        # Phase 2: Reveal
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            reveal_resp = await client.post("/__darkmatter__/antimatter_match", json={
+                "phase": "reveal",
+                "session_token": session_token,
+                "orchestrator_pick": orch_pick,
+                "orchestrator_nonce": orch_nonce.hex(),
+            })
+
+        report("reveal returns 200", reveal_resp.status_code == 200,
+               f"got: {reveal_resp.status_code}")
+        reveal_data = reveal_resp.json()
+        peer_pick = reveal_data.get("peer_pick")
+        peer_nonce_hex = reveal_data.get("peer_nonce")
+        report("reveal has peer_pick", peer_pick is not None, f"got: {reveal_data}")
+        report("peer_pick in [0, 5]", peer_pick is not None and 0 <= peer_pick <= 5,
+               f"got: {peer_pick}")
+
+        # Verify peer's commitment
+        if peer_commitment and peer_pick is not None and peer_nonce_hex:
+            valid = verify_commitment(peer_commitment, peer_pick, peer_nonce_hex)
+            report("peer commitment verifies", valid, "commitment mismatch")
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+async def test_commit_reveal_bad_orchestrator_commitment() -> None:
+    """Reveal with wrong orchestrator commitment is rejected."""
+    path = make_state_file()
+    try:
+        app, state = create_agent(path)
+        use_agent(state)
+
+        # Phase 1: Commit with a real commitment
+        orch_commitment = hashlib.sha256(b"\x00\x00\x00\x02" + secrets.token_bytes(32)).hexdigest()
+
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            commit_resp = await client.post("/__darkmatter__/antimatter_match", json={
+                "phase": "commit",
+                "signal_id": "cr-bad",
+                "n": 5,
+                "orchestrator_commitment": orch_commitment,
+            })
+        session_token = commit_resp.json().get("session_token")
+
+        # Phase 2: Reveal with WRONG pick (send 3 instead of 2)
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            reveal_resp = await client.post("/__darkmatter__/antimatter_match", json={
+                "phase": "reveal",
+                "session_token": session_token,
+                "orchestrator_pick": 3,
+                "orchestrator_nonce": secrets.token_hex(32),
+            })
+
+        report("bad commitment -> 400", reveal_resp.status_code == 400,
+               f"got: {reveal_resp.status_code}")
+        report("error mentions verification", "verification" in reveal_resp.json().get("error", "").lower(),
+               f"got: {reveal_resp.json()}")
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+async def test_commit_reveal_expired_session() -> None:
+    """Reveal with unknown/expired session token is rejected."""
+    path = make_state_file()
+    try:
+        app, state = create_agent(path)
+        use_agent(state)
+
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            reveal_resp = await client.post("/__darkmatter__/antimatter_match", json={
+                "phase": "reveal",
+                "session_token": "nonexistent-token",
+                "orchestrator_pick": 0,
+                "orchestrator_nonce": secrets.token_hex(32),
+            })
+
+        report("expired session -> 400", reveal_resp.status_code == 400,
+               f"got: {reveal_resp.status_code}")
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+async def test_commit_reveal_peer_dropout_at_commit() -> None:
+    """Peer fails at commit phase -> excluded, game continues as terminal if all fail."""
+    import darkmatter.wallet.antimatter as _am
+    import darkmatter.state as _state_mod
+
+    path = make_state_file()
+    try:
+        _, state = create_agent(path)
+        use_agent(state)
+        now = datetime.now(timezone.utc)
+        state.created_at = now.isoformat()
+
+        # Add one peer that will fail at commit
+        peer_id = "peer-dropout-" + uuid.uuid4().hex[:8]
+        state.connections[peer_id] = Connection(
+            agent_id=peer_id,
+            agent_url="http://localhost:9999/mcp",
+            agent_bio="Peer",
+            wallets={"solana": "PeerWallet1111111111111111111111111111111111"},
+            peer_created_at=(now + timedelta(days=1)).isoformat(),
+        )
+
+        sig = AntiMatterSignal(
+            signal_id="am-dropout-commit",
+            original_tx="tx-1",
+            sender_agent_id="sender-1",
+            amount=0.005,
+            token="SOL",
+            token_decimals=9,
+            sender_superagent_wallet="",
+            callback_url="http://test/__darkmatter__/antimatter_result",
+            created_at=now.isoformat(),
+            path=[],
+        )
+
+        # Mock _network_send_fn to always fail
+        async def mock_network_send_fail(agent_id, path_str, payload):
+            raise ConnectionError("peer down")
+
+        orig_network_send = _am._network_send_fn
+        _am._network_send_fn = mock_network_send_fail
+
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
+        try:
+            await run_antimatter_match(state, sig, is_originator=True)
+            kept = [e for e in state.antimatter_log if e.get("type") == "antimatter_kept"]
+            report("all peers fail commit -> terminal",
+                   len(kept) == 1,
+                   f"antimatter_log: {[e.get('type') for e in state.antimatter_log]}")
+        finally:
+            _am._network_send_fn = orig_network_send
+            _state_mod.save_state = orig_save
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+async def test_legacy_match_backward_compat() -> None:
+    """Request without 'phase' key uses legacy stateless random pick."""
+    path = make_state_file()
+    try:
+        app, state = create_agent(path)
+        use_agent(state)
+
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/__darkmatter__/antimatter_match", json={
+                "signal_id": "legacy-test",
+                "n": 5,
+            })
+
+        report("legacy returns 200", resp.status_code == 200,
+               f"got: {resp.status_code}")
+        data = resp.json()
+        pick = data.get("pick")
+        report("legacy pick in [0, 5]", pick is not None and 0 <= pick <= 5,
+               f"got: {pick}")
+        report("legacy has no session_token", "session_token" not in data,
+               f"got: {data}")
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -1107,14 +1301,15 @@ async def test_match_game_ttl_exceeded() -> None:
 
 async def test_initiate_antimatter_from_payment() -> None:
     """Payment message metadata triggers antimatter_initiated log entry."""
-    import server
+    import darkmatter.wallet.antimatter as _am
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
         _, state = create_agent(path)
         use_agent(state)
 
-        msg = server.QueuedMessage(
+        msg = QueuedMessage(
             message_id="msg-pay-1",
             content="payment",
             webhook="http://test/webhook",
@@ -1129,16 +1324,16 @@ async def test_initiate_antimatter_from_payment() -> None:
             from_agent_id="sender-1",
         )
 
-        # Mock _run_antimatter_match and _antimatter_timeout_watchdog
-        orig_match = server._run_antimatter_match
-        orig_watchdog = server._antimatter_timeout_watchdog
-        server._run_antimatter_match = lambda *a, **kw: asyncio.sleep(0)
-        server._antimatter_timeout_watchdog = lambda *a, **kw: asyncio.sleep(0)
+        # Mock run_antimatter_match and antimatter_timeout_watchdog
+        orig_match = _am.run_antimatter_match
+        orig_watchdog = _am.antimatter_timeout_watchdog
+        _am.run_antimatter_match = lambda *a, **kw: asyncio.sleep(0)
+        _am.antimatter_timeout_watchdog = lambda *a, **kw: asyncio.sleep(0)
 
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
         try:
-            await server._initiate_antimatter_from_payment(state, msg)
+            await initiate_antimatter_from_payment(state, msg)
             initiated = [e for e in state.antimatter_log if e.get("type") == "antimatter_initiated"]
             report("antimatter_initiated logged", len(initiated) == 1,
                    f"antimatter_log: {state.antimatter_log}")
@@ -1146,9 +1341,9 @@ async def test_initiate_antimatter_from_payment() -> None:
                 report("amount is 1% of payment", initiated[0].get("amount") == 0.01,
                        f"got: {initiated[0].get('amount')}")
         finally:
-            server._run_antimatter_match = orig_match
-            server._antimatter_timeout_watchdog = orig_watchdog
-            server.save_state = orig_save
+            _am.run_antimatter_match = orig_match
+            _am.antimatter_timeout_watchdog = orig_watchdog
+            _state_mod.save_state = orig_save
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -1156,14 +1351,15 @@ async def test_initiate_antimatter_from_payment() -> None:
 
 async def test_trust_boost_on_successful_gas() -> None:
     """Successful antimatter resolution boosts trust for sender and elder."""
-    import server
+    import darkmatter.wallet.solana as _sol
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
         _, state = create_agent(path)
         use_agent(state)
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-trust-boost",
             original_tx="tx-1",
             sender_agent_id="sender-trust",
@@ -1175,15 +1371,15 @@ async def test_trust_boost_on_successful_gas() -> None:
             path=[],
         )
 
-        orig_send = server.send_solana_sol
+        orig_send = _sol.send_solana_sol
         async def mock_send_success(*a, **kw):
             return {"success": True, "tx_signature": "mock-tx"}
-        server.send_solana_sol = mock_send_success
+        _sol.send_solana_sol = mock_send_success
 
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
         try:
-            await server._resolve_antimatter(state, sig, "match", "dest-wallet", is_originator=True, resolved_by="elder-trust")
+            await resolve_antimatter(state, sig, "match", "dest-wallet", is_originator=True, resolved_by="elder-trust")
 
             sender_imp = state.impressions.get("sender-trust")
             elder_imp = state.impressions.get("elder-trust")
@@ -1194,8 +1390,8 @@ async def test_trust_boost_on_successful_gas() -> None:
                    elder_imp is not None and elder_imp.score == 0.01,
                    f"got: {elder_imp}")
         finally:
-            server.send_solana_sol = orig_send
-            server.save_state = orig_save
+            _sol.send_solana_sol = orig_send
+            _state_mod.save_state = orig_save
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -1203,14 +1399,15 @@ async def test_trust_boost_on_successful_gas() -> None:
 
 async def test_no_trust_boost_on_failed_send() -> None:
     """Failed send_solana_sol -> impressions unchanged."""
-    import server
+    import darkmatter.wallet.solana as _sol
+    import darkmatter.state as _state_mod
 
     path = make_state_file()
     try:
         _, state = create_agent(path)
         use_agent(state)
 
-        sig = server.AntiMatterSignal(
+        sig = AntiMatterSignal(
             signal_id="am-trust-fail",
             original_tx="tx-1",
             sender_agent_id="sender-fail",
@@ -1222,15 +1419,15 @@ async def test_no_trust_boost_on_failed_send() -> None:
             path=[],
         )
 
-        orig_send = server.send_solana_sol
+        orig_send = _sol.send_solana_sol
         async def mock_send_fail(*a, **kw):
             return {"success": False, "error": "insufficient funds"}
-        server.send_solana_sol = mock_send_fail
+        _sol.send_solana_sol = mock_send_fail
 
-        orig_save = server.save_state
-        server.save_state = lambda: None
+        orig_save = _state_mod.save_state
+        _state_mod.save_state = lambda: None
         try:
-            await server._resolve_antimatter(state, sig, "match", "dest-wallet", is_originator=True, resolved_by="elder-fail")
+            await resolve_antimatter(state, sig, "match", "dest-wallet", is_originator=True, resolved_by="elder-fail")
 
             sender_imp = state.impressions.get("sender-fail")
             elder_imp = state.impressions.get("elder-fail")
@@ -1241,8 +1438,8 @@ async def test_no_trust_boost_on_failed_send() -> None:
                    elder_imp is None or elder_imp.score == 0.0,
                    f"got: {elder_imp}")
         finally:
-            server.send_solana_sol = orig_send
-            server.save_state = orig_save
+            _sol.send_solana_sol = orig_send
+            _state_mod.save_state = orig_save
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -1250,15 +1447,13 @@ async def test_no_trust_boost_on_failed_send() -> None:
 
 async def test_gather_peer_trust() -> None:
     """_gather_peer_trust aggregates scores from connected agents."""
-    import server
-
     path_a = make_state_file()
     path_b = make_state_file()
     path_c = make_state_file()
     path_d = make_state_file()
     try:
         app_a, state_a = create_agent(path_a, port=9900)
-        stashed_a = server._agent_state
+        stashed_a = get_state()
 
         # Create 3 peers — 2 will have opinions
         app_b, state_b = create_agent(path_b, port=9901)
@@ -1275,8 +1470,8 @@ async def test_gather_peer_trust() -> None:
 
         # Set impressions on B and C about a target agent
         target_id = "target-agent-xyz"
-        state_b.impressions[target_id] = server.Impression(score=0.8, note="good")
-        state_c.impressions[target_id] = server.Impression(score=0.4, note="ok")
+        state_b.impressions[target_id] = Impression(score=0.8, note="good")
+        state_c.impressions[target_id] = Impression(score=0.4, note="ok")
         # D has no impression of target
 
         # Mock httpx to simulate peer queries
@@ -1310,7 +1505,7 @@ async def test_gather_peer_trust() -> None:
         _httpx.AsyncClient = lambda **kw: MockClient()
 
         try:
-            result = await server._gather_peer_trust(stashed_a, target_id)
+            result = await _gather_peer_trust(stashed_a, target_id)
             report("peers_queried = 3", result.get("peers_queried") == 3,
                    f"got: {result.get('peers_queried')}")
             report("peers_with_opinion = 2", result.get("peers_with_opinion") == 2,
@@ -1333,7 +1528,6 @@ async def test_gather_peer_trust() -> None:
 
 async def airdrop_and_wait(pubkey_str: str, lamports: int = 1_000_000_000, timeout: int = 30):
     """Request devnet airdrop and poll until balance reflects it."""
-    import server
     from solders.pubkey import Pubkey as SolanaPubkey
     from solana.rpc.async_api import AsyncClient as SolanaClient
 
@@ -1352,17 +1546,15 @@ async def airdrop_and_wait(pubkey_str: str, lamports: int = 1_000_000_000, timeo
             await asyncio.sleep(2)
             resp = await client.get_balance(pubkey)
             if resp.value > init_balance:
-                return resp.value / server.LAMPORTS_PER_SOL
+                return resp.value / LAMPORTS_PER_SOL
         raise TimeoutError(f"Airdrop not confirmed after {timeout}s")
 
 
 async def test_devnet_fresh_wallet_zero_balance() -> None:
     """Fresh keypair -> balance query succeeds, returns 0."""
-    import server
-
-    priv, _ = server._generate_keypair()
-    addr = server._get_solana_wallet_address(priv)
-    result = await server.get_solana_balance({"solana": addr})
+    priv, _ = generate_keypair()
+    addr = _get_solana_wallet_address(priv)
+    result = await get_solana_balance({"solana": addr})
     report("balance query succeeds", result.get("success") is True,
            f"got: {result}")
     report("balance is 0", result.get("balance") == 0,
@@ -1371,10 +1563,8 @@ async def test_devnet_fresh_wallet_zero_balance() -> None:
 
 async def test_devnet_airdrop_balance() -> None:
     """Request 1 SOL airdrop, verify balance >= 1.0."""
-    import server
-
-    priv, _ = server._generate_keypair()
-    addr = server._get_solana_wallet_address(priv)
+    priv, _ = generate_keypair()
+    addr = _get_solana_wallet_address(priv)
 
     try:
         balance = await airdrop_and_wait(addr, 1_000_000_000, timeout=30)
@@ -1385,12 +1575,10 @@ async def test_devnet_airdrop_balance() -> None:
 
 async def test_devnet_sol_transfer() -> None:
     """Airdrop 2 SOL to sender, send 0.5 to recipient, verify both balances."""
-    import server
-
-    priv_sender, _ = server._generate_keypair()
-    priv_recv, _ = server._generate_keypair()
-    addr_sender = server._get_solana_wallet_address(priv_sender)
-    addr_recv = server._get_solana_wallet_address(priv_recv)
+    priv_sender, _ = generate_keypair()
+    priv_recv, _ = generate_keypair()
+    addr_sender = _get_solana_wallet_address(priv_sender)
+    addr_recv = _get_solana_wallet_address(priv_recv)
 
     try:
         await airdrop_and_wait(addr_sender, 2_000_000_000, timeout=30)
@@ -1398,32 +1586,30 @@ async def test_devnet_sol_transfer() -> None:
         report("SOL transfer (airdrop failed)", False, str(e))
         return
 
-    result = await server.send_solana_sol(priv_sender, {"solana": addr_sender}, addr_recv, 0.5)
+    result = await send_solana_sol(priv_sender, {"solana": addr_sender}, addr_recv, 0.5)
     report("transfer success", result.get("success") is True,
            f"got: {result}")
 
     if result.get("success"):
         await asyncio.sleep(3)  # wait for confirmation
-        recv_bal = await server.get_solana_balance({"solana": addr_recv})
+        recv_bal = await get_solana_balance({"solana": addr_recv})
         report("recipient received SOL", recv_bal.get("balance", 0) >= 0.49,
                f"balance: {recv_bal.get('balance')}")
 
-        send_bal = await server.get_solana_balance({"solana": addr_sender})
+        send_bal = await get_solana_balance({"solana": addr_sender})
         report("sender balance decreased", send_bal.get("balance", 2) < 2.0,
                f"balance: {send_bal.get('balance')}")
 
 
 async def test_devnet_insufficient_funds() -> None:
     """Fresh wallet (no airdrop), send 1 SOL -> success=false."""
-    import server
+    priv, _ = generate_keypair()
+    addr = _get_solana_wallet_address(priv)
 
-    priv, _ = server._generate_keypair()
-    addr = server._get_solana_wallet_address(priv)
+    priv_recv, _ = generate_keypair()
+    addr_recv = _get_solana_wallet_address(priv_recv)
 
-    priv_recv, _ = server._generate_keypair()
-    addr_recv = server._get_solana_wallet_address(priv_recv)
-
-    result = await server.send_solana_sol(priv, {"solana": addr}, addr_recv, 1.0)
+    result = await send_solana_sol(priv, {"solana": addr}, addr_recv, 1.0)
     report("insufficient funds -> failure", result.get("success") is False,
            f"got: {result}")
 
@@ -1433,17 +1619,15 @@ async def test_devnet_insufficient_funds() -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    import server
-
     print(f"\n{BOLD}DarkMatter Economy & Trust Test Suite{RESET}\n")
 
     # --- Tier 1: Pure In-Memory ---
     tier1_tests = [
-        ("1. _adjust_trust increment", test_adjust_trust_increment),
-        ("2. _adjust_trust preserves note", test_adjust_trust_preserves_note),
-        ("3. _adjust_trust clamps to 1.0", test_adjust_trust_clamps_upper),
-        ("4. _adjust_trust clamps to -1.0", test_adjust_trust_clamps_lower),
-        ("5. _adjust_trust rounding", test_adjust_trust_rounding),
+        ("1. adjust_trust increment", test_adjust_trust_increment),
+        ("2. adjust_trust preserves note", test_adjust_trust_preserves_note),
+        ("3. adjust_trust clamps to 1.0", test_adjust_trust_clamps_upper),
+        ("4. adjust_trust clamps to -1.0", test_adjust_trust_clamps_lower),
+        ("5. adjust_trust rounding", test_adjust_trust_rounding),
         ("6. Wallet derivation determinism", test_wallet_derivation_determinism),
         ("7. Different keys -> different wallets", test_wallet_derivation_different_keys),
         ("8. Wallet address valid base58", test_wallet_address_valid_base58),
@@ -1479,10 +1663,15 @@ async def main() -> None:
         ("26. Match game: no match -> forward", test_match_game_no_match_forwards_to_elder),
         ("27. Match game: no peers -> terminal", test_match_game_no_peers_terminal),
         ("28. Match game: TTL exceeded", test_match_game_ttl_exceeded),
-        ("29. _initiate_antimatter_from_payment", test_initiate_antimatter_from_payment),
-        ("30. Trust boost on success", test_trust_boost_on_successful_gas),
-        ("31. No trust boost on failure", test_no_trust_boost_on_failed_send),
-        ("32. _gather_peer_trust aggregation", test_gather_peer_trust),
+        ("29. Commit-reveal round-trip", test_commit_reveal_round_trip),
+        ("30. Bad orchestrator commitment", test_commit_reveal_bad_orchestrator_commitment),
+        ("31. Expired session token", test_commit_reveal_expired_session),
+        ("32. Peer dropout at commit", test_commit_reveal_peer_dropout_at_commit),
+        ("33. Legacy match backward compat", test_legacy_match_backward_compat),
+        ("34. initiate_antimatter_from_payment", test_initiate_antimatter_from_payment),
+        ("35. Trust boost on success", test_trust_boost_on_successful_gas),
+        ("36. No trust boost on failure", test_no_trust_boost_on_failed_send),
+        ("37. _gather_peer_trust aggregation", test_gather_peer_trust),
     ]
 
     print(f"\n\n{BOLD}Tier 2: ASGI Integration{RESET}")
@@ -1495,12 +1684,12 @@ async def main() -> None:
 
     # --- Tier 3: Solana Devnet (opt-in) ---
     run_devnet = os.environ.get("RUN_DEVNET_TESTS", "").strip() == "1"
-    if run_devnet and server.SOLANA_AVAILABLE:
+    if run_devnet and SOLANA_AVAILABLE:
         tier3_tests = [
-            ("33. Fresh wallet zero balance", test_devnet_fresh_wallet_zero_balance),
-            ("34. Airdrop + balance check", test_devnet_airdrop_balance),
-            ("35. SOL transfer", test_devnet_sol_transfer),
-            ("36. Insufficient funds", test_devnet_insufficient_funds),
+            ("38. Fresh wallet zero balance", test_devnet_fresh_wallet_zero_balance),
+            ("39. Airdrop + balance check", test_devnet_airdrop_balance),
+            ("40. SOL transfer", test_devnet_sol_transfer),
+            ("41. Insufficient funds", test_devnet_insufficient_funds),
         ]
 
         print(f"\n\n{BOLD}Tier 3: Solana Devnet{RESET}")
@@ -1510,7 +1699,7 @@ async def main() -> None:
                 await test_fn()
             except Exception as e:
                 report(label, False, f"EXCEPTION: {e}")
-    elif run_devnet and not server.SOLANA_AVAILABLE:
+    elif run_devnet and not SOLANA_AVAILABLE:
         print(f"\n\n{YELLOW}Tier 3: Skipped (solana/solders not installed){RESET}")
     else:
         print(f"\n\n{YELLOW}Tier 3: Skipped (set RUN_DEVNET_TESTS=1 to enable){RESET}")

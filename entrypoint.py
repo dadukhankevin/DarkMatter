@@ -30,14 +30,32 @@ def _is_ajax():
     return request.headers.get('X-Requested-With') == 'XMLHttpRequest'
 
 # ---------------------------------------------------------------------------
-# Import DarkMatter internals from server.py
+# Import DarkMatter internals from darkmatter/ package
 # ---------------------------------------------------------------------------
 
-_darkmatter_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".darkmatter")
-if _darkmatter_dir not in sys.path:
-    sys.path.insert(0, _darkmatter_dir)
-
-import server
+from darkmatter.app import init_state
+from darkmatter.state import get_state, set_state, save_state
+from darkmatter.models import AgentState, AgentStatus, Connection, SentMessage
+from darkmatter.identity import (
+    load_or_create_passport, sign_message, sign_peer_update,
+    sign_relay_poll, validate_url,
+)
+from darkmatter.config import (
+    PROTOCOL_VERSION, MAX_CONNECTIONS, MAX_BIO_LENGTH,
+    ANCHOR_NODES, SOLANA_AVAILABLE, SPL_TOKENS, ANTIMATTER_RATE,
+    AGENT_SPAWN_ENABLED,
+)
+from darkmatter.network.mesh import (
+    process_connection_request, process_connection_accepted,
+    process_accept_pending, _process_incoming_message,
+    _process_webhook_locally, process_connection_relay_callback,
+    build_outbound_request_payload, build_connection_from_accepted,
+    process_antimatter_match, process_antimatter_signal,
+    process_antimatter_result,
+)
+from darkmatter.network.manager import NetworkManager, get_network_manager, set_network_manager
+from darkmatter.wallet.solana import get_solana_balance, send_solana_sol, send_solana_token
+import darkmatter.config
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -63,24 +81,28 @@ os.environ.setdefault("DARKMATTER_DISPLAY_NAME", "Human")
 os.environ.setdefault("DARKMATTER_BIO", "Human operator on the DarkMatter mesh")
 os.environ.setdefault("DARKMATTER_PORT", str(PORT))
 
-server._init_state(PORT)
+init_state(PORT)
 os.chdir(_original_cwd)
-server._agent_state.router_mode = "queue_only"
-server.AGENT_SPAWN_ENABLED = False  # human node — no agent spawning
+get_state().router_mode = "queue_only"
+darkmatter.config.AGENT_SPAWN_ENABLED = False  # human node — no agent spawning
+
+# Set up a NetworkManager for public URL discovery and NAT detection
+_mgr = NetworkManager(get_state_fn=get_state)
+set_network_manager(_mgr)
 
 # Discover public URL using the same logic as the real server
 # (env var > UPnP port mapping > ipify public IP > localhost fallback)
-_public_url = asyncio.run(server._discover_public_url(PORT))
-server._agent_state.public_url = _public_url
+_public_url = asyncio.run(_mgr.discover_public_url())
+get_state().public_url = _public_url
 
 # Detect NAT — if behind CGNAT, use anchor relay for webhooks
-server._agent_state.nat_detected = server._check_nat_status_sync(_public_url)
-if server._agent_state.nat_detected:
+get_state().nat_detected = asyncio.run(_mgr.check_nat_status(_public_url))
+if get_state().nat_detected:
     print(f"[DarkMatter Entrypoint] NAT detected: True — using anchor webhook relay", file=sys.stderr)
 
 # Register with anchor nodes (required for relay poll signature verification)
-if server.ANCHOR_NODES and _public_url:
-    _reg_state = server._agent_state
+if ANCHOR_NODES and _public_url:
+    _reg_state = get_state()
     _reg_ts = datetime.now(timezone.utc).isoformat()
     _reg_payload = {
         "agent_id": _reg_state.agent_id,
@@ -89,10 +111,10 @@ if server.ANCHOR_NODES and _public_url:
         "timestamp": _reg_ts,
     }
     if _reg_state.private_key_hex and _reg_state.public_key_hex:
-        _reg_payload["signature"] = server._sign_peer_update(
+        _reg_payload["signature"] = sign_peer_update(
             _reg_state.private_key_hex, _reg_state.agent_id, _public_url, _reg_ts
         )
-    for _anchor in server.ANCHOR_NODES:
+    for _anchor in ANCHOR_NODES:
         try:
             with httpx.Client(timeout=5.0) as _c:
                 _c.post(f"{_anchor}/__darkmatter__/peer_update", json=_reg_payload)
@@ -101,14 +123,14 @@ if server.ANCHOR_NODES and _public_url:
             print(f"[DarkMatter Entrypoint] Anchor registration failed ({_anchor}): {_e}", file=sys.stderr)
 
 # Remove self-connection if present (shared passport state file)
-if state := server._agent_state:
+if state := get_state():
     self_id = state.agent_id
     if self_id in state.connections:
         del state.connections[self_id]
 
-server.save_state()
+save_state()
 
-state = server._agent_state
+state = get_state()
 
 # ---------------------------------------------------------------------------
 # Check for cached wallet-derived passport (overrides default passport)
@@ -125,11 +147,18 @@ if os.path.exists(_wallet_passport_path):
     state.agent_id = _wallet_pub
     state.private_key_hex = _wallet_priv
     state.public_key_hex = _wallet_pub
-    server.save_state()
+    save_state()
     print(f"[DarkMatter Entrypoint] Wallet identity loaded: {_wallet_pub[:16]}...", file=sys.stderr)
 
 # Clean up UPnP mapping on exit
-atexit.register(server._cleanup_upnp)
+# Clean up UPnP mapping on exit (async stop → sync wrapper)
+def _cleanup_network():
+    try:
+        asyncio.run(_mgr.stop())
+    except Exception:
+        pass
+
+atexit.register(_cleanup_network)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +227,7 @@ def _message_timeout_checker():
                 dirty = True
 
         if dirty:
-            server.save_state()
+            save_state()
 
 
 threading.Thread(target=_message_timeout_checker, daemon=True).start()
@@ -325,14 +354,14 @@ def _relay_poll_loop():
     while True:
         try:
             time.sleep(5)
-            if not state.nat_detected or not server.ANCHOR_NODES or not state.private_key_hex:
+            if not state.nat_detected or not ANCHOR_NODES or not state.private_key_hex:
                 continue
 
             ts = datetime.now(timezone.utc).isoformat()
-            sig = server._sign_relay_poll(state.private_key_hex, state.agent_id, ts)
+            sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
 
             # Try anchors in order: last working first, then the rest
-            ordered = list(server.ANCHOR_NODES)
+            ordered = list(ANCHOR_NODES)
             if _last_working and _last_working in ordered:
                 ordered.remove(_last_working)
                 ordered.insert(0, _last_working)
@@ -356,7 +385,7 @@ def _relay_poll_loop():
                             msg_id = cb.get("message_id", "")
                             cb_data = cb.get("data", {})
                             if msg_id and cb_data:
-                                result, status = server._process_webhook_locally(state, msg_id, cb_data)
+                                result, status = _process_webhook_locally(state, msg_id, cb_data)
                                 if result.get("success"):
                                     print(f"[DarkMatter Entrypoint] Relay: webhook for {msg_id} OK", file=sys.stderr)
 
@@ -369,7 +398,7 @@ def _relay_poll_loop():
                             data2 = resp2.json()
                             for cb_data in data2.get("callbacks", []):
                                 if isinstance(cb_data, dict) and cb_data.get("agent_id"):
-                                    server._process_connection_relay_callback(state, cb_data)
+                                    process_connection_relay_callback(state, cb_data)
                                     print(f"[DarkMatter Entrypoint] Relay: connection accepted by {cb_data['agent_id'][:12]}...", file=sys.stderr)
                         break  # success — don't try other anchors
                 except Exception:
@@ -492,8 +521,8 @@ def _notify_connection_accepted(conn, payload):
     except Exception:
         pass
 
-    if not direct_ok and server.ANCHOR_NODES:
-        for anchor in server.ANCHOR_NODES:
+    if not direct_ok and ANCHOR_NODES:
+        for anchor in ANCHOR_NODES:
             try:
                 with httpx.Client(timeout=10.0) as client:
                     resp = client.post(
@@ -508,7 +537,7 @@ def _notify_connection_accepted(conn, payload):
 
 
 # ---------------------------------------------------------------------------
-# Mesh protocol endpoints (Flask thin wrappers around server.py shared logic)
+# Mesh protocol endpoints (Flask thin wrappers around darkmatter.network.mesh)
 # ---------------------------------------------------------------------------
 
 @app.route("/.well-known/darkmatter.json", methods=["GET"])
@@ -516,13 +545,13 @@ def well_known():
     public_url = _get_public_url()
     return jsonify({
         "darkmatter": True,
-        "protocol_version": server.PROTOCOL_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
         "bio": state.bio,
         "status": state.status.value,
-        "accepting_connections": len(state.connections) < server.MAX_CONNECTIONS,
+        "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "mesh_url": f"{public_url}/__darkmatter__",
         "mcp_url": None,
         "webrtc_enabled": False,
@@ -538,7 +567,7 @@ def dm_status():
         "bio": state.bio,
         "status": state.status.value,
         "num_connections": len(state.connections),
-        "accepting_connections": len(state.connections) < server.MAX_CONNECTIONS,
+        "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
     })
 
 
@@ -554,7 +583,7 @@ def dm_network_info():
         "public_key_hex": state.public_key_hex,
         "agent_url": _get_public_url(),
         "bio": state.bio,
-        "accepting_connections": len(state.connections) < server.MAX_CONNECTIONS,
+        "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "wallets": state.wallets,
         "peers": peers,
     })
@@ -563,14 +592,14 @@ def dm_network_info():
 @app.route("/__darkmatter__/connection_request", methods=["POST"])
 def dm_connection_request():
     data = request.get_json(silent=True) or {}
-    result, status = asyncio.run(server.process_connection_request(state, data, _get_public_url()))
+    result, status = asyncio.run(process_connection_request(state, data, _get_public_url()))
     return jsonify(result), status
 
 
 @app.route("/__darkmatter__/connection_accepted", methods=["POST"])
 def dm_connection_accepted():
     data = request.get_json(silent=True) or {}
-    result, status = server.process_connection_accepted(state, data)
+    result, status = process_connection_accepted(state, data)
     return jsonify(result), status
 
 
@@ -581,7 +610,7 @@ def dm_accept_pending():
     if not request_id:
         return jsonify({"error": "Missing request_id"}), 400
 
-    result, status, notify_payload = server.process_accept_pending(state, request_id, _get_public_url())
+    result, status, notify_payload = process_accept_pending(state, request_id, _get_public_url())
 
     if status == 200 and notify_payload:
         agent_id = result.get("agent_id", "")
@@ -607,7 +636,7 @@ def dm_message():
     # so messages queue for the human to read and respond to.
     loop = asyncio.new_event_loop()
     try:
-        result, status = loop.run_until_complete(server._process_incoming_message(state, data))
+        result, status = loop.run_until_complete(_process_incoming_message(state, data))
     finally:
         # Let any background tasks (webhook notify, antimatter interception) finish
         pending = asyncio.all_tasks(loop)
@@ -621,7 +650,7 @@ def dm_message():
 @app.route("/__darkmatter__/webhook/<message_id>", methods=["POST"])
 def dm_webhook_post(message_id):
     data = request.get_json(silent=True) or {}
-    result, status = server._process_webhook_locally(state, message_id, data)
+    result, status = _process_webhook_locally(state, message_id, data)
     return jsonify(result), status
 
 
@@ -644,7 +673,7 @@ def dm_peer_update():
     new_url = data.get("new_url", "")
     if not agent_id or not new_url:
         return jsonify({"error": "Missing agent_id or new_url"}), 400
-    url_err = server.validate_url(new_url)
+    url_err = validate_url(new_url)
     if url_err:
         return jsonify({"error": url_err}), 400
     conn = state.connections.get(agent_id)
@@ -654,8 +683,8 @@ def dm_peer_update():
     # Update bio if included in the peer_update payload
     new_bio = data.get("bio")
     if new_bio is not None and isinstance(new_bio, str):
-        conn.agent_bio = new_bio[:server.MAX_BIO_LENGTH]
-    server.save_state()
+        conn.agent_bio = new_bio[:MAX_BIO_LENGTH]
+    save_state()
     return jsonify({"success": True, "updated": True})
 
 
@@ -683,21 +712,21 @@ def dm_impression(agent_id):
 @app.route("/__darkmatter__/gas_match", methods=["POST"])
 def dm_gas_match():
     data = request.get_json(silent=True) or {}
-    result, status = server.process_gas_match(data)
+    result, status = process_antimatter_match(data)
     return jsonify(result), status
 
 
 @app.route("/__darkmatter__/gas_signal", methods=["POST"])
 def dm_gas_signal():
     data = request.get_json(silent=True) or {}
-    result, status = asyncio.run(server.process_gas_signal(state, data))
+    result, status = asyncio.run(process_antimatter_signal(state, data))
     return jsonify(result), status
 
 
 @app.route("/__darkmatter__/gas_result", methods=["POST"])
 def dm_gas_result():
     data = request.get_json(silent=True) or {}
-    result, status = asyncio.run(server.process_gas_result(state, data))
+    result, status = asyncio.run(process_antimatter_result(state, data))
     return jsonify(result), status
 
 
@@ -713,16 +742,16 @@ def _sync_connection_request(target_url, mutual=False):
             target_base = target_base[:-len(suffix)]
             break
 
-    payload = server.build_outbound_request_payload(state, _get_public_url(), mutual=mutual)
+    payload = build_outbound_request_payload(state, _get_public_url(), mutual=mutual)
 
     with httpx.Client(timeout=30.0) as client:
         response = client.post(target_base + "/__darkmatter__/connection_request", json=payload)
         result = response.json()
 
         if result.get("auto_accepted"):
-            conn = server.build_connection_from_accepted(result)
+            conn = build_connection_from_accepted(result)
             state.connections[result["agent_id"]] = conn
-            server.save_state()
+            save_state()
             return {"success": True, "status": "connected", "agent_id": result["agent_id"]}
 
         state.pending_outbound[target_base] = result.get("agent_id", "")
@@ -732,7 +761,7 @@ def _sync_connection_request(target_url, mutual=False):
 def _sync_send_message(content, target_agent_id=None, metadata=None):
     """Send a message to an agent (sync version)."""
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
-    webhook = server._build_webhook_url(state, message_id)
+    webhook = _mgr.build_webhook_url(message_id)
 
     if target_agent_id:
         conn = state.connections.get(target_agent_id)
@@ -748,7 +777,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     signature_hex = None
     if state.private_key_hex:
-        signature_hex = server._sign_message(
+        signature_hex = sign_message(
             state.private_key_hex, state.agent_id, message_id, msg_timestamp, content
         )
 
@@ -780,15 +809,15 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             failed.append({"agent_id": conn.agent_id, "error": str(e)})
 
     if sent_to:
-        sent_msg = server.SentMessage(
+        sent_msg = SentMessage(
             message_id=message_id, content=content, status="active",
             initial_hops=10, routed_to=sent_to,
         )
         state.sent_messages[message_id] = sent_msg
-        server.save_state()
+        save_state()
     elif failed:
         # All deliveries failed — record the failure so UI can show it immediately
-        sent_msg = server.SentMessage(
+        sent_msg = SentMessage(
             message_id=message_id, content=content, status="failed",
             initial_hops=10, routed_to=[f["agent_id"] for f in failed],
         )
@@ -800,7 +829,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
         state.sent_messages[message_id] = sent_msg
-        server.save_state()
+        save_state()
 
     result = {"success": len(sent_to) > 0, "message_id": message_id, "routed_to": sent_to}
     if failed:
@@ -820,12 +849,12 @@ def _sync_send_payment_notification(agent_id, amount, token, tx_result):
         "from_wallet": tx_result.get("from_wallet", ""),
         "to_wallet": tx_result.get("to_wallet", ""),
         "gas_eligible": True,
-        "gas_rate": server.GAS_RATE,
+        "gas_rate": ANTIMATTER_RATE,
         "sender_created_at": state.created_at,
         "sender_superagent_wallet": state.wallets.get("solana", ""),
     }
-    if token != "SOL" and token in server.SPL_TOKENS:
-        gas_meta["decimals"] = server.SPL_TOKENS[token][1]
+    if token != "SOL" and token in SPL_TOKENS:
+        gas_meta["decimals"] = SPL_TOKENS[token][1]
     _sync_send_message(
         f"Sent {amount} {token} — tx: {tx_result.get('tx_signature', 'unknown')}",
         target_agent_id=agent_id,
@@ -876,7 +905,7 @@ def _sync_respond_to_message(message_id, response_text):
     resp_timestamp = datetime.now(timezone.utc).isoformat()
     resp_signature_hex = None
     if state.private_key_hex:
-        resp_signature_hex = server._sign_message(
+        resp_signature_hex = sign_message(
             state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, response_text
         )
 
@@ -896,7 +925,7 @@ def _sync_respond_to_message(message_id, response_text):
         conn = state.connections[msg.from_agent_id]
         conn.last_activity = datetime.now(timezone.utc).isoformat()
 
-    server.save_state()
+    save_state()
     return {"success": webhook_success, "message_id": msg.message_id}
 
 
@@ -990,7 +1019,7 @@ def accept(request_id):
 
     display_name = pending.from_agent_display_name or _short_id(pending.from_agent_id)
 
-    result, status, notify_payload = server.process_accept_pending(state, request_id, _get_public_url())
+    result, status, notify_payload = process_accept_pending(state, request_id, _get_public_url())
 
     if status == 200 and notify_payload:
         agent_id = result.get("agent_id", "")
@@ -1023,7 +1052,7 @@ def reject(request_id):
 def disconnect(agent_id):
     if agent_id in state.connections:
         del state.connections[agent_id]
-        server.save_state()
+        save_state()
     if _is_ajax():
         return jsonify({"success": True})
     return redirect(url_for("index"))
@@ -1147,11 +1176,11 @@ def scan():
 
 async def _fetch_all_balances(wallets):
     """Fetch SOL + all known SPL token balances in a single event loop."""
-    sol_result = await server.get_solana_balance(wallets)
+    sol_result = await get_solana_balance(wallets)
     tokens = {}
-    for name, (mint, _decimals) in server.SPL_TOKENS.items():
+    for name, (mint, _decimals) in SPL_TOKENS.items():
         try:
-            tokens[name] = await server.get_solana_balance(wallets, mint=mint)
+            tokens[name] = await get_solana_balance(wallets, mint=mint)
         except Exception as e:
             tokens[name] = {"success": False, "error": str(e)}
     return sol_result, tokens
@@ -1160,7 +1189,7 @@ async def _fetch_all_balances(wallets):
 @app.route("/api/wallet-balances", methods=["GET"])
 def wallet_balances_api():
     """Get SOL balance + known SPL token balances."""
-    if not server.SOLANA_AVAILABLE or not state.wallets.get("solana"):
+    if not SOLANA_AVAILABLE or not state.wallets.get("solana"):
         return jsonify({"success": False, "error": "Solana wallet not available"})
 
     try:
@@ -1171,7 +1200,7 @@ def wallet_balances_api():
             "wallet_address": state.wallets.get("solana"),
             "sol": sol_result,
             "tokens": tokens,
-            "known_tokens": list(server.SPL_TOKENS.keys()),
+            "known_tokens": list(SPL_TOKENS.keys()),
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
@@ -1196,7 +1225,7 @@ def wallet_send_api():
     if amount <= 0:
         return jsonify({"success": False, "error": "Amount must be positive"}), 400
 
-    if not server.SOLANA_AVAILABLE or not state.wallets.get("solana"):
+    if not SOLANA_AVAILABLE or not state.wallets.get("solana"):
         return jsonify({"success": False, "error": "Solana wallet not available"})
 
     conn = state.connections.get(agent_id)
@@ -1209,16 +1238,16 @@ def wallet_send_api():
 
     try:
         if token == "SOL":
-            result = asyncio.run(server.send_solana_sol(
+            result = asyncio.run(send_solana_sol(
                 state.private_key_hex, state.wallets, conn_sol, amount
             ))
-        elif token in server.SPL_TOKENS:
-            mint, decimals = server.SPL_TOKENS[token]
-            result = asyncio.run(server.send_solana_token(
+        elif token in SPL_TOKENS:
+            mint, decimals = SPL_TOKENS[token]
+            result = asyncio.run(send_solana_token(
                 state.private_key_hex, state.wallets, conn_sol, mint, amount, decimals
             ))
         else:
-            return jsonify({"success": False, "error": f"Unknown token '{token}'. Known: SOL, {', '.join(server.SPL_TOKENS.keys())}"}), 400
+            return jsonify({"success": False, "error": f"Unknown token '{token}'. Known: SOL, {', '.join(SPL_TOKENS.keys())}"}), 400
 
         if result.get("success"):
             result["to_agent_id"] = agent_id
@@ -1252,7 +1281,7 @@ def _swap_identity(new_private_key):
     state.agent_id = new_pub
     state.private_key_hex = new_priv
     state.public_key_hex = new_pub
-    server.save_state()
+    save_state()
 
 
 def _apply_wallet_signature(signature_hex, pubkey_hex, remember=False):
@@ -1418,7 +1447,7 @@ def wallet_disconnect():
     # Reload original passport
     _saved_cwd = os.getcwd()
     os.chdir(_entrypoint_data_dir)
-    priv, pub = server._load_or_create_passport()
+    priv, pub = load_or_create_passport()
     os.chdir(_saved_cwd)
 
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
