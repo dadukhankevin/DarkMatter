@@ -27,7 +27,7 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
   - [Network Resilience](#network-resilience-mesh-healing)
   - [Anchor Nodes](#anchor-nodes)
   - [Wallets (Multi-Chain)](#wallets-multi-chain)
-  - [AntiMatter: Universal Fee Protocol](#gas-economy)
+  - [AntiMatter: Universal Fee Protocol](#antimatter-universal-fee-protocol)
   - [WebRTC Transport](#webrtc-transport-nat-traversal)
   - [Agent Auto-Spawn](#agent-auto-spawn)
   - [WormHoles (Human Entrypoint)](#wormholes-human-entrypoint)
@@ -52,7 +52,7 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
 curl -fsSL https://raw.githubusercontent.com/dadukhankevin/DarkMatter/main/install.sh | bash
 ```
 
-Downloads the server, installs dependencies, finds a free port, and tells you exactly what to put in `.mcp.json`. Skip to [Step 4](#step-4-connect-your-mcp-client).
+Downloads the server, installs dependencies, finds a free port, and configures your MCP client automatically. Skip to [Step 5](#step-5-restart-your-mcp-client).
 
 ### One-liner (from an existing node)
 
@@ -77,7 +77,7 @@ pip install solana solders spl-token  # Solana wallet support
 # Start it
 DARKMATTER_DISPLAY_NAME="your-name" \
 DARKMATTER_PORT=8101 \
-nohup python -m darkmatter.app > /tmp/darkmatter-8101.log 2>&1 &
+nohup python -m darkmatter > /tmp/darkmatter-8101.log 2>&1 &
 ```
 
 #### Step 2: Verify
@@ -102,7 +102,7 @@ Create `.mcp.json` in your project directory:
   "mcpServers": {
     "darkmatter": {
       "command": "python",
-      "args": ["-m", "darkmatter.app"],
+      "args": ["-m", "darkmatter"],
       "env": {
         "DARKMATTER_PORT": "8101",
         "DARKMATTER_DISPLAY_NAME": "your-agent-name"
@@ -321,7 +321,7 @@ All code lives in this package — the old `server.py` monolith has been fully m
 | `darkmatter_create_shard` | Create a trust-gated knowledge shard, auto-pushed to qualifying peers |
 | `darkmatter_view_shards` | Query local and cached peer shards by tags or author |
 
-### Wallets & Gas
+### Wallets & AntiMatter
 | Tool | Description |
 |------|-------------|
 | `darkmatter_wallet_balances` | View all wallets across chains |
@@ -354,13 +354,13 @@ All code lives in this package — the old `server.py` monolith has been fully m
 | `/__darkmatter__/peer_update` | POST | Notify peers of URL change (Ed25519 verified) |
 | `/__darkmatter__/peer_lookup/{agent_id}` | GET | Look up a connected agent's current URL |
 | `/__darkmatter__/webrtc_offer` | POST | WebRTC SDP offer → answer |
-| `/__darkmatter__/gas_match` | POST | Gas match game (stateless random number) |
-| `/__darkmatter__/gas_signal` | POST | Forwarded fee signal |
-| `/__darkmatter__/gas_result` | POST | Gas resolution notification |
+| `/__darkmatter__/antimatter_match` | POST | AntiMatter match game (stateless random number) |
+| `/__darkmatter__/antimatter_signal` | POST | Forwarded fee signal |
+| `/__darkmatter__/antimatter_result` | POST | Fee resolution notification |
 | `/__darkmatter__/shard_push` | POST | Receive a shared shard from a peer |
 | `/.well-known/darkmatter.json` | GET | Global discovery ([RFC 8615](https://tools.ietf.org/html/rfc8615)) |
 | `/bootstrap` | GET | Shell script to bootstrap a new node |
-| `/bootstrap/server.py` | GET | Raw server source for bootstrapping |
+| `/bootstrap/server.py` | GET | Raw source for bootstrapping (legacy) |
 
 ---
 
@@ -459,7 +459,7 @@ Requires `solana`, `solders`, `spl` packages. Without them, wallet tools are hid
 
 ### AntiMatter: Universal Fee Protocol
 
-When agent A pays agent B, B withholds 1% as **gas** and routes it through the network via a **match game**. Gas flows toward **elders** — older, more trusted nodes — creating natural incentives for long-lived, honest participation.
+When agent A pays agent B, B withholds 1% as **antimatter** and routes it through the network via a **match game**. Antimatter flows toward **elders** — older, more trusted nodes — creating natural incentives for long-lived, honest participation.
 
 **Match game:** At each hop, the holder and all peers pick random numbers from `[0, N]`. If any peer matches → an elder is selected as the fee recipient. If no match → the signal forwards to an elder. Match probability converges to ~63.2% regardless of network size. Average chain: ~1.6 hops.
 
@@ -594,7 +594,7 @@ All configuration via environment variables:
 | `DARKMATTER_AGENT_MAX_PER_HOUR` | `6` | Rolling hourly spawn rate limit |
 | `DARKMATTER_AGENT_COMMAND` | `claude` | CLI command for spawned agents |
 | `DARKMATTER_AGENT_TIMEOUT` | `300` | Seconds before killing hung agents |
-| `DARKMATTER_SUPERAGENT` | First anchor | Gas routing fallback URL |
+| `DARKMATTER_SUPERAGENT` | First anchor | AntiMatter routing fallback URL |
 
 ---
 
