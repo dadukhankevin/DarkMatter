@@ -171,6 +171,26 @@ def build_agent_prompt(state: AgentState, msg: QueuedMessage) -> str:
     from darkmatter.context import build_context_feed, format_feed_for_prompt
     feed = build_context_feed(state, responding_to=msg.message_id)
     context = format_feed_for_prompt(feed, state)
+
+    meta = msg.metadata or {}
+    if meta.get("type") == "connection_request":
+        request_id = meta.get("request_id", msg.message_id)
+        return f"""\
+DARKMATTER: You have received an incoming connection request. Here is your conversation context:
+
+{context}
+
+An agent wants to connect to you. Review the request details:
+- Request ID: {request_id}
+- Message: {msg.content}
+
+Use darkmatter_list_inbox or darkmatter_status to see your current state, then decide:
+- To accept: darkmatter_connection(action="accept", request_id="{request_id}")
+- To reject: darkmatter_connection(action="reject", request_id="{request_id}")
+
+Consider the agent's bio, peer trust scores, and whether this connection would be valuable.
+"""
+
     return f"""\
 DARKMATTER: You have received a message. Here is your conversation context:
 

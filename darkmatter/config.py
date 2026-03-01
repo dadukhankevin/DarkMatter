@@ -61,6 +61,7 @@ WEBHOOK_RECOVERY_MAX_ATTEMPTS = 3   # max peer-lookup recovery attempts per webh
 WEBHOOK_RECOVERY_TIMEOUT = 30.0     # total wall-clock budget for all recovery attempts
 ANCHOR_LOOKUP_TIMEOUT = 2.0         # seconds to wait for anchor node responses
 PEER_UPDATE_MAX_AGE = 300           # max age for peer_update timestamps (replay prevention)
+REQUEST_EXPIRY_S = int(os.environ.get("DARKMATTER_REQUEST_EXPIRY", "3600"))  # pending request TTL
 
 # =============================================================================
 # Rate Limiting

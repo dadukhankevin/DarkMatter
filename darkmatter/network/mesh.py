@@ -22,12 +22,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from darkmatter.config import (
+    AGENT_SPAWN_ENABLED,
     MAX_AGENT_ID_LENGTH,
     MAX_BIO_LENGTH,
     MAX_CONNECTIONS,
     MAX_CONTENT_LENGTH,
     MESSAGE_QUEUE_MAX,
     PROTOCOL_VERSION,
+    REQUEST_EXPIRY_S,
     ANTIMATTER_MAX_AGE_S,
     TRUST_ANTIMATTER_SUCCESS,
     WEBRTC_AVAILABLE,
@@ -203,24 +205,74 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "message": "Already connected.",
         }, 200
 
-    # Queue the request
-    if len(state.pending_requests) >= MESSAGE_QUEUE_MAX:
-        return {"error": "Too many pending requests"}, 429
+    # Prune expired pending requests
+    now = datetime.now(timezone.utc)
+    expired_ids = []
+    for rid, req in state.pending_requests.items():
+        try:
+            req_time = datetime.fromisoformat(req.requested_at)
+            if (now - req_time).total_seconds() > REQUEST_EXPIRY_S:
+                expired_ids.append(rid)
+        except (ValueError, TypeError):
+            expired_ids.append(rid)
+    for rid in expired_ids:
+        del state.pending_requests[rid]
 
-    request_id = f"req-{uuid.uuid4().hex[:8]}"
-    peer_trust = await _gather_peer_trust(state, from_agent_id)
-    state.pending_requests[request_id] = PendingConnectionRequest(
-        request_id=request_id,
-        from_agent_id=from_agent_id,
-        from_agent_url=from_agent_url,
-        from_agent_bio=from_agent_bio,
-        from_agent_public_key_hex=from_agent_public_key_hex,
-        from_agent_display_name=from_agent_display_name,
-        from_agent_wallets=from_agent_wallets,
-        from_agent_created_at=from_agent_created_at,
-        peer_trust=peer_trust,
-        mutual=mutual,
-    )
+    # Dedup: if there's already a pending request from the same agent, refresh it
+    existing_request_id = None
+    for rid, req in state.pending_requests.items():
+        if req.from_agent_id == from_agent_id:
+            existing_request_id = rid
+            break
+
+    if existing_request_id:
+        existing = state.pending_requests[existing_request_id]
+        peer_trust = await _gather_peer_trust(state, from_agent_id)
+        existing.from_agent_url = from_agent_url
+        existing.from_agent_bio = from_agent_bio
+        existing.from_agent_public_key_hex = from_agent_public_key_hex
+        existing.from_agent_display_name = from_agent_display_name
+        existing.from_agent_wallets = from_agent_wallets
+        existing.from_agent_created_at = from_agent_created_at
+        existing.peer_trust = peer_trust
+        existing.mutual = mutual
+        existing.requested_at = now.isoformat()
+        request_id = existing_request_id
+        save_state()
+    else:
+        # Queue the request
+        if len(state.pending_requests) >= MESSAGE_QUEUE_MAX:
+            return {"error": "Too many pending requests"}, 429
+
+        request_id = f"req-{uuid.uuid4().hex[:8]}"
+        peer_trust = await _gather_peer_trust(state, from_agent_id)
+        state.pending_requests[request_id] = PendingConnectionRequest(
+            request_id=request_id,
+            from_agent_id=from_agent_id,
+            from_agent_url=from_agent_url,
+            from_agent_bio=from_agent_bio,
+            from_agent_public_key_hex=from_agent_public_key_hex,
+            from_agent_display_name=from_agent_display_name,
+            from_agent_wallets=from_agent_wallets,
+            from_agent_created_at=from_agent_created_at,
+            peer_trust=peer_trust,
+            mutual=mutual,
+        )
+        save_state()
+
+    # Spawn agent to handle the connection request
+    if AGENT_SPAWN_ENABLED and state.router_mode == "spawn":
+        from darkmatter.spawn import spawn_agent_for_message
+        display = from_agent_display_name or from_agent_id[:16] + "..."
+        synthetic_msg = QueuedMessage(
+            message_id=request_id,
+            content=f"Connection request from {display}. Bio: {from_agent_bio}",
+            webhook="",
+            hops_remaining=0,
+            metadata={"type": "connection_request", "request_id": request_id},
+            from_agent_id=from_agent_id,
+        )
+        asyncio.create_task(spawn_agent_for_message(state, synthetic_msg))
 
     return {
         "auto_accepted": False,
