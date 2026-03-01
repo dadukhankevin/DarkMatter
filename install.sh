@@ -145,7 +145,7 @@ with open('$target', 'w') as f:
 
 echo ""
 echo "Installing MCP config (global — applies to all projects)..."
-install_mcp_entry "$HOME/.claude/settings.json"
+install_mcp_entry "$HOME/.claude.json"
 
 echo ""
 echo "=== Setup complete ==="
