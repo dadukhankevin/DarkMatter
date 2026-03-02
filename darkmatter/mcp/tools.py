@@ -73,6 +73,7 @@ from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
 from darkmatter.network.mesh import (
     build_outbound_request_payload,
     build_connection_from_accepted,
+    notify_connection_accepted,
     process_accept_pending,
 )
 from darkmatter.wallet.solana import (
@@ -186,24 +187,12 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
     if status != 200:
         return json.dumps({"success": False, "error": result.get("error", "Unknown error")})
 
-    # Notify the requesting agent
+    # Notify the requesting agent (direct POST with anchor relay fallback)
     if notify_payload:
         agent_id = result.get("agent_id", "")
         conn = state.connections.get(agent_id)
         if conn:
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    base = conn.agent_url.rstrip("/")
-                    for suffix in ("/mcp", "/__darkmatter__"):
-                        if base.endswith(suffix):
-                            base = base[:-len(suffix)]
-                            break
-                    await client.post(
-                        base + "/__darkmatter__/connection_accepted",
-                        json=notify_payload,
-                    )
-            except Exception:
-                pass
+            await notify_connection_accepted(conn, notify_payload)
 
             # Auto WebRTC upgrade
             if WEBRTC_AVAILABLE:

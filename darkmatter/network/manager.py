@@ -118,6 +118,7 @@ class NetworkManager:
         self._tasks: list[asyncio.Task] = []
         self._last_working_anchor: Optional[str] = None
         self._process_webhook_fn: Optional[Callable] = None
+        self._process_connection_relay_fn: Optional[Callable] = None
 
     # -- Transport registry --
 
@@ -450,6 +451,10 @@ class NetworkManager:
         """Set the webhook processing callback (injected to avoid circular imports)."""
         self._process_webhook_fn = fn
 
+    def set_process_connection_relay_fn(self, fn: Callable) -> None:
+        """Set the connection relay processing callback (injected to avoid circular imports)."""
+        self._process_connection_relay_fn = fn
+
     async def start(self) -> None:
         """Start all transports, discover public URL, detect NAT, start background tasks."""
         state = self._get_state()
@@ -700,6 +705,20 @@ class NetworkManager:
                             if result.get("success"):
                                 print(f"[DarkMatter] Relay: processed webhook for {msg_id}",
                                       file=sys.stderr)
+
+                    # Poll for connection relay callbacks
+                    if self._process_connection_relay_fn:
+                        resp2 = await client.get(
+                            f"{anchor}/__darkmatter__/connection_relay_poll/{state.agent_id}",
+                            params={"signature": sig, "timestamp": ts},
+                        )
+                        if resp2.status_code == 200:
+                            data2 = resp2.json()
+                            for cb_data in data2.get("callbacks", []):
+                                if isinstance(cb_data, dict) and cb_data.get("agent_id"):
+                                    self._process_connection_relay_fn(state, cb_data)
+                                    print(f"[DarkMatter] Relay: connection accepted by {cb_data['agent_id'][:12]}...",
+                                          file=sys.stderr)
                     return
             except Exception as e:
                 print(f"[DarkMatter] Relay poll error ({anchor}): {e}", file=sys.stderr)

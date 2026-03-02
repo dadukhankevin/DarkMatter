@@ -87,7 +87,7 @@ get_state().router_mode = "queue_only"
 darkmatter.config.AGENT_SPAWN_ENABLED = False  # human node — no agent spawning
 
 # Set up a NetworkManager for public URL discovery and NAT detection
-_mgr = NetworkManager(get_state_fn=get_state)
+_mgr = NetworkManager(state_getter=get_state, state_saver=save_state)
 set_network_manager(_mgr)
 
 # Discover public URL using the same logic as the real server

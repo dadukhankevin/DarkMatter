@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, Response
 
 from darkmatter.config import (
     AGENT_SPAWN_ENABLED,
+    ANCHOR_NODES,
     MAX_AGENT_ID_LENGTH,
     MAX_BIO_LENGTH,
     MAX_CONNECTIONS,
@@ -388,6 +389,37 @@ def process_connection_relay_callback(state: AgentState, data: dict) -> None:
     state.connections[agent_id] = conn
     save_state()
     print(f"[DarkMatter] Relay callback: connection established with {agent_id[:12]}...", file=sys.stderr)
+
+
+async def notify_connection_accepted(conn: Connection, payload: dict) -> None:
+    """Notify a peer that we accepted their connection request, with anchor relay fallback.
+
+    Uses NetworkManager.send() for the direct attempt (tries all transports in
+    priority order: WebRTC, HTTP, etc.). Falls back to anchor relay only when
+    all transports fail (e.g. both sides behind NAT).
+    """
+    result = await get_network_manager().send(
+        conn.agent_id, "/__darkmatter__/connection_accepted", payload
+    )
+    if result.success:
+        return
+
+    # All transports failed — fall back to anchor relay (signaling escape hatch)
+    if ANCHOR_NODES:
+        for anchor in ANCHOR_NODES:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(
+                        f"{anchor}/__darkmatter__/connection_relay/{conn.agent_id}",
+                        json=payload,
+                    )
+                    if resp.status_code < 400:
+                        print(f"[DarkMatter] Connection accept relayed via {anchor} for {conn.agent_id[:12]}...", file=sys.stderr)
+                        return
+            except Exception:
+                continue
+
+    print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... (transports + all anchors failed)", file=sys.stderr)
 
 
 def process_accept_pending(state: AgentState, request_id: str, public_url: str) -> tuple[dict, int, dict | None]:
@@ -975,23 +1007,9 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
     result, status, notify_payload = process_accept_pending(state, request_id, public_url)
 
     if status == 200 and notify_payload:
-        # Notify the requesting agent
-        # Get the from_agent_url from the connection we just created
         conn = state.connections.get(result.get("agent_id", ""))
         if conn:
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    base = conn.agent_url.rstrip("/")
-                    for suffix in ("/mcp", "/__darkmatter__"):
-                        if base.endswith(suffix):
-                            base = base[:-len(suffix)]
-                            break
-                    await client.post(
-                        base + "/__darkmatter__/connection_accepted",
-                        json=notify_payload,
-                    )
-            except Exception:
-                pass
+            await notify_connection_accepted(conn, notify_payload)
 
             # Auto WebRTC upgrade
             if WEBRTC_AVAILABLE:

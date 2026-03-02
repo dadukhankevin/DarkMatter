@@ -71,9 +71,15 @@ def build_status_line() -> str:
             "You are INACTIVE — other agents cannot see or message you. Use darkmatter_set_status to go active"
         )
     if pending > 0:
-        actions.append(
-            f"{pending} agent(s) want to connect — use darkmatter_list_pending_requests to review (includes peer trust scores)"
-        )
+        lines = [f"{pending} agent(s) want to connect:"]
+        for rid, req in state.pending_requests.items():
+            display = req.from_agent_display_name or req.from_agent_id[:12]
+            agent_short = req.from_agent_id[:8] + "..."
+            bio_snippet = (req.from_agent_bio[:60] + "...") if len(req.from_agent_bio or "") > 60 else (req.from_agent_bio or "no bio")
+            lines.append(f'  - {rid}: "{display}" ({agent_short}) — bio: "{bio_snippet}"')
+            lines.append(f'    Accept: darkmatter_connection(action="accept", request_id="{rid}")')
+            lines.append(f'    Reject: darkmatter_connection(action="reject", request_id="{rid}")')
+        actions.append("\n".join(lines))
     if msgs > 0:
         actions.append(
             f"{msgs} message(s) in your inbox — use darkmatter_list_inbox to read and darkmatter_send_message(content=..., reply_to=...) to reply"
@@ -164,9 +170,6 @@ def compute_visible_optional() -> set:
         visible.add("darkmatter_create_shard")
     if state.shared_shards:
         visible.add("darkmatter_view_shards")
-
-    if pending > 0:
-        visible.add("darkmatter_list_pending_requests")
 
     if state.wallets:
         visible.add("darkmatter_wallet_balances")

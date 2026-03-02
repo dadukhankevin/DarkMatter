@@ -205,8 +205,9 @@ def create_app() -> Router:
         initialize_tool_visibility()
 
         # Wire up webhook processing callback (avoids circular import)
-        from darkmatter.network.mesh import _process_webhook_locally
+        from darkmatter.network.mesh import _process_webhook_locally, process_connection_relay_callback
         manager.set_process_webhook_fn(_process_webhook_locally)
+        manager.set_process_connection_relay_fn(process_connection_relay_callback)
 
         # Start NetworkManager (discovers public URL, detects NAT, starts health loop, registers with anchors)
         await manager.start()
@@ -380,6 +381,16 @@ async def run_stdio_with_http() -> None:
         print(f"[DarkMatter] Running stdio-only MCP (parallel session, shared state).", file=sys.stderr)
 
         init_state(port)
+
+        # Initialize NetworkManager so MCP tools work (outbound HTTP via primary session's port)
+        manager = NetworkManager(state_getter=get_state, state_saver=save_state)
+        manager.register_transport(HttpTransport())
+        manager.register_transport(WebRTCTransport())
+        set_network_manager(manager)
+        set_antimatter_network_fns(
+            send_fn=manager.send,
+            webhook_request_fn=manager.webhook_request,
+        )
 
         async with stdio_server() as (read_stream, write_stream):
             await mcp._mcp_server.run(
