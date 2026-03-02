@@ -42,6 +42,7 @@ from darkmatter.network.discovery import (
     discovery_loop,
     ensure_entrypoint_running,
     handle_well_known,
+    shutdown_entrypoint,
 )
 from darkmatter.network.mesh import (
     handle_connection_request,
@@ -374,6 +375,7 @@ async def run_stdio_with_http() -> None:
                     mcp._mcp_server.create_initialization_options(),
                 )
                 server.should_exit = True
+                shutdown_entrypoint()
 
     elif port_owner == our_agent_id:
         # Our server is already running — parallel session, share state

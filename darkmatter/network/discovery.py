@@ -170,8 +170,13 @@ def find_entrypoint_path() -> Optional[str]:
     return fallback if os.path.isfile(fallback) else None
 
 
+_entrypoint_pid: Optional[int] = None  # PID of entrypoint we spawned (so we can shut it down)
+
+
 async def ensure_entrypoint_running() -> None:
     """Auto-start the entrypoint (human node) on port 8200 if not already running."""
+    global _entrypoint_pid
+
     if not ENTRYPOINT_AUTOSTART:
         return
 
@@ -206,7 +211,7 @@ async def ensure_entrypoint_running() -> None:
         print(f"[DarkMatter] Spawning entrypoint: {path}", file=sys.stderr)
         spawn_env = {k: v for k, v in os.environ.items()
                      if not k.startswith("WERKZEUG_")}
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, path],
             start_new_session=True,
             cwd=entrypoint_dir,
@@ -214,6 +219,7 @@ async def ensure_entrypoint_running() -> None:
             stderr=log_file,
             env=spawn_env,
         )
+        _entrypoint_pid = proc.pid
 
         for _ in range(20):
             await asyncio.sleep(0.5)
@@ -221,15 +227,34 @@ async def ensure_entrypoint_running() -> None:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.5)) as client:
                     resp = await client.get(f"http://127.0.0.1:{ENTRYPOINT_PORT}/.well-known/darkmatter.json")
                     if resp.status_code == 200:
-                        print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT}", file=sys.stderr)
+                        print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
                         return
             except Exception:
                 pass
 
         print(f"[DarkMatter] Entrypoint failed to start within 10s (check {log_path})", file=sys.stderr)
+        _entrypoint_pid = None
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
+
+
+def shutdown_entrypoint() -> None:
+    """Kill the entrypoint process we spawned. Called on primary session shutdown."""
+    global _entrypoint_pid
+    import signal
+
+    if _entrypoint_pid is None:
+        return
+
+    try:
+        os.kill(_entrypoint_pid, signal.SIGTERM)
+        print(f"[DarkMatter] Entrypoint (PID {_entrypoint_pid}) terminated", file=sys.stderr)
+    except ProcessLookupError:
+        pass  # already dead
+    except Exception as e:
+        print(f"[DarkMatter] Failed to kill entrypoint (PID {_entrypoint_pid}): {e}", file=sys.stderr)
+    _entrypoint_pid = None
 
 
 # =============================================================================
