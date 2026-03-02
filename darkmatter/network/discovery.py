@@ -165,7 +165,7 @@ def find_entrypoint_path() -> Optional[str]:
     """Locate the entrypoint.py script for the human node."""
     if ENTRYPOINT_PATH:
         return ENTRYPOINT_PATH if os.path.isfile(ENTRYPOINT_PATH) else None
-    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     fallback = os.path.join(project_dir, "entrypoint.py")
     return fallback if os.path.isfile(fallback) else None
 
