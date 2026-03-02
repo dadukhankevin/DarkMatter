@@ -49,6 +49,10 @@ fi
 COMMIT=$(git -C "$REPO_DIR" rev-parse --short HEAD)
 echo "Installed commit: $COMMIT"
 
+# Copy entrypoint to canonical per-device location
+cp "$REPO_DIR/entrypoint.py" "$DM_DIR/entrypoint.py"
+echo "Entrypoint installed: $DM_DIR/entrypoint.py"
+
 # Create venv and install dependencies
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."

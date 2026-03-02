@@ -162,12 +162,16 @@ async def scan_local_ports(state: AgentState) -> None:
 # =============================================================================
 
 def find_entrypoint_path() -> Optional[str]:
-    """Locate the entrypoint.py script for the human node."""
+    """Locate the entrypoint.py script for the human node.
+
+    Search order:
+    1. DARKMATTER_ENTRYPOINT_PATH env var (explicit override)
+    2. ~/.darkmatter/entrypoint.py (canonical per-device location)
+    """
     if ENTRYPOINT_PATH:
         return ENTRYPOINT_PATH if os.path.isfile(ENTRYPOINT_PATH) else None
-    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    fallback = os.path.join(project_dir, "entrypoint.py")
-    return fallback if os.path.isfile(fallback) else None
+    canonical = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.py")
+    return canonical if os.path.isfile(canonical) else None
 
 
 _entrypoint_pid: Optional[int] = None  # PID of entrypoint we spawned (so we can shut it down)
