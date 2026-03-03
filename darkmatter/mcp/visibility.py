@@ -15,6 +15,7 @@ from darkmatter.config import (
     CORE_TOOLS,
     SOLANA_AVAILABLE,
     AGENT_SPAWN_ENABLED,
+    client_has,
 )
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional
@@ -102,7 +103,7 @@ def build_status_line() -> str:
         )
     if not state.display_name:
         actions.append(
-            "No display name set — edit DARKMATTER_DISPLAY_NAME in your .mcp.json and ask the user to restart"
+            "No display name set — edit DARKMATTER_DISPLAY_NAME in your .mcp.json and ask the user to restart their MCP client"
         )
 
     # Broadcast activity hints
@@ -232,7 +233,8 @@ async def update_status_tool() -> None:
         removed_str = ", ".join(sorted(to_remove)) if to_remove else "none"
         print(f"[DarkMatter] Tool visibility: +[{added_str}] -[{removed_str}] (total: {len(mcp._tool_manager._tools)})", file=sys.stderr)
 
-    await notify_tools_changed()
+    if client_has("tools_list_changed"):
+        await notify_tools_changed()
     if status_changed:
         print(f"[DarkMatter] Status tool updated: {new_desc}", file=sys.stderr)
 

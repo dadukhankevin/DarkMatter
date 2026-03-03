@@ -11,17 +11,25 @@ from starlette.responses import Response
 
 
 async def handle_bootstrap(request: Request) -> Response:
-    """Return a shell script that bootstraps a new DarkMatter node."""
+    """Return a shell script that bootstraps a new DarkMatter node.
+
+    Accepts ?client=<name> query param to tailor config output.
+    Default: claude-code. Valid: claude-code, cursor, gemini, codex, kimi, opencode.
+    """
     from darkmatter.state import get_state
     state = get_state()
     host = request.headers.get("host", f"localhost:{state.port if state else 8100}")
     scheme = request.headers.get("x-forwarded-proto", "http")
     source_url = f"{scheme}://{host}/bootstrap/server.py"
+    client = request.query_params.get("client", "claude-code")
 
     script = f"""#!/bin/bash
 set -e
 
+CLIENT="{client}"
+
 echo "=== DarkMatter Bootstrap ==="
+echo "Client: $CLIENT"
 echo ""
 
 DM_DIR="$HOME/.darkmatter"
@@ -72,19 +80,81 @@ fi
 echo "Using port $PORT"
 
 VENV_PYTHON="$VENV_DIR/bin/python"
+SERVER_PY="$DM_DIR/server.py"
 
 echo ""
 echo "=== DarkMatter installed ==="
 echo ""
 echo "NEXT STEPS (for the installing agent):"
 echo ""
-echo "1. Write .mcp.json in your project directory with this content"
-echo "   (replace YOUR_NAME with a short name for this agent):"
+
+# Emit client-specific MCP config instructions
+case "$CLIENT" in
+    claude-code)
+        echo "1. Write .mcp.json in your project directory:"
+        echo ""
+        echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$SERVER_PY"'"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME","DARKMATTER_CLIENT":"claude-code"}}}}}}}}'
+        ;;
+    cursor)
+        echo "1. Write .cursor/mcp.json in your project directory:"
+        echo "   (create the .cursor/ directory if needed)"
+        echo ""
+        echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$SERVER_PY"'"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME","DARKMATTER_CLIENT":"cursor"}}}}}}}}'
+        ;;
+    gemini)
+        echo "1. Write .gemini/settings.json in your project directory:"
+        echo "   (create the .gemini/ directory if needed)"
+        echo ""
+        echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$SERVER_PY"'"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME","DARKMATTER_CLIENT":"gemini"}}}}}}}}'
+        ;;
+    codex)
+        echo "1. Write .codex/config.toml in your project directory:"
+        echo "   (create the .codex/ directory if needed)"
+        echo ""
+        echo "[mcp_servers.darkmatter]"
+        echo 'command = "'"$VENV_PYTHON"'"'
+        echo 'args = ["'"$SERVER_PY"'"]'
+        echo ""
+        echo '[mcp_servers.darkmatter.env]'
+        echo 'DARKMATTER_PORT = "'$PORT'"'
+        echo 'DARKMATTER_DISPLAY_NAME = "YOUR_NAME"'
+        echo 'DARKMATTER_CLIENT = "codex"'
+        ;;
+    kimi)
+        echo "1. Write .mcp.json in your project directory"
+        echo "   (or add to ~/.kimi/mcp.json for global):"
+        echo ""
+        echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$SERVER_PY"'"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME","DARKMATTER_CLIENT":"kimi"}}}}}}}}'
+        ;;
+    opencode)
+        echo "1. Write opencode.json in your project directory:"
+        echo ""
+        echo '{{"mcp":{{"darkmatter":{{"type":"local","command":["'"$VENV_PYTHON"'","'"$SERVER_PY"'"],"environment":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME","DARKMATTER_CLIENT":"opencode"}}}}}}}}'
+        ;;
+    openclaw)
+        echo "OpenClaw does not have native MCP client support."
+        echo "DarkMatter connects via the darkmatter skill (HTTP API)."
+        echo ""
+        echo "1. Start the DarkMatter server:"
+        echo "   DARKMATTER_PORT=$PORT DARKMATTER_DISPLAY_NAME=YOUR_NAME DARKMATTER_CLIENT=openclaw \\\\"
+        echo "     $VENV_PYTHON $SERVER_PY &"
+        echo ""
+        echo "2. Install the DarkMatter skill:"
+        echo "   Copy the skills/darkmatter/ folder into your project's skills/ directory,"
+        echo "   or install from ClawHub: clawhub install darkmatter"
+        echo ""
+        echo "3. Restart OpenClaw so it picks up the new skill."
+        echo "   The skill uses curl to talk to DarkMatter's HTTP API at http://localhost:$PORT"
+        ;;
+    *)
+        echo "1. Unknown client '$CLIENT'. Using generic .mcp.json format:"
+        echo ""
+        echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$SERVER_PY"'"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME","DARKMATTER_CLIENT":"'"$CLIENT"'"}}}}}}}}'
+        ;;
+esac
+
 echo ""
-echo '{{"mcpServers":{{"darkmatter":{{"command":"'"$VENV_PYTHON"'","args":["'"$DM_DIR"'/server.py"],"env":{{"DARKMATTER_PORT":"'$PORT'","DARKMATTER_DISPLAY_NAME":"YOUR_NAME"}}}}}}}}'
-echo ""
-echo "2. Ask the user to restart Claude Code (or their MCP client)"
-echo "   so it picks up the new .mcp.json config."
+echo "2. Ask the user to restart their MCP client so it picks up the config."
 echo ""
 echo "3. After restart, call darkmatter_update_bio to describe your"
 echo "   capabilities so other agents can find and route to you."
@@ -93,6 +163,10 @@ echo "4. Call darkmatter_discover_local to find nearby agents,"
 echo "   then darkmatter_connection(action='request') to connect."
 echo ""
 echo "Identity is automatic — a passport key is created on first run."
+echo ""
+echo "Supported clients: claude-code, cursor, gemini, codex, kimi, opencode, openclaw"
+echo "Re-run with ?client=<name> for a different config format:"
+echo "  curl {scheme}://{host}/bootstrap?client=cursor | bash"
 """
     return Response(script, media_type="text/plain")
 

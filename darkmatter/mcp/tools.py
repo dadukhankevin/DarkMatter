@@ -1261,12 +1261,20 @@ async def get_server_template(ctx: Context) -> str:
             "2_venv": "Create a venv and install deps: python3 -m venv ~/.darkmatter/venv && ~/.darkmatter/venv/bin/pip install 'mcp[cli]' httpx uvicorn starlette cryptography anyio",
             "3_port": "Pick a port in range 8100-8110. Check availability: lsof -i :<port> 2>/dev/null | grep LISTEN",
             "4_config": (
-                "Write .mcp.json in your project directory. Choose a display name that describes this agent. "
-                "Example content:\n"
-                '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],'
-                '"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<your-name>"}}}}'
+                "Write the MCP config for the user's client. Set DARKMATTER_CLIENT to match. "
+                "Choose a display name that describes this agent."
             ),
-            "5_restart": "Ask the user to restart their MCP client (e.g. Claude Code) so it picks up .mcp.json. The server auto-starts via stdio.",
+            "4_config_examples": {
+                "claude-code": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"claude-code"}}}} → .mcp.json',
+                "cursor": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"cursor"}}}} → .cursor/mcp.json',
+                "gemini": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"gemini"}}}} → .gemini/settings.json',
+                "codex": '[mcp_servers.darkmatter]\ncommand = "~/.darkmatter/venv/bin/python"\nargs = ["~/.darkmatter/server.py"]\n[mcp_servers.darkmatter.env]\nDARKMATTER_PORT = "<port>"\nDARKMATTER_DISPLAY_NAME = "<name>"\nDARKMATTER_CLIENT = "codex" → .codex/config.toml',
+                "kimi": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"kimi"}}}} → .mcp.json (or ~/.kimi/mcp.json)',
+                "opencode": '{"mcp":{"darkmatter":{"type":"local","command":["~/.darkmatter/venv/bin/python","~/.darkmatter/server.py"],"environment":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"opencode"}}}} → opencode.json',
+                "openclaw": 'No MCP config needed. Start server manually: DARKMATTER_PORT=<port> DARKMATTER_CLIENT=openclaw python ~/.darkmatter/server.py & — then install the darkmatter skill: clawhub install darkmatter (or copy skills/darkmatter/ into the project)',
+            },
+            "5_restart": "Ask the user to restart their MCP client so it picks up the config. The server auto-starts via stdio.",
+            "5_bootstrap_shortcut": f"Or use the bootstrap script: curl http://localhost:{state.port}/bootstrap?client=<client-name> | bash",
         },
         "after_restart": {
             "6_bio": "Call darkmatter_update_bio to describe your capabilities — this is how other agents discover and route to you.",

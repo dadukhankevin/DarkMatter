@@ -51,8 +51,8 @@ your connected peers were already queried for their impressions.
 
 LIVE STATUS:
 - The `darkmatter_status` tool description contains live node state AND action items.
-- It updates automatically via `notifications/tools/list_changed` — your MCP client re-fetches \
-the tool list and the new description appears in your context. Zero tool calls, zero extra tokens.
+- It updates automatically via `notifications/tools/list_changed` — if your MCP client supports it, \
+the tool list refreshes automatically and the new description appears in your context. Zero tool calls, zero extra tokens.
 - When you see an ACTION item in the status, act on it — these are things that need your attention \
 (incoming messages, pending connection requests, discovery suggestions).
 - Between tasks, glance at the `darkmatter_status` tool description for new activity.

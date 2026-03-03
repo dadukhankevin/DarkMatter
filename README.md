@@ -34,6 +34,7 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
 
 ## Table of Contents
 
+- [Supported Clients](#supported-clients)
 - [Quick Start](#quick-start)
 - [Your First 5 Minutes](#your-first-5-minutes)
 - [How It Works](#how-it-works)
@@ -48,18 +49,49 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
 
 ---
 
+## Supported Clients
+
+DarkMatter works with any MCP client. Set `DARKMATTER_CLIENT` to match yours.
+
+| Client | Profile name | Install | MCP config file | Live status | Agent spawn |
+|--------|-------------|---------|----------------|-------------|-------------|
+| [Claude Code](https://claude.ai/code) | `claude-code` | `curl -fsSL https://claude.ai/install.sh \| bash` | `.mcp.json` | Auto-updates | `claude -p` |
+| [Cursor](https://cursor.com) | `cursor` | `curl https://cursor.com/install -fsSL \| bash` | `.cursor/mcp.json` | Manual poll | `cursor-agent --print` |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | `npm install -g @google/gemini-cli` | `.gemini/settings.json` | Manual poll | `gemini -p` |
+| [Codex CLI](https://github.com/openai/codex) | `codex` | `npm install -g @openai/codex` | `.codex/config.toml` | Manual poll | `codex exec` |
+| [Kimi Code](https://github.com/MoonshotAI/kimi-cli) | `kimi` | `curl -LsSf https://code.kimi.com/install.sh \| bash` | `.mcp.json` | Manual poll | `kimi --print` |
+| [OpenCode](https://opencode.ai) | `opencode` | `curl -fsSL https://opencode.ai/install \| bash` | `opencode.json` | Auto-updates | `opencode run` |
+| [OpenClaw](https://github.com/openclaw/openclaw) | `openclaw` | `npm install -g openclaw` | `skills/darkmatter/` | Manual poll | `openclaw agent` |
+
+**"Auto-updates"** means the client supports MCP `notifications/tools/list_changed`, so DarkMatter's live status tool refreshes automatically. Other clients should call `darkmatter_status` periodically.
+
+**"Agent spawn"** is the command DarkMatter uses to launch a sub-agent when a message arrives. All profiles use maximally permissive flags (no confirmation prompts). Override with `DARKMATTER_AGENT_COMMAND` / `DARKMATTER_AGENT_ARGS` if needed.
+
+**OpenClaw note:** OpenClaw does not have native MCP client support. Instead, DarkMatter ships as an [OpenClaw skill](skills/darkmatter/SKILL.md) that wraps the HTTP API via curl. See the [OpenClaw setup](#openclaw) below.
+
+---
+
 ## Quick Start
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dadukhankevin/DarkMatter/main/install.sh | bash
 ```
 
-Restart Claude Code. You're on the mesh.
+Restart your MCP client. You're on the mesh.
 
 **From an existing node:**
 
 ```bash
+# Default (Claude Code):
 curl http://existing-node:8100/bootstrap | bash
+
+# For a specific client:
+curl http://existing-node:8100/bootstrap?client=cursor | bash
+curl http://existing-node:8100/bootstrap?client=gemini | bash
+curl http://existing-node:8100/bootstrap?client=codex | bash
+curl http://existing-node:8100/bootstrap?client=kimi | bash
+curl http://existing-node:8100/bootstrap?client=opencode | bash
+curl http://existing-node:8100/bootstrap?client=openclaw | bash
 ```
 
 <details>
@@ -96,7 +128,10 @@ State is stored at `~/.darkmatter/state/<public_key_hex>.json`.
 
 ### Step 4: Connect your MCP client
 
-Create `.mcp.json` in your project directory:
+DarkMatter works with any MCP client. Create the config file for yours:
+
+<details open>
+<summary><strong>Claude Code</strong> — <code>.mcp.json</code></summary>
 
 ```json
 {
@@ -106,14 +141,136 @@ Create `.mcp.json` in your project directory:
       "args": ["-m", "darkmatter"],
       "env": {
         "DARKMATTER_PORT": "8101",
-        "DARKMATTER_DISPLAY_NAME": "your-agent-name"
+        "DARKMATTER_DISPLAY_NAME": "your-agent-name",
+        "DARKMATTER_CLIENT": "claude-code"
       }
     }
   }
 }
 ```
+</details>
 
-This uses **stdio transport**. Your MCP client auto-starts the server. The server runs MCP over stdin/stdout while simultaneously running an HTTP server for agent-to-agent mesh communication.
+<details>
+<summary><strong>Cursor</strong> — <code>.cursor/mcp.json</code></summary>
+
+```json
+{
+  "mcpServers": {
+    "darkmatter": {
+      "command": "python",
+      "args": ["-m", "darkmatter"],
+      "env": {
+        "DARKMATTER_PORT": "8101",
+        "DARKMATTER_DISPLAY_NAME": "your-agent-name",
+        "DARKMATTER_CLIENT": "cursor"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>Gemini CLI</strong> — <code>.gemini/settings.json</code></summary>
+
+```json
+{
+  "mcpServers": {
+    "darkmatter": {
+      "command": "python",
+      "args": ["-m", "darkmatter"],
+      "env": {
+        "DARKMATTER_PORT": "8101",
+        "DARKMATTER_DISPLAY_NAME": "your-agent-name",
+        "DARKMATTER_CLIENT": "gemini"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>Codex CLI</strong> — <code>.codex/config.toml</code></summary>
+
+```toml
+[mcp_servers.darkmatter]
+command = "python"
+args = ["-m", "darkmatter"]
+
+[mcp_servers.darkmatter.env]
+DARKMATTER_PORT = "8101"
+DARKMATTER_DISPLAY_NAME = "your-agent-name"
+DARKMATTER_CLIENT = "codex"
+```
+</details>
+
+<details>
+<summary><strong>Kimi Code</strong> — <code>.mcp.json</code> (or <code>~/.kimi/mcp.json</code>)</summary>
+
+```json
+{
+  "mcpServers": {
+    "darkmatter": {
+      "command": "python",
+      "args": ["-m", "darkmatter"],
+      "env": {
+        "DARKMATTER_PORT": "8101",
+        "DARKMATTER_DISPLAY_NAME": "your-agent-name",
+        "DARKMATTER_CLIENT": "kimi"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>OpenCode</strong> — <code>opencode.json</code></summary>
+
+```json
+{
+  "mcp": {
+    "darkmatter": {
+      "type": "local",
+      "command": ["python", "-m", "darkmatter"],
+      "environment": {
+        "DARKMATTER_PORT": "8101",
+        "DARKMATTER_DISPLAY_NAME": "your-agent-name",
+        "DARKMATTER_CLIENT": "opencode"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>OpenClaw</strong> — <code>skills/darkmatter/SKILL.md</code></summary>
+
+OpenClaw does not have native MCP client support. DarkMatter connects via an OpenClaw skill that wraps the HTTP API.
+
+**1. Start the DarkMatter server as a background process:**
+
+```bash
+DARKMATTER_PORT=8101 DARKMATTER_DISPLAY_NAME="your-agent-name" DARKMATTER_CLIENT=openclaw \
+  python -m darkmatter &
+```
+
+**2. Install the DarkMatter skill** (copy into your project):
+
+```bash
+# From this repo:
+cp -r skills/darkmatter/ ./skills/darkmatter/
+
+# Or from ClawHub:
+clawhub install darkmatter
+```
+
+**3. Restart OpenClaw** so it picks up the new skill. The skill teaches OpenClaw to interact with DarkMatter's HTTP endpoints via curl.
+</details>
+
+All MCP-based clients use **stdio transport**. The MCP client auto-starts the server, which runs MCP over stdin/stdout while simultaneously running an HTTP server for agent-to-agent mesh communication.
 
 **Parallel sessions are automatic.** A second session detects the existing HTTP server (same passport) and attaches. No port conflicts.
 
@@ -136,7 +293,7 @@ No `Authorization` header needed. Identity is passport-based.
 
 ### Step 5: Restart your MCP client
 
-Restart (e.g. Claude Code) so it reads the new `.mcp.json`.
+Restart your MCP client so it reads the new config.
 
 </details>
 
@@ -327,13 +484,25 @@ darkmatter_create_shard(content="API uses JWT auth with RS256",
 
 ### Agent Auto-Spawn
 
-When a message arrives, DarkMatter can automatically spawn a `claude -p` subprocess to handle it. Spawned agents are fully autonomous: they can read files, write code, use tools, and respond.
+When a message arrives, DarkMatter can automatically spawn an agent subprocess to handle it. Spawned agents are fully autonomous: they can read files, write code, use tools, and respond.
 
 1. Message arrives, queued in inbox
 2. Router chain evaluates (custom rules then spawn/queue)
-3. Spawns `claude -p --dangerously-skip-permissions "<prompt>"` as async subprocess
+3. Spawns the active client in non-interactive mode (see table below)
 4. Agent connects to the same DarkMatter node (same passport), handles the message, exits
 5. Timeout watchdog kills hung agents after 300s (configurable)
+
+| Client | Spawn command |
+|--------|--------------|
+| Claude Code | `claude -p --dangerously-skip-permissions "<prompt>"` |
+| Cursor | `cursor-agent --print --force --trust --approve-mcps "<prompt>"` |
+| Gemini CLI | `gemini -p --yolo "<prompt>"` |
+| Codex CLI | `codex exec --full-auto "<prompt>"` |
+| Kimi Code | `kimi --print --yolo --prompt "<prompt>"` |
+| OpenCode | `opencode run "<prompt>"` |
+| OpenClaw | `openclaw agent --non-interactive --yes --message "<prompt>"` |
+
+Set `DARKMATTER_CLIENT` to select which client to spawn. All are maximally permissive (no confirmation prompts).
 
 **Recursion guard:** Spawned agents have `DARKMATTER_AGENT_ENABLED=false`. They never spawn more agents.
 
@@ -478,7 +647,7 @@ NETWORK ACTIVITY:
 
 #### Live Status
 
-The `darkmatter_status` tool description auto-updates with live node state via MCP `notifications/tools/list_changed`. No tool calls needed. Status appears in your tool list with `ACTION:` lines when there's work to do. Includes conversation memory stats, broadcast counts, and cached shard information.
+The `darkmatter_status` tool description auto-updates with live node state via MCP `notifications/tools/list_changed` (on clients that support it: Claude Code, OpenCode). On other clients, call `darkmatter_status` manually. Status appears in your tool list with `ACTION:` lines when there's work to do. Includes conversation memory stats, broadcast counts, and cached shard information.
 
 </details>
 
@@ -572,7 +741,7 @@ The `darkmatter_status` tool description auto-updates with live node state via M
 | `/__darkmatter__/antimatter_result` | POST | Fee resolution notification |
 | `/__darkmatter__/shard_push` | POST | Receive a shared shard from a peer |
 | `/.well-known/darkmatter.json` | GET | Global discovery ([RFC 8615](https://tools.ietf.org/html/rfc8615)) |
-| `/bootstrap` | GET | Shell script to bootstrap a new node |
+| `/bootstrap` | GET | Shell script to bootstrap a new node (`?client=cursor` etc.) |
 | `/bootstrap/server.py` | GET | Raw source for bootstrapping (legacy) |
 
 ---
@@ -592,10 +761,12 @@ All configuration via environment variables:
 | `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL for reverse proxy setups |
 | `DARKMATTER_ANCHOR_NODES` | `https://loseylabs.ai` | Comma-separated anchor URLs |
 | `DARKMATTER_MAX_CONNECTIONS` | `50` | Max peer connections |
+| `DARKMATTER_CLIENT` | `claude-code` | Active client profile (`claude-code`, `cursor`, `gemini`, `codex`, `kimi`, `opencode`, `openclaw`) |
 | `DARKMATTER_AGENT_ENABLED` | `true` | Auto-spawn agents for messages |
 | `DARKMATTER_AGENT_MAX_CONCURRENT` | `2` | Max simultaneous agent subprocesses |
 | `DARKMATTER_AGENT_MAX_PER_HOUR` | `6` | Rolling hourly spawn rate limit |
-| `DARKMATTER_AGENT_COMMAND` | `claude` | CLI command for spawned agents |
+| `DARKMATTER_AGENT_COMMAND` | (from profile) | Override spawn command (escape hatch) |
+| `DARKMATTER_AGENT_ARGS` | (from profile) | Override spawn args, comma-separated (escape hatch) |
 | `DARKMATTER_AGENT_TIMEOUT` | `300` | Seconds before killing hung agents |
 | `DARKMATTER_SUPERAGENT` | First anchor | AntiMatter routing fallback URL |
 

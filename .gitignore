@@ -2,6 +2,7 @@
 .darkmatter/
 .mcp.json
 darkmatter_state*.json
+.darkmatter_anchor_directory.json
 __pycache__/
 *.pyc
 .venv/

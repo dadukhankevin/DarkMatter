@@ -23,7 +23,7 @@ from darkmatter.config import (
     AGENT_SPAWN_ENABLED,
     AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
-    AGENT_SPAWN_TERMINAL,
+    ACTIVE_CLIENT,
     SOLANA_AVAILABLE,
     WEBRTC_AVAILABLE,
     UPNP_AVAILABLE,
@@ -286,8 +286,8 @@ def print_startup_banner(port: int, transport: str, discovery_enabled: bool) -> 
     print(f"[DarkMatter] WebRTC: {'AVAILABLE' if WEBRTC_AVAILABLE else 'disabled (pip install aiortc)'}", file=sys.stderr)
     print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
     spawn_info = f"ENABLED (max {AGENT_SPAWN_MAX_CONCURRENT} concurrent, {AGENT_SPAWN_MAX_PER_HOUR}/hr)" if AGENT_SPAWN_ENABLED else "disabled"
-    if AGENT_SPAWN_ENABLED and AGENT_SPAWN_TERMINAL:
-        spawn_info += " [terminal mode]"
+    if AGENT_SPAWN_ENABLED:
+        spawn_info += f" [client: {ACTIVE_CLIENT['command']}]"
     print(f"[DarkMatter] Agent auto-spawn: {spawn_info}", file=sys.stderr)
     print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
 

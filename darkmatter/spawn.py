@@ -6,22 +6,16 @@ Depends on: config, models
 
 import asyncio
 import os
-import shlex
-import signal
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from darkmatter.config import (
     AGENT_SPAWN_ENABLED,
     AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
-    AGENT_SPAWN_COMMAND,
-    AGENT_SPAWN_ARGS,
-    AGENT_SPAWN_ENV_CLEANUP,
     AGENT_SPAWN_TIMEOUT,
-    AGENT_SPAWN_TERMINAL,
+    ACTIVE_CLIENT,
 )
 from darkmatter.models import AgentState, QueuedMessage
 
@@ -32,13 +26,10 @@ from darkmatter.models import AgentState, QueuedMessage
 
 @dataclass
 class SpawnedAgent:
-    process: Optional[asyncio.subprocess.Process]  # None in terminal mode
+    process: asyncio.subprocess.Process
     message_id: str
     spawned_at: float
-    pid: Optional[int]
-    terminal_mode: bool = False
-    pid_file: Optional[str] = None
-    script_file: Optional[str] = None
+    pid: int
 
 
 _spawned_agents: list[SpawnedAgent] = []
@@ -81,60 +72,15 @@ def can_spawn_agent() -> tuple[bool, str]:
 
 def is_agent_running(agent: SpawnedAgent) -> bool:
     """Check if a spawned agent is still running."""
-    if not agent.terminal_mode:
-        return agent.process is not None and agent.process.returncode is None
-
-    pid = agent.pid
-    if pid is None and agent.pid_file:
-        try:
-            pid = int(open(agent.pid_file).read().strip())
-            agent.pid = pid
-        except (FileNotFoundError, ValueError):
-            return False
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+    return agent.process.returncode is None
 
 
 def kill_agent(agent: SpawnedAgent, force: bool = False) -> None:
     """Send terminate/kill signal to a spawned agent."""
-    if not agent.terminal_mode:
-        if agent.process is not None:
-            if force:
-                agent.process.kill()
-            else:
-                agent.process.terminate()
-        return
-
-    pid = agent.pid
-    if pid is None and agent.pid_file:
-        try:
-            pid = int(open(agent.pid_file).read().strip())
-            agent.pid = pid
-        except (FileNotFoundError, ValueError):
-            return
-    if pid is None:
-        return
-    try:
-        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-
-
-def cleanup_terminal_files(agent: SpawnedAgent) -> None:
-    """Remove PID and script files for a finished terminal agent."""
-    for path in (agent.pid_file, agent.script_file):
-        if path:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+    if force:
+        agent.process.kill()
+    else:
+        agent.process.terminate()
 
 
 def cleanup_finished_agents() -> None:
@@ -142,20 +88,11 @@ def cleanup_finished_agents() -> None:
     still_running = []
     for agent in _spawned_agents:
         if not is_agent_running(agent):
-            pid_display = agent.pid or "unknown"
-            if agent.terminal_mode:
-                print(
-                    f"[DarkMatter] Terminal agent PID {pid_display} finished "
-                    f"(msg={agent.message_id[:12]}...)",
-                    file=sys.stderr,
-                )
-                cleanup_terminal_files(agent)
-            else:
-                print(
-                    f"[DarkMatter] Spawned agent PID {pid_display} exited "
-                    f"(code={agent.process.returncode if agent.process else '?'}, msg={agent.message_id[:12]}...)",
-                    file=sys.stderr,
-                )
+            print(
+                f"[DarkMatter] Spawned agent PID {agent.pid} exited "
+                f"(code={agent.process.returncode}, msg={agent.message_id[:12]}...)",
+                file=sys.stderr,
+            )
         else:
             still_running.append(agent)
     _spawned_agents.clear()
@@ -204,77 +141,6 @@ Check message {msg.message_id} and respond or forward accordingly.
 # Spawn
 # =============================================================================
 
-async def spawn_in_terminal(msg: QueuedMessage, prompt: str, env: dict, cwd: str) -> SpawnedAgent:
-    """Spawn an agent in a visible Terminal.app window (macOS only)."""
-    darkmatter_dir = os.path.expanduser("~/.darkmatter")
-    pids_dir = os.path.join(darkmatter_dir, "spawn_pids")
-    scripts_dir = os.path.join(darkmatter_dir, "spawn_scripts")
-    os.makedirs(pids_dir, exist_ok=True)
-    os.makedirs(scripts_dir, exist_ok=True)
-
-    pid_file = os.path.join(pids_dir, f"{msg.message_id}.pid")
-    script_file = os.path.join(scripts_dir, f"{msg.message_id}.sh")
-
-    env_lines = []
-    for k, v in env.items():
-        env_lines.append(f"export {k}={shlex.quote(v)}")
-    env_block = "\n".join(env_lines)
-
-    cmd_parts = [AGENT_SPAWN_COMMAND] + AGENT_SPAWN_ARGS + [prompt]
-    cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
-
-    unset_block = "\n".join(f"unset {var}" for var in AGENT_SPAWN_ENV_CLEANUP)
-
-    script_content = f"""\
-#!/bin/bash
-# DarkMatter spawned agent — message {msg.message_id[:12]}...
-echo $$ > {shlex.quote(pid_file)}
-
-cleanup() {{
-    rm -f {shlex.quote(pid_file)}
-}}
-trap cleanup EXIT
-
-{unset_block}
-{env_block}
-
-cd {shlex.quote(cwd)}
-
-echo "[DarkMatter] Agent started for message {msg.message_id[:12]}..."
-echo "PID: $$"
-echo "---"
-
-exec {cmd_str}
-"""
-
-    with open(script_file, "w") as f:
-        f.write(script_content)
-    os.chmod(script_file, 0o755)
-
-    escaped_path = script_file.replace('\\', '\\\\').replace('"', '\\"')
-    apple_script = f'tell application "Terminal" to do script "{escaped_path}"'
-    await asyncio.create_subprocess_exec("osascript", "-e", apple_script)
-
-    pid = None
-    for _ in range(20):
-        await asyncio.sleep(0.25)
-        try:
-            pid = int(open(pid_file).read().strip())
-            break
-        except (FileNotFoundError, ValueError):
-            continue
-
-    return SpawnedAgent(
-        process=None,
-        message_id=msg.message_id,
-        spawned_at=time.monotonic(),
-        pid=pid,
-        terminal_mode=True,
-        pid_file=pid_file,
-        script_file=script_file,
-    )
-
-
 async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
                                    save_state_fn=None) -> None:
     """Spawn an agent subprocess to handle an incoming message."""
@@ -296,33 +162,43 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     env = os.environ.copy()
     env["DARKMATTER_AGENT_ENABLED"] = "false"
     env["DARKMATTER_ENTRYPOINT_AUTOSTART"] = "false"
-    for var in AGENT_SPAWN_ENV_CLEANUP:
+    for var in ACTIVE_CLIENT["env_cleanup"]:
         env.pop(var, None)
 
     import random
     env["DARKMATTER_PORT"] = str(random.randint(9200, 9299))
 
-    try:
-        if AGENT_SPAWN_TERMINAL and sys.platform == "darwin":
-            agent = await spawn_in_terminal(msg, prompt, env, os.getcwd())
-            _spawned_agents.append(agent)
-            _spawn_timestamps.append(time.monotonic())
-            pid_display = agent.pid or "pending"
-            print(
-                f"[DarkMatter] Spawned terminal agent (PID {pid_display}) for message {msg.message_id[:12]}... "
-                f"from {msg.from_agent_id or 'unknown'}",
-                file=sys.stderr,
-            )
-            asyncio.create_task(agent_timeout_watchdog(agent))
-            return
+    command = ACTIVE_CLIENT["command"]
+    args = list(ACTIVE_CLIENT["args"])
+    prompt_style = ACTIVE_CLIENT.get("prompt_style", "positional")
+    stdin_pipe = None
 
+    if prompt_style == "positional":
+        args.append(prompt)
+    elif prompt_style == "stdin":
+        stdin_pipe = asyncio.subprocess.PIPE
+    elif prompt_style.startswith("flag:"):
+        flag_name = prompt_style.split(":", 1)[1]
+        args.extend([f"--{flag_name}", prompt])
+    else:
+        print(f"[DarkMatter] Unknown prompt_style '{prompt_style}', falling back to positional", file=sys.stderr)
+        args.append(prompt)
+
+    try:
         process = await asyncio.create_subprocess_exec(
-            AGENT_SPAWN_COMMAND, *AGENT_SPAWN_ARGS, prompt,
+            command, *args,
             env=env,
+            stdin=stdin_pipe,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.getcwd(),
         )
+
+        if stdin_pipe is not None:
+            process.stdin.write(prompt.encode())
+            await process.stdin.drain()
+            process.stdin.close()
+
         agent = SpawnedAgent(
             process=process,
             message_id=msg.message_id,
@@ -341,8 +217,8 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
     except FileNotFoundError:
         print(
-            f"[DarkMatter] Agent spawn failed: command '{AGENT_SPAWN_COMMAND}' not found. "
-            f"Set DARKMATTER_AGENT_COMMAND to the correct path.",
+            f"[DarkMatter] Agent spawn failed: command '{command}' not found. "
+            f"Set DARKMATTER_CLIENT to a valid profile or DARKMATTER_AGENT_COMMAND to the correct path.",
             file=sys.stderr,
         )
     except Exception as e:
@@ -354,18 +230,15 @@ async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:
     await asyncio.sleep(AGENT_SPAWN_TIMEOUT)
     if not is_agent_running(agent):
         return
-    pid_display = agent.pid or "unknown"
     print(
-        f"[DarkMatter] Spawned agent PID {pid_display} timed out after {AGENT_SPAWN_TIMEOUT}s, terminating...",
+        f"[DarkMatter] Spawned agent PID {agent.pid} timed out after {AGENT_SPAWN_TIMEOUT}s, terminating...",
         file=sys.stderr,
     )
     try:
         kill_agent(agent, force=False)
         await asyncio.sleep(5.0)
         if is_agent_running(agent):
-            print(f"[DarkMatter] Force-killing agent PID {pid_display}", file=sys.stderr)
+            print(f"[DarkMatter] Force-killing agent PID {agent.pid}", file=sys.stderr)
             kill_agent(agent, force=True)
-        if agent.terminal_mode:
-            cleanup_terminal_files(agent)
     except ProcessLookupError:
         pass

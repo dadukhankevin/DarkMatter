@@ -150,19 +150,106 @@ SUPERAGENT_DEFAULT_URL = os.environ.get(
 AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
 AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
 AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "6"))
-AGENT_SPAWN_COMMAND = os.environ.get("DARKMATTER_AGENT_COMMAND", "claude")
-AGENT_SPAWN_ARGS: list[str] = [
-    a.strip() for a in os.environ.get(
-        "DARKMATTER_AGENT_ARGS", "-p,--dangerously-skip-permissions"
-    ).split(",") if a.strip()
-]
-AGENT_SPAWN_ENV_CLEANUP: list[str] = [
-    v.strip() for v in os.environ.get(
-        "DARKMATTER_AGENT_ENV_CLEANUP", "CLAUDECODE,CLAUDE_CODE_ENTRYPOINT"
-    ).split(",") if v.strip()
-]
 AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "300"))
-AGENT_SPAWN_TERMINAL = os.environ.get("DARKMATTER_AGENT_TERMINAL", "false").lower() == "true"
+
+# Client profiles — each entry describes how to invoke an MCP client as a spawned agent.
+# DARKMATTER_CLIENT env var selects the active profile (default: "claude-code").
+# prompt_style: "positional" = append prompt as trailing arg,
+#               "stdin" = pipe prompt to stdin,
+#               "flag:<name>" = add --<name> <prompt> as args.
+CLIENT_PROFILES: dict[str, dict] = {
+    "claude-code": {
+        "command": "claude",
+        "args": ["-p", "--dangerously-skip-permissions"],
+        "env_cleanup": ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"],
+        "prompt_style": "positional",          # claude -p --flags <prompt>
+        "capabilities": {"spawn", "tools_list_changed", "mcp_stdio"},
+        "config_file": ".mcp.json",
+        "install": "curl -fsSL https://claude.ai/install.sh | bash",
+    },
+    "cursor": {
+        "command": "cursor-agent",
+        "args": ["--print", "--force", "--trust", "--approve-mcps"],
+        "env_cleanup": ["CURSOR_CLI", "CURSOR_AGENT"],
+        "prompt_style": "positional",          # cursor-agent --print --force <prompt>
+        "capabilities": {"spawn", "mcp_stdio"},
+        "config_file": ".cursor/mcp.json",
+        "install": "curl https://cursor.com/install -fsSL | bash",
+    },
+    "gemini": {
+        "command": "gemini",
+        "args": ["-p", "--yolo"],
+        "env_cleanup": [],
+        "prompt_style": "positional",          # gemini -p --yolo <prompt>
+        "capabilities": {"spawn", "mcp_stdio"},
+        "config_file": ".gemini/settings.json",
+        "install": "npm install -g @google/gemini-cli",
+    },
+    "codex": {
+        "command": "codex",
+        "args": ["exec", "--full-auto"],
+        "env_cleanup": [],
+        "prompt_style": "positional",          # codex exec --full-auto <prompt>
+        "capabilities": {"spawn", "mcp_stdio"},
+        "config_file": ".codex/config.toml",
+        "install": "npm install -g @openai/codex",
+    },
+    "kimi": {
+        "command": "kimi",
+        "args": ["--print", "--yolo"],
+        "env_cleanup": [],
+        "prompt_style": "flag:prompt",         # kimi --print --yolo --prompt <prompt>
+        "capabilities": {"spawn", "mcp_stdio"},
+        "config_file": ".mcp.json",
+        "install": "curl -LsSf https://code.kimi.com/install.sh | bash",
+    },
+    "opencode": {
+        "command": "opencode",
+        "args": ["run"],
+        "env_cleanup": ["OPENCODE"],
+        "prompt_style": "positional",          # opencode run <prompt>
+        "capabilities": {"spawn", "tools_list_changed", "mcp_stdio"},
+        "config_file": "opencode.json",
+        "install": "curl -fsSL https://opencode.ai/install | bash",
+    },
+    "openclaw": {
+        "command": "openclaw",
+        "args": ["agent", "--non-interactive", "--yes", "--message"],
+        "env_cleanup": [],
+        "prompt_style": "positional",          # openclaw agent --non-interactive --yes --message <prompt>
+        "capabilities": {"spawn"},             # no native MCP client — uses DarkMatter skill instead
+        "config_file": "skills/darkmatter/SKILL.md",
+        "install": "npm install -g openclaw",
+    },
+}
+
+_client_name = os.environ.get("DARKMATTER_CLIENT", "claude-code")
+if _client_name not in CLIENT_PROFILES:
+    import sys as _sys
+    print(
+        f"[DarkMatter] WARNING: Unknown client profile '{_client_name}', falling back to 'claude-code'. "
+        f"Valid profiles: {', '.join(CLIENT_PROFILES.keys())}",
+        file=_sys.stderr,
+    )
+    _client_name = "claude-code"
+
+ACTIVE_CLIENT: dict = dict(CLIENT_PROFILES[_client_name])
+
+# Manual overrides (escape hatches)
+_cmd_override = os.environ.get("DARKMATTER_AGENT_COMMAND")
+if _cmd_override:
+    ACTIVE_CLIENT["command"] = _cmd_override
+_args_override = os.environ.get("DARKMATTER_AGENT_ARGS")
+if _args_override:
+    ACTIVE_CLIENT["args"] = [a.strip() for a in _args_override.split(",") if a.strip()]
+_env_cleanup_override = os.environ.get("DARKMATTER_AGENT_ENV_CLEANUP")
+if _env_cleanup_override:
+    ACTIVE_CLIENT["env_cleanup"] = [v.strip() for v in _env_cleanup_override.split(",") if v.strip()]
+
+
+def client_has(capability: str) -> bool:
+    """Check if the active client profile declares a capability."""
+    return capability in ACTIVE_CLIENT.get("capabilities", set())
 
 # =============================================================================
 # Entrypoint (human node) Auto-Start
