@@ -44,6 +44,8 @@ from darkmatter.models import (
     AntiMatterSignal,
     PendingConnectionRequest,
     QueuedMessage,
+    RouterAction,
+    RouterDecision,
 )
 from darkmatter.identity import (
     validate_url,
@@ -709,6 +711,48 @@ async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict
     return {"status": "resolved"}, 200
 
 
+async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decision: RouterDecision) -> None:
+    """Execute a router decision — spawn, forward, respond, or drop."""
+    if decision.action == RouterAction.HANDLE:
+        if AGENT_SPAWN_ENABLED:
+            from darkmatter.spawn import spawn_agent_for_message
+            await spawn_agent_for_message(state, msg)
+        # If spawn disabled, message stays in queue for manual handling
+
+    elif decision.action == RouterAction.FORWARD:
+        from darkmatter.network import send_to_peer
+        for target_id in (decision.forward_to or []):
+            conn = state.connections.get(target_id)
+            if conn:
+                try:
+                    await send_to_peer(conn, "/__darkmatter__/message", {
+                        "from_agent_id": msg.from_agent_id,
+                        "content": msg.content,
+                        "metadata": msg.metadata or {},
+                        "hops_remaining": (msg.hops_remaining or 10) - 1,
+                    })
+                except Exception as e:
+                    print(f"[DarkMatter] Forward to {target_id[:12]}... failed: {e}", file=sys.stderr)
+        # Remove from queue after forwarding
+        state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
+
+    elif decision.action == RouterAction.RESPOND:
+        if msg.webhook_url and decision.response:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(msg.webhook_url, json={
+                        "type": "response",
+                        "from_agent_id": state.agent_id,
+                        "content": decision.response,
+                    })
+            except Exception as e:
+                print(f"[DarkMatter] Auto-respond webhook failed: {e}", file=sys.stderr)
+        state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
+
+    elif decision.action == RouterAction.DROP:
+        state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
+
+
 async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict, int]:
     """Core message processing logic, shared by HTTP and WebRTC receive paths.
 
@@ -867,7 +911,7 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     # Route message through the extensible router chain
     from darkmatter.router import execute_routing
-    asyncio.create_task(execute_routing(state, msg))
+    asyncio.create_task(execute_routing(state, msg, execute_decision_fn=_execute_router_decision))
 
     return {"success": True, "queued": True, "queue_position": len(state.message_queue)}, 200
 
