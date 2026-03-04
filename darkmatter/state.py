@@ -4,7 +4,6 @@ State persistence — save/load JSON, replay protection.
 Depends on: config, models, identity
 """
 
-import fcntl
 import json
 import os
 import sys
@@ -12,6 +11,7 @@ import time
 import threading
 from typing import Optional
 
+from darkmatter.filelock import lock_exclusive, unlock
 from darkmatter.config import (
     DEFAULT_PORT,
     SENT_MESSAGES_MAX,
@@ -276,13 +276,13 @@ def save_state() -> None:
     try:
         with _state_write_lock:
             with open(tmp, "w") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                lock_exclusive(f)
                 try:
                     json.dump(data, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    unlock(f)
             os.replace(tmp, path)
     except OSError as e:
         print(f"[DarkMatter] Warning: could not save state to {path}: {e}", file=sys.stderr)

@@ -5,7 +5,6 @@ Depends on: config, models
 """
 
 import asyncio
-import fcntl
 import json
 import os
 import socket
@@ -15,6 +14,7 @@ from typing import Optional
 
 import httpx
 
+from darkmatter.filelock import lock_exclusive_nb, unlock
 from darkmatter.config import (
     DEFAULT_PORT,
     MAX_CONNECTIONS,
@@ -344,7 +344,7 @@ async def ensure_entrypoint_running() -> None:
     lockfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.lock")
     try:
         lock_fd = os.open(lockfile_path, os.O_CREAT | os.O_WRONLY)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_exclusive_nb(lock_fd)
     except (OSError, IOError):
         print(f"[DarkMatter] Entrypoint spawn locked by another agent, skipping", file=sys.stderr)
         return
@@ -362,14 +362,17 @@ async def ensure_entrypoint_running() -> None:
         print(f"[DarkMatter] Spawning entrypoint: {path}", file=sys.stderr)
         spawn_env = {k: v for k, v in os.environ.items()
                      if not k.startswith("WERKZEUG_")}
-        proc = subprocess.Popen(
-            [sys.executable, path],
-            start_new_session=True,
+        popen_kwargs = dict(
             cwd=entrypoint_dir,
             stdout=log_file,
             stderr=log_file,
             env=spawn_env,
         )
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen([sys.executable, path], **popen_kwargs)
         _entrypoint_pid = proc.pid
 
         for _ in range(20):
@@ -386,7 +389,7 @@ async def ensure_entrypoint_running() -> None:
         print(f"[DarkMatter] Entrypoint failed to start within 10s (check {log_path})", file=sys.stderr)
         _entrypoint_pid = None
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        unlock(lock_fd)
         os.close(lock_fd)
 
 
@@ -399,7 +402,10 @@ def shutdown_entrypoint() -> None:
         return
 
     try:
-        os.kill(_entrypoint_pid, signal.SIGTERM)
+        if sys.platform == "win32":
+            os.kill(_entrypoint_pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.kill(_entrypoint_pid, signal.SIGTERM)
         print(f"[DarkMatter] Entrypoint (PID {_entrypoint_pid}) terminated", file=sys.stderr)
     except ProcessLookupError:
         pass  # already dead

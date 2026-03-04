@@ -14,11 +14,31 @@ Stale entries (>24h unseen) are pruned on writes.
 """
 
 import collections
-import fcntl
 import json
 import os
 import sys
 import time
+
+# Cross-platform file locking
+if sys.platform == "win32":
+    import msvcrt
+    def _flock_sh(f):
+        msvcrt.locking(f.fileno() if hasattr(f, 'fileno') else f, msvcrt.LK_LOCK, 1)
+    def _flock_ex(f):
+        _flock_sh(f)
+    def _flock_un(f):
+        try:
+            msvcrt.locking(f.fileno() if hasattr(f, 'fileno') else f, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+    def _flock_sh(f):
+        _flock_sh(f)
+    def _flock_ex(f):
+        _flock_ex(f)
+    def _flock_un(f):
+        _flock_un(f)
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -106,9 +126,9 @@ def _read_directory() -> dict[str, dict]:
     """Read the peer directory from disk. Returns empty dict if missing/corrupt."""
     try:
         with open(_directory_path) as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+            _flock_sh(f)
             data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
@@ -119,9 +139,9 @@ def _write_directory(directory: dict[str, dict]) -> None:
     try:
         Path(_directory_path).parent.mkdir(parents=True, exist_ok=True)
         with open(_directory_path, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _flock_ex(f)
             json.dump(directory, f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
     except Exception as e:
         print(f"[DarkMatter Anchor] Failed to write directory: {e}", file=sys.stderr)
 
@@ -264,9 +284,9 @@ def _read_relay_buffer() -> dict[str, list[dict]]:
     """Read the relay buffer from disk. Returns empty dict if missing/corrupt."""
     try:
         with open(_relay_buffer_path) as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+            _flock_sh(f)
             data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
@@ -277,9 +297,9 @@ def _write_relay_buffer(buf: dict[str, list[dict]]) -> None:
     try:
         Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
         with open(_relay_buffer_path, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _flock_ex(f)
             json.dump(buf, f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
     except Exception as e:
         print(f"[DarkMatter Anchor] Failed to write relay buffer: {e}", file=sys.stderr)
 
@@ -392,9 +412,9 @@ def _read_conn_relay_buffer() -> dict[str, list[dict]]:
     """Read the connection relay buffer from the shared relay buffer file."""
     try:
         with open(_relay_buffer_path) as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+            _flock_sh(f)
             data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
         top = data.get("connections") if isinstance(data, dict) else None
         return top if isinstance(top, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
@@ -408,18 +428,18 @@ def _write_conn_relay_buffer(conn_buf: dict[str, list[dict]]) -> None:
         # Read existing file to preserve webhook entries
         try:
             with open(_relay_buffer_path) as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
+                _flock_sh(f)
                 full = json.load(f)
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _flock_un(f)
             if not isinstance(full, dict):
                 full = {}
         except (FileNotFoundError, json.JSONDecodeError):
             full = {}
         full["connections"] = conn_buf
         with open(_relay_buffer_path, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _flock_ex(f)
             json.dump(full, f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
     except Exception as e:
         print(f"[DarkMatter Anchor] Failed to write conn relay buffer: {e}", file=sys.stderr)
 
@@ -505,9 +525,9 @@ def _read_sdp_relay_buffer() -> dict[str, list[dict]]:
     """Read the SDP relay buffer from the shared relay buffer file."""
     try:
         with open(_relay_buffer_path) as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+            _flock_sh(f)
             data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
         top = data.get("sdp_signals") if isinstance(data, dict) else None
         return top if isinstance(top, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
@@ -520,18 +540,18 @@ def _write_sdp_relay_buffer(sdp_buf: dict[str, list[dict]]) -> None:
         Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(_relay_buffer_path) as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
+                _flock_sh(f)
                 full = json.load(f)
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _flock_un(f)
             if not isinstance(full, dict):
                 full = {}
         except (FileNotFoundError, json.JSONDecodeError):
             full = {}
         full["sdp_signals"] = sdp_buf
         with open(_relay_buffer_path, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _flock_ex(f)
             json.dump(full, f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
     except Exception as e:
         print(f"[DarkMatter Anchor] Failed to write SDP relay buffer: {e}", file=sys.stderr)
 
@@ -616,9 +636,9 @@ def _read_msg_relay_buffer() -> dict[str, list[dict]]:
     """Read the message relay buffer from the shared relay buffer file."""
     try:
         with open(_relay_buffer_path) as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+            _flock_sh(f)
             data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
         top = data.get("message_relay") if isinstance(data, dict) else None
         return top if isinstance(top, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
@@ -631,18 +651,18 @@ def _write_msg_relay_buffer(msg_buf: dict[str, list[dict]]) -> None:
         Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(_relay_buffer_path) as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
+                _flock_sh(f)
                 full = json.load(f)
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _flock_un(f)
             if not isinstance(full, dict):
                 full = {}
         except (FileNotFoundError, json.JSONDecodeError):
             full = {}
         full["message_relay"] = msg_buf
         with open(_relay_buffer_path, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _flock_ex(f)
             json.dump(full, f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            _flock_un(f)
     except Exception as e:
         print(f"[DarkMatter Anchor] Failed to write message relay buffer: {e}", file=sys.stderr)
 
