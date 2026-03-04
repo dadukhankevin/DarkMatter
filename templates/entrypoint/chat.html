@@ -1087,7 +1087,8 @@ function showMeshTooltip(c, e) {
   const tip = document.getElementById('mesh-tooltip');
   if (!tip) return;
   document.getElementById('mesh-tooltip-name').textContent = agentLabel(c);
-  document.getElementById('mesh-tooltip-bio').textContent = c.bio ? c.bio.slice(0, 80) : 'No bio';
+  const levelTag = c.connectivity_level ? ` [L${c.connectivity_level}:${c.connectivity_method || '?'}]` : '';
+  document.getElementById('mesh-tooltip-bio').textContent = (c.bio ? c.bio.slice(0, 70) : 'No bio') + levelTag;
   tip.classList.remove('hidden');
   moveMeshTooltip(e);
 }
@@ -1780,7 +1781,10 @@ function createMobileConnNode(c) {
       <button type="button" class="dc-btn text-faint hover:text-mesh-red text-[11px] opacity-0 group-hover:opacity-100 transition-all">&times;</button>
     </div>
     ${c.bio ? `<div class="text-[10px] text-muted truncate mt-0.5 pl-3">${esc(c.bio.slice(0, 50))}</div>` : ''}
-    ${c.last_activity ? `<div class="text-[9px] text-faint mt-0.5 pl-3">${timeAgo(c.last_activity)}</div>` : ''}`;
+    <div class="flex items-center gap-1.5 mt-0.5 pl-3">
+      ${c.connectivity_level ? `<span class="text-[9px] px-1 py-px rounded bg-mesh-blue/10 text-mesh-blue font-mono">L${c.connectivity_level}:${esc(c.connectivity_method || '?')}</span>` : ''}
+      ${c.last_activity ? `<span class="text-[9px] text-faint">${timeAgo(c.last_activity)}</span>` : ''}
+    </div>`;
 
   el.querySelector('.dc-btn').addEventListener('click', async () => {
     try {
@@ -1794,7 +1798,7 @@ function createMobileConnNode(c) {
 }
 
 function connHash(c) {
-  return `${c.display_name}|${c.bio}|${c.direction}|${c.last_activity}|${c.health_status || 'ok'}`;
+  return `${c.display_name}|${c.bio}|${c.direction}|${c.last_activity}|${c.health_status || 'ok'}|${c.connectivity_level || 0}`;
 }
 
 function renderConnections(conns) {

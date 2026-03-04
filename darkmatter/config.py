@@ -64,6 +64,15 @@ PEER_UPDATE_MAX_AGE = 300           # max age for peer_update timestamps (replay
 REQUEST_EXPIRY_S = int(os.environ.get("DARKMATTER_REQUEST_EXPIRY", "3600"))  # pending request TTL
 
 # =============================================================================
+# NAT Traversal
+# =============================================================================
+
+SDP_RELAY_TIMEOUT = 30              # seconds to wait for SDP answer via anchor relay
+PEER_RELAY_SDP_TIMEOUT = 15         # seconds for peer-relayed SDP
+CONNECTIVITY_UPGRADE_INTERVAL = 120 # seconds between upgrade attempts
+MESSAGE_RELAY_POLL_INTERVAL = 5     # seconds between anchor message relay polls
+
+# =============================================================================
 # Rate Limiting
 # =============================================================================
 

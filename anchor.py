@@ -490,6 +490,228 @@ def relay_connection_poll(agent_id):
     })
 
 
+# ---------------------------------------------------------------------------
+# SDP Relay — buffer SDP offers/answers for NAT-ed agents (Level 4)
+#
+# Allows agents behind NAT to exchange WebRTC SDP via the anchor as
+# a signaling relay. Short TTL (2 min) since SDP goes stale fast.
+# ---------------------------------------------------------------------------
+
+SDP_RELAY_MAX_PER_AGENT = 10
+SDP_RELAY_ENTRY_TTL = 120  # 2 minutes
+
+
+def _read_sdp_relay_buffer() -> dict[str, list[dict]]:
+    """Read the SDP relay buffer from the shared relay buffer file."""
+    try:
+        with open(_relay_buffer_path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        top = data.get("sdp_signals") if isinstance(data, dict) else None
+        return top if isinstance(top, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_sdp_relay_buffer(sdp_buf: dict[str, list[dict]]) -> None:
+    """Write the SDP relay buffer back into the shared relay buffer file."""
+    try:
+        Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(_relay_buffer_path) as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                full = json.load(f)
+                fcntl.flock(f, fcntl.LOCK_UN)
+            if not isinstance(full, dict):
+                full = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            full = {}
+        full["sdp_signals"] = sdp_buf
+        with open(_relay_buffer_path, "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(full, f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[DarkMatter Anchor] Failed to write SDP relay buffer: {e}", file=sys.stderr)
+
+
+def _prune_sdp_relay_buffer(buf: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Remove expired SDP entries."""
+    now = time.time()
+    pruned = {}
+    for agent_id, entries in buf.items():
+        valid = [e for e in entries if now - e.get("timestamp", 0) < SDP_RELAY_ENTRY_TTL]
+        if valid:
+            pruned[agent_id] = valid
+    return pruned
+
+
+@anchor_bp.route("/__darkmatter__/sdp_relay/<target_agent_id>", methods=["POST"])
+def sdp_relay_post(target_agent_id):
+    """Buffer an SDP offer or answer for a NAT-ed target agent."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    buf = _prune_sdp_relay_buffer(_read_sdp_relay_buffer())
+
+    if target_agent_id not in buf:
+        buf[target_agent_id] = []
+
+    entries = buf[target_agent_id]
+
+    while len(entries) >= SDP_RELAY_MAX_PER_AGENT:
+        entries.pop(0)
+
+    entries.append({
+        "data": data,
+        "timestamp": time.time(),
+    })
+
+    _write_sdp_relay_buffer(buf)
+    return jsonify({"success": True, "buffered": True})
+
+
+@anchor_bp.route("/__darkmatter__/sdp_relay_poll/<agent_id>", methods=["GET"])
+def sdp_relay_poll(agent_id):
+    """Drain buffered SDP signals for an agent. Requires Ed25519 signature."""
+    signature_hex = request.args.get("signature", "")
+    timestamp = request.args.get("timestamp", "")
+
+    if not signature_hex or not timestamp:
+        return jsonify({"error": "Missing signature or timestamp"}), 400
+
+    if not _is_timestamp_fresh(timestamp):
+        return jsonify({"error": "Timestamp expired"}), 403
+
+    if not _verify_relay_poll_signature(agent_id, signature_hex, timestamp):
+        return jsonify({"error": "Invalid signature"}), 403
+
+    buf = _prune_sdp_relay_buffer(_read_sdp_relay_buffer())
+    entries = buf.pop(agent_id, [])
+    _write_sdp_relay_buffer(buf)
+
+    now = time.time()
+    valid = [e["data"] for e in entries if now - e.get("timestamp", 0) < SDP_RELAY_ENTRY_TTL]
+
+    return jsonify({
+        "success": True,
+        "signals": valid,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Message Relay — full message relay for agents behind symmetric NAT (Level 5)
+#
+# When all WebRTC signaling methods fail, agents can relay entire messages
+# through the anchor. Max 50 per agent, 1-hour TTL.
+# ---------------------------------------------------------------------------
+
+MSG_RELAY_MAX_PER_AGENT = 50
+MSG_RELAY_ENTRY_TTL = 3600  # 1 hour
+
+
+def _read_msg_relay_buffer() -> dict[str, list[dict]]:
+    """Read the message relay buffer from the shared relay buffer file."""
+    try:
+        with open(_relay_buffer_path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        top = data.get("message_relay") if isinstance(data, dict) else None
+        return top if isinstance(top, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_msg_relay_buffer(msg_buf: dict[str, list[dict]]) -> None:
+    """Write the message relay buffer back into the shared relay buffer file."""
+    try:
+        Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(_relay_buffer_path) as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                full = json.load(f)
+                fcntl.flock(f, fcntl.LOCK_UN)
+            if not isinstance(full, dict):
+                full = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            full = {}
+        full["message_relay"] = msg_buf
+        with open(_relay_buffer_path, "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(full, f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[DarkMatter Anchor] Failed to write message relay buffer: {e}", file=sys.stderr)
+
+
+def _prune_msg_relay_buffer(buf: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Remove expired message relay entries."""
+    now = time.time()
+    pruned = {}
+    for agent_id, entries in buf.items():
+        valid = [e for e in entries if now - e.get("timestamp", 0) < MSG_RELAY_ENTRY_TTL]
+        if valid:
+            pruned[agent_id] = valid
+    return pruned
+
+
+@anchor_bp.route("/__darkmatter__/message_relay/<target_agent_id>", methods=["POST"])
+def message_relay_post(target_agent_id):
+    """Buffer a full message for a NAT-ed target agent (Level 5 relay)."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    buf = _prune_msg_relay_buffer(_read_msg_relay_buffer())
+
+    if target_agent_id not in buf:
+        buf[target_agent_id] = []
+
+    entries = buf[target_agent_id]
+
+    while len(entries) >= MSG_RELAY_MAX_PER_AGENT:
+        entries.pop(0)
+
+    entries.append({
+        "data": data,
+        "timestamp": time.time(),
+    })
+
+    _write_msg_relay_buffer(buf)
+    return jsonify({"success": True, "buffered": True})
+
+
+@anchor_bp.route("/__darkmatter__/message_relay_poll/<agent_id>", methods=["GET"])
+def message_relay_poll(agent_id):
+    """Drain buffered messages for an agent. Requires Ed25519 signature."""
+    signature_hex = request.args.get("signature", "")
+    timestamp = request.args.get("timestamp", "")
+
+    if not signature_hex or not timestamp:
+        return jsonify({"error": "Missing signature or timestamp"}), 400
+
+    if not _is_timestamp_fresh(timestamp):
+        return jsonify({"error": "Timestamp expired"}), 403
+
+    if not _verify_relay_poll_signature(agent_id, signature_hex, timestamp):
+        return jsonify({"error": "Invalid signature"}), 403
+
+    buf = _prune_msg_relay_buffer(_read_msg_relay_buffer())
+    entries = buf.pop(agent_id, [])
+    _write_msg_relay_buffer(buf)
+
+    now = time.time()
+    valid = [e["data"] for e in entries if now - e.get("timestamp", 0) < MSG_RELAY_ENTRY_TTL]
+
+    return jsonify({
+        "success": True,
+        "messages": valid,
+    })
+
+
 # CSRF exemption list — these routes need to be exempt when used with Flask-WTF
 CSRF_EXEMPT_VIEWS = [
     "darkmatter_anchor.anchor_peer_update",
@@ -500,6 +722,10 @@ CSRF_EXEMPT_VIEWS = [
     "darkmatter_anchor.relay_webhook_poll",
     "darkmatter_anchor.relay_connection_post",
     "darkmatter_anchor.relay_connection_poll",
+    "darkmatter_anchor.sdp_relay_post",
+    "darkmatter_anchor.sdp_relay_poll",
+    "darkmatter_anchor.message_relay_post",
+    "darkmatter_anchor.message_relay_poll",
 ]
 
 

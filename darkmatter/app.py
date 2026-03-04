@@ -37,6 +37,7 @@ from darkmatter.mcp.visibility import initialize_tool_visibility, status_updater
 from darkmatter.network.manager import NetworkManager, set_network_manager, get_network_manager
 from darkmatter.network.transports.http import HttpTransport
 from darkmatter.network.transports.webrtc import WebRTCTransport
+from darkmatter.network.transports.anchor_relay import AnchorRelayTransport
 from darkmatter.network.discovery import (
     DiscoveryProtocol,
     discovery_loop,
@@ -61,6 +62,8 @@ from darkmatter.network.mesh import (
     handle_antimatter_signal,
     handle_antimatter_result,
     handle_shard_push,
+    handle_sdp_relay,
+    handle_sdp_relay_deliver,
 )
 from darkmatter.bootstrap import handle_bootstrap, handle_bootstrap_source
 from darkmatter.spawn import spawn_agent_for_message
@@ -155,6 +158,7 @@ def create_app() -> Router:
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
     manager.register_transport(HttpTransport())
     manager.register_transport(WebRTCTransport())
+    manager.register_transport(AnchorRelayTransport(state_getter=get_state))
     set_network_manager(manager)
 
     # Wire antimatter economy into NetworkManager for transport-agnostic sends
@@ -241,6 +245,8 @@ def create_app() -> Router:
         Route("/antimatter_signal", handle_antimatter_signal, methods=["POST"]),
         Route("/antimatter_result", handle_antimatter_result, methods=["POST"]),
         Route("/shard_push", handle_shard_push, methods=["POST"]),
+        Route("/sdp_relay", handle_sdp_relay, methods=["POST"]),
+        Route("/sdp_relay_deliver", handle_sdp_relay_deliver, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
@@ -388,6 +394,7 @@ async def run_stdio_with_http() -> None:
         manager = NetworkManager(state_getter=get_state, state_saver=save_state)
         manager.register_transport(HttpTransport())
         manager.register_transport(WebRTCTransport())
+        manager.register_transport(AnchorRelayTransport(state_getter=get_state))
         set_network_manager(manager)
         set_antimatter_network_fns(
             send_fn=manager.send,

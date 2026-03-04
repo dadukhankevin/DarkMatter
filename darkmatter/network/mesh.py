@@ -1549,3 +1549,101 @@ async def handle_shard_push(request: Request) -> JSONResponse:
 
     save_state()
     return JSONResponse({"success": True, "shard_id": shard_id})
+
+
+# =============================================================================
+# SDP Relay (Level 3 — Peer-relayed WebRTC signaling)
+# =============================================================================
+
+async def handle_sdp_relay(request: Request) -> JSONResponse:
+    """A peer asks us to relay an SDP offer to a target we're connected to.
+
+    POST /__darkmatter__/sdp_relay
+    Body: {target_agent_id, offer_data, from_agent_id}
+    Returns: {sdp, type} — the SDP answer from the target, or error.
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    target_id = data.get("target_agent_id", "")
+    from_id = data.get("from_agent_id", "")
+    offer_data = data.get("offer_data")
+
+    if not target_id or not from_id or not offer_data:
+        return JSONResponse({"error": "Missing target_agent_id, from_agent_id, or offer_data"}, status_code=400)
+
+    # We must be connected to the target to relay
+    if target_id not in state.connections:
+        return JSONResponse({"error": "Not connected to target agent"}, status_code=404)
+
+    # Forward the SDP offer to the target via our direct connection
+    conn = state.connections[target_id]
+
+    try:
+        from darkmatter.network.transports.http import strip_base_url
+        base_url = strip_base_url(conn.agent_url)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{base_url}/__darkmatter__/sdp_relay_deliver",
+                json={
+                    "from_agent_id": from_id,
+                    "offer_data": offer_data,
+                    "relay_agent_id": state.agent_id,
+                },
+            )
+            if resp.status_code == 200:
+                return JSONResponse(resp.json())
+            return JSONResponse({"error": f"Target returned {resp.status_code}"}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": f"Relay failed: {e}"}, status_code=502)
+
+
+async def handle_sdp_relay_deliver(request: Request) -> JSONResponse:
+    """The actual SDP offer arrives at the target via a relay peer.
+
+    POST /__darkmatter__/sdp_relay_deliver
+    Body: {from_agent_id, offer_data, relay_agent_id}
+    Returns: {sdp, type} — the SDP answer.
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    from_id = data.get("from_agent_id", "")
+    offer_data = data.get("offer_data")
+
+    if not from_id or not offer_data:
+        return JSONResponse({"error": "Missing from_agent_id or offer_data"}, status_code=400)
+
+    # The originator must be connected to us
+    if from_id not in state.connections:
+        return JSONResponse({"error": "Not connected to originating agent"}, status_code=403)
+
+    # Process the offer via WebRTC transport
+    from darkmatter.network.manager import get_network_manager
+    mgr = get_network_manager()
+    webrtc = mgr.get_transport("webrtc")
+    if not webrtc:
+        return JSONResponse({"error": "WebRTC not available"}, status_code=501)
+
+    answer = await webrtc.handle_offer(state, offer_data)
+    if not answer:
+        return JSONResponse({"error": "Failed to generate SDP answer"}, status_code=500)
+
+    # Mark the signaling method on the connection
+    conn = state.connections.get(from_id)
+    if conn:
+        conn._signaling_method = "peer_relay"
+
+    return JSONResponse(answer)

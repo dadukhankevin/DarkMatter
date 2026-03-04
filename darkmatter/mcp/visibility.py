@@ -41,7 +41,9 @@ def build_status_line() -> str:
     peer_labels = []
     for c in state.connections.values():
         label = c.agent_display_name or c.agent_id[:12]
-        if c.transport == "webrtc":
+        if c.connectivity_level > 0:
+            label += f" [L{c.connectivity_level}:{c.connectivity_method}]"
+        elif c.transport == "webrtc":
             label += " [webrtc]"
         peer_labels.append(label)
     peers = ", ".join(peer_labels) if peer_labels else "none"

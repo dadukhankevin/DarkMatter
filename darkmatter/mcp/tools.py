@@ -851,6 +851,8 @@ async def list_connections(ctx: Context) -> str:
             "bio_summary": _truncate(conn.agent_bio, 250) if conn.agent_bio else None,
             "crypto": conn.agent_public_key_hex is not None,
             "transport": conn.transport,
+            "connectivity_level": conn.connectivity_level,
+            "connectivity_method": conn.connectivity_method,
             "connected_at": conn.connected_at,
             "messages_sent": conn.messages_sent,
             "messages_received": conn.messages_received,

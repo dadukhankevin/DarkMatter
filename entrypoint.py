@@ -1213,6 +1213,8 @@ def poll():
         "spawned_agents": spawned_counts.get(c.agent_id, 0),
         "health_status": getattr(c, "health_status", "ok"),
         "wallets": c.wallets,
+        "connectivity_level": getattr(c, "connectivity_level", 0),
+        "connectivity_method": getattr(c, "connectivity_method", ""),
     } for c in state.connections.values() if c.agent_id != state.agent_id]
 
     # Discovered agents (not yet connected)

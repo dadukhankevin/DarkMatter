@@ -66,6 +66,9 @@ class Connection:
     transport: str = "http"              # "http" | "webrtc"
     webrtc_pc: Optional[object] = None   # RTCPeerConnection
     webrtc_channel: Optional[object] = None  # RTCDataChannel
+    # NAT traversal connectivity tracking (ephemeral)
+    connectivity_level: int = 0    # 0=unknown, 1=direct, 2=lan_webrtc, 3=peer_relay, 4=anchor_relay, 5=anchor_msg_relay
+    connectivity_method: str = ""  # human label set alongside level
 
     @property
     def avg_response_time_ms(self) -> float:

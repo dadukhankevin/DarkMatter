@@ -33,6 +33,9 @@ from darkmatter.config import (
     WEBHOOK_RECOVERY_MAX_ATTEMPTS,
     WEBHOOK_RECOVERY_TIMEOUT,
     TRUST_NEGATIVE_TIMEOUT,
+    CONNECTIVITY_UPGRADE_INTERVAL,
+    MESSAGE_RELAY_POLL_INTERVAL,
+    SDP_RELAY_TIMEOUT,
 )
 from darkmatter.identity import (
     validate_webhook_url,
@@ -119,6 +122,7 @@ class NetworkManager:
         self._last_working_anchor: Optional[str] = None
         self._process_webhook_fn: Optional[Callable] = None
         self._process_connection_relay_fn: Optional[Callable] = None
+        self._process_relayed_message_fn: Optional[Callable] = None
 
     # -- Transport registry --
 
@@ -455,6 +459,10 @@ class NetworkManager:
         """Set the connection relay processing callback (injected to avoid circular imports)."""
         self._process_connection_relay_fn = fn
 
+    def set_process_relayed_message_fn(self, fn: Callable) -> None:
+        """Set the relayed message processing callback (Level 5 anchor relay)."""
+        self._process_relayed_message_fn = fn
+
     async def start(self) -> None:
         """Start all transports, discover public URL, detect NAT, start background tasks."""
         state = self._get_state()
@@ -479,7 +487,10 @@ class NetworkManager:
 
         # Start background tasks
         self._tasks.append(asyncio.create_task(self._health_loop()))
+        self._tasks.append(asyncio.create_task(self._connectivity_upgrade_loop()))
         print(f"[DarkMatter] Network health loop: ENABLED ({HEALTH_CHECK_INTERVAL}s interval)",
+              file=sys.stderr)
+        print(f"[DarkMatter] Connectivity upgrade loop: ENABLED ({CONNECTIVITY_UPGRADE_INTERVAL}s interval)",
               file=sys.stderr)
         print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}",
               file=sys.stderr)
@@ -561,6 +572,11 @@ class NetworkManager:
                 state = self._get_state()
                 if state.nat_detected and ANCHOR_NODES and state.private_key_hex:
                     await self._poll_webhook_relay()
+                    await self._poll_sdp_relay()
+                    await self._poll_message_relay()
+
+                # Update connectivity levels on all connections
+                self.update_connectivity_levels()
 
             except asyncio.CancelledError:
                 return
@@ -723,6 +739,202 @@ class NetworkManager:
             except Exception as e:
                 print(f"[DarkMatter] Relay poll error ({anchor}): {e}", file=sys.stderr)
                 continue
+
+    # -- Connectivity level --
+
+    def determine_connectivity_level(self, conn) -> tuple[int, str]:
+        """Determine the connectivity level for a connection.
+
+        Returns (level, method_label):
+            1 = direct (HTTP or WebRTC with direct signaling)
+            2 = LAN WebRTC (WebRTC via LAN multicast signaling)
+            3 = Peer-relayed WebRTC (WebRTC via mutual peer SDP relay)
+            4 = Anchor-relayed WebRTC (WebRTC via anchor SDP relay)
+            5 = Anchor message relay (all messages through anchor)
+            0 = unknown
+        """
+        signaling = getattr(conn, "_signaling_method", "")
+
+        if conn.transport == "webrtc" and conn.webrtc_channel is not None:
+            ready = getattr(conn.webrtc_channel, "readyState", None)
+            if ready == "open":
+                if signaling == "lan":
+                    return 2, "lan-webrtc"
+                elif signaling == "peer_relay":
+                    return 3, "peer-relay"
+                elif signaling == "anchor_relay":
+                    return 4, "anchor-relay"
+                else:
+                    return 1, "direct"
+
+        if conn.transport == "http":
+            # Check if we're actually reaching this peer via anchor relay
+            anchor_transport = self.get_transport("anchor_relay")
+            if anchor_transport:
+                # If HTTP is working directly, it's level 1
+                return 1, "direct"
+
+        if conn.transport == "anchor_relay":
+            return 5, "anchor-msg-relay"
+
+        return 0, "unknown"
+
+    def update_connectivity_levels(self) -> None:
+        """Update connectivity_level and connectivity_method on all connections."""
+        state = self._get_state()
+        if state is None:
+            return
+        for conn in state.connections.values():
+            level, method = self.determine_connectivity_level(conn)
+            conn.connectivity_level = level
+            conn.connectivity_method = method
+
+    # -- Connectivity upgrade loop --
+
+    async def _connectivity_upgrade_loop(self) -> None:
+        """Periodically try to upgrade connections to better connectivity levels."""
+        while True:
+            try:
+                await asyncio.sleep(CONNECTIVITY_UPGRADE_INTERVAL)
+                state = self._get_state()
+                if state is None:
+                    continue
+
+                webrtc = self.get_transport("webrtc")
+                if not webrtc or not webrtc.available:
+                    continue
+
+                for conn in list(state.connections.values()):
+                    level, _ = self.determine_connectivity_level(conn)
+
+                    # Already at best possible level
+                    if level <= 2:
+                        continue
+
+                    # Try LAN signaling first (Level 2) if peer is on LAN
+                    if conn.agent_id in state.discovered_peers:
+                        from darkmatter.network.transports.webrtc import LANSignaling
+                        success = await webrtc.upgrade(state, conn, LANSignaling())
+                        if success:
+                            conn._signaling_method = "lan"
+                            lvl, meth = self.determine_connectivity_level(conn)
+                            conn.connectivity_level = lvl
+                            conn.connectivity_method = meth
+                            peer = conn.agent_display_name or conn.agent_id[:12]
+                            print(f"[DarkMatter] Upgraded {peer} to L{lvl}:{meth}", file=sys.stderr)
+                            continue
+
+                    # Try peer relay (Level 3) if we have mutual peers
+                    if level > 3 and len(state.connections) > 1:
+                        from darkmatter.network.transports.webrtc import PeerRelaySignaling
+                        success = await webrtc.upgrade(state, conn, PeerRelaySignaling())
+                        if success:
+                            conn._signaling_method = "peer_relay"
+                            lvl, meth = self.determine_connectivity_level(conn)
+                            conn.connectivity_level = lvl
+                            conn.connectivity_method = meth
+                            peer = conn.agent_display_name or conn.agent_id[:12]
+                            print(f"[DarkMatter] Upgraded {peer} to L{lvl}:{meth}", file=sys.stderr)
+                            continue
+
+                    # Try anchor relay signaling (Level 4) if available
+                    if level > 4 and ANCHOR_NODES:
+                        from darkmatter.network.transports.webrtc import AnchorRelaySignaling
+                        success = await webrtc.upgrade(state, conn, AnchorRelaySignaling())
+                        if success:
+                            conn._signaling_method = "anchor_relay"
+                            lvl, meth = self.determine_connectivity_level(conn)
+                            conn.connectivity_level = lvl
+                            conn.connectivity_method = meth
+                            peer = conn.agent_display_name or conn.agent_id[:12]
+                            print(f"[DarkMatter] Upgraded {peer} to L{lvl}:{meth}", file=sys.stderr)
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                print(f"[DarkMatter] Connectivity upgrade loop error: {e}", file=sys.stderr)
+
+    # -- Relay polling (SDP + messages) --
+
+    async def _poll_sdp_relay(self) -> None:
+        """Poll anchor for buffered SDP signals when behind NAT."""
+        state = self._get_state()
+        if not state.private_key_hex or not ANCHOR_NODES:
+            return
+
+        ts = datetime.now(timezone.utc).isoformat()
+        sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
+
+        for anchor in ANCHOR_NODES:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{anchor}/__darkmatter__/sdp_relay_poll/{state.agent_id}",
+                        params={"signature": sig, "timestamp": ts},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    signals = data.get("signals", [])
+                    for signal in signals:
+                        sig_type = signal.get("type")
+                        from_id = signal.get("from_agent_id", "")
+                        if sig_type == "offer" and from_id:
+                            offer_data = signal.get("offer_data")
+                            if offer_data:
+                                # Process the SDP offer
+                                webrtc = self.get_transport("webrtc")
+                                if webrtc:
+                                    answer = await webrtc.handle_offer(state, offer_data)
+                                    if answer:
+                                        # Post the answer back to anchor for the offerer
+                                        await client.post(
+                                            f"{anchor}/__darkmatter__/sdp_relay/{from_id}",
+                                            json={
+                                                "from_agent_id": state.agent_id,
+                                                "answer_data": answer,
+                                                "type": "answer",
+                                            },
+                                        )
+                                        conn = state.connections.get(from_id)
+                                        if conn:
+                                            conn._signaling_method = "anchor_relay"
+                    return
+            except Exception as e:
+                print(f"[DarkMatter] SDP relay poll error ({anchor}): {e}", file=sys.stderr)
+
+    async def _poll_message_relay(self) -> None:
+        """Poll anchor for buffered messages when behind NAT (Level 5)."""
+        state = self._get_state()
+        if not state.private_key_hex or not ANCHOR_NODES:
+            return
+
+        ts = datetime.now(timezone.utc).isoformat()
+        sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
+
+        for anchor in ANCHOR_NODES:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{anchor}/__darkmatter__/message_relay_poll/{state.agent_id}",
+                        params={"signature": sig, "timestamp": ts},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    messages = data.get("messages", [])
+                    for msg in messages:
+                        path = msg.get("path", "")
+                        payload = msg.get("payload", {})
+                        from_id = msg.get("from_agent_id", "")
+                        if path and payload and self._process_relayed_message_fn:
+                            self._process_relayed_message_fn(state, path, payload, from_id)
+                        elif path and payload:
+                            print(f"[DarkMatter] Relay: received message on {path} from {from_id[:12]}...",
+                                  file=sys.stderr)
+                    return
+            except Exception as e:
+                print(f"[DarkMatter] Message relay poll error ({anchor}): {e}", file=sys.stderr)
 
     # -- Private helpers --
 

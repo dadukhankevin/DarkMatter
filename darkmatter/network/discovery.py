@@ -27,8 +27,68 @@ from darkmatter.config import (
     ENTRYPOINT_AUTOSTART,
     ENTRYPOINT_PORT,
     ENTRYPOINT_PATH,
+    PEER_RELAY_SDP_TIMEOUT,
 )
 from darkmatter.models import AgentState
+
+
+# =============================================================================
+# LAN SDP Exchange (Level 2 signaling)
+# =============================================================================
+
+# Pending SDP answer futures: keyed by (from_agent_id, target_agent_id)
+_sdp_answer_waiters: dict[tuple[str, str], asyncio.Future] = {}
+
+# Global reference to the multicast socket used by discovery_loop
+_mcast_sock: Optional[socket.socket] = None
+
+
+async def lan_sdp_exchange(state: AgentState, target_agent_id: str,
+                           offer_data: dict) -> Optional[dict]:
+    """Send an SDP offer via LAN multicast and wait for an answer.
+
+    Used by LANSignaling (Level 2). Broadcasts the offer to all LAN agents;
+    the target agent picks it up, processes it, and broadcasts the answer back.
+
+    Returns the SDP answer dict or None on timeout.
+    """
+    global _mcast_sock
+    if _mcast_sock is None:
+        return None
+
+    loop = asyncio.get_event_loop()
+
+    # Create a future to wait for the answer
+    key = (state.agent_id, target_agent_id)
+    fut: asyncio.Future = loop.create_future()
+    _sdp_answer_waiters[key] = fut
+
+    try:
+        # Broadcast the SDP offer via multicast
+        packet = json.dumps({
+            "proto": "darkmatter",
+            "type": "sdp_offer",
+            "target_agent_id": target_agent_id,
+            "from_agent_id": state.agent_id,
+            "offer_data": offer_data,
+        }).encode("utf-8")
+
+        try:
+            await loop.run_in_executor(
+                None, _mcast_sock.sendto, packet,
+                (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT),
+            )
+        except OSError as e:
+            print(f"[DarkMatter] LAN SDP broadcast failed: {e}", file=sys.stderr)
+            return None
+
+        # Wait for answer
+        try:
+            return await asyncio.wait_for(fut, timeout=PEER_RELAY_SDP_TIMEOUT)
+        except asyncio.TimeoutError:
+            return None
+    finally:
+        _sdp_answer_waiters.pop(key, None)
 
 
 # =============================================================================
@@ -87,10 +147,14 @@ def register_peer(state: AgentState, peer_id: str, url: str, bio: str,
 # =============================================================================
 
 class DiscoveryProtocol(asyncio.DatagramProtocol):
-    """Receives UDP multicast discovery beacons from LAN agents."""
+    """Receives UDP multicast discovery beacons and SDP signals from LAN agents."""
 
     def __init__(self, state: AgentState):
         self.state = state
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         try:
@@ -101,6 +165,19 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         if packet.get("proto") != "darkmatter":
             return
 
+        msg_type = packet.get("type", "beacon")
+
+        # Handle SDP offer (Level 2 signaling)
+        if msg_type == "sdp_offer":
+            self._handle_sdp_offer(packet, addr)
+            return
+
+        # Handle SDP answer (Level 2 signaling)
+        if msg_type == "sdp_answer":
+            self._handle_sdp_answer(packet)
+            return
+
+        # Standard discovery beacon
         peer_id = packet.get("agent_id", "")
         if not peer_id or peer_id == self.state.agent_id:
             return
@@ -116,6 +193,76 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
             accepting=packet.get("accepting", True),
             source="lan",
         )
+
+    def _handle_sdp_offer(self, packet: dict, addr: tuple) -> None:
+        """Handle an incoming SDP offer via LAN multicast."""
+        target_id = packet.get("target_agent_id", "")
+        from_id = packet.get("from_agent_id", "")
+        offer_data = packet.get("offer_data")
+
+        if target_id != self.state.agent_id:
+            return  # Not for us
+        if not from_id or not offer_data:
+            return
+        if from_id not in self.state.connections:
+            return  # Only accept from connected peers
+
+        # Process the offer asynchronously
+        asyncio.ensure_future(self._process_lan_offer(from_id, offer_data))
+
+    async def _process_lan_offer(self, from_agent_id: str, offer_data: dict) -> None:
+        """Process a LAN SDP offer and broadcast the answer back."""
+        global _mcast_sock
+        from darkmatter.network.manager import get_network_manager
+
+        try:
+            mgr = get_network_manager()
+            webrtc = mgr.get_transport("webrtc")
+            if not webrtc:
+                return
+
+            answer = await webrtc.handle_offer(self.state, offer_data)
+            if not answer:
+                return
+
+            # Broadcast the answer back via multicast
+            response = json.dumps({
+                "proto": "darkmatter",
+                "type": "sdp_answer",
+                "target_agent_id": from_agent_id,
+                "from_agent_id": self.state.agent_id,
+                "answer_data": answer,
+            }).encode("utf-8")
+
+            if _mcast_sock:
+                loop = asyncio.get_event_loop()
+                try:
+                    await loop.run_in_executor(
+                        None, _mcast_sock.sendto, response,
+                        (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT),
+                    )
+                except OSError:
+                    pass
+
+        except Exception as e:
+            print(f"[DarkMatter] LAN SDP offer processing failed: {e}", file=sys.stderr)
+
+    def _handle_sdp_answer(self, packet: dict) -> None:
+        """Handle an incoming SDP answer via LAN multicast."""
+        target_id = packet.get("target_agent_id", "")
+        from_id = packet.get("from_agent_id", "")
+        answer_data = packet.get("answer_data")
+
+        if target_id != self.state.agent_id:
+            return  # Not for us
+        if not from_id or not answer_data:
+            return
+
+        # Resolve the waiting future
+        key = (self.state.agent_id, from_id)
+        fut = _sdp_answer_waiters.get(key)
+        if fut and not fut.done():
+            fut.set_result(answer_data)
 
 
 # =============================================================================
@@ -267,12 +414,14 @@ def shutdown_entrypoint() -> None:
 
 async def discovery_loop(state: AgentState) -> None:
     """Periodically discover peers via local HTTP scan and LAN multicast."""
+    global _mcast_sock
     loop = asyncio.get_event_loop()
 
     mcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
     mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
     mcast_sock.setblocking(False)
+    _mcast_sock = mcast_sock
 
     try:
         while True:
