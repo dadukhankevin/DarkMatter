@@ -254,7 +254,8 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
     if params.broadcast or params.message_type == "broadcast":
         metadata["type"] = "broadcast"
 
-    webhook = get_network_manager().build_webhook_url(message_id)
+    # Determine peer_url for local relay bypass (set after target resolution)
+    _peer_url = None
 
     if params.broadcast:
         # Broadcast: send to all peers meeting trust threshold
@@ -280,6 +281,11 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
             "success": False,
             "error": "No connections available to route this message."
         })
+
+    # Build webhook URL — pass single target's URL for local relay bypass
+    if len(targets) == 1:
+        _peer_url = targets[0].agent_url
+    webhook = get_network_manager().build_webhook_url(message_id, peer_url=_peer_url)
 
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     base_payload = {
@@ -1224,82 +1230,6 @@ async def wait_for_response(params: WaitForResponseInput, ctx: Context) -> str:
     })
 
 
-# =============================================================================
-# Replication Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_get_server_template",
-    annotations={
-        "title": "Get Server Template (Replicate)",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def get_server_template(ctx: Context) -> str:
-    """Get a copy of this agent's recommended MCP server template.
-
-    This is the replication mechanism. Any agent can provide a server
-    template to new agents joining the network. The template doesn't
-    have to be the same server this agent runs -- it's a recommendation.
-
-    New agents can modify the template however they want, as long as
-    they maintain compatibility with the core mesh primitives:
-    connect, accept, disconnect, message.
-
-    Returns:
-        JSON with the server source code and bootstrap instructions.
-    """
-    state = get_state()
-
-    # Read our own source as the template
-    server_path = os.path.abspath(__file__)
-    with open(server_path, "r") as f:
-        source = f.read()
-
-    return json.dumps({
-        "template_from": state.agent_id,
-        "server_source": source,
-        "setup_instructions": {
-            "1_save": "Save the server_source to ~/.darkmatter/server.py (create the directory if needed)",
-            "2_venv": "Create a venv and install deps: python3 -m venv ~/.darkmatter/venv && ~/.darkmatter/venv/bin/pip install 'mcp[cli]' httpx uvicorn starlette cryptography anyio",
-            "3_port": "Pick a port in range 8100-8200. Check availability: lsof -i :<port> 2>/dev/null | grep LISTEN",
-            "4_config": (
-                "Write the MCP config for the user's client. Set DARKMATTER_CLIENT to match. "
-                "Choose a display name that describes this agent."
-            ),
-            "4_config_examples": {
-                "claude-code": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"claude-code"}}}} → .mcp.json',
-                "cursor": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"cursor"}}}} → .cursor/mcp.json',
-                "gemini": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"gemini"}}}} → .gemini/settings.json',
-                "codex": '[mcp_servers.darkmatter]\ncommand = "~/.darkmatter/venv/bin/python"\nargs = ["~/.darkmatter/server.py"]\n[mcp_servers.darkmatter.env]\nDARKMATTER_PORT = "<port>"\nDARKMATTER_DISPLAY_NAME = "<name>"\nDARKMATTER_CLIENT = "codex" → .codex/config.toml',
-                "kimi": '{"mcpServers":{"darkmatter":{"command":"~/.darkmatter/venv/bin/python","args":["~/.darkmatter/server.py"],"env":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"kimi"}}}} → .mcp.json (or ~/.kimi/mcp.json)',
-                "opencode": '{"mcp":{"darkmatter":{"type":"local","command":["~/.darkmatter/venv/bin/python","~/.darkmatter/server.py"],"environment":{"DARKMATTER_PORT":"<port>","DARKMATTER_DISPLAY_NAME":"<name>","DARKMATTER_CLIENT":"opencode"}}}} → opencode.json',
-                "openclaw": 'No MCP config needed. Start server manually: DARKMATTER_PORT=<port> DARKMATTER_CLIENT=openclaw python ~/.darkmatter/server.py & — then install the darkmatter skill: clawhub install darkmatter (or copy skills/darkmatter/ into the project)',
-            },
-            "5_restart": "Ask the user to restart their MCP client so it picks up the config. The server auto-starts via stdio.",
-            "5_bootstrap_shortcut": f"Or use the bootstrap script: curl http://localhost:{state.port}/bootstrap?client=<client-name> | bash",
-        },
-        "after_restart": {
-            "6_bio": "Call darkmatter_update_bio to describe your capabilities — this is how other agents discover and route to you.",
-            "7_discover": "Call darkmatter_discover_local to find nearby agents on the local network.",
-            "8_connect": f"Connect to this agent: darkmatter_connection(action='request', target_url='http://localhost:{state.port}')",
-        },
-        "notes": {
-            "identity": "Identity is automatic — a passport (.darkmatter/passport.key) is created on first run. Your agent_id = public key hex.",
-            "name_change": "To change your display name later, edit DARKMATTER_DISPLAY_NAME in .mcp.json and ask the user to restart.",
-        },
-        "core_primitives": [
-            "darkmatter_connection",
-            "darkmatter_send_message",
-        ],
-        "compatibility_note": "You may modify the server however you like. "
-            "As long as you implement the core primitives and the "
-            "/__darkmatter__/* HTTP endpoints, you remain compatible with the mesh.",
-    })
-
 
 # =============================================================================
 # Network Discovery Tools
@@ -2003,7 +1933,11 @@ async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
     for shard in state.shared_shards:
         # Filter by tags
         if params.tags:
-            if not any(t in shard.tags for t in params.tags):
+            if not any(
+                st == qt or st.startswith(qt + ":")
+                for qt in params.tags
+                for st in shard.tags
+            ):
                 continue
         # Filter by author
         if params.author and shard.author_agent_id != params.author:

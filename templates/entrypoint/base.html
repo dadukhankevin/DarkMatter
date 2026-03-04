@@ -3,8 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{% block title %}WormHole{% endblock %}</title>
-  <!-- Apply theme before first paint to prevent flash -->
+  <title>{% block title %}DarkMatter{% endblock %}</title>
   <script>
     (function() {
       var t = localStorage.getItem('dm-theme');
@@ -12,185 +11,293 @@
     })();
   </script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
   <script>
     tailwind.config = {
       theme: {
         extend: {
           fontFamily: {
-            mono: ['"JetBrains Mono"', 'monospace'],
+            sans: ['-apple-system', 'BlinkMacSystemFont', '"SF Pro Text"', '"Helvetica Neue"', 'sans-serif'],
           },
           colors: {
-            ink: 'rgb(var(--c-ink) / <alpha-value>)',
-            dim: 'rgb(var(--c-dim) / <alpha-value>)',
-            slab: 'rgb(var(--c-slab) / <alpha-value>)',
-            edge: 'rgb(var(--c-edge) / <alpha-value>)',
+            surface: 'rgb(var(--c-surface) / <alpha-value>)',
+            base: 'rgb(var(--c-base) / <alpha-value>)',
+            card: 'rgb(var(--c-card) / <alpha-value>)',
+            border: 'rgb(var(--c-border) / <alpha-value>)',
             muted: 'rgb(var(--c-muted) / <alpha-value>)',
-            faint: 'rgb(var(--c-faint) / <alpha-value>)',
-            ghost: 'rgb(var(--c-ghost) / <alpha-value>)',
-            pale: 'rgb(var(--c-pale) / <alpha-value>)',
-            bright: 'rgb(var(--c-bright) / <alpha-value>)',
-            solar: {
-              50: '#fef6f0',
-              100: '#fde8d8',
-              200: '#fbd4b8',
-              300: '#f8bb8a',
-              400: '#e89050',
-              500: '#dd8040',
-              600: '#c46a30',
-              700: '#a85525',
+            subtle: 'rgb(var(--c-subtle) / <alpha-value>)',
+            primary: 'rgb(var(--c-primary) / <alpha-value>)',
+            label: 'rgb(var(--c-label) / <alpha-value>)',
+            accent: {
+              blue: 'var(--accent-blue)',
+              green: '#34C759',
+              red: '#FF3B30',
+              orange: '#FF9500',
+              purple: '#AF52DE',
+              cyan: '#32ADE6',
+              yellow: '#FFCC00',
             },
-            mesh: {
-              green: '#34d399',
-              red: '#f87171',
-              blue: '#60a5fa',
-              purple: '#a78bfa',
-              yellow: '#fbbf24',
-              cyan: '#22d3ee',
-            }
           }
         }
       }
     }
   </script>
   <style>
-    /* Theme variables — dark (default) */
     :root {
-      --c-ink: 10 10 11;
-      --c-dim: 17 17 19;
-      --c-slab: 25 25 29;
-      --c-edge: 37 37 41;
-      --c-muted: 85 85 96;
-      --c-faint: 58 58 66;
-      --c-ghost: 45 45 53;
-      --c-pale: 142 142 154;
-      --c-bright: 226 226 234;
-      --qr-fg: #e2e2ea;
-      --qr-bg: #111113;
+      --c-surface: 0 0 0;
+      --c-base: 28 28 30;
+      --c-card: 44 44 46;
+      --c-border: 58 58 60;
+      --c-muted: 142 142 147;
+      --c-subtle: 99 99 102;
+      --c-primary: 255 255 255;
+      --c-label: 174 174 178;
+      --accent-blue: #0A84FF;
+      --bubble-out: #0A84FF;
+      --bubble-in: 44 44 46;
+      --qr-fg: #ffffff;
+      --qr-bg: #1c1c1e;
+      --system-bg: rgba(255,255,255,0.06);
     }
-    /* Light theme */
     [data-theme="light"] {
-      --c-ink: 246 246 249;
-      --c-dim: 255 255 255;
-      --c-slab: 235 236 242;
-      --c-edge: 212 212 224;
-      --c-muted: 128 128 155;
-      --c-faint: 182 182 200;
-      --c-ghost: 222 222 234;
-      --c-pale: 82 82 108;
-      --c-bright: 24 24 42;
-      --qr-fg: #1a1a2e;
+      --c-surface: 245 245 247;
+      --c-base: 255 255 255;
+      --c-card: 255 255 255;
+      --c-border: 220 220 224;
+      --c-muted: 142 142 147;
+      --c-subtle: 174 174 178;
+      --c-primary: 0 0 0;
+      --c-label: 60 60 67;
+      --accent-blue: #007AFF;
+      --bubble-out: #007AFF;
+      --bubble-in: 233 233 235;
+      --qr-fg: #000000;
       --qr-bg: #ffffff;
+      --system-bg: rgba(0,0,0,0.04);
     }
 
     * { box-sizing: border-box; }
-    ::selection { background: #dd8040; color: #0a0a0b; }
-    [data-theme="light"] ::selection { background: #dd8040; color: #fff; }
+    ::selection { background: var(--accent-blue); color: #fff; }
     input:focus, textarea:focus, button:focus { outline: none; }
 
-    /* Scrollbars */
-    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgb(var(--c-ghost)); border-radius: 2px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgb(var(--c-faint)); }
-
-    /* Animations */
-    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-    .pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+    ::-webkit-scrollbar-thumb { background: rgb(var(--c-muted) / 0.15); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgb(var(--c-muted) / 0.3); }
 
     @keyframes fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-    .fade-in { animation: fade-in 0.2s ease-out; }
+    .fade-in { animation: fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1); }
 
-    @keyframes slide-in-left { from { opacity: 0; transform: translateX(-12px); } to { opacity: 1; transform: translateX(0); } }
-    .slide-in-left { animation: slide-in-left 0.25s ease-out; }
+    @keyframes slide-up { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+    .slide-up { animation: slide-up 0.3s ease-out; }
 
-    @keyframes slide-in-right { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
-    .slide-in-right { animation: slide-in-right 0.25s ease-out; }
+    @keyframes glow-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
 
-    @keyframes glow-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(221,128,64,0); } 50% { box-shadow: 0 0 12px 2px rgba(221,128,64,0.15); } }
-    .glow-pulse { animation: glow-pulse 3s ease-in-out infinite; }
-
-    @keyframes toast-in { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
-    @keyframes toast-out { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(100%); } }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(12px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
+    @keyframes toast-out { from { opacity: 1; transform: translateY(0) scale(1); } to { opacity: 0; transform: translateY(12px) scale(0.95); } }
     .toast-enter { animation: toast-in 0.25s ease-out forwards; }
     .toast-exit { animation: toast-out 0.2s ease-in forwards; }
 
-    @keyframes feed-in { from { opacity: 0; max-height: 0; } to { opacity: 1; max-height: 60px; } }
-    .feed-in { animation: feed-in 0.3s ease-out forwards; }
-
-    /* Custom dropdown */
     .dropdown-menu { display: none; }
     .dropdown-open .dropdown-menu { display: block; }
 
-    /* Mesh SVG */
-    @keyframes mesh-glow {
-      0%, 100% { opacity: 0.1; }
-      50% { opacity: 0.25; }
-    }
-    .mesh-glow-pulse { animation: mesh-glow 3s ease-in-out infinite; }
-
-    @keyframes particle-fade {
-      0% { opacity: 0.9; r: 3; }
-      100% { opacity: 0; r: 1; }
-    }
-
-    /* Mobile drawer */
     .drawer-overlay { opacity: 0; pointer-events: none; transition: opacity 0.3s; }
     .drawer-overlay.active { opacity: 1; pointer-events: auto; }
-    .drawer-panel { transform: translateX(100%); transition: transform 0.3s ease; }
+    .drawer-panel { transform: translateX(-100%); transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1); }
     .drawer-overlay.active .drawer-panel { transform: translateX(0); }
+
+    .card-shadow { box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    [data-theme="light"] .card-shadow { box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+    /* ---- Message blocks ---- */
+    .msg-block {
+      padding: 1rem 1.5rem;
+      transition: background 0.2s ease;
+      border-radius: 0;
+    }
+    @media (min-width: 640px) { .msg-block { padding: 1.125rem 2rem; } }
+    .msg-block + .msg-block { border-top: 1px solid rgb(var(--c-border) / 0.06); }
+
+    .msg-sender {
+      font-size: 0.875rem;
+      font-weight: 650;
+      letter-spacing: -0.005em;
+    }
+    .msg-meta {
+      font-size: 0.75rem;
+      color: rgb(var(--c-muted));
+    }
+
+    /* ---- Markdown prose ---- */
+    .msg-content { font-size: 0.9375rem; line-height: 1.7; color: rgb(var(--c-primary) / 0.88); }
+    .msg-content p { margin-bottom: 0.6em; }
+    .msg-content p:last-child { margin-bottom: 0; }
+    .msg-content code {
+      background: rgb(var(--c-card) / 0.7);
+      border: 1px solid rgb(var(--c-border) / 0.15);
+      border-radius: 6px;
+      padding: 0.15em 0.4em;
+      font-size: 0.85em;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
+    }
+    .msg-content pre {
+      background: rgb(var(--c-base));
+      border-radius: 12px;
+      padding: 1em 1.25em;
+      overflow-x: auto;
+      border: 1px solid rgb(var(--c-border) / 0.15);
+      margin: 0.75em 0;
+    }
+    .msg-content pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: 0.85em;
+      line-height: 1.6;
+    }
+    .msg-content a { color: var(--accent-blue); text-decoration: none; transition: opacity 0.15s; }
+    .msg-content a:hover { opacity: 0.8; text-decoration: underline; }
+    .msg-content ul, .msg-content ol { padding-left: 1.5em; margin: 0.5em 0; }
+    .msg-content ul { list-style: disc; }
+    .msg-content ol { list-style: decimal; }
+    .msg-content li { margin-bottom: 0.2em; }
+    .msg-content li p { margin-bottom: 0.2em; }
+    .msg-content strong { font-weight: 600; color: rgb(var(--c-primary)); }
+    .msg-content em { font-style: italic; }
+    .msg-content blockquote {
+      border-left: 3px solid rgb(var(--c-border) / 0.4);
+      padding: 0.25em 0 0.25em 1em;
+      margin: 0.5em 0;
+      color: rgb(var(--c-label));
+    }
+    .msg-content h1, .msg-content h2, .msg-content h3 {
+      font-weight: 650;
+      letter-spacing: -0.01em;
+      color: rgb(var(--c-primary));
+      margin: 0.75em 0 0.35em;
+    }
+    .msg-content h1 { font-size: 1.25em; }
+    .msg-content h2 { font-size: 1.1em; }
+    .msg-content h3 { font-size: 1em; }
+    .msg-content hr { border: none; border-top: 1px solid rgb(var(--c-border) / 0.2); margin: 1em 0; }
+    .msg-content table { border-collapse: collapse; width: 100%; margin: 0.5em 0; font-size: 0.875em; }
+    .msg-content th, .msg-content td { border: 1px solid rgb(var(--c-border) / 0.2); padding: 0.4em 0.75em; text-align: left; }
+    .msg-content th { font-weight: 600; background: rgb(var(--c-card) / 0.5); }
+
+    /* ---- Shard card ---- */
+    .shard-card {
+      background: rgb(var(--c-card) / 0.35);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid rgb(var(--c-border) / 0.1);
+      border-radius: 14px;
+      overflow: hidden;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      position: relative;
+    }
+    .shard-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, #AF52DE, var(--accent-blue));
+      opacity: 0.6;
+    }
+    .shard-card:hover {
+      border-color: rgb(var(--c-border) / 0.2);
+      box-shadow: 0 2px 16px rgba(0,0,0,0.05);
+    }
+    .shard-expand-btn { cursor: pointer; transition: opacity 0.15s; }
+    .shard-expand-btn:hover { opacity: 0.7; }
+
+    /* ---- Reply area ---- */
+    .reply-area {
+      overflow: hidden;
+      max-height: 0;
+      opacity: 0;
+      transition: max-height 0.25s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease, margin 0.25s ease;
+      margin-top: 0;
+    }
+    .reply-area.open {
+      max-height: 200px;
+      opacity: 1;
+      margin-top: 0.75rem;
+    }
+
+    /* ---- System event ---- */
+    .sys-event {
+      font-size: 0.75rem;
+      color: rgb(var(--c-muted));
+      padding: 0.5rem 0;
+      text-align: center;
+      letter-spacing: 0.01em;
+    }
+
+    /* ---- Compose ---- */
+    .compose-ring {
+      border: 1px solid rgb(var(--c-border) / 0.2);
+      border-radius: 1rem;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      background: rgb(var(--c-card) / 0.25);
+    }
+    .compose-ring:focus-within {
+      border-color: rgb(var(--c-border) / 0.4);
+      box-shadow: 0 0 0 4px rgb(var(--c-border) / 0.06);
+      background: rgb(var(--c-card) / 0.35);
+    }
   </style>
 </head>
-<body class="bg-ink h-full font-mono text-bright antialiased overflow-hidden">
+<body class="bg-surface h-full font-sans text-primary antialiased overflow-hidden">
 
-  <!-- Top status bar -->
-  <header class="h-11 bg-dim border-b border-edge flex items-center justify-between px-4 shrink-0 z-40 relative">
+  <!-- Header -->
+  <header class="h-12 bg-base/80 backdrop-blur-xl border-b border-border/50 flex items-center justify-between px-4 shrink-0 z-40 relative">
     <div class="flex items-center gap-3">
       <div class="flex items-center gap-2">
-        <div class="w-2 h-2 rounded-full bg-solar-400 pulse-dot"></div>
-        <span class="text-solar-400 font-semibold text-xs tracking-widest uppercase">WormHole</span>
+        <div class="w-2 h-2 rounded-full bg-accent-green"></div>
+        <span class="text-primary font-semibold text-[13px]">DarkMatter</span>
       </div>
-      <span class="text-faint text-[10px] hidden sm:inline">&middot;</span>
-      <span class="text-pale text-xs hidden sm:inline" id="header-display-name">{{ state.display_name or 'Human' }}</span>
-      <span class="text-muted text-[10px] font-light hidden md:inline" id="header-agent-id">{{ short_id(state.agent_id) }}</span>
+      <span class="text-muted text-[13px] hidden sm:inline" id="header-display-name">{{ state.display_name or 'Human' }}</span>
+      <span class="text-muted/60 text-[11px] hidden md:inline" id="header-agent-id">{{ short_id(state.agent_id) }}</span>
     </div>
-    <div class="flex items-center gap-3 text-xs">
+    <div class="flex items-center gap-2 text-[13px]">
       <div class="flex items-center gap-1.5" id="nav-connections">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
-        <span class="text-pale" id="conn-count">{{ state.connections|length }}</span>
-        <span class="text-muted text-[10px] hidden sm:inline">connected</span>
+        <div class="w-1.5 h-1.5 rounded-full bg-accent-green"></div>
+        <span class="text-label" id="conn-count">{{ state.connections|length }}</span>
       </div>
       <div class="flex items-center gap-1.5 hidden" id="nav-agents-badge">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-cyan pulse-dot"></div>
-        <span class="text-cyan-400 font-medium">0</span>
-        <span class="text-muted text-[10px] hidden sm:inline">agents</span>
+        <div class="w-1.5 h-1.5 rounded-full bg-accent-cyan"></div>
+        <span class="text-accent-cyan font-medium text-[12px]">0</span>
       </div>
       <div class="flex items-center gap-1.5 hidden" id="nav-inbox-badge">
-        <div class="w-1.5 h-1.5 rounded-full bg-solar-400 pulse-dot"></div>
-        <span class="text-solar-400 font-medium">0</span>
+        <span class="bg-accent-blue text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1">0</span>
       </div>
       <div class="flex items-center gap-1.5 hidden" id="nav-pending-badge">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple pulse-dot"></div>
-        <span class="text-mesh-purple font-medium">0</span>
+        <span class="bg-accent-purple text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1">0</span>
       </div>
-      <!-- Wallet connect -->
-      <button id="wallet-btn" onclick="openWalletModal()" class="text-pale hover:text-bright transition-colors p-1" title="Connect Wallet">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <!-- Mesh view toggle -->
+      <button id="mesh-btn" onclick="if(typeof toggleMeshView==='function')toggleMeshView()" class="text-muted hover:text-primary transition-colors p-1.5 rounded-lg hover:bg-card/50" title="Mesh view">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><line x1="12" y1="7" x2="5" y2="17"/><line x1="12" y1="7" x2="19" y2="17"/><line x1="7" y1="19" x2="17" y2="19"/>
+        </svg>
+      </button>
+      <!-- Wallet -->
+      <button id="wallet-btn" onclick="openWalletModal()" class="text-muted hover:text-primary transition-colors p-1.5 rounded-lg hover:bg-card/50" title="Wallet">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><circle cx="18" cy="15" r="1"/>
         </svg>
       </button>
       <!-- Theme toggle -->
-      <button onclick="toggleTheme()" class="text-pale hover:text-bright transition-colors p-1" title="Toggle theme">
-        <svg id="theme-icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-        <svg id="theme-icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="hidden"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+      <button onclick="toggleTheme()" class="text-muted hover:text-primary transition-colors p-1.5 rounded-lg hover:bg-card/50" title="Toggle theme">
+        <svg id="theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+        <svg id="theme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="hidden"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
       </button>
-      <!-- Mobile: toggle right panel -->
-      <button id="mobile-network-toggle" class="md:hidden text-pale hover:text-bright transition-colors p-1"
+      <!-- Mobile sidebar toggle -->
+      <button id="mobile-sidebar-toggle" class="md:hidden text-muted hover:text-primary transition-colors p-1.5 rounded-lg hover:bg-card/50"
         onclick="toggleMobileDrawer()">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" fill="currentColor"/><circle cx="3" cy="5" r="1.5" fill="currentColor" opacity="0.5"/><circle cx="13" cy="5" r="1.5" fill="currentColor" opacity="0.5"/><circle cx="5" cy="13" r="1.5" fill="currentColor" opacity="0.5"/><circle cx="11" cy="13" r="1.5" fill="currentColor" opacity="0.5"/><line x1="8" y1="8" x2="3" y2="5" stroke="currentColor" opacity="0.3" stroke-width="0.5"/><line x1="8" y1="8" x2="13" y2="5" stroke="currentColor" opacity="0.3" stroke-width="0.5"/><line x1="8" y1="8" x2="5" y2="13" stroke="currentColor" opacity="0.3" stroke-width="0.5"/><line x1="8" y1="8" x2="11" y2="13" stroke="currentColor" opacity="0.3" stroke-width="0.5"/></svg>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
     </div>
   </header>
@@ -198,10 +305,9 @@
   {% block content %}{% endblock %}
 
   <!-- Toast container -->
-  <div id="toast-container" class="fixed bottom-4 right-4 flex flex-col gap-2 z-50 pointer-events-none"></div>
+  <div id="toast-container" class="fixed bottom-4 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2 z-50 pointer-events-none"></div>
 
   <script>
-    // --- Theme ---
     function toggleTheme() {
       const html = document.documentElement;
       const isLight = html.getAttribute('data-theme') === 'light';
@@ -223,17 +329,17 @@
     }
     updateThemeIcons();
 
-    // --- Toast system ---
     function showToast(message, type = 'info') {
       const container = document.getElementById('toast-container');
       const colors = {
-        success: 'border-mesh-green/30 bg-mesh-green/8 text-mesh-green',
-        error: 'border-mesh-red/30 bg-mesh-red/8 text-mesh-red',
-        info: 'border-mesh-blue/30 bg-mesh-blue/8 text-mesh-blue',
+        success: 'bg-accent-green/90 text-white',
+        error: 'bg-accent-red/90 text-white',
+        info: 'bg-card/90 text-primary border border-border/50',
       };
       const cls = colors[type] || colors.info;
       const el = document.createElement('div');
-      el.className = `pointer-events-auto border rounded px-3 py-2 text-[11px] font-medium shadow-xl backdrop-blur-sm toast-enter ${cls}`;
+      el.className = `pointer-events-auto rounded-2xl px-4 py-2 text-[13px] font-medium backdrop-blur-xl toast-enter ${cls}`;
+      el.style.boxShadow = '0 4px 16px rgba(0,0,0,0.15)';
       el.textContent = message;
       container.appendChild(el);
       setTimeout(() => {
@@ -243,13 +349,11 @@
       }, 3000);
     }
 
-    // --- Mobile drawer ---
     function toggleMobileDrawer() {
       const overlay = document.getElementById('mobile-drawer-overlay');
       if (overlay) overlay.classList.toggle('active');
     }
 
-    // --- Polling ---
     let _pollInterval = null;
 
     function startPolling() {
@@ -259,8 +363,12 @@
 
     function pollServer() {
       fetch('/api/poll')
-        .then(r => r.json())
+        .then(r => {
+          if (r.status === 401) { window.location.href = '/login'; return null; }
+          return r.json();
+        })
         .then(data => {
+          if (!data) return;
           const inboxBadge = document.getElementById('nav-inbox-badge');
           const pendingBadge = document.getElementById('nav-pending-badge');
 
@@ -294,10 +402,9 @@
         .catch(() => {});
     }
 
-    // --- Wallet modal stub (overridden in chat.html) ---
     if (typeof openWalletModal === 'undefined') {
       window.openWalletModal = function() {
-        showToast('Wallet modal not available on this page', 'info');
+        showToast('Wallet not available on this page', 'info');
       };
     }
 

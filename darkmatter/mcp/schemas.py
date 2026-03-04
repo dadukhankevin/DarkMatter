@@ -178,5 +178,5 @@ class CreateShardInput(BaseModel):
 class ViewShardsInput(BaseModel):
     """Query shared knowledge shards."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    tags: Optional[list[str]] = Field(default=None, description="Filter by tags (ANY match)")
+    tags: Optional[list[str]] = Field(default=None, description="Filter by tags (ANY match, prefix matching — 'pool' matches 'pool:llm')")
     author: Optional[str] = Field(default=None, description="Filter by author agent ID")

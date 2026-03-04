@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DarkMatter - PIN</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+    .card {
+      background: #1c1c1e;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 20px;
+      padding: 2.5rem 2rem;
+      width: 320px;
+      text-align: center;
+    }
+    .icon {
+      width: 48px;
+      height: 48px;
+      background: rgba(10,132,255,0.15);
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 1.25rem;
+    }
+    .icon svg { color: #0A84FF; }
+    h1 {
+      font-size: 1.125rem;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+      margin-bottom: 0.25rem;
+    }
+    .subtitle {
+      font-size: 0.8125rem;
+      color: #8e8e93;
+      margin-bottom: 1.5rem;
+    }
+    .pin-input {
+      width: 100%;
+      background: #2c2c2e;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 0.875rem 1rem;
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: 0.5em;
+      text-align: center;
+      color: #fff;
+      outline: none;
+      transition: border-color 0.2s;
+      -moz-appearance: textfield;
+    }
+    .pin-input::-webkit-outer-spin-button,
+    .pin-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .pin-input:focus { border-color: #0A84FF; }
+    .error {
+      color: #FF3B30;
+      font-size: 0.8125rem;
+      margin-top: 0.75rem;
+      font-weight: 500;
+    }
+    .dots {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      margin-bottom: 1.25rem;
+    }
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #3a3a3c;
+      transition: background 0.15s;
+    }
+    .dot.filled { background: #0A84FF; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+    </div>
+    <h1>DarkMatter</h1>
+    <p class="subtitle">Enter your 4-digit PIN</p>
+    <div class="dots" id="dots">
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+    </div>
+    <form method="POST" action="/login" id="pin-form">
+      <input type="number" name="pin" class="pin-input" maxlength="4"
+             autofocus autocomplete="off" inputmode="numeric" id="pin-input">
+      {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    </form>
+  </div>
+  <script>
+    const input = document.getElementById('pin-input');
+    const dots = document.querySelectorAll('.dot');
+    const form = document.getElementById('pin-form');
+
+    input.addEventListener('input', () => {
+      const val = input.value.replace(/\D/g, '').slice(0, 4);
+      input.value = val;
+      dots.forEach((d, i) => d.classList.toggle('filled', i < val.length));
+      if (val.length === 4) {
+        setTimeout(() => form.submit(), 100);
+      }
+    });
+  </script>
+</body>
+</html>

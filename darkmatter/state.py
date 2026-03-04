@@ -27,6 +27,9 @@ from darkmatter.models import (
     Connection,
     ConversationEntry,
     Impression,
+    Pool,
+    PoolAccessToken,
+    PoolProvider,
     QueuedMessage,
     RoutingRule,
     SentMessage,
@@ -254,6 +257,49 @@ def save_state() -> None:
             }
             for s in state.shared_shards[-SHARED_SHARD_MAX:]
         ],
+        "pools": [
+            {
+                "pool_id": p.pool_id,
+                "name": p.name,
+                "tags": p.tags,
+                "description": p.description,
+                "created_at": p.created_at,
+                "shard_id": p.shard_id,
+                "providers": [
+                    {
+                        "provider_id": pv.provider_id,
+                        "agent_id": pv.agent_id,
+                        "base_url": pv.base_url,
+                        "credential_header": pv.credential_header,
+                        "credential_value": pv.credential_value,
+                        "allowed_paths": pv.allowed_paths,
+                        "price_per_call": pv.price_per_call,
+                        "price_token": pv.price_token,
+                        "enabled": pv.enabled,
+                        "calls_served": pv.calls_served,
+                        "failures": pv.failures,
+                        "added_at": pv.added_at,
+                    }
+                    for pv in p.providers
+                ],
+                "access_tokens": [
+                    {
+                        "token_id": at.token_id,
+                        "consumer_agent_id": at.consumer_agent_id,
+                        "balance": at.balance,
+                        "token_mint": at.token_mint,
+                        "total_deposited": at.total_deposited,
+                        "total_spent": at.total_spent,
+                        "calls_made": at.calls_made,
+                        "created_at": at.created_at,
+                        "last_used": at.last_used,
+                        "revoked": at.revoked,
+                    }
+                    for at in p.access_tokens
+                ],
+            }
+            for p in state.pools
+        ],
         "seen_message_ids": {
             mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < REPLAY_WINDOW
@@ -396,6 +442,50 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             signature_hex=sd.get("signature_hex"),
         ))
 
+    # Deserialize pools
+    pools = []
+    for pd in data.get("pools", []):
+        providers = []
+        for pvd in pd.get("providers", []):
+            providers.append(PoolProvider(
+                provider_id=pvd["provider_id"],
+                agent_id=pvd.get("agent_id", ""),
+                base_url=pvd.get("base_url", ""),
+                credential_header=pvd.get("credential_header", ""),
+                credential_value=pvd.get("credential_value", ""),
+                allowed_paths=pvd.get("allowed_paths", []),
+                price_per_call=pvd.get("price_per_call", 0.0),
+                price_token=pvd.get("price_token", "SOL"),
+                enabled=pvd.get("enabled", True),
+                calls_served=pvd.get("calls_served", 0),
+                failures=pvd.get("failures", 0),
+                added_at=pvd.get("added_at", ""),
+            ))
+        access_tokens = []
+        for atd in pd.get("access_tokens", []):
+            access_tokens.append(PoolAccessToken(
+                token_id=atd["token_id"],
+                consumer_agent_id=atd.get("consumer_agent_id", ""),
+                balance=atd.get("balance", 0.0),
+                token_mint=atd.get("token_mint", "SOL"),
+                total_deposited=atd.get("total_deposited", 0.0),
+                total_spent=atd.get("total_spent", 0.0),
+                calls_made=atd.get("calls_made", 0),
+                created_at=atd.get("created_at", ""),
+                last_used=atd.get("last_used"),
+                revoked=atd.get("revoked", False),
+            ))
+        pools.append(Pool(
+            pool_id=pd["pool_id"],
+            name=pd.get("name", ""),
+            tags=pd.get("tags", []),
+            description=pd.get("description", ""),
+            providers=providers,
+            access_tokens=access_tokens,
+            created_at=pd.get("created_at", ""),
+            shard_id=pd.get("shard_id"),
+        ))
+
     state = AgentState(
         agent_id=data["agent_id"],
         bio=data.get("bio", ""),
@@ -424,6 +514,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         antimatter_log=data.get("gas_log", []),
         conversation_log=conversation_log,
         shared_shards=shared_shards,
+        pools=pools,
     )
 
     return state

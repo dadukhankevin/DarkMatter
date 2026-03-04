@@ -9,6 +9,7 @@ Depends on: config, models, identity, state, network/transport
 """
 
 import asyncio
+import ipaddress
 import os
 import sys
 import time
@@ -100,6 +101,23 @@ def try_upnp_mapping(local_port: int) -> Optional[tuple]:
     except Exception as e:
         print(f"[DarkMatter] UPnP mapping failed: {e}", file=sys.stderr)
         return None
+
+
+# =============================================================================
+# URL locality check
+# =============================================================================
+
+def is_local_url(url: str) -> bool:
+    """Check if a URL points to a local/private address (localhost, LAN, etc.)."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return True
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback
+    except (ValueError, TypeError):
+        return False
 
 
 # =============================================================================
@@ -236,10 +254,17 @@ class NetworkManager:
 
         raise last_err
 
-    def build_webhook_url(self, message_id: str) -> str:
-        """Build the webhook URL, using anchor relay if behind NAT."""
+    def build_webhook_url(self, message_id: str, peer_url: str = None) -> str:
+        """Build the webhook URL, using anchor relay if behind NAT.
+
+        If peer_url is local (private IP / localhost), bypass the anchor relay
+        and use a direct localhost webhook URL instead.
+        """
         state = self._get_state()
         if state.nat_detected and ANCHOR_NODES:
+            # Local peers don't need anchor relay
+            if peer_url and is_local_url(peer_url):
+                return f"http://localhost:{state.port}/__darkmatter__/webhook/{message_id}"
             anchor = self.get_active_anchor()
             return f"{anchor}/__darkmatter__/webhook_relay/{state.agent_id}/{message_id}"
         return f"{self.get_public_url()}/__darkmatter__/webhook/{message_id}"

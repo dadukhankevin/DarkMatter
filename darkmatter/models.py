@@ -146,6 +146,55 @@ class SharedShard:
 
 
 # =============================================================================
+# Pools
+# =============================================================================
+
+@dataclass
+class PoolProvider:
+    """An API provider registered in a pool."""
+    provider_id: str          # "pv-{hex12}"
+    agent_id: str             # who registered this
+    base_url: str             # "https://api.openai.com"
+    credential_header: str    # "Authorization"
+    credential_value: str     # never exposed to consumers
+    allowed_paths: list[str]  # ["/v1/chat/completions"]
+    price_per_call: float
+    price_token: str          # "SOL" or mint address
+    enabled: bool = True
+    calls_served: int = 0
+    failures: int = 0
+    added_at: str = ""
+
+
+@dataclass
+class PoolAccessToken:
+    """A consumer's access token with prepaid balance."""
+    token_id: str             # "at-{hex16}", bearer token for consumer
+    consumer_agent_id: str
+    balance: float
+    token_mint: str
+    total_deposited: float
+    total_spent: float
+    calls_made: int = 0
+    created_at: str = ""
+    last_used: Optional[str] = None
+    revoked: bool = False
+
+
+@dataclass
+class Pool:
+    """A DarkMatter pool — credentialless API access for agents."""
+    pool_id: str              # "pool-{hex12}"
+    name: str
+    tags: list[str]           # ["pool:llm", "pool:openai"]
+    description: str = ""
+    providers: list[PoolProvider] = field(default_factory=list)
+    access_tokens: list[PoolAccessToken] = field(default_factory=list)
+    created_at: str = ""
+    shard_id: Optional[str] = None
+
+
+# =============================================================================
 # Connection Requests
 # =============================================================================
 
@@ -278,3 +327,5 @@ class AgentState:
     conversation_log: list[ConversationEntry] = field(default_factory=list)
     # Shared shards
     shared_shards: list[SharedShard] = field(default_factory=list)
+    # Pools
+    pools: list = field(default_factory=list)  # list[Pool]

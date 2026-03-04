@@ -29,6 +29,7 @@ from darkmatter.config import (
     UPNP_AVAILABLE,
 )
 from darkmatter.models import AgentState, AgentStatus
+from darkmatter.names import generate_agent_name
 from darkmatter.identity import load_or_create_passport
 from darkmatter.state import set_state, get_state, save_state, state_file_path, load_state_from_file
 from darkmatter.mcp import mcp
@@ -65,8 +66,10 @@ from darkmatter.network.mesh import (
     handle_sdp_relay,
     handle_sdp_relay_deliver,
     handle_connection_proof,
+    handle_pool_buy,
+    handle_pool_proxy,
+    handle_pool_info,
 )
-from darkmatter.bootstrap import handle_bootstrap, handle_bootstrap_source
 from darkmatter.spawn import spawn_agent_for_message
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
 
@@ -105,7 +108,7 @@ def init_state(port: int = None) -> None:
         port=port,
         private_key_hex=priv,
         public_key_hex=pub,
-        display_name=display_name or None,
+        display_name=display_name or generate_agent_name(),
     )
     set_state(state)
 
@@ -122,6 +125,8 @@ def init_state(port: int = None) -> None:
         restored.status = AgentStatus.ACTIVE
         if display_name:
             restored.display_name = display_name
+        elif not restored.display_name:
+            restored.display_name = generate_agent_name()
         set_state(restored)
         print(f"[DarkMatter] Restored state (display: {restored.display_name or 'none'}, "
               f"{len(restored.connections)} connections)", file=sys.stderr)
@@ -249,6 +254,9 @@ def create_app() -> Router:
         Route("/shard_push", handle_shard_push, methods=["POST"]),
         Route("/sdp_relay", handle_sdp_relay, methods=["POST"]),
         Route("/sdp_relay_deliver", handle_sdp_relay_deliver, methods=["POST"]),
+        Route("/pool_buy", handle_pool_buy, methods=["POST"]),
+        Route("/pool_proxy", handle_pool_proxy, methods=["POST"]),
+        Route("/pool_info/{pool_id}", handle_pool_info, methods=["GET"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
@@ -270,9 +278,7 @@ def create_app() -> Router:
     app = Router(
         routes=[
             Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
-            Route("/bootstrap", handle_bootstrap, methods=["GET"]),
-            Route("/bootstrap/server.py", handle_bootstrap_source, methods=["GET"]),
-            Mount("/__darkmatter__", routes=darkmatter_routes),
+Mount("/__darkmatter__", routes=darkmatter_routes),
             Route("/mcp", mcp_handler),
         ],
         redirect_slashes=False,
@@ -297,7 +303,7 @@ def print_startup_banner(port: int, transport: str, discovery_enabled: bool) -> 
     if AGENT_SPAWN_ENABLED:
         spawn_info += f" [client: {ACTIVE_CLIENT['command']}]"
     print(f"[DarkMatter] Agent auto-spawn: {spawn_info}", file=sys.stderr)
-    print(f"[DarkMatter] Bootstrap: curl http://localhost:{port}/bootstrap | bash", file=sys.stderr)
+    print(f"[DarkMatter] Install: curl -fsSL https://raw.githubusercontent.com/dadukhankevin/DarkMatter/main/install.sh | bash", file=sys.stderr)
 
 
 def check_port_owner(host: str, port: int) -> Optional[str]:

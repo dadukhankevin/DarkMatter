@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
-from flask import Flask, request, jsonify, render_template, redirect, url_for
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session as flask_session
 
 
 def _is_ajax():
@@ -241,6 +241,42 @@ threading.Thread(target=_message_timeout_checker, daemon=True).start()
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__, template_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "entrypoint"))
+
+# --- Optional PIN auth ---
+_DARKMATTER_PIN = os.environ.get("DARKMATTER_PIN", "").strip()
+app.secret_key = hashlib.sha256(f"darkmatter-entrypoint-session-{state.agent_id}".encode()).digest()
+
+
+@app.before_request
+def _pin_auth_guard():
+    if not _DARKMATTER_PIN:
+        return  # No PIN configured — open access
+    # Exempt paths: login, mesh protocol, well-known
+    path = request.path
+    if path == "/login" or path.startswith("/__darkmatter__/") or path.startswith("/.well-known/"):
+        return
+    if flask_session.get("pin_authenticated"):
+        return
+    # 401 for AJAX, redirect for pages
+    if _is_ajax() or request.headers.get("Accept", "").startswith("application/json"):
+        return jsonify({"error": "Authentication required"}), 401
+    return redirect("/login")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def pin_login():
+    if not _DARKMATTER_PIN:
+        return redirect("/")
+    error = None
+    if request.method == "POST":
+        pin = request.form.get("pin", "").strip()
+        if pin == _DARKMATTER_PIN:
+            flask_session["pin_authenticated"] = True
+            flask_session.permanent = True
+            app.permanent_session_lifetime = __import__("datetime").timedelta(hours=24)
+            return redirect("/")
+        error = "Incorrect PIN"
+    return render_template("pin_login.html", error=error)
 
 
 def _get_public_url():
@@ -857,7 +893,6 @@ def _sync_connection_request(target_url, mutual=False):
 def _sync_send_message(content, target_agent_id=None, metadata=None):
     """Send a message to an agent (sync version)."""
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
-    webhook = _mgr.build_webhook_url(message_id)
 
     if target_agent_id:
         conn = state.connections.get(target_agent_id)
@@ -869,6 +904,8 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
         if not best:
             return {"success": False, "error": "No agents connected."}
         targets = [best]
+
+    webhook = _mgr.build_webhook_url(message_id, peer_url=targets[0].agent_url)
 
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     signature_hex = None
@@ -1244,6 +1281,15 @@ def poll():
         },
         "inbox": inbox, "outbox": outbox, "pending_requests": pending,
         "connections": connections, "discovered": discovered,
+        "shards": [{
+            "shard_id": s.shard_id,
+            "author_id": s.author_agent_id,
+            "author_name": _display_name_for(s.author_agent_id),
+            "content": s.content,
+            "summary": s.summary,
+            "tags": s.tags,
+            "created_at": s.created_at,
+        } for s in getattr(state, "shared_shards", [])],
     })
 
 
@@ -1270,6 +1316,47 @@ def scan():
     """Force an immediate discovery scan."""
     _scan_local_agents()
     return jsonify({"success": True})
+
+
+@app.route("/api/mesh-topology", methods=["GET"])
+def mesh_topology():
+    """Return this node's star graph for client-side mesh crawl.
+
+    Returns {self_id, nodes, edges, peer_urls} so the UI can fan out
+    to each peer's /__darkmatter__/network_info for the full picture.
+    """
+    nodes = [{
+        "id": state.agent_id,
+        "display_name": state.display_name or _short_id(state.agent_id),
+        "bio": state.bio,
+        "is_self": True,
+    }]
+    edges = []
+    peer_urls = {}
+
+    for aid, conn in state.connections.items():
+        nodes.append({
+            "id": aid,
+            "display_name": conn.agent_display_name or _short_id(aid),
+            "bio": conn.agent_bio or "",
+            "is_self": False,
+            "connectivity_level": getattr(conn, "connectivity_level", 0),
+            "connectivity_method": getattr(conn, "connectivity_method", "unknown"),
+        })
+        edges.append({
+            "source": state.agent_id,
+            "target": aid,
+            "connectivity_level": getattr(conn, "connectivity_level", 0),
+        })
+        if conn.agent_url:
+            peer_urls[aid] = conn.agent_url.rstrip("/")
+
+    return jsonify({
+        "self_id": state.agent_id,
+        "nodes": nodes,
+        "edges": edges,
+        "peer_urls": peer_urls,
+    })
 
 
 async def _fetch_all_balances(wallets):

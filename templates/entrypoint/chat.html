@@ -1,202 +1,218 @@
 {% extends "base.html" %}
-{% block title %}WormHole{% endblock %}
+{% block title %}DarkMatter{% endblock %}
 {% block content %}
 
-<div class="flex h-[calc(100vh-44px)] relative">
+<div class="flex h-[calc(100vh-48px)] relative">
 
   <!-- ================================================================== -->
-  <!-- LEFT PANEL — QR Code + Connect + Discovery + Pending + Connections  -->
+  <!-- SIDEBAR — 240px                                                     -->
   <!-- ================================================================== -->
-  <div id="left-panel" class="w-64 bg-dim border-r border-edge flex flex-col shrink-0 overflow-hidden hidden md:flex z-20">
+  <div id="sidebar" class="bg-base border-r border-border/50 flex flex-col shrink-0 overflow-hidden hidden md:flex z-20 transition-[width] duration-200 ease-out" style="width:240px">
 
-    <!-- QR Code panel -->
-    <div id="qr-panel" class="border-b border-edge">
-      <button onclick="toggleQR()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-slab/50 transition-colors">
-        <div class="flex items-center gap-2">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="0.5" y="0.5" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="0.8" class="text-mesh-cyan"/><rect x="7.5" y="0.5" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="0.8" class="text-mesh-cyan"/><rect x="0.5" y="7.5" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="0.8" class="text-mesh-cyan"/><rect x="8" y="8" width="3" height="3" rx="0.5" fill="currentColor" class="text-mesh-cyan" opacity="0.4"/></svg>
-          <span class="text-[10px] text-mesh-cyan font-medium uppercase tracking-wider">LAN Access</span>
+    <!-- Identity card -->
+    <div class="px-4 py-3 border-b border-border/30">
+      <div class="flex items-center gap-2.5">
+        <div class="w-9 h-9 rounded-full bg-accent-blue/15 flex items-center justify-center shrink-0">
+          <span class="text-[15px] font-semibold" style="color: var(--accent-blue)" id="sidebar-avatar">H</span>
         </div>
-        <svg id="qr-chevron" class="text-muted transition-transform" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
-      </button>
-      <div id="qr-content" class="px-3 pb-3 hidden">
-        <div id="qr-code" class="flex justify-center mb-2"></div>
-        <div id="qr-url" class="text-[10px] text-pale text-center break-all select-all"></div>
-        <div id="qr-unavailable" class="text-[10px] text-muted text-center italic hidden">LAN not available</div>
+        <div class="min-w-0">
+          <div class="text-[14px] font-semibold text-primary truncate" id="sidebar-name">{{ state.display_name or 'Human' }}</div>
+          <div class="text-[11px] text-muted truncate" id="sidebar-agent-id">{{ short_id(state.agent_id) }}</div>
+        </div>
       </div>
     </div>
 
     <!-- Connect form -->
-    <div class="px-3 py-2.5 border-b border-edge">
+    <div class="px-3 py-2.5 border-b border-border/30">
       <form id="connect-form" class="flex gap-1.5">
         <input type="text" name="url" placeholder="http://host:port"
-          class="flex-1 bg-slab border border-edge rounded px-2 py-1.5 text-[11px] text-bright placeholder-muted focus:border-solar-500/60 transition-colors min-w-0">
+          class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted focus:border-accent-blue/50 transition-colors min-w-0">
         <button type="submit"
-          class="bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-2.5 py-1.5 rounded transition-colors shrink-0">
+          class="text-white text-[13px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
+          style="background: var(--accent-blue)">
           +
         </button>
       </form>
     </div>
 
     <!-- Discovered agents -->
-    <div id="discovered-section" class="border-b border-edge">
+    <div id="discovered-section" class="border-b border-border/30">
       <div class="px-3 py-2 flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <div class="w-1.5 h-1.5 rounded-full bg-mesh-blue"></div>
-          <span class="text-[10px] text-mesh-blue font-medium uppercase tracking-wider">Discovered</span>
-        </div>
+        <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Discovered</span>
         <button onclick="fetch('/api/scan',{method:'POST'}).then(()=>pollServer())"
-          class="text-muted hover:text-pale text-[10px] transition-colors">scan</button>
+          class="text-muted hover:text-primary text-[11px] transition-colors">Scan</button>
       </div>
       <div id="discovered-list" class="px-3 pb-2 space-y-1">
-        <p class="text-[10px] text-muted italic">Scanning...</p>
+        <p class="text-[12px] text-muted">Scanning...</p>
       </div>
     </div>
 
     <!-- Pending requests -->
-    <div id="pending-section" class="hidden border-b border-edge">
+    <div id="pending-section" class="hidden border-b border-border/30">
       <div class="px-3 py-2 flex items-center gap-2">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-purple pulse-dot"></div>
-        <span class="text-[10px] text-mesh-purple font-medium uppercase tracking-wider">Pending</span>
+        <div class="w-1.5 h-1.5 rounded-full bg-accent-purple"></div>
+        <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Pending</span>
       </div>
       <div id="pending-list" class="px-3 pb-2 space-y-1"></div>
     </div>
 
     <!-- Connections list -->
-    <div class="border-b border-edge">
-      <div class="px-3 py-2 flex items-center gap-2">
-        <div class="w-1.5 h-1.5 rounded-full bg-mesh-green"></div>
-        <span class="text-[10px] text-mesh-green font-medium uppercase tracking-wider">Connections</span>
-        <span class="text-[10px] text-muted ml-auto" id="sidebar-conn-count">0</span>
+    <div class="border-b border-border/30">
+      <div class="px-3 py-2 flex items-center justify-between">
+        <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Connections</span>
+        <span class="text-[11px] text-muted" id="sidebar-conn-count">0</span>
       </div>
-      <div id="connections-list" class="px-3 pb-2 space-y-0.5 max-h-40 overflow-y-auto">
-        <p class="text-[10px] text-muted italic">No connections</p>
+      <div id="connections-list" class="px-3 pb-2 space-y-0.5 max-h-48 overflow-y-auto">
+        <p class="text-[12px] text-muted">No connections</p>
       </div>
     </div>
 
-    <!-- Activity feed -->
-    <div class="flex-1 flex flex-col min-h-0">
-      <div class="px-3 py-2 flex items-center gap-2 shrink-0">
-        <div class="w-1.5 h-1.5 rounded-full bg-solar-400"></div>
-        <span class="text-[10px] text-solar-400 font-medium uppercase tracking-wider">Activity</span>
-      </div>
-      <div id="activity-feed" class="px-3 pb-2 space-y-0.5 overflow-y-auto flex-1">
-        <p class="text-[10px] text-muted italic">Waiting for activity...</p>
+    <!-- QR Code -->
+    <div id="qr-panel" class="border-b border-border/30">
+      <button onclick="toggleQR()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
+        <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">LAN Access</span>
+        <svg id="qr-chevron" class="text-muted transition-transform" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+      </button>
+      <div id="qr-content" class="px-3 pb-3 hidden">
+        <div id="qr-code" class="flex justify-center mb-2"></div>
+        <div id="qr-url" class="text-[11px] text-muted text-center break-all select-all"></div>
+        <div id="qr-unavailable" class="text-[11px] text-muted text-center hidden">LAN not available</div>
       </div>
     </div>
 
     <!-- NAT status footer -->
-    <div id="nat-status" class="px-3 py-2 border-t border-edge hidden">
+    <div id="nat-status" class="px-3 py-2 mt-auto hidden">
       <div class="flex items-center gap-1.5">
-        <div class="w-1 h-1 rounded-full bg-mesh-yellow"></div>
-        <span class="text-[9px] text-muted">NAT detected — using relay</span>
+        <div class="w-1.5 h-1.5 rounded-full bg-accent-orange"></div>
+        <span class="text-[11px] text-muted">NAT detected — using relay</span>
       </div>
     </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- CONSTELLATION — Full-area SVG + floating overlays                    -->
+  <!-- MAIN CHAT AREA                                                      -->
   <!-- ================================================================== -->
-  <div id="constellation-area" class="flex-1 relative bg-ink overflow-hidden">
+  <div id="chat-area" class="flex-1 flex flex-col bg-surface overflow-hidden relative">
 
-    <!-- SVG fills entire area -->
-    <svg id="mesh-svg" class="absolute inset-0 w-full h-full"></svg>
+    <!-- Sidebar toggle (desktop) -->
+    <button id="sidebar-toggle" onclick="toggleSidebar()" class="hidden md:flex absolute top-2 left-2 z-30 w-7 h-7 items-center justify-center rounded-lg text-muted/50 hover:text-muted hover:bg-card/40 transition-all" title="Toggle sidebar">
+      <svg id="sidebar-toggle-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+    </button>
 
-    <!-- Hover tooltip -->
-    <div id="mesh-tooltip" class="absolute hidden bg-slab border border-edge rounded px-2.5 py-1.5 text-[10px] z-30 pointer-events-none shadow-lg max-w-[200px]">
-      <div class="text-bright font-medium" id="mesh-tooltip-name"></div>
-      <div class="text-muted mt-0.5" id="mesh-tooltip-bio"></div>
-    </div>
-
-    <!-- Empty state -->
-    <div id="empty-state" class="absolute inset-0 flex flex-col items-center justify-center text-center select-none pointer-events-none z-10">
-      <div class="relative mb-5">
-        <div class="w-20 h-20 rounded-full border border-solar-500/20 flex items-center justify-center" style="box-shadow: 0 0 40px 4px rgba(221,128,64,0.08)">
-          <div class="w-14 h-14 rounded-full border border-solar-500/15 flex items-center justify-center">
-            <div class="w-4 h-4 rounded-full bg-solar-500/60 pulse-dot"></div>
-          </div>
-        </div>
+    <!-- Network context banner (collapsible) -->
+    <div id="context-banner" class="border-b border-border/30 bg-base/60 backdrop-blur-sm hidden">
+      <button onclick="toggleContextPanel()" class="w-full px-5 py-2.5 flex items-center justify-between text-[12px] text-muted hover:text-label transition-colors">
+        <span class="flex items-center gap-2">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <span id="context-summary" class="font-medium">Network context</span>
+        </span>
+        <svg id="context-chevron" class="transition-transform duration-200" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+      </button>
+      <div id="context-panel" class="hidden px-5 pb-4">
+        <div id="context-connections" class="space-y-2"></div>
       </div>
-      <p class="text-pale text-sm font-medium">WormHole</p>
-      <p class="text-muted text-xs mt-1">connect to an agent to begin</p>
-      <p class="text-faint text-[10px] mt-0.5">the constellation will form around you</p>
     </div>
 
-    <!-- Floating compose bar -->
-    <div id="compose-bar" class="absolute bottom-4 left-4 right-4 z-30">
-      <form id="compose-form">
-        <div id="compose-container" class="bg-dim/90 backdrop-blur-md border border-edge rounded-xl transition-colors focus-within:border-solar-500/40 shadow-xl">
-          <!-- Route pill row -->
-          <div class="flex items-center px-3 pt-2.5 pb-0">
-            <div class="relative" id="target-dropdown-wrap">
-              <button type="button" id="target-dropdown-btn" onclick="toggleDropdown()"
-                class="flex items-center gap-1.5 text-[11px] text-pale hover:text-bright bg-edge/40 hover:bg-edge/70 rounded-full px-2.5 py-1 transition-colors">
-                <svg id="route-icon" width="10" height="10" viewBox="0 0 10 10" class="text-mesh-green shrink-0"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
-                <span id="target-label">auto-route</span>
-                <svg width="8" height="8" viewBox="0 0 8 8" class="text-muted shrink-0"><path d="M2 3l2 2 2-2" stroke="currentColor" stroke-width="1" fill="none"/></svg>
-              </button>
-              <div id="target-dropdown-menu" class="dropdown-menu absolute bottom-full left-0 mb-1 w-52 bg-slab border border-edge rounded-lg shadow-xl z-30 py-1 max-h-48 overflow-y-auto"></div>
+    <!-- Message feed -->
+    <div id="feed-scroll" class="flex-1 overflow-y-auto">
+      <div id="feed-container">
+        <!-- Empty state -->
+        <div id="empty-state" class="flex flex-col items-center justify-center h-full text-center select-none pt-32 px-4">
+          <div class="relative mb-6">
+            <div class="w-20 h-20 rounded-2xl bg-card flex items-center justify-center" style="box-shadow: 0 0 40px rgba(10,132,255,0.08)">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" class="text-muted">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+              </svg>
+            </div>
+            <div class="absolute -bottom-1 -right-1 w-5 h-5 rounded-full bg-accent-green flex items-center justify-center">
+              <div class="w-2 h-2 rounded-full bg-white"></div>
             </div>
           </div>
-          <!-- Textarea + send button -->
-          <div class="flex items-end gap-2 px-3 pt-1.5 pb-2.5">
-            <textarea name="content" id="compose-input" rows="1"
-              placeholder="Send a message..."
-              class="flex-1 bg-transparent text-sm text-bright placeholder-muted resize-none leading-relaxed p-0 border-0 focus:ring-0"
-              style="max-height:120px;outline:none"
-              oninput="autoGrow(this)"></textarea>
+          <p class="text-primary text-lg font-semibold tracking-tight">DarkMatter</p>
+          <p class="text-muted text-sm mt-1.5 max-w-xs leading-relaxed">Connect to an agent in the sidebar to start messaging the mesh</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Compose bar -->
+    <div id="compose-bar" class="px-4 sm:px-6 py-3">
+      <form id="compose-form">
+        <div class="compose-ring bg-card/30 relative">
+          <!-- Textarea -->
+          <textarea name="content" id="compose-input" rows="1"
+            placeholder="Send a message..."
+            class="w-full bg-transparent text-[15px] text-primary placeholder-muted/50 resize-none leading-relaxed px-4 pt-3 pb-12 border-0 focus:ring-0"
+            style="max-height:200px;outline:none;min-height:52px"
+            oninput="autoGrow(this)"></textarea>
+          <!-- Bottom toolbar inside textarea -->
+          <div class="absolute bottom-0 left-0 right-0 flex items-center justify-between px-3 pb-2.5">
+            <div class="flex items-center gap-1.5">
+              <!-- Route selector -->
+              <div class="relative" id="target-dropdown-wrap">
+                <button type="button" id="target-dropdown-btn" onclick="toggleDropdown()"
+                  class="flex items-center gap-1.5 text-[11px] text-muted hover:text-primary rounded-lg px-2 py-1 transition-all hover:bg-surface/50">
+                  <div id="route-dot" class="w-1.5 h-1.5 rounded-full bg-accent-green shrink-0"></div>
+                  <span id="target-label" class="font-medium">auto</span>
+                  <svg width="7" height="7" viewBox="0 0 8 8" class="text-muted/60"><path d="M2 3l2 2 2-2" stroke="currentColor" stroke-width="1" fill="none"/></svg>
+                </button>
+                <div id="target-dropdown-menu" class="dropdown-menu absolute bottom-full left-0 mb-1.5 w-56 bg-card/95 backdrop-blur-xl border border-border/30 rounded-xl z-30 py-1 max-h-48 overflow-y-auto" style="box-shadow: 0 8px 32px rgba(0,0,0,0.2)"></div>
+              </div>
+              <!-- Clear button -->
+              <button type="button" onclick="clearFeed()" title="Clear messages"
+                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+            <!-- Send button -->
             <button type="submit" id="send-btn"
-              class="w-8 h-8 rounded-full bg-solar-500 hover:bg-solar-400 text-ink flex items-center justify-center transition-colors disabled:opacity-30 disabled:cursor-not-allowed shrink-0 mb-0.5"
+              class="rounded-lg text-white flex items-center justify-center transition-all disabled:opacity-20 px-3 py-1.5 text-[12px] font-semibold gap-1.5"
+              style="background: var(--accent-blue)"
               title="Send">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+              Send
             </button>
           </div>
         </div>
         <input type="hidden" name="target" id="target-value" value="auto">
-        <div class="flex items-center justify-end mt-1 px-1">
-          <span class="text-[9px] text-faint"><kbd class="text-muted">Shift+Enter</kbd> newline &middot; <kbd class="text-muted">Enter</kbd> send</span>
-        </div>
       </form>
     </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- RIGHT PANEL — Message Timeline                                      -->
+  <!-- MESH VIEW                                                            -->
   <!-- ================================================================== -->
-  <div id="right-panel" class="relative bg-dim border-l border-edge flex flex-col shrink-0 overflow-hidden hidden md:flex z-20" style="width:320px;min-width:200px;max-width:50vw">
-    <!-- Drag handle for resizing -->
-    <div id="right-panel-handle" class="absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-solar-500/30 active:bg-solar-500/40 transition-colors z-30" style="left:0"></div>
-    <div class="px-3 py-2.5 border-b border-edge flex items-center justify-between">
+  <div id="mesh-view" class="flex-1 flex flex-col bg-surface overflow-hidden relative hidden">
+    <div class="px-4 py-3 border-b border-border/30 flex items-center justify-between">
       <div class="flex items-center gap-2">
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M1 3h10M1 6h7M1 9h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" class="text-solar-400"/></svg>
-        <span class="text-[11px] text-solar-400 font-medium uppercase tracking-wider">Messages</span>
-        <span id="timeline-count" class="text-[10px] text-muted bg-edge/50 rounded-full px-1.5 py-0.5 min-w-[18px] text-center">0</span>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="text-accent-blue">
+          <circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><line x1="12" y1="7" x2="5" y2="17"/><line x1="12" y1="7" x2="19" y2="17"/><line x1="7" y1="19" x2="17" y2="19"/>
+        </svg>
+        <span class="text-[14px] font-semibold text-primary">Mesh Topology</span>
+        <span id="mesh-node-count" class="text-[11px] text-muted"></span>
       </div>
-      <button id="timeline-clear-btn" onclick="clearTimeline()" class="text-faint hover:text-muted transition-colors" title="Clear messages">
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
-      </button>
+      <button onclick="showChatView()" class="text-muted hover:text-primary text-[13px] font-medium transition-colors">Back to Chat</button>
     </div>
-    <div id="timeline-scroll" class="flex-1 overflow-y-auto px-2.5 py-2 space-y-2"></div>
+    <div id="mesh-graph" class="flex-1 relative"></div>
+    <!-- Mesh tooltip -->
+    <div id="mesh-tooltip" class="fixed hidden bg-card/95 backdrop-blur-xl border border-border/50 rounded-xl p-3 z-50 max-w-xs" style="box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
+      <div class="text-[13px] font-semibold text-primary" id="tooltip-name"></div>
+      <div class="text-[11px] text-muted mt-0.5" id="tooltip-id"></div>
+      <div class="text-[12px] text-label mt-1.5" id="tooltip-bio"></div>
+      <div class="text-[11px] text-muted mt-1" id="tooltip-level"></div>
+      <button id="tooltip-connect-btn" class="hidden mt-2 w-full text-[12px] font-semibold text-white rounded-lg py-1.5 transition-colors" style="background: var(--accent-blue)" onclick="connectFromTooltip()">Connect</button>
+    </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- MOBILE DRAWER — Left panel on small screens                         -->
+  <!-- MOBILE DRAWER                                                       -->
   <!-- ================================================================== -->
-  <div id="mobile-drawer-overlay" class="drawer-overlay fixed inset-0 bg-black/60 z-50 md:hidden" onclick="toggleMobileDrawer()">
-    <div class="drawer-panel absolute left-0 top-0 bottom-0 w-72 bg-dim border-r border-edge flex flex-col overflow-hidden" onclick="event.stopPropagation()" style="transform:translateX(-100%)">
-      <div class="px-3 py-2.5 border-b border-edge flex items-center justify-between">
-        <span class="text-[10px] text-solar-400 font-medium uppercase tracking-wider">WormHole</span>
-        <button onclick="toggleMobileDrawer()" class="text-muted hover:text-bright text-xs">&times;</button>
+  <div id="mobile-drawer-overlay" class="drawer-overlay fixed inset-0 bg-black/40 backdrop-blur-sm z-50 md:hidden" onclick="toggleMobileDrawer()">
+    <div class="drawer-panel absolute left-0 top-0 bottom-0 w-72 bg-base flex flex-col overflow-hidden" onclick="event.stopPropagation()">
+      <div class="px-4 py-3 border-b border-border/30 flex items-center justify-between">
+        <span class="text-[14px] font-semibold text-primary">DarkMatter</span>
+        <button onclick="toggleMobileDrawer()" class="text-muted hover:text-primary text-lg">&times;</button>
       </div>
-      <!-- Connected agents (mobile) -->
       <div class="flex-1 overflow-y-auto px-3 py-2 space-y-1" id="mobile-connections-list"></div>
-      <!-- Activity feed (mobile) -->
-      <div class="border-t border-edge">
-        <div class="px-3 py-2 flex items-center gap-2">
-          <div class="w-1.5 h-1.5 rounded-full bg-solar-400"></div>
-          <span class="text-[10px] text-solar-400 font-medium uppercase tracking-wider">Activity</span>
-        </div>
-        <div id="mobile-activity-feed" class="px-3 pb-2 space-y-0.5 max-h-36 overflow-y-auto"></div>
-      </div>
     </div>
   </div>
 
@@ -205,191 +221,160 @@
 <!-- ================================================================== -->
 <!-- WALLET MODAL                                                        -->
 <!-- ================================================================== -->
-<div id="wallet-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-[60] hidden flex items-center justify-center" onclick="if(event.target===this)closeWalletModal()">
-  <div class="bg-dim border border-edge rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-    <div class="px-5 pt-5 pb-3 border-b border-edge flex items-center justify-between">
-      <div class="flex items-center gap-2">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-solar-400">
+<div id="wallet-modal" class="fixed inset-0 bg-black/40 backdrop-blur-sm z-[60] hidden flex items-center justify-center" onclick="if(event.target===this)closeWalletModal()">
+  <div class="bg-base border border-border/50 rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+    <div class="px-5 pt-5 pb-3 border-b border-border/30 flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--accent-blue)">
           <rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><circle cx="18" cy="15" r="1"/>
         </svg>
-        <span class="text-sm font-semibold text-bright">Wallet</span>
+        <span class="text-[15px] font-semibold text-primary">Wallet</span>
       </div>
-      <button onclick="closeWalletModal()" class="text-muted hover:text-bright transition-colors text-lg">&times;</button>
+      <button onclick="closeWalletModal()" class="text-muted hover:text-primary transition-colors text-xl leading-none">&times;</button>
     </div>
 
-    <!-- Main wallet tabs: Balances vs Identity -->
-    <div class="flex border-b border-edge">
+    <!-- Tabs -->
+    <div class="flex border-b border-border/30">
       <button id="wallet-main-tab-balances" onclick="walletMainTab('balances')"
-        class="flex-1 text-[10px] font-semibold py-2.5 transition-colors bg-slab/50 text-bright border-b-2 border-solar-400">
+        class="flex-1 text-[12px] font-semibold py-2.5 transition-colors text-primary border-b-2" style="border-color: var(--accent-blue)">
         Balances
       </button>
       <button id="wallet-main-tab-send" onclick="walletMainTab('send')"
-        class="flex-1 text-[10px] font-semibold py-2.5 transition-colors text-muted hover:text-pale border-b-2 border-transparent">
+        class="flex-1 text-[12px] font-semibold py-2.5 transition-colors text-muted hover:text-primary border-b-2 border-transparent">
         Send
       </button>
       <button id="wallet-main-tab-identity" onclick="walletMainTab('identity')"
-        class="flex-1 text-[10px] font-semibold py-2.5 transition-colors text-muted hover:text-pale border-b-2 border-transparent">
+        class="flex-1 text-[12px] font-semibold py-2.5 transition-colors text-muted hover:text-primary border-b-2 border-transparent">
         Identity
       </button>
     </div>
 
-    <!-- ======== BALANCES PANEL ======== -->
+    <!-- Balances panel -->
     <div id="wallet-panel-balances" class="px-5 py-4 space-y-3 max-h-[60vh] overflow-y-auto">
-      <!-- Solana address -->
       <div class="flex items-center gap-2">
-        <span class="text-[10px] text-muted uppercase tracking-wider">Solana</span>
-        <span id="wallet-sol-addr" class="text-[10px] text-pale font-mono flex-1 truncate"></span>
-        <button onclick="copyWalletAddr()" class="text-muted hover:text-bright transition-colors" title="Copy address">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        <span class="text-[11px] text-muted uppercase tracking-wider">Solana</span>
+        <span id="wallet-sol-addr" class="text-[11px] text-label font-mono flex-1 truncate"></span>
+        <button onclick="copyWalletAddr()" class="text-muted hover:text-primary transition-colors" title="Copy">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
         </button>
       </div>
-      <div id="wallet-no-solana" class="hidden text-[11px] text-muted italic py-4 text-center">
-        No Solana wallet available
-      </div>
-
-      <!-- SOL balance -->
+      <div id="wallet-no-solana" class="hidden text-[13px] text-muted py-4 text-center">No Solana wallet available</div>
       <div id="wallet-balances-list" class="space-y-1.5">
-        <div class="flex items-center justify-between px-3 py-2 bg-slab/50 rounded-lg">
-          <span class="text-[11px] text-bright font-medium">SOL</span>
-          <span id="wallet-sol-balance" class="text-[11px] text-pale font-mono">--</span>
+        <div class="flex items-center justify-between px-3 py-2.5 bg-surface rounded-xl">
+          <span class="text-[13px] text-primary font-medium">SOL</span>
+          <span id="wallet-sol-balance" class="text-[13px] text-label font-mono">--</span>
         </div>
       </div>
-
-      <!-- Token balances -->
       <div id="wallet-token-balances" class="space-y-1"></div>
-
-      <!-- Refresh button -->
       <button onclick="refreshWalletBalances()" id="wallet-refresh-btn"
-        class="w-full text-[10px] text-muted hover:text-pale py-1.5 transition-colors flex items-center justify-center gap-1">
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-        Refresh balances
+        class="w-full text-[12px] text-muted hover:text-primary py-1.5 transition-colors flex items-center justify-center gap-1">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Refresh
       </button>
     </div>
 
-    <!-- ======== SEND PANEL ======== -->
+    <!-- Send panel -->
     <div id="wallet-panel-send" class="px-5 py-4 space-y-3 hidden">
       <div>
-        <label class="text-[10px] text-muted uppercase tracking-wider mb-1 block">Recipient</label>
-        <select id="wallet-send-recipient" class="w-full bg-slab border border-edge rounded-lg px-3 py-2 text-[11px] text-bright focus:border-solar-500/60 transition-colors">
+        <label class="text-[11px] text-muted uppercase tracking-wider mb-1 block">Recipient</label>
+        <select id="wallet-send-recipient" class="w-full bg-surface border border-border/50 rounded-xl px-3 py-2.5 text-[13px] text-primary focus:border-accent-blue/50 transition-colors">
           <option value="">Select connected agent...</option>
         </select>
       </div>
       <div class="flex gap-2">
         <div class="flex-1">
-          <label class="text-[10px] text-muted uppercase tracking-wider mb-1 block">Amount</label>
+          <label class="text-[11px] text-muted uppercase tracking-wider mb-1 block">Amount</label>
           <input type="number" id="wallet-send-amount" step="any" min="0" placeholder="0.0"
-            class="w-full bg-slab border border-edge rounded-lg px-3 py-2 text-[11px] text-bright placeholder-muted focus:border-solar-500/60 transition-colors">
+            class="w-full bg-surface border border-border/50 rounded-xl px-3 py-2.5 text-[13px] text-primary placeholder-muted focus:border-accent-blue/50 transition-colors">
         </div>
         <div class="w-28">
-          <label class="text-[10px] text-muted uppercase tracking-wider mb-1 block">Token</label>
-          <select id="wallet-send-token" class="w-full bg-slab border border-edge rounded-lg px-3 py-2 text-[11px] text-bright focus:border-solar-500/60 transition-colors">
+          <label class="text-[11px] text-muted uppercase tracking-wider mb-1 block">Token</label>
+          <select id="wallet-send-token" class="w-full bg-surface border border-border/50 rounded-xl px-3 py-2.5 text-[13px] text-primary focus:border-accent-blue/50 transition-colors">
             <option value="SOL">SOL</option>
           </select>
         </div>
       </div>
       <button onclick="walletSend()" id="wallet-send-btn"
-        class="w-full bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors">
+        class="w-full text-white text-[13px] font-semibold px-4 py-2.5 rounded-xl transition-colors"
+        style="background: var(--accent-blue)">
         Send
       </button>
-      <div id="wallet-send-result" class="hidden text-[10px] font-mono bg-slab/50 rounded-lg px-3 py-2 break-all"></div>
+      <div id="wallet-send-result" class="hidden text-[12px] font-mono bg-surface rounded-xl px-3 py-2 break-all"></div>
     </div>
 
-    <!-- ======== IDENTITY PANEL ======== -->
+    <!-- Identity panel -->
     <div id="wallet-panel-identity" class="px-5 py-4 space-y-4 hidden">
-      <p class="text-[11px] text-pale leading-relaxed">
+      <p class="text-[13px] text-label leading-relaxed">
         Sign a deterministic challenge with your Solana wallet to derive a mesh identity.
-        The same wallet always produces the same agent ID on any device.
       </p>
 
-      <!-- Tab buttons: Extension vs Mobile QR -->
-      <div class="flex border border-edge rounded-lg overflow-hidden">
+      <div class="flex border border-border/50 rounded-xl overflow-hidden">
         <button id="wallet-tab-ext" onclick="walletTab('ext')"
-          class="flex-1 text-[10px] font-semibold py-2 transition-colors bg-slab text-bright">
+          class="flex-1 text-[12px] font-semibold py-2 transition-colors bg-surface text-primary">
           Browser Extension
         </button>
         <button id="wallet-tab-qr" onclick="walletTab('qr')"
-          class="flex-1 text-[10px] font-semibold py-2 transition-colors text-muted hover:text-pale">
+          class="flex-1 text-[12px] font-semibold py-2 transition-colors text-muted hover:text-primary">
           Mobile QR
         </button>
       </div>
 
       <!-- Extension flow -->
       <div id="wallet-ext-panel">
-        <div class="bg-mesh-yellow/5 border border-mesh-yellow/20 rounded-lg px-3 py-2 mb-3">
-          <p class="text-[10px] text-mesh-yellow">This will change your identity and disconnect existing peers.</p>
+        <div class="bg-accent-orange/10 border border-accent-orange/20 rounded-xl px-3 py-2 mb-3">
+          <p class="text-[12px] text-accent-orange">This will change your identity and disconnect existing peers.</p>
         </div>
         <label class="flex items-center gap-2 cursor-pointer mb-3">
-          <input type="checkbox" id="wallet-remember" class="w-3.5 h-3.5 rounded border-edge bg-slab accent-solar-500">
-          <span class="text-[11px] text-pale">Remember on this device</span>
+          <input type="checkbox" id="wallet-remember" class="w-3.5 h-3.5 rounded accent-blue-500">
+          <span class="text-[13px] text-label">Remember on this device</span>
         </label>
         <div class="flex gap-2">
           <button id="wallet-connect-btn" onclick="walletAuth()"
-            class="flex-1 bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors">
+            class="flex-1 text-white text-[13px] font-semibold px-4 py-2.5 rounded-xl transition-colors"
+            style="background: var(--accent-blue)">
             Connect Wallet
           </button>
           <button id="wallet-disconnect-btn" onclick="walletDisconnect()"
-            class="hidden bg-mesh-red/10 hover:bg-mesh-red/20 text-mesh-red text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors border border-mesh-red/20">
+            class="hidden bg-accent-red/10 hover:bg-accent-red/20 text-accent-red text-[13px] font-semibold px-4 py-2.5 rounded-xl transition-colors border border-accent-red/20">
             Revert
           </button>
         </div>
-        <p class="text-[10px] text-muted mt-2">Phantom, Solflare, Backpack, or any Solana wallet extension.</p>
+        <p class="text-[11px] text-muted mt-2">Phantom, Solflare, Backpack, or any Solana wallet extension.</p>
       </div>
 
       <!-- Mobile QR flow -->
       <div id="wallet-qr-panel" class="hidden">
-        <div class="bg-mesh-yellow/5 border border-mesh-yellow/20 rounded-lg px-3 py-2 mb-3">
-          <p class="text-[10px] text-mesh-yellow">Scan with your phone camera, then sign in your wallet app.</p>
+        <div class="bg-accent-orange/10 border border-accent-orange/20 rounded-xl px-3 py-2 mb-3">
+          <p class="text-[12px] text-accent-orange">Scan with your phone camera, then sign in your wallet app.</p>
         </div>
         <div id="wallet-qr-idle">
           <label class="flex items-center gap-2 cursor-pointer mb-3">
-            <input type="checkbox" id="wallet-qr-remember" class="w-3.5 h-3.5 rounded border-edge bg-slab accent-solar-500">
-            <span class="text-[11px] text-pale">Remember on this device</span>
+            <input type="checkbox" id="wallet-qr-remember" class="w-3.5 h-3.5 rounded accent-blue-500">
+            <span class="text-[13px] text-label">Remember on this device</span>
           </label>
           <button onclick="startQRSession()"
-            class="w-full bg-solar-600/80 hover:bg-solar-500 text-ink text-[11px] font-bold px-4 py-2.5 rounded-lg transition-colors">
+            class="w-full text-white text-[13px] font-semibold px-4 py-2.5 rounded-xl transition-colors"
+            style="background: var(--accent-blue)">
             Generate QR Code
           </button>
         </div>
         <div id="wallet-qr-active" class="hidden">
           <div id="wallet-qr-code" class="flex justify-center mb-2"></div>
-          <p id="wallet-qr-url" class="text-[9px] text-muted text-center break-all select-all mb-2"></p>
+          <p id="wallet-qr-url" class="text-[11px] text-muted text-center break-all select-all mb-2"></p>
           <div class="flex items-center justify-center gap-2">
-            <div class="w-1.5 h-1.5 rounded-full bg-solar-400 pulse-dot"></div>
-            <span class="text-[10px] text-pale">Waiting for signature from mobile...</span>
+            <div class="w-1.5 h-1.5 rounded-full bg-accent-blue animate-pulse"></div>
+            <span class="text-[12px] text-label">Waiting for signature...</span>
           </div>
         </div>
         <div id="wallet-qr-done" class="hidden text-center py-2">
-          <p class="text-[11px] text-mesh-green font-medium">Signed! Applying identity...</p>
+          <p class="text-[13px] text-accent-green font-medium">Signed! Applying identity...</p>
         </div>
       </div>
 
-      <!-- Status (shared) -->
-      <div id="wallet-status" class="hidden text-[11px] text-mesh-green font-mono bg-mesh-green/5 border border-mesh-green/20 rounded-lg px-3 py-2"></div>
+      <div id="wallet-status" class="hidden text-[13px] text-accent-green font-mono bg-accent-green/10 border border-accent-green/20 rounded-xl px-3 py-2"></div>
     </div>
   </div>
 </div>
-
-<style>
-  /* Constellation-specific animations */
-  @keyframes ring-expand {
-    0% { r: 8; opacity: 0.8; stroke-width: 2; }
-    100% { r: 30; opacity: 0; stroke-width: 0.5; }
-  }
-  @keyframes scatter-particle {
-    0% { opacity: 0.8; }
-    100% { opacity: 0; }
-  }
-  /* Mobile drawer slides from left */
-  .drawer-panel { transition: transform 0.3s ease; }
-  .drawer-overlay.active .drawer-panel { transform: translateX(0) !important; }
-  /* Timeline sidebar */
-  @keyframes timeline-in { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
-  .timeline-enter { animation: timeline-in 0.25s ease-out forwards; }
-  .truncated-content { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .truncated-content.expanded { -webkit-line-clamp: unset; }
-  .connector-line { pointer-events: none; }
-  body.resizing-panel, body.resizing-panel * { cursor: col-resize !important; user-select: none !important; }
-</style>
 
 <script>
 // =========================================================================
@@ -404,88 +389,40 @@ const composeForm = document.getElementById('compose-form');
 const composeInput = document.getElementById('compose-input');
 const sendBtn = document.getElementById('send-btn');
 const connectForm = document.getElementById('connect-form');
-const activityFeed = document.getElementById('activity-feed');
-const mobileActivityFeed = document.getElementById('mobile-activity-feed');
 const targetValue = document.getElementById('target-value');
 const targetLabel = document.getElementById('target-label');
 const targetMenu = document.getElementById('target-dropdown-menu');
-const constellationArea = document.getElementById('constellation-area');
+const feedScroll = document.getElementById('feed-scroll');
+const feedContainer = document.getElementById('feed-container');
 const emptyState = document.getElementById('empty-state');
 
-// Diff-tracking maps
 const renderedConns = new Map();
 const renderedConnsMobile = new Map();
 const renderedDiscovered = new Map();
 const renderedPending = new Map();
 
-// SVG engine — persistent element refs
-const svgRefs = {
-  defs: null,
-  lineGroup: null,
-  labelGroup: null,
-  nodeGroup: null,
-  particleGroup: null,
-  hitGroup: null,
-  connectorGroup: null,
-  centerNode: null,
-  centerGlow: null,
-  centerLabel: null,
-  centerAgentLabel: null,
-  hintText: null,
-  lines: new Map(),       // agent_id -> { base, glow } (two lines — base dashed + glow overlay)
-  nodes: new Map(),       // agent_id -> { circle, label, hit, glow }
-  lineHits: new Map(),    // agent_id -> invisible thick hit area for hover
-};
-const nodePositions = new Map();  // agent_id -> { x, y }
-let centerPos = { x: 0, y: 0 };
-let svgW = 0, svgH = 0;
-let currentConns = [];
-
-// Message visualization
-const messageVisuals = new Map();  // message_id -> { lastUpdateIndex }
-const lineWaveTimers = new Map();  // agent_id -> { raf, startTime }
-
-// Orbital planet system
-const orbitingPlanets = new Map(); // agent_id -> Map<message_id, {el, trail[], angle, speed, orbitR}>
-const orbitAnimFrames = new Map(); // agent_id -> { raf, lastTime }
-const orbitPlanetColors = ['#fbbf24', '#22d3ee', '#a78bfa', '#f472b6', '#34d399', '#fb923c', '#60a5fa'];
-
-// Deterministic color for an agent — consistent across reloads
-function agentColor(agentId) {
-  if (!agentId) return orbitPlanetColors[0];
-  let hash = 0;
-  for (let i = 0; i < agentId.length; i++) hash = ((hash << 5) - hash + agentId.charCodeAt(i)) | 0;
-  return orbitPlanetColors[Math.abs(hash) % orbitPlanetColors.length];
-}
-const lineMessageHistory = new Map(); // agent_id -> [{ content, status, direction, time }]
-
-// Polling state
 let prevPollData = null;
-let activityItems = [];
-const MAX_ACTIVITY = 30;
-let totalActiveAgents = 0;
-const prevAgentCounts = new Map();
+let selfAgentId = null;
 let qrInitialized = false;
 let qrExpanded = false;
+let _walletData = null;
+let _walletQRPollTimer = null;
 
-// Timeline sidebar state
-const timelineScroll = document.getElementById('timeline-scroll');
-const timelineCountEl = document.getElementById('timeline-count');
-const renderedTimeline = new Map(); // message_id -> DOM element
-const dismissedTimeline = new Set(); // message_ids cleared by user
-let timelineConnectorLine = null;
-let highlightedTimelineAgent = null;
+// Feed timeline: all items merged chronologically
+const feedItems = new Map();  // id -> { type, timestamp, ... }
+const renderedFeedItems = new Map();  // id -> DOM element
+let clearedAtTs = parseInt(sessionStorage.getItem('dm-cleared-at') || '0', 10);  // items older than this are hidden
+let prevConnIds = new Set();
 
 // =========================================================================
 // Utilities
 // =========================================================================
 function shortId(id) {
   if (!id) return '?';
-  if (id.length > 16) return id.slice(0, 8) + '...' + id.slice(-4);
+  if (id.length > 16) return id.slice(0, 8) + '\u2026' + id.slice(-4);
   return id;
 }
 
-let selfAgentId = null;  // set from poll data
 function agentLabel(obj) {
   if (!obj) return '?';
   const id = obj.agent_id || obj.from_agent_id;
@@ -499,16 +436,49 @@ function timeAgo(iso) {
   if (!iso) return '';
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 5) return 'now';
-  if (s < 60) return s + 's';
-  if (s < 3600) return Math.floor(s/60) + 'm';
-  if (s < 86400) return Math.floor(s/3600) + 'h';
-  return Math.floor(s/86400) + 'd';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+
+function formatTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function esc(t) {
   const d = document.createElement('div');
   d.textContent = t;
   return d.innerHTML;
+}
+
+function agentColor(agentId) {
+  if (!agentId) return '#8e8e93';
+  let hash = 0;
+  for (let i = 0; i < agentId.length; i++) hash = ((hash << 5) - hash + agentId.charCodeAt(i)) | 0;
+  const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9'];
+  return colors[Math.abs(hash) % colors.length];
+}
+
+// Returns a very subtle rgba background tint from an agent color
+function agentTint(agentId) {
+  const hex = agentColor(agentId);
+  const r = parseInt(hex.slice(1,3), 16);
+  const g = parseInt(hex.slice(3,5), 16);
+  const b = parseInt(hex.slice(5,7), 16);
+  return `rgba(${r},${g},${b},0.04)`;
+}
+
+function renderMd(text) {
+  if (!text) return '';
+  try {
+    const html = marked.parse(text, { breaks: true, gfm: true });
+    return DOMPurify.sanitize(html);
+  } catch (e) {
+    return esc(text);
+  }
 }
 
 function ajaxPost(url, body) {
@@ -524,13 +494,56 @@ function ajaxPost(url, body) {
 
 function autoGrow(el) {
   el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+  el.style.height = Math.min(el.scrollHeight, 200) + 'px';
 }
 
-function svgEl(tag, attrs) {
-  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  if (attrs) Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, String(v)));
-  return el;
+let sidebarCollapsed = false;
+function toggleSidebar() {
+  const sb = document.getElementById('sidebar');
+  sidebarCollapsed = !sidebarCollapsed;
+  if (sidebarCollapsed) {
+    sb.style.width = '0px';
+    sb.style.borderRightWidth = '0px';
+    sb.style.overflow = 'hidden';
+  } else {
+    sb.style.width = '240px';
+    sb.style.borderRightWidth = '';
+    setTimeout(() => { sb.style.overflow = ''; }, 200);
+  }
+  localStorage.setItem('dm-sidebar', sidebarCollapsed ? '0' : '1');
+}
+
+// Restore sidebar state
+(function() {
+  if (localStorage.getItem('dm-sidebar') === '0') {
+    const sb = document.getElementById('sidebar');
+    if (sb) { sb.style.width = '0px'; sb.style.borderRightWidth = '0px'; sb.style.overflow = 'hidden'; sidebarCollapsed = true; }
+  }
+})();
+
+function clearFeed() {
+  for (const [id, domEl] of renderedFeedItems) {
+    domEl.remove();
+  }
+  renderedFeedItems.clear();
+  clearedAtTs = Date.now();
+  sessionStorage.setItem('dm-cleared-at', String(clearedAtTs));
+  if (emptyState) emptyState.style.display = '';
+}
+
+function toggleShardExpand(btn) {
+  const target = document.getElementById(btn.dataset.target);
+  if (!target) return;
+  const expanded = btn.dataset.expanded === '1';
+  if (expanded) {
+    target.textContent = btn.dataset.short;
+    btn.textContent = 'Show more';
+    btn.dataset.expanded = '0';
+  } else {
+    target.textContent = btn.dataset.full;
+    btn.textContent = 'Show less';
+    btn.dataset.expanded = '1';
+  }
 }
 
 // =========================================================================
@@ -556,8 +569,8 @@ function initQR(lanUrl) {
   const style = getComputedStyle(document.documentElement);
   new QRCode(el, {
     text: lanUrl, width: 120, height: 120,
-    colorDark: style.getPropertyValue('--qr-fg').trim() || '#e2e2ea',
-    colorLight: style.getPropertyValue('--qr-bg').trim() || '#111113',
+    colorDark: style.getPropertyValue('--qr-fg').trim() || '#ffffff',
+    colorLight: style.getPropertyValue('--qr-bg').trim() || '#1c1c1e',
     correctLevel: QRCode.CorrectLevel.M,
   });
   if (!qrExpanded) toggleQR();
@@ -568,12 +581,10 @@ function onThemeChange() {
     qrInitialized = false;
     initQR(document.getElementById('qr-url').textContent);
   }
-  // Force SVG re-render for theme-dependent colors
-  rebuildSVG();
 }
 
 // =========================================================================
-// Custom dropdown
+// Target dropdown
 // =========================================================================
 let dropdownOpen = false;
 
@@ -587,16 +598,14 @@ function selectTarget(el) {
   const label = el.textContent.trim();
   targetValue.value = val;
   targetLabel.textContent = label;
-  const iconEl = document.getElementById('route-icon');
+  const dot = document.getElementById('route-dot');
   if (val === 'broadcast') {
-    iconEl.innerHTML = '<circle cx="5" cy="3" r="1.8" fill="currentColor"/><circle cx="2.5" cy="7.5" r="1.8" fill="currentColor"/><circle cx="7.5" cy="7.5" r="1.8" fill="currentColor"/>';
-    iconEl.setAttribute('class', 'text-mesh-yellow shrink-0');
+    dot.className = 'w-2 h-2 rounded-full bg-accent-yellow shrink-0';
   } else if (val === 'auto') {
-    iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
-    iconEl.setAttribute('class', 'text-mesh-green shrink-0');
+    dot.className = 'w-2 h-2 rounded-full bg-accent-green shrink-0';
   } else {
-    iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
-    iconEl.setAttribute('class', 'text-mesh-blue shrink-0');
+    dot.style.background = 'var(--accent-blue)';
+    dot.className = 'w-2 h-2 rounded-full shrink-0';
   }
   dropdownOpen = false;
   document.getElementById('target-dropdown-wrap').classList.remove('dropdown-open');
@@ -611,29 +620,25 @@ document.addEventListener('click', (e) => {
 
 function updateDropdownOptions(conns) {
   const cur = targetValue.value;
-  let html = `<div class="dropdown-option px-3 py-1.5 text-[11px] text-pale hover:bg-edge/50 cursor-pointer flex items-center gap-2 transition-colors rounded mx-1"
+  let html = `<div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
     data-value="auto" onclick="selectTarget(this)">
-    <svg width="10" height="10" viewBox="0 0 10 10" class="text-mesh-green shrink-0"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
-    auto-route
+    <div class="w-2 h-2 rounded-full bg-accent-green shrink-0"></div>auto
   </div>
-  <div class="dropdown-option px-3 py-1.5 text-[11px] text-pale hover:bg-edge/50 cursor-pointer flex items-center gap-2 transition-colors rounded mx-1"
+  <div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
     data-value="broadcast" onclick="selectTarget(this)">
-    <svg width="10" height="10" viewBox="0 0 10 10" class="text-mesh-yellow shrink-0"><circle cx="5" cy="3" r="1.8" fill="currentColor"/><circle cx="2.5" cy="7.5" r="1.8" fill="currentColor"/><circle cx="7.5" cy="7.5" r="1.8" fill="currentColor"/></svg>
-    broadcast all
+    <div class="w-2 h-2 rounded-full bg-accent-yellow shrink-0"></div>broadcast all
   </div>`;
   if (conns.length > 0) {
-    html += `<div class="border-t border-edge my-1 mx-2"></div>`;
+    html += `<div class="border-t border-border/30 my-1 mx-2"></div>`;
     conns.forEach(c => {
       const dead = c.health_status === 'unreachable';
-      const dotClass = dead ? 'text-muted shrink-0' : 'text-mesh-blue shrink-0';
-      const textClass = dead ? 'text-muted' : 'text-pale';
-      const hoverClass = dead ? '' : 'hover:bg-edge/50 cursor-pointer';
+      const dotCls = dead ? 'bg-muted' : 'bg-accent-blue';
+      const textCls = dead ? 'text-muted' : 'text-label';
+      const hoverCls = dead ? '' : 'hover:bg-surface cursor-pointer';
       const clickAttr = dead ? '' : 'onclick="selectTarget(this)"';
-      const suffix = dead ? ' <span class="text-[9px] text-mesh-red">\u2298</span>' : '';
-      html += `<div class="dropdown-option px-3 py-1.5 text-[11px] ${textClass} ${hoverClass} flex items-center gap-2 transition-colors rounded mx-1"
+      html += `<div class="px-3 py-2 text-[13px] ${textCls} ${hoverCls} flex items-center gap-2 transition-colors rounded-lg mx-1"
         data-value="${c.agent_id}" ${clickAttr}>
-        <svg width="10" height="10" viewBox="0 0 10 10" class="${dotClass}"><circle cx="5" cy="5" r="3" fill="currentColor"/></svg>
-        ${esc(agentLabel(c))}${suffix}
+        <div class="w-2 h-2 rounded-full ${dotCls} shrink-0"></div>${esc(agentLabel(c))}
       </div>`;
     });
   }
@@ -641,907 +646,370 @@ function updateDropdownOptions(conns) {
   const validValues = ['auto', 'broadcast', ...conns.map(c => c.agent_id)];
   if (!validValues.includes(cur)) {
     targetValue.value = 'auto';
-    targetLabel.textContent = 'auto-route';
-    const iconEl = document.getElementById('route-icon');
-    iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
-    iconEl.setAttribute('class', 'text-mesh-green shrink-0');
+    targetLabel.textContent = 'auto';
+    document.getElementById('route-dot').className = 'w-2 h-2 rounded-full bg-accent-green shrink-0';
   }
 }
 
 // =========================================================================
-// Activity feed
+// Chat Feed — Build unified timeline
 // =========================================================================
-function addActivity(icon, color, text) {
-  const item = { icon, color, text, time: new Date().toISOString() };
-  activityItems.unshift(item);
-  if (activityItems.length > MAX_ACTIVITY) activityItems.pop();
-  renderActivityFeed();
+function buildFeedItems(data) {
+  const items = [];
+  const conns = data.connections || [];
+  const findConn = (id) => conns.find(cn => cn.agent_id === id);
+
+  // Outbound messages
+  for (const msg of (data.outbox || [])) {
+    items.push({
+      id: 'out_' + msg.message_id,
+      type: 'outbound',
+      content: msg.content,
+      timestamp: msg.created_at,
+      status: msg.status,
+      routed_to: msg.routed_to || [],
+      routed_to_names: msg.routed_to_names || [],
+      updates: msg.updates || [],
+      responses: msg.responses || [],
+      message_id: msg.message_id,
+    });
+
+    // Responses to sent messages appear as inbound replies
+    for (const r of (msg.responses || [])) {
+      const c = findConn(r.agent_id);
+      items.push({
+        id: 'resp_' + msg.message_id + '_' + r.agent_id,
+        type: 'response',
+        content: r.response,
+        timestamp: r.timestamp || msg.created_at,
+        from_name: c ? agentLabel(c) : (r.display_name || shortId(r.agent_id)),
+        from_agent_id: r.agent_id,
+        parent_id: msg.message_id,
+      });
+    }
+  }
+
+  // Inbound messages
+  for (const msg of (data.inbox || [])) {
+    const c = findConn(msg.from_agent_id);
+    items.push({
+      id: 'in_' + msg.message_id,
+      type: 'inbound',
+      content: msg.content,
+      timestamp: msg.received_at,
+      from_name: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
+      from_agent_id: msg.from_agent_id,
+      message_id: msg.message_id,
+    });
+  }
+
+  // Shards
+  for (const shard of (data.shards || [])) {
+    items.push({
+      id: 'shard_' + shard.shard_id,
+      type: 'shard',
+      content: shard.content || shard.summary || '',
+      timestamp: shard.created_at,
+      tags: shard.tags || [],
+      author: shard.author_name || shortId(shard.author_id),
+      author_id: shard.author_id,
+    });
+  }
+
+  // Sort by timestamp
+  items.sort((a, b) => {
+    const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+    const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+    return ta - tb;
+  });
+
+  return items;
 }
 
-function renderActivityFeed() {
-  const html = activityItems.map(a =>
-    `<div class="flex items-center gap-1.5 text-[10px] feed-in">
-      <span class="${a.color}">${a.icon}</span>
-      <span class="text-pale truncate flex-1">${esc(a.text)}</span>
-      <span class="text-faint shrink-0">${timeAgo(a.time)}</span>
-    </div>`
-  ).join('');
-  const placeholder = activityItems.length === 0
-    ? '<p class="text-[10px] text-muted italic">Waiting for activity...</p>' : '';
-  activityFeed.innerHTML = html || placeholder;
-  if (mobileActivityFeed) mobileActivityFeed.innerHTML = html || placeholder;
-}
+function renderFeedItem(item) {
+  const el = document.createElement('div');
+  el.className = 'fade-in';
+  el.dataset.feedId = item.id;
 
-// =========================================================================
-// Incremental SVG Engine — Constellation
-// =========================================================================
-function initSVG() {
-  const svg = document.getElementById('mesh-svg');
-  if (!svg) return;
-  svg.innerHTML = '';
-
-  // Defs
-  svgRefs.defs = svgEl('defs');
-  svgRefs.defs.innerHTML = `
-    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%">
-      <feGaussianBlur stdDeviation="6" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-    <filter id="glow-sm" x="-100%" y="-100%" width="300%" height="300%">
-      <feGaussianBlur stdDeviation="3" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-    <filter id="line-glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="2.5" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>`;
-  svg.appendChild(svgRefs.defs);
-
-  // Layered groups: lines → edgeLabels → nodes → particles → hit areas
-  svgRefs.lineGroup = svgEl('g');
-  svgRefs.labelGroup = svgEl('g');
-  svgRefs.nodeGroup = svgEl('g');
-  svgRefs.particleGroup = svgEl('g');
-  svgRefs.hitGroup = svgEl('g');
-  svgRefs.connectorGroup = svgEl('g');
-  svg.appendChild(svgRefs.lineGroup);
-  svg.appendChild(svgRefs.labelGroup);
-  svg.appendChild(svgRefs.nodeGroup);
-  svg.appendChild(svgRefs.particleGroup);
-  svg.appendChild(svgRefs.hitGroup);
-  svg.appendChild(svgRefs.connectorGroup);
-
-  // Center glow
-  svgRefs.centerGlow = svgEl('circle', {
-    cx: 0, cy: 0, r: 34,
-    fill: '#dd8040', opacity: 0.1,
-    filter: 'url(#glow)',
-  });
-  svgRefs.centerGlow.classList.add('mesh-glow-pulse');
-  svgRefs.nodeGroup.appendChild(svgRefs.centerGlow);
-
-  // Center node
-  svgRefs.centerNode = svgEl('circle', {
-    cx: 0, cy: 0, r: 14,
-    fill: '#dd8040',
-  });
-  svgRefs.centerNode.style.transition = 'r 0.4s ease';
-  svgRefs.nodeGroup.appendChild(svgRefs.centerNode);
-
-  // Center label
-  svgRefs.centerLabel = svgEl('text', {
-    x: 0, y: 30,
-    'text-anchor': 'middle',
-    fill: 'rgb(var(--c-pale))',
-    'font-size': '9',
-    'font-family': 'JetBrains Mono, monospace',
-  });
-  svgRefs.centerLabel.textContent = 'You';
-  svgRefs.nodeGroup.appendChild(svgRefs.centerLabel);
-
-  // Center agent count label (shown when agents > 0)
-  svgRefs.centerAgentLabel = svgEl('text', {
-    x: 0, y: 42,
-    'text-anchor': 'middle',
-    fill: '#22d3ee',
-    'font-size': '7',
-    'font-family': 'JetBrains Mono, monospace',
-    opacity: 0,
-  });
-  svgRefs.centerAgentLabel.style.transition = 'opacity 0.3s ease';
-  svgRefs.nodeGroup.appendChild(svgRefs.centerAgentLabel);
-
-  // Hint text (shown when no connections)
-  svgRefs.hintText = svgEl('text', {
-    x: 0, y: 52,
-    'text-anchor': 'middle',
-    fill: 'rgb(var(--c-muted))',
-    'font-size': '9',
-    'font-family': 'JetBrains Mono, monospace',
-  });
-  svgRefs.hintText.textContent = 'no peers connected';
-  svgRefs.nodeGroup.appendChild(svgRefs.hintText);
-
-  updateSVGLayout();
-}
-
-function updateSVGLayout() {
-  const svg = document.getElementById('mesh-svg');
-  const area = constellationArea;
-  if (!svg || !area) return;
-
-  const rect = area.getBoundingClientRect();
-  svgW = rect.width || 800;
-  svgH = rect.height || 600;
-  svg.setAttribute('viewBox', `0 0 ${svgW} ${svgH}`);
-
-  // Center node offset upward to leave room for compose bar
-  centerPos = { x: svgW / 2, y: svgH * 0.42 };
-
-  // Update center elements
-  if (svgRefs.centerNode) {
-    svgRefs.centerNode.setAttribute('cx', centerPos.x);
-    svgRefs.centerNode.setAttribute('cy', centerPos.y);
-  }
-  if (svgRefs.centerGlow) {
-    svgRefs.centerGlow.setAttribute('cx', centerPos.x);
-    svgRefs.centerGlow.setAttribute('cy', centerPos.y);
-  }
-  if (svgRefs.centerLabel) {
-    svgRefs.centerLabel.setAttribute('x', centerPos.x);
-    svgRefs.centerLabel.setAttribute('y', centerPos.y + 30);
-  }
-  if (svgRefs.centerAgentLabel) {
-    svgRefs.centerAgentLabel.setAttribute('x', centerPos.x);
-    svgRefs.centerAgentLabel.setAttribute('y', centerPos.y + 42);
-  }
-  if (svgRefs.hintText) {
-    svgRefs.hintText.setAttribute('x', centerPos.x);
-    svgRefs.hintText.setAttribute('y', centerPos.y + 52);
-  }
-
-  // Recalculate peer positions
-  layoutPeers(currentConns);
-}
-
-function layoutPeers(conns) {
-  const radius = Math.min(svgW, svgH) * 0.3;
-  nodePositions.clear();
-
-  conns.forEach((c, i) => {
-    const angle = conns.length === 1 ? -Math.PI / 2
-      : (2 * Math.PI * i / conns.length) - Math.PI / 2;
-    const x = centerPos.x + radius * Math.cos(angle);
-    const y = centerPos.y + radius * Math.sin(angle);
-    nodePositions.set(c.agent_id, { x, y });
-  });
-
-  // Update existing SVG element positions
-  for (const [agentId, pos] of nodePositions) {
-    const refs = svgRefs.nodes.get(agentId);
-    if (refs) {
-      refs.circle.setAttribute('cx', pos.x);
-      refs.circle.setAttribute('cy', pos.y);
-      refs.label.setAttribute('x', pos.x);
-      refs.label.setAttribute('y', pos.y + 26);
-      refs.hit.setAttribute('cx', pos.x);
-      refs.hit.setAttribute('cy', pos.y);
-      if (refs.glow) {
-        refs.glow.setAttribute('cx', pos.x);
-        refs.glow.setAttribute('cy', pos.y);
+  if (item.type === 'outbound') {
+    const tint = agentTint(selfAgentId);
+    el.innerHTML = `
+      <div class="msg-block msg-block-out" style="background:${tint}">
+        <div class="flex items-baseline gap-3 mb-1.5">
+          <span class="msg-sender text-primary">You</span>
+          ${item.routed_to_names.length ? `<span class="msg-meta">&rarr; ${esc(item.routed_to_names.join(', '))}</span>` : ''}
+          <span class="msg-meta ml-auto flex items-center gap-1.5" title="${item.timestamp || ''}">${timeAgo(item.timestamp)} ${buildStatusDot(item.status, item.updates)}</span>
+        </div>
+        <div class="msg-content">${renderMd(item.content)}</div>
+      </div>`;
+  } else if (item.type === 'inbound') {
+    const aColor = agentColor(item.from_agent_id);
+    const tint = agentTint(item.from_agent_id);
+    el.innerHTML = `
+      <div class="msg-block msg-block-in group" style="background:${tint}">
+        <div class="flex items-baseline gap-3 mb-1.5">
+          <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+          <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
+          <button class="msg-reply-btn msg-meta opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 hover:text-primary cursor-pointer ml-auto" data-agent-id="${item.from_agent_id}" data-agent-name="${esc(item.from_name)}" data-message-id="${item.message_id}">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+            Reply
+          </button>
+        </div>
+        <div class="msg-content">${renderMd(item.content)}</div>
+        <div class="reply-area" data-reply-for="${item.message_id}">
+          <div class="flex gap-2">
+            <input type="text" placeholder="Reply to ${esc(item.from_name)}..." data-message-id="${item.message_id}"
+              class="reply-input flex-1 compose-ring bg-card/30 px-4 py-2.5 text-[14px] text-primary placeholder-muted/50 min-w-0">
+            <button type="button" data-message-id="${item.message_id}"
+              class="reply-btn text-white text-[13px] font-semibold px-5 py-2.5 rounded-lg transition-all hover:opacity-90"
+              style="background: var(--accent-blue)">
+              Send
+            </button>
+          </div>
+        </div>
+      </div>`;
+    const replyBtn = el.querySelector('.msg-reply-btn');
+    const replyArea = el.querySelector('.reply-area');
+    replyBtn.addEventListener('click', () => {
+      replyArea.classList.toggle('open');
+      if (replyArea.classList.contains('open')) {
+        replyArea.querySelector('.reply-input').focus();
       }
-      if (refs.badge) {
-        refs.badge.setAttribute('x', pos.x);
-        refs.badge.setAttribute('y', pos.y);
-      }
-    }
-    const lineRefs = svgRefs.lines.get(agentId);
-    if (lineRefs) {
-      for (const el of [lineRefs.base, lineRefs.glow]) {
-        el.setAttribute('x1', centerPos.x);
-        el.setAttribute('y1', centerPos.y);
-        el.setAttribute('x2', pos.x);
-        el.setAttribute('y2', pos.y);
-      }
-    }
-    const lineHit = svgRefs.lineHits.get(agentId);
-    if (lineHit) {
-      lineHit.setAttribute('x1', centerPos.x);
-      lineHit.setAttribute('y1', centerPos.y);
-      lineHit.setAttribute('x2', pos.x);
-      lineHit.setAttribute('y2', pos.y);
-    }
+    });
+    wireReply(el, item);
+  } else if (item.type === 'response') {
+    const aColor = agentColor(item.from_agent_id);
+    const tint = agentTint(item.from_agent_id);
+    el.innerHTML = `
+      <div class="msg-block msg-block-in" style="background:${tint}">
+        <div class="flex items-baseline gap-3 mb-1.5">
+          <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+          <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
+        </div>
+        <div class="msg-content">${renderMd(item.content)}</div>
+      </div>`;
+  } else if (item.type === 'shard') {
+    const shardId = 'shard-content-' + item.id.replace(/[^a-zA-Z0-9]/g, '_');
+    const isLong = item.content.length > 300;
+    const aColor = agentColor(item.author_id);
+    el.innerHTML = `
+      <div class="msg-block" style="padding-top:0.75rem;padding-bottom:0.75rem">
+        <div class="shard-card">
+          <div class="px-5 py-4">
+            <div class="flex items-center justify-between mb-3">
+              <div class="flex items-baseline gap-2.5">
+                <span class="msg-sender" style="color:${aColor}">${esc(item.author)}</span>
+                <span class="msg-meta">${timeAgo(item.timestamp)}</span>
+              </div>
+              <span class="text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-md" style="background: linear-gradient(135deg, rgba(175,82,222,0.1), rgba(10,132,255,0.1)); color: #AF52DE;">SHARD</span>
+            </div>
+            <div id="${shardId}" class="msg-content" style="color:rgb(var(--c-label))">${esc(isLong ? item.content.slice(0, 300) : item.content)}${isLong ? '...' : ''}</div>
+            ${isLong ? `<span class="shard-expand-btn text-[12px] mt-2 inline-block font-medium" style="color: var(--accent-blue)" data-expanded="0" data-full="${esc(item.content).replace(/"/g, '&quot;')}" data-short="${esc(item.content.slice(0, 300)).replace(/"/g, '&quot;')}..." data-target="${shardId}" onclick="toggleShardExpand(this)">Show more</span>` : ''}
+            ${item.tags.length ? `<div class="flex flex-wrap gap-1.5 mt-3 pt-3" style="border-top:1px solid rgb(var(--c-border)/0.06)">${item.tags.map(t => `<span class="text-[11px] px-2.5 py-0.5 rounded-full font-medium" style="background: rgb(var(--c-surface) / 0.5); color: rgb(var(--c-muted))">${esc(t)}</span>`).join('')}</div>` : ''}
+          </div>
+        </div>
+      </div>`;
+  } else if (item.type === 'connection_event') {
+    const aColor = item.agent_id ? agentColor(item.agent_id) : null;
+    const lvl = item.connectivity_level ? `L${item.connectivity_level}${item.connectivity_method ? ':' + item.connectivity_method : ''}` : '';
+    el.innerHTML = `
+      <div class="sys-event">
+        ${aColor ? `<span style="color:${aColor};font-weight:600">${esc(item.agent_name || '')}</span> connected` : esc(item.content)}${lvl ? ` <span style="opacity:0.4;font-family:monospace;font-size:0.7rem">[${lvl}]</span>` : ''}
+      </div>`;
+  } else if (item.type === 'pending_request') {
+    const aColor = agentColor(item.from_agent_id);
+    const tint = agentTint(item.from_agent_id);
+    el.innerHTML = `
+      <div class="msg-block" style="background:${tint}">
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <div class="flex items-baseline gap-2">
+              <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+              <span class="msg-meta">wants to connect</span>
+            </div>
+            ${item.bio ? `<div class="msg-meta mt-1 leading-snug">${esc(item.bio.slice(0, 120))}</div>` : ''}
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <button class="feed-accept-btn text-white text-[12px] font-semibold px-4 py-1.5 rounded-lg transition-all hover:opacity-90" style="background: var(--accent-blue)">Accept</button>
+            <button class="feed-reject-btn text-[12px] font-medium px-3 py-1.5 rounded-lg transition-all border" style="color:rgb(var(--c-muted));border-color:rgb(var(--c-border)/0.2)">Deny</button>
+          </div>
+        </div>
+      </div>`;
+    el.querySelector('.feed-accept-btn').addEventListener('click', async () => {
+      try {
+        const result = await ajaxPost(`/accept/${encodeURIComponent(item.request_id)}`, {});
+        if (result.success) showToast(`Connected to ${item.from_name}`, 'success');
+      } catch (err) { showToast('Accept failed', 'error'); }
+      pollServer();
+    });
+    el.querySelector('.feed-reject-btn').addEventListener('click', async () => {
+      try {
+        await ajaxPost(`/reject/${encodeURIComponent(item.request_id)}`, {});
+        showToast('Request denied', 'info');
+      } catch (err) { showToast('Reject failed', 'error'); }
+      pollServer();
+    });
   }
 
-  // Sync orbit positions when nodes move
-  syncOrbitPositions();
+  return el;
 }
 
-function updateConstellationNodes(conns) {
-  currentConns = conns;
-  const currentIds = new Set(conns.map(c => c.agent_id));
-
-  // Show/hide hint + empty state
-  if (svgRefs.hintText) {
-    svgRefs.hintText.setAttribute('display', conns.length === 0 ? '' : 'none');
+function buildStatusDot(status, updates) {
+  if (!updates || !updates.length) {
+    if (status === 'pending') return '<div class="w-1.5 h-1.5 rounded-full bg-muted"></div>';
+    if (status === 'delivered') return '<div class="w-1.5 h-1.5 rounded-full bg-accent-green"></div>';
+    return '';
   }
-  if (emptyState) {
-    emptyState.style.display = conns.length === 0 ? '' : 'none';
-  }
+  const lastType = updates[updates.length - 1].type;
+  const colors = {
+    received: 'bg-accent-blue', responding: 'bg-accent-yellow animate-pulse',
+    forwarded: 'bg-accent-purple', expired: 'bg-accent-red',
+  };
+  return `<div class="w-1.5 h-1.5 rounded-full ${colors[lastType] || 'bg-muted'}" title="${lastType}"></div>`;
+}
 
-  // Remove stale nodes
-  for (const [id, refs] of svgRefs.nodes) {
-    if (!currentIds.has(id)) {
-      refs.circle.remove();
-      refs.label.remove();
-      refs.hit.remove();
-      if (refs.glow) refs.glow.remove();
-      if (refs.badge) refs.badge.remove();
-      // Clean up any orbiting planets for this node
-      const planets = orbitingPlanets.get(id);
-      if (planets) {
-        for (const [, p] of planets) { p.el.remove(); p.trail.forEach(t => t.remove()); }
-        orbitingPlanets.delete(id);
+function wireReply(el, item) {
+  const input = el.querySelector('.reply-input');
+  const btn = el.querySelector('.reply-btn');
+  if (!input || !btn) return;
+
+  async function doReply() {
+    const text = input.value.trim();
+    if (!text) return;
+    btn.disabled = true;
+    input.disabled = true;
+    try {
+      const result = await ajaxPost(`/respond/${encodeURIComponent(item.message_id)}`, { response: text });
+      if (result.success) {
+        showToast('Reply sent', 'success');
+        input.value = '';
+      } else {
+        showToast(result.error || 'Reply failed', 'error');
       }
-      const anim = orbitAnimFrames.get(id);
-      if (anim) { cancelAnimationFrame(anim.raf); orbitAnimFrames.delete(id); }
-      svgRefs.nodes.delete(id);
+    } catch (err) {
+      showToast('Reply failed', 'error');
     }
-  }
-  for (const [id, refs] of svgRefs.lines) {
-    if (!currentIds.has(id)) {
-      refs.base.remove();
-      refs.glow.remove();
-      svgRefs.lines.delete(id);
-    }
-  }
-  for (const [id, hit] of svgRefs.lineHits) {
-    if (!currentIds.has(id)) {
-      hit.remove();
-      svgRefs.lineHits.delete(id);
-    }
+    btn.disabled = false;
+    input.disabled = false;
   }
 
-  // Layout positions first
-  layoutPeers(conns);
+  btn.addEventListener('click', doReply);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doReply(); }
+  });
+}
 
-  // Add new nodes + lines
-  conns.forEach(c => {
-    const pos = nodePositions.get(c.agent_id);
-    if (!pos) return;
+function renderFeed(data) {
+  const items = buildFeedItems(data);
 
-    // Line (base dashed + glow overlay + invisible hit area)
-    if (!svgRefs.lines.has(c.agent_id)) {
-      const base = svgEl('line', {
-        x1: centerPos.x, y1: centerPos.y, x2: pos.x, y2: pos.y,
-        stroke: 'rgb(var(--c-edge))', 'stroke-width': 1.5, 'stroke-dasharray': '5,4',
-        'stroke-linecap': 'round',
-      });
-      const glow = svgEl('line', {
-        x1: centerPos.x, y1: centerPos.y, x2: pos.x, y2: pos.y,
-        stroke: '#dd8040', 'stroke-width': 2, opacity: 0,
-        'stroke-linecap': 'round', filter: 'url(#line-glow)',
-      });
-      glow.style.transition = 'opacity 0.3s ease';
-      svgRefs.lineGroup.appendChild(base);
-      svgRefs.lineGroup.appendChild(glow);
-      svgRefs.lines.set(c.agent_id, { base, glow });
-
-      // Invisible wide hit area for hover
-      const lineHit = svgEl('line', {
-        x1: centerPos.x, y1: centerPos.y, x2: pos.x, y2: pos.y,
-        stroke: 'transparent', 'stroke-width': 16, class: 'cursor-pointer',
-      });
-      lineHit.addEventListener('mouseenter', (e) => showLineTooltip(c.agent_id, e));
-      lineHit.addEventListener('mousemove', (e) => moveMeshTooltip(e));
-      lineHit.addEventListener('mouseleave', () => hideMeshTooltip());
-      svgRefs.hitGroup.appendChild(lineHit);
-      svgRefs.lineHits.set(c.agent_id, lineHit);
-    }
-
-    // Node
-    if (!svgRefs.nodes.has(c.agent_id)) {
-      const spawned = c.spawned_agents || 0;
-      const glowR = 18 + Math.min(spawned * 5, 20);
-      const nodeR = 10 + Math.min(spawned * 3, 12);
-
-      const isUnreachable = c.health_status === 'unreachable';
-      const nodeColor = isUnreachable ? '#6b7280' : '#34d399';
-      const glowColor = isUnreachable ? '#6b7280' : '#34d399';
-
-      const glow = svgEl('circle', {
-        cx: pos.x, cy: pos.y, r: glowR,
-        fill: glowColor, opacity: isUnreachable ? 0.04 : 0.08, filter: 'url(#glow-sm)',
-      });
-      glow.style.transition = 'r 0.4s ease, opacity 0.3s ease';
-      svgRefs.nodeGroup.appendChild(glow);
-
-      const circle = svgEl('circle', {
-        cx: pos.x, cy: pos.y, r: nodeR,
-        fill: nodeColor,
-      });
-      circle.style.transition = 'r 0.15s ease, fill 0.3s ease';
-      svgRefs.nodeGroup.appendChild(circle);
-
-      // Spawned agent count badge
-      let badge = null;
-      if (spawned > 0) {
-        badge = svgEl('text', {
-          x: pos.x, y: pos.y,
-          'text-anchor': 'middle',
-          'dominant-baseline': 'central',
-          fill: '#fff',
-          'font-size': '7',
-          'font-weight': 'bold',
-          'font-family': 'JetBrains Mono, monospace',
-          'pointer-events': 'none',
+  // Detect connection events by diffing
+  const currConnIds = new Set(data.connections.map(c => c.agent_id));
+  if (prevConnIds.size > 0) {
+    for (const c of data.connections) {
+      if (!prevConnIds.has(c.agent_id)) {
+        items.push({
+          id: 'evt_conn_' + c.agent_id + '_' + Date.now(),
+          type: 'connection_event',
+          content: `${agentLabel(c)} connected`,
+          timestamp: new Date().toISOString(),
+          agent_id: c.agent_id,
+          agent_name: agentLabel(c),
+          connectivity_level: c.connectivity_level || null,
+          connectivity_method: c.connectivity_method || '',
         });
-        badge.textContent = spawned;
-        svgRefs.nodeGroup.appendChild(badge);
-      }
-
-      const name = agentLabel(c);
-      const labelSuffix = isUnreachable ? ' \u2298' : '';
-      const label = svgEl('text', {
-        x: pos.x, y: pos.y + 26,
-        'text-anchor': 'middle',
-        fill: isUnreachable ? '#f87171' : 'rgb(var(--c-pale))',
-        'font-size': '8',
-        'font-family': 'JetBrains Mono, monospace',
-      });
-      const truncName = name.length > 14 ? name.slice(0, 12) + '..' : name;
-      label.textContent = truncName + labelSuffix;
-      svgRefs.labelGroup.appendChild(label);
-
-      const hit = svgEl('circle', {
-        cx: pos.x, cy: pos.y, r: 28,
-        fill: 'transparent', class: 'cursor-pointer',
-      });
-      hit.addEventListener('mouseenter', (e) => {
-        const baseR = parseFloat(circle.getAttribute('r')) || 10;
-        circle.setAttribute('r', baseR + 2);
-        showMeshTooltip(c, e);
-      });
-      hit.addEventListener('mousemove', (e) => moveMeshTooltip(e));
-      hit.addEventListener('mouseleave', () => {
-        const spawned = c.spawned_agents || 0;
-        circle.setAttribute('r', 10 + Math.min(spawned * 3, 12));
-        hideMeshTooltip();
-      });
-      hit.addEventListener('click', () => {
-        targetValue.value = c.agent_id;
-        targetLabel.textContent = agentLabel(c);
-        const iconEl = document.getElementById('route-icon');
-        iconEl.innerHTML = '<circle cx="5" cy="5" r="3" fill="currentColor"/>';
-        iconEl.setAttribute('class', 'text-mesh-blue shrink-0');
-        composeInput.focus();
-      });
-      svgRefs.hitGroup.appendChild(hit);
-
-      svgRefs.nodes.set(c.agent_id, { circle, label, hit, glow, badge });
-    } else {
-      // Update existing node — label + size + badge + health based on state
-      const refs = svgRefs.nodes.get(c.agent_id);
-      const isUnreachable = c.health_status === 'unreachable';
-      const name = agentLabel(c);
-      const labelSuffix = isUnreachable ? ' \u2298' : '';
-      const labelText = (name.length > 14 ? name.slice(0, 12) + '..' : name) + labelSuffix;
-      if (refs.label.textContent !== labelText) {
-        refs.label.textContent = labelText;
-      }
-      refs.label.setAttribute('fill', isUnreachable ? '#f87171' : 'rgb(var(--c-pale))');
-      refs.circle.setAttribute('fill', isUnreachable ? '#6b7280' : '#34d399');
-      if (refs.glow) {
-        refs.glow.setAttribute('fill', isUnreachable ? '#6b7280' : '#34d399');
-        refs.glow.setAttribute('opacity', isUnreachable ? '0.04' : '0.08');
-      }
-      const spawned = c.spawned_agents || 0;
-      refs.circle.setAttribute('r', 10 + Math.min(spawned * 3, 12));
-      if (refs.glow) {
-        refs.glow.setAttribute('r', 18 + Math.min(spawned * 5, 20));
-      }
-      // Update badge
-      if (spawned > 0) {
-        if (!refs.badge) {
-          const pos = nodePositions.get(c.agent_id) || { x: 0, y: 0 };
-          refs.badge = svgEl('text', {
-            x: pos.x, y: pos.y,
-            'text-anchor': 'middle',
-            'dominant-baseline': 'central',
-            fill: '#fff',
-            'font-size': '7',
-            'font-weight': 'bold',
-            'font-family': 'JetBrains Mono, monospace',
-            'pointer-events': 'none',
-          });
-          svgRefs.nodeGroup.appendChild(refs.badge);
-        }
-        refs.badge.textContent = spawned;
-      } else if (refs.badge) {
-        refs.badge.remove();
-        refs.badge = null;
       }
     }
-  });
-}
-
-function rebuildSVG() {
-  // Full rebuild — used on theme change
-  svgRefs.lines.clear();
-  svgRefs.nodes.clear();
-  svgRefs.lineHits.clear();
-  // Clean up orbital planets
-  for (const [agentId, planets] of orbitingPlanets) {
-    const anim = orbitAnimFrames.get(agentId);
-    if (anim) cancelAnimationFrame(anim.raf);
+    for (const id of prevConnIds) {
+      if (!currConnIds.has(id)) {
+        items.push({
+          id: 'evt_disc_' + id + '_' + Date.now(),
+          type: 'connection_event',
+          content: `Agent disconnected`,
+          timestamp: new Date().toISOString(),
+          agent_id: id,
+          agent_name: null,
+        });
+      }
+    }
   }
-  orbitingPlanets.clear();
-  orbitAnimFrames.clear();
-  lineWaveTimers.clear();
-  initSVG();
-  updateConstellationNodes(currentConns);
-}
+  prevConnIds = currConnIds;
 
-// Mesh tooltip
-function showMeshTooltip(c, e) {
-  const tip = document.getElementById('mesh-tooltip');
-  if (!tip) return;
-  document.getElementById('mesh-tooltip-name').textContent = agentLabel(c);
-  const levelTag = c.connectivity_level ? ` [L${c.connectivity_level}:${c.connectivity_method || '?'}]` : '';
-  document.getElementById('mesh-tooltip-bio').textContent = (c.bio ? c.bio.slice(0, 70) : 'No bio') + levelTag;
-  tip.classList.remove('hidden');
-  moveMeshTooltip(e);
-}
-
-function moveMeshTooltip(e) {
-  const tip = document.getElementById('mesh-tooltip');
-  if (!tip) return;
-  const cr = constellationArea.getBoundingClientRect();
-  let x = e.clientX - cr.left + 12;
-  let y = e.clientY - cr.top - 12;
-  if (x + 200 > cr.width) x = x - 224;
-  if (y < 0) y = y + 30;
-  tip.style.left = x + 'px';
-  tip.style.top = y + 'px';
-}
-
-function hideMeshTooltip() {
-  const tip = document.getElementById('mesh-tooltip');
-  if (tip) {
-    tip.classList.add('hidden');
-    const bioEl = document.getElementById('mesh-tooltip-bio');
-    if (bioEl) bioEl.style.whiteSpace = '';
-  }
-}
-
-// =========================================================================
-// Particle & Ring Animations
-// =========================================================================
-function animateParticle(fromX, fromY, toX, toY, color, duration) {
-  duration = duration || 600;
-  const particle = svgEl('circle', { cx: fromX, cy: fromY, r: 3.5, fill: color, opacity: 0.9 });
-  svgRefs.particleGroup.appendChild(particle);
-
-  const start = performance.now();
-  function step(now) {
-    const t = Math.min((now - start) / duration, 1);
-    const ease = t < 0.5 ? 2*t*t : -1+(4-2*t)*t; // ease in-out quad
-    particle.setAttribute('cx', fromX + (toX - fromX) * ease);
-    particle.setAttribute('cy', fromY + (toY - fromY) * ease);
-    particle.setAttribute('opacity', String(0.9 - t * 0.5));
-    particle.setAttribute('r', String(3.5 - t * 1.5));
-    if (t < 1) requestAnimationFrame(step);
-    else particle.remove();
-  }
-  requestAnimationFrame(step);
-}
-
-function animateSendParticle(agentId) {
-  const pos = nodePositions.get(agentId);
-  if (!pos) return;
-  animateParticle(centerPos.x, centerPos.y, pos.x, pos.y, '#dd8040', 600);
-}
-
-function animateReceiveParticle(agentId) {
-  const pos = nodePositions.get(agentId);
-  if (!pos) return;
-  animateParticle(pos.x, pos.y, centerPos.x, centerPos.y, '#60a5fa', 600);
-}
-
-function animateResponseParticle(agentId) {
-  const pos = nodePositions.get(agentId);
-  if (!pos) return;
-  animateParticle(pos.x, pos.y, centerPos.x, centerPos.y, '#34d399', 700);
-}
-
-function animateForwardParticle(fromAgentId, toAgentId) {
-  const from = nodePositions.get(fromAgentId);
-  const to = nodePositions.get(toAgentId);
-  if (!from || !to) return;
-  animateParticle(from.x, from.y, to.x, to.y, '#a78bfa', 500);
-}
-
-function showRingExpand(agentId, color) {
-  const pos = nodePositions.get(agentId);
-  if (!pos) return;
-  const ring = svgEl('circle', {
-    cx: pos.x, cy: pos.y, r: 8,
-    fill: 'none', stroke: color, 'stroke-width': 2, opacity: 0.8,
-  });
-  svgRefs.particleGroup.appendChild(ring);
-
-  const start = performance.now();
-  const duration = 600;
-  function step(now) {
-    const t = Math.min((now - start) / duration, 1);
-    ring.setAttribute('r', String(8 + t * 25));
-    ring.setAttribute('opacity', String(0.8 * (1 - t)));
-    ring.setAttribute('stroke-width', String(2 - t * 1.5));
-    if (t < 1) requestAnimationFrame(step);
-    else ring.remove();
-  }
-  requestAnimationFrame(step);
-}
-
-// =========================================================================
-// Orbital Planet System — replaces responding throb
-// =========================================================================
-function addOrbitingPlanet(agentId, messageId, fromSelf) {
-  if (!orbitingPlanets.has(agentId)) orbitingPlanets.set(agentId, new Map());
-  const planets = orbitingPlanets.get(agentId);
-  if (planets.has(messageId)) return; // already orbiting
-
-  const pos = nodePositions.get(agentId);
-  const refs = svgRefs.nodes.get(agentId);
-  if (!pos || !refs) return;
-
-  // Color by agent: sent messages use the target agent's color
-  const color = fromSelf ? '#dd8040' : agentColor(agentId);
-  const planetIndex = planets.size;
-  const nodeR = parseFloat(refs.circle.getAttribute('r')) || 10;
-
-  // Each planet gets a unique elliptical orbit + speed
-  const baseR = nodeR + 10 + (planetIndex * 6);
-  const rx = baseR + (Math.random() * 8 - 4);           // semi-major axis
-  const ry = baseR * (0.5 + Math.random() * 0.4);       // semi-minor axis (ellipse)
-  const tilt = Math.random() * Math.PI;                  // orbit tilt angle
-  const period = 1800 + Math.random() * 1400;            // 1.8s–3.2s per revolution
-  const startAngle = Math.random() * Math.PI * 2;
-  const clockwise = Math.random() > 0.3 ? 1 : -1;       // mostly clockwise, some counter
-
-  function orbitPos(angle) {
-    // Read live position in case node moved
-    const p = nodePositions.get(agentId) || pos;
-    const lx = rx * Math.cos(angle);
-    const ly = ry * Math.sin(angle);
-    return {
-      x: p.x + lx * Math.cos(tilt) - ly * Math.sin(tilt),
-      y: p.y + lx * Math.sin(tilt) + ly * Math.cos(tilt),
-    };
-  }
-
-  const startPos = orbitPos(startAngle);
-  const el = svgEl('circle', {
-    cx: startPos.x, cy: startPos.y,
-    r: 3.5, fill: color, opacity: 0.9,
-  });
-  el.style.transition = 'none';
-  svgRefs.particleGroup.appendChild(el);
-
-  // Trail circles
-  const trail = [];
-  const trailSizes = [2.5, 2, 1.5];
-  const trailOpacities = [0.3, 0.2, 0.1];
-  const trailOffsets = [-0.25, -0.5, -0.75];
-  for (let i = 0; i < 3; i++) {
-    const tp = orbitPos(startAngle + trailOffsets[i] * clockwise);
-    const t = svgEl('circle', {
-      cx: tp.x, cy: tp.y,
-      r: trailSizes[i], fill: color, opacity: trailOpacities[i],
+  // Add pending requests as feed items
+  for (const req of (data.pending_requests || [])) {
+    items.push({
+      id: 'pending_' + req.request_id,
+      type: 'pending_request',
+      timestamp: req.requested_at || new Date().toISOString(),
+      from_name: req.from_display_name || shortId(req.from_agent_id),
+      from_agent_id: req.from_agent_id,
+      bio: req.from_bio,
+      request_id: req.request_id,
     });
-    svgRefs.particleGroup.appendChild(t);
-    trail.push(t);
   }
 
-  // Materialize animation: scale 0→1
-  el.setAttribute('r', '0');
-  const matStart = performance.now();
-  function materialize(now) {
-    const t = Math.min((now - matStart) / 200, 1);
-    el.setAttribute('r', String(3.5 * t));
-    if (t < 1) requestAnimationFrame(materialize);
-  }
-  requestAnimationFrame(materialize);
-
-  planets.set(messageId, {
-    el, trail, angle: startAngle,
-    speed: clockwise * (2 * Math.PI) / period,
-    rx, ry, tilt, color, orbitPos,
+  // Re-sort after adding events
+  items.sort((a, b) => {
+    const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+    const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+    return ta - tb;
   });
 
-  // Tint node amber on first planet
-  if (planets.size === 1) {
-    refs.circle.setAttribute('fill', '#fbbf24');
-  }
+  const newIds = new Set(items.map(i => i.id));
 
-  // Start animation loop if not running
-  if (!orbitAnimFrames.has(agentId)) {
-    const lastTime = performance.now();
-    function loop(now) {
-      updateOrbits(agentId, now);
-      orbitAnimFrames.set(agentId, { raf: requestAnimationFrame(loop), lastTime: now });
-    }
-    orbitAnimFrames.set(agentId, { raf: requestAnimationFrame(loop), lastTime });
-  }
-}
-
-function removeOrbitingPlanet(agentId, messageId) {
-  const planets = orbitingPlanets.get(agentId);
-  if (!planets) return;
-  const planet = planets.get(messageId);
-  if (!planet) return;
-
-  // Burst animation: expand and fade
-  const burstStart = performance.now();
-  const origR = 3.5;
-  function burst(now) {
-    const t = Math.min((now - burstStart) / 300, 1);
-    planet.el.setAttribute('r', String(origR + t * 8));
-    planet.el.setAttribute('opacity', String(0.9 * (1 - t)));
-    if (t < 1) {
-      requestAnimationFrame(burst);
-    } else {
-      planet.el.remove();
-      planet.trail.forEach(t => t.remove());
+  // Remove stale (except connection events which are ephemeral)
+  for (const [id, el] of renderedFeedItems) {
+    if (!newIds.has(id) && !id.startsWith('evt_')) {
+      el.remove();
+      renderedFeedItems.delete(id);
     }
   }
-  requestAnimationFrame(burst);
 
-  planets.delete(messageId);
+  // Filter out cleared items for empty state check
+  const visibleItems = clearedAtTs > 0
+    ? items.filter(i => !i.timestamp || new Date(i.timestamp).getTime() >= clearedAtTs)
+    : items;
+  if (emptyState) emptyState.style.display = visibleItems.length > 0 ? 'none' : '';
 
-  // If no more planets, stop animation and reset node color
-  if (planets.size === 0) {
-    orbitingPlanets.delete(agentId);
-    const anim = orbitAnimFrames.get(agentId);
-    if (anim) { cancelAnimationFrame(anim.raf); orbitAnimFrames.delete(agentId); }
-    const refs = svgRefs.nodes.get(agentId);
-    if (refs) refs.circle.setAttribute('fill', '#34d399');
-  }
-}
+  // Check if near bottom for auto-scroll
+  const nearBottom = feedScroll.scrollHeight - feedScroll.scrollTop - feedScroll.clientHeight < 80;
 
-function updateOrbits(agentId, now) {
-  const planets = orbitingPlanets.get(agentId);
-  if (!planets || planets.size === 0) return;
-
-  const anim = orbitAnimFrames.get(agentId);
-  const dt = (now - (anim ? anim.lastTime : now)) / 1000;
-
-  for (const [, p] of planets) {
-    p.angle += p.speed * dt;
-    if (p.angle > Math.PI * 2) p.angle -= Math.PI * 2;
-    if (p.angle < 0) p.angle += Math.PI * 2;
-
-    const pp = p.orbitPos(p.angle);
-    p.el.setAttribute('cx', String(pp.x));
-    p.el.setAttribute('cy', String(pp.y));
-
-    // Trail follows at angle offsets
-    const dir = p.speed > 0 ? 1 : -1;
-    const trailOffsets = [-0.25 * dir, -0.5 * dir, -0.75 * dir];
-    for (let i = 0; i < p.trail.length; i++) {
-      const tp = p.orbitPos(p.angle + trailOffsets[i]);
-      p.trail[i].setAttribute('cx', String(tp.x));
-      p.trail[i].setAttribute('cy', String(tp.y));
+  // Add new items (skip items cleared by user)
+  for (const item of items) {
+    if (clearedAtTs > 0 && item.timestamp) {
+      const itemTs = new Date(item.timestamp).getTime();
+      if (itemTs < clearedAtTs) continue;
     }
-  }
-}
-
-function syncOrbitPositions() {
-  // Called from layoutPeers when nodes move — orbits auto-sync on next frame via nodePositions
-  // Nothing extra needed since updateOrbits reads nodePositions each frame
-}
-
-function showNodeFlash(agentId, color) {
-  const refs = svgRefs.nodes.get(agentId);
-  if (!refs) return;
-  const spawned = (currentConns.find(c => c.agent_id === agentId) || {}).spawned_agents || 0;
-  refs.circle.setAttribute('fill', color);
-  refs.circle.setAttribute('r', String(14 + Math.min(spawned * 3, 12)));
-  setTimeout(() => {
-    refs.circle.setAttribute('fill', '#34d399');
-    refs.circle.setAttribute('r', String(10 + Math.min(spawned * 3, 12)));
-  }, 400);
-}
-
-function showScatterParticles(agentId) {
-  const pos = nodePositions.get(agentId);
-  if (!pos) return;
-  for (let i = 0; i < 6; i++) {
-    const angle = (Math.PI * 2 * i) / 6;
-    const dx = Math.cos(angle) * 20;
-    const dy = Math.sin(angle) * 20;
-    const p = svgEl('circle', { cx: pos.x, cy: pos.y, r: 2, fill: '#f87171', opacity: 0.8 });
-    svgRefs.particleGroup.appendChild(p);
-    const start = performance.now();
-    (function(particle, ddx, ddy) {
-      function step(now) {
-        const t = Math.min((now - start) / 500, 1);
-        particle.setAttribute('cx', String(pos.x + ddx * t));
-        particle.setAttribute('cy', String(pos.y + ddy * t));
-        particle.setAttribute('opacity', String(0.8 * (1 - t)));
-        particle.setAttribute('r', String(2 * (1 - t)));
-        if (t < 1) requestAnimationFrame(step);
-        else particle.remove();
+    if (renderedFeedItems.has(item.id)) {
+      // Update existing outbound status
+      if (item.type === 'outbound') {
+        const existing = renderedFeedItems.get(item.id);
+        const dot = existing.querySelector('.msg-meta [class*="rounded-full"]');
+        if (dot) dot.outerHTML = buildStatusDot(item.status, item.updates);
+        // Update responses count? We add them as separate items, so no need.
       }
-      requestAnimationFrame(step);
-    })(p, dx, dy);
-  }
-}
-
-// =========================================================================
-// Line Wave — directional dash animation on a connection line
-// =========================================================================
-function startLineWave(agentId, color, duration, direction) {
-  // direction: 'out' = center→peer, 'in' = peer→center
-  duration = duration || 2000;
-  color = color || '#dd8040';
-  const lineRefs = svgRefs.lines.get(agentId);
-  if (!lineRefs) return;
-
-  // Stop any existing wave on this line
-  stopLineWave(agentId);
-
-  const base = lineRefs.base;
-  const glow = lineRefs.glow;
-
-  // Compute dash length from line geometry
-  const x1 = parseFloat(base.getAttribute('x1'));
-  const y1 = parseFloat(base.getAttribute('y1'));
-  const x2 = parseFloat(base.getAttribute('x2'));
-  const y2 = parseFloat(base.getAttribute('y2'));
-  const lineLen = Math.sqrt((x2-x1)**2 + (y2-y1)**2);
-  const dashLen = 12;
-  const gapLen = lineLen; // one dash + big gap = "traveling" look
-
-  glow.setAttribute('stroke', color);
-  glow.setAttribute('stroke-dasharray', `${dashLen},${gapLen}`);
-  glow.setAttribute('opacity', '0.7');
-
-  const startTime = performance.now();
-  const sign = direction === 'in' ? -1 : 1;
-
-  function step(now) {
-    const elapsed = now - startTime;
-    const t = elapsed / duration;
-    if (t >= 1) {
-      glow.setAttribute('opacity', '0');
-      lineWaveTimers.delete(agentId);
-      return;
+      continue;
     }
-    // Move dash along the line
-    const offset = sign * t * (lineLen + dashLen);
-    glow.setAttribute('stroke-dashoffset', String(-offset));
-    // Fade out in last 30%
-    const alpha = t > 0.7 ? 0.7 * (1 - (t - 0.7) / 0.3) : 0.7;
-    glow.setAttribute('opacity', String(alpha));
-    lineWaveTimers.set(agentId, { raf: requestAnimationFrame(step), startTime });
-  }
-  lineWaveTimers.set(agentId, { raf: requestAnimationFrame(step), startTime });
-}
+    if (item.type === 'connection_event' && renderedFeedItems.has(item.id)) continue;
 
-function stopLineWave(agentId) {
-  const timer = lineWaveTimers.get(agentId);
-  if (timer) {
-    cancelAnimationFrame(timer.raf);
-    lineWaveTimers.delete(agentId);
-  }
-  const lineRefs = svgRefs.lines.get(agentId);
-  if (lineRefs) lineRefs.glow.setAttribute('opacity', '0');
-}
-
-// =========================================================================
-// Line Pulse — brief color flash on the connection line (for webhook updates)
-// =========================================================================
-function pulseLineColor(agentId, color, duration) {
-  duration = duration || 800;
-  const lineRefs = svgRefs.lines.get(agentId);
-  if (!lineRefs) return;
-
-  const base = lineRefs.base;
-  const origStroke = 'rgb(var(--c-edge))';
-
-  base.setAttribute('stroke', color);
-  base.setAttribute('stroke-width', '2.5');
-
-  const start = performance.now();
-  function step(now) {
-    const t = Math.min((now - start) / duration, 1);
-    const w = 2.5 - t * 1; // 2.5 → 1.5
-    base.setAttribute('stroke-width', String(w));
-    if (t >= 1) {
-      base.setAttribute('stroke', origStroke);
-      base.setAttribute('stroke-width', '1.5');
-      return;
-    }
-    // Lerp opacity of color flash
-    if (t > 0.5) {
-      base.setAttribute('stroke', origStroke);
-    }
-    requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
-}
-
-// =========================================================================
-// Line Tooltip — hover over a line to see recent messages
-// =========================================================================
-function trackLineMessage(agentId, content, status, direction) {
-  if (!lineMessageHistory.has(agentId)) lineMessageHistory.set(agentId, []);
-  const history = lineMessageHistory.get(agentId);
-  history.unshift({ content, status, direction, time: new Date().toISOString() });
-  if (history.length > 5) history.length = 5; // keep last 5
-}
-
-function showLineTooltip(agentId, e) {
-  const tip = document.getElementById('mesh-tooltip');
-  if (!tip) return;
-  const nameEl = document.getElementById('mesh-tooltip-name');
-  const bioEl = document.getElementById('mesh-tooltip-bio');
-
-  const history = lineMessageHistory.get(agentId) || [];
-  const conn = currentConns.find(c => c.agent_id === agentId);
-  const name = conn ? agentLabel(conn) : shortId(agentId);
-
-  if (history.length === 0) {
-    nameEl.textContent = name;
-    bioEl.textContent = 'No messages yet';
-  } else {
-    nameEl.textContent = name;
-    const lines = history.slice(0, 3).map(m => {
-      const arrow = m.direction === 'out' ? '\u2192' : '\u2190';
-      const preview = m.content.length > 40 ? m.content.slice(0, 38) + '..' : m.content;
-      return `${arrow} ${preview} (${timeAgo(m.time)})`;
-    });
-    bioEl.textContent = lines.join('\n');
-    bioEl.style.whiteSpace = 'pre-line';
+    const el = renderFeedItem(item);
+    feedContainer.appendChild(el);
+    renderedFeedItems.set(item.id, el);
   }
 
-  tip.classList.remove('hidden');
-  moveMeshTooltip(e);
-}
-
-
-// =========================================================================
-// Message Flow Visualization — process outbox updates
-// =========================================================================
-function processOutboxVisuals(outbox) {
-  for (const msg of outbox) {
-    const targets = msg.routed_to || [];
-    const isActive = msg.status === 'active';
-
-    // Simple rule: active message = orbit. Not active = no orbit.
-    if (isActive) {
-      for (const id of targets) {
-        addOrbitingPlanet(id, msg.message_id, msg.from_self);
-      }
-    } else {
-      for (const id of targets) {
-        removeOrbitingPlanet(id, msg.message_id);
-      }
-    }
+  // Auto-scroll
+  if (nearBottom) {
+    feedScroll.scrollTop = feedScroll.scrollHeight;
   }
-
 }
 
 // =========================================================================
-// Compose — send message
+// Send message
 // =========================================================================
 composeForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const content = composeInput.value.trim();
   if (!content) return;
   const target = targetValue.value;
-  const isBroadcast = target === 'broadcast';
 
   sendBtn.disabled = true;
   composeInput.value = '';
@@ -1552,30 +1020,11 @@ composeForm.addEventListener('submit', async (e) => {
     if (!result.success) {
       showToast(result.error || 'Send failed', 'error');
     } else {
-      if (isBroadcast && result.broadcast) {
-        addActivity('&#x21D1;', 'text-mesh-yellow', `Broadcast to ${result.sent_count} agent${result.sent_count !== 1 ? 's' : ''}`);
+      if (target === 'broadcast' && result.broadcast) {
         showToast(`Broadcast to ${result.sent_count} agent${result.sent_count !== 1 ? 's' : ''}`, 'success');
-        for (const [id] of nodePositions) {
-          setTimeout(() => {
-            animateSendParticle(id);
-            startLineWave(id, '#fbbf24', 1200, 'out');
-          }, Math.random() * 200);
-        }
-      } else {
-        addActivity('&uarr;', 'text-solar-400', 'Sent message');
-        if (target !== 'auto' && nodePositions.has(target)) {
-          animateSendParticle(target);
-          startLineWave(target, '#dd8040', 1500, 'out');
-        } else if (result.routed_to && result.routed_to.length > 0) {
-          result.routed_to.forEach((id, i) => setTimeout(() => {
-            animateSendParticle(id);
-            startLineWave(id, '#dd8040', 1500, 'out');
-          }, i * 100));
-        }
       }
-      // Force poll + scroll timeline to bottom so user sees their message
       pollServer();
-      if (timelineScroll) setTimeout(() => { timelineScroll.scrollTop = timelineScroll.scrollHeight; }, 300);
+      setTimeout(() => { feedScroll.scrollTop = feedScroll.scrollHeight; }, 300);
     }
   } catch (err) {
     showToast('Failed to send message', 'error');
@@ -1607,7 +1056,6 @@ connectForm.addEventListener('submit', async (e) => {
     const result = await ajaxPost('/connect', { url });
     if (result.success) {
       showToast(result.status === 'connected' ? 'Connected' : 'Request sent', 'success');
-      addActivity('+', 'text-mesh-green', `Connected to ${url.split(':').pop()}`);
       urlInput.value = '';
     } else {
       showToast(result.error || 'Connection failed', 'error');
@@ -1621,7 +1069,7 @@ connectForm.addEventListener('submit', async (e) => {
 });
 
 // =========================================================================
-// Render pending requests (diff-aware)
+// Render pending requests (sidebar)
 // =========================================================================
 function renderPending(requests) {
   if (requests.length === 0) {
@@ -1641,28 +1089,26 @@ function renderPending(requests) {
     if (renderedPending.has(r.request_id)) return;
 
     const el = document.createElement('div');
-    el.className = 'bg-slab border border-edge rounded p-2 flex items-center justify-between gap-2 slide-in-left';
+    el.className = 'bg-surface border border-border/30 rounded-xl p-2.5 fade-in';
     el.innerHTML = `
-      <div class="min-w-0">
-        <div class="text-[11px] text-bright font-medium truncate">${esc(agentLabel(r))}</div>
-        ${r.from_bio ? `<div class="text-[10px] text-muted truncate mt-0.5">${esc(r.from_bio.slice(0, 40))}</div>` : ''}
-      </div>
-      <div class="flex gap-1 shrink-0">
-        <button class="accept-btn bg-mesh-green/15 hover:bg-mesh-green/25 text-mesh-green text-[10px] px-2 py-0.5 rounded transition-colors font-medium">Accept</button>
-        <button class="reject-btn bg-mesh-red/15 hover:bg-mesh-red/25 text-mesh-red text-[10px] px-2 py-0.5 rounded transition-colors">Deny</button>
+      <div class="flex items-center justify-between gap-2">
+        <div class="min-w-0">
+          <div class="text-[13px] text-primary font-medium truncate">${esc(agentLabel(r))}</div>
+          ${r.from_bio ? `<div class="text-[11px] text-muted truncate mt-0.5">${esc(r.from_bio.slice(0, 40))}</div>` : ''}
+        </div>
+        <div class="flex gap-1 shrink-0">
+          <button class="accept-btn text-white text-[11px] font-semibold px-2.5 py-1 rounded-lg transition-colors" style="background: var(--accent-blue)">Accept</button>
+          <button class="reject-btn text-accent-red bg-accent-red/10 text-[11px] px-2 py-1 rounded-lg transition-colors hover:bg-accent-red/20">Deny</button>
+        </div>
       </div>`;
 
     el.querySelector('.accept-btn').addEventListener('click', async () => {
       try {
         const result = await ajaxPost(`/accept/${encodeURIComponent(r.request_id)}`, {});
-        if (result.success) {
-          showToast(`Connected to ${agentLabel(r)}`, 'success');
-          addActivity('+', 'text-mesh-green', `Accepted ${agentLabel(r)}`);
-        }
+        if (result.success) showToast(`Connected to ${agentLabel(r)}`, 'success');
       } catch (err) { showToast('Accept failed', 'error'); }
       pollServer();
     });
-
     el.querySelector('.reject-btn').addEventListener('click', async () => {
       try {
         await ajaxPost(`/reject/${encodeURIComponent(r.request_id)}`, {});
@@ -1677,7 +1123,7 @@ function renderPending(requests) {
 }
 
 // =========================================================================
-// Render discovered agents (diff-aware)
+// Render discovered agents (sidebar)
 // =========================================================================
 function renderDiscovered(agents) {
   const currentIds = new Set(agents.map(a => a.agent_id));
@@ -1687,7 +1133,7 @@ function renderDiscovered(agents) {
 
   if (agents.length === 0 && renderedDiscovered.size === 0) {
     if (!discoveredList.querySelector('.text-muted')) {
-      discoveredList.innerHTML = '<p class="text-[10px] text-muted italic">No agents found</p>';
+      discoveredList.innerHTML = '<p class="text-[12px] text-muted">No agents found</p>';
     }
     return;
   }
@@ -1702,17 +1148,18 @@ function renderDiscovered(agents) {
     if (existing) { existing.el.remove(); renderedDiscovered.delete(a.agent_id); }
 
     const el = document.createElement('div');
-    el.className = 'bg-slab border border-edge rounded p-2 flex items-center justify-between gap-2';
+    el.className = 'bg-surface border border-border/30 rounded-xl p-2.5 flex items-center justify-between gap-2';
     el.innerHTML = `
       <div class="min-w-0">
         <div class="flex items-center gap-1">
-          <span class="text-[11px] text-bright font-medium truncate">${esc(agentLabel(a))}</span>
-          <span class="text-[10px] text-faint">:${a.port}</span>
+          <span class="text-[13px] text-primary font-medium truncate">${esc(agentLabel(a))}</span>
+          <span class="text-[11px] text-muted">:${a.port}</span>
         </div>
-        ${a.bio ? `<div class="text-[10px] text-muted truncate mt-0.5">${esc(a.bio.slice(0, 35))}</div>` : ''}
+        ${a.bio ? `<div class="text-[11px] text-muted truncate mt-0.5">${esc(a.bio.slice(0, 35))}</div>` : ''}
       </div>
       <button type="button"
-        class="connect-btn shrink-0 bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[10px] px-2 py-0.5 rounded transition-colors font-medium">
+        class="connect-btn shrink-0 text-[11px] font-semibold px-2.5 py-1 rounded-lg transition-colors"
+        style="background: var(--accent-blue); color: white">
         Connect
       </button>`;
 
@@ -1723,7 +1170,6 @@ function renderDiscovered(agents) {
         const result = await ajaxPost('/connect', { url: a.url });
         if (result.success) {
           showToast(result.status === 'connected' ? `Connected to ${agentLabel(a)}` : 'Request sent', 'success');
-          addActivity('+', 'text-mesh-green', `Connected to ${agentLabel(a)}`);
         } else { showToast(result.error || 'Failed', 'error'); }
       } catch (err) { showToast('Connection failed', 'error'); }
       btn.disabled = false; btn.textContent = 'Connect';
@@ -1736,64 +1182,40 @@ function renderDiscovered(agents) {
 }
 
 // =========================================================================
-// Render connections — sidebar list + constellation
+// Render connections (sidebar)
 // =========================================================================
-function createCompactConnNode(c) {
+function createConnNode(c) {
   const el = document.createElement('div');
-  el.className = 'flex items-center justify-between text-[10px] py-0.5 group';
-  const isUnreachable = c.health_status === 'unreachable';
-  const dotColor = isUnreachable ? 'bg-mesh-red' : 'bg-mesh-green';
-  const nameClass = isUnreachable ? 'text-muted truncate' : 'text-pale truncate';
-  const suffix = isUnreachable ? ' <span class="text-[8px] text-mesh-red">\u2298</span>' : '';
+  el.className = 'flex items-center justify-between text-[12px] py-1 group rounded-lg px-1.5 hover:bg-surface/50 transition-colors';
+  const dead = c.health_status === 'unreachable';
+  const dotColor = dead ? 'bg-accent-red' : 'bg-accent-green';
+  const nameClass = dead ? 'text-muted truncate' : 'text-label truncate';
   el.innerHTML = `
-    <div class="flex items-center gap-1.5 min-w-0">
+    <div class="flex items-center gap-2 min-w-0">
       <div class="w-1.5 h-1.5 rounded-full ${dotColor} shrink-0"></div>
-      <span class="${nameClass}">${esc(agentLabel(c))}${suffix}</span>
-      <span class="text-[9px] text-faint">${c.direction === 'inbound' ? '&#8592;' : '&#8594;'}</span>
+      <span class="${nameClass}">${esc(agentLabel(c))}</span>
     </div>
-    <button type="button" class="dc-btn text-faint hover:text-mesh-red transition-colors ml-1 shrink-0 opacity-0 group-hover:opacity-100">&times;</button>`;
+    <button type="button" class="dc-btn text-muted hover:text-accent-red transition-colors ml-1 shrink-0 opacity-0 group-hover:opacity-100 text-sm">&times;</button>`;
 
   el.querySelector('.dc-btn').addEventListener('click', async () => {
     try {
       await ajaxPost(`/disconnect/${encodeURIComponent(c.agent_id)}`, {});
       showToast(`Disconnected from ${agentLabel(c)}`, 'info');
-      addActivity('&minus;', 'text-mesh-red', `Disconnected from ${agentLabel(c)}`);
     } catch (err) { showToast('Disconnect failed', 'error'); }
     pollServer();
   });
-  return el;
-}
 
-function createMobileConnNode(c) {
-  const el = document.createElement('div');
-  el.className = 'bg-slab border border-edge rounded p-2 group';
-  const isUnreachable = c.health_status === 'unreachable';
-  const dotColor = isUnreachable ? 'bg-mesh-red' : 'bg-mesh-green';
-  const nameClass = isUnreachable ? 'text-[11px] text-muted font-medium truncate' : 'text-[11px] text-bright font-medium truncate';
-  const suffix = isUnreachable ? ' <span class="text-[9px] text-mesh-red">\u2298</span>' : '';
-  el.innerHTML = `
-    <div class="flex items-center justify-between">
-      <div class="flex items-center gap-1.5 min-w-0">
-        <div class="w-1.5 h-1.5 rounded-full ${dotColor} shrink-0"></div>
-        <span class="${nameClass}">${esc(agentLabel(c))}${suffix}</span>
-        <span class="text-[9px] text-faint">${c.direction === 'inbound' ? '&larr;' : '&rarr;'}</span>
-      </div>
-      <button type="button" class="dc-btn text-faint hover:text-mesh-red text-[11px] opacity-0 group-hover:opacity-100 transition-all">&times;</button>
-    </div>
-    ${c.bio ? `<div class="text-[10px] text-muted truncate mt-0.5 pl-3">${esc(c.bio.slice(0, 50))}</div>` : ''}
-    <div class="flex items-center gap-1.5 mt-0.5 pl-3">
-      ${c.connectivity_level ? `<span class="text-[9px] px-1 py-px rounded bg-mesh-blue/10 text-mesh-blue font-mono">L${c.connectivity_level}:${esc(c.connectivity_method || '?')}</span>` : ''}
-      ${c.last_activity ? `<span class="text-[9px] text-faint">${timeAgo(c.last_activity)}</span>` : ''}
-    </div>`;
-
-  el.querySelector('.dc-btn').addEventListener('click', async () => {
-    try {
-      await ajaxPost(`/disconnect/${encodeURIComponent(c.agent_id)}`, {});
-      showToast(`Disconnected from ${agentLabel(c)}`, 'info');
-      addActivity('&minus;', 'text-mesh-red', `Disconnected from ${agentLabel(c)}`);
-    } catch (err) { showToast('Disconnect failed', 'error'); }
-    pollServer();
+  // Click to target this agent
+  el.addEventListener('click', (e) => {
+    if (e.target.closest('.dc-btn')) return;
+    targetValue.value = c.agent_id;
+    targetLabel.textContent = agentLabel(c);
+    const dot = document.getElementById('route-dot');
+    dot.style.background = 'var(--accent-blue)';
+    dot.className = 'w-2 h-2 rounded-full shrink-0';
+    composeInput.focus();
   });
+
   return el;
 }
 
@@ -1802,10 +1224,6 @@ function connHash(c) {
 }
 
 function renderConnections(conns) {
-  // Update constellation SVG
-  updateConstellationNodes(conns);
-
-  // Sidebar compact list
   const currentIds = new Set(conns.map(c => c.agent_id));
   for (const [id, entry] of renderedConns) {
     if (!currentIds.has(id)) { entry.el.remove(); renderedConns.delete(id); }
@@ -1817,15 +1235,15 @@ function renderConnections(conns) {
     if (existing) { existing.el.remove(); renderedConns.delete(c.agent_id); }
     const ph = connectionsList.querySelector('p.text-muted');
     if (ph) ph.remove();
-    const el = createCompactConnNode(c);
+    const el = createConnNode(c);
     connectionsList.appendChild(el);
     renderedConns.set(c.agent_id, { el, hash: h });
   });
   if (conns.length === 0 && connectionsList.children.length === 0) {
-    connectionsList.innerHTML = '<p class="text-[10px] text-muted italic">No connections</p>';
+    connectionsList.innerHTML = '<p class="text-[12px] text-muted">No connections</p>';
   }
 
-  // Mobile list
+  // Mobile
   for (const [id, entry] of renderedConnsMobile) {
     if (!currentIds.has(id)) { entry.el.remove(); renderedConnsMobile.delete(id); }
   }
@@ -1834,7 +1252,7 @@ function renderConnections(conns) {
     const existing = renderedConnsMobile.get(c.agent_id);
     if (existing && existing.hash === h) return;
     if (existing) { existing.el.remove(); renderedConnsMobile.delete(c.agent_id); }
-    const el = createMobileConnNode(c);
+    const el = createConnNode(c);
     mobileConnectionsList.appendChild(el);
     renderedConnsMobile.set(c.agent_id, { el, hash: h });
   });
@@ -1844,465 +1262,83 @@ function renderConnections(conns) {
 }
 
 // =========================================================================
-// Activity diffing — detect changes between polls
+// Network context panel
 // =========================================================================
-function diffActivity(prev, curr) {
-  if (!prev) return;
+let contextExpanded = false;
 
-  const prevConnIds = new Set(prev.connections.map(c => c.agent_id));
-  curr.connections.forEach(c => {
-    if (!prevConnIds.has(c.agent_id)) {
-      addActivity('+', 'text-mesh-green', `Connected: ${agentLabel(c)}`);
-    }
-  });
-
-  const currConnIds = new Set(curr.connections.map(c => c.agent_id));
-  prev.connections.forEach(c => {
-    if (!currConnIds.has(c.agent_id)) {
-      addActivity('&minus;', 'text-mesh-red', `Disconnected: ${agentLabel(c)}`);
-    }
-  });
-
-  const prevInboxIds = new Set(prev.inbox.map(m => m.message_id));
-  curr.inbox.forEach(m => {
-    if (!prevInboxIds.has(m.message_id)) {
-      addActivity('&darr;', 'text-mesh-blue', `Message from ${agentLabel(m)}`);
-      if (m.from_agent_id && nodePositions.has(m.from_agent_id)) {
-        animateReceiveParticle(m.from_agent_id);
-        startLineWave(m.from_agent_id, '#60a5fa', 1500, 'in');
-        pulseLineColor(m.from_agent_id, '#60a5fa', 600);
-        trackLineMessage(m.from_agent_id, m.content, 'inbox', 'in');
-      }
-    }
-  });
-
-  const prevPendingIds = new Set(prev.pending_requests.map(p => p.request_id));
-  curr.pending_requests.forEach(p => {
-    if (!prevPendingIds.has(p.request_id)) {
-      addActivity('?', 'text-mesh-purple', `Request from ${agentLabel(p)}`);
-    }
-  });
+function toggleContextPanel() {
+  contextExpanded = !contextExpanded;
+  document.getElementById('context-panel').classList.toggle('hidden', !contextExpanded);
+  document.getElementById('context-chevron').style.transform = contextExpanded ? 'rotate(180deg)' : '';
 }
 
-// =========================================================================
-// Timeline sidebar
-// =========================================================================
-function buildThreads(data) {
-  const threads = [];
+function renderContextPanel(data) {
+  const banner = document.getElementById('context-banner');
+  const summary = document.getElementById('context-summary');
+  const container = document.getElementById('context-connections');
   const conns = data.connections || [];
-  const findConn = (id) => conns.find(cn => cn.agent_id === id);
+  const shardCount = (data.shards || []).length;
+  const inboxCount = (data.inbox || []).length;
+  const outboxCount = (data.outbox || []).length;
 
-  // Sent messages become threads with answers from responses
-  for (const msg of (data.outbox || [])) {
-    const agentIds = new Set(msg.routed_to || []);
-    const answers = [];
-    for (const r of (msg.responses || [])) {
-      const c = findConn(r.agent_id);
-      const name = c ? agentLabel(c) : (r.display_name || shortId(r.agent_id));
-      answers.push({
-        agent: name,
-        content: r.response,
-        timestamp: r.timestamp,
-        agent_id: r.agent_id,
-      });
-      agentIds.add(r.agent_id);
-    }
-    threads.push({
-      id: msg.message_id,
-      type: 'sent',
-      question: msg.content,
-      asker: 'You',
-      timestamp: msg.timestamp || msg.created_at,
-      agent_ids: [...agentIds],
-      answers,
-      updates: msg.updates || [],
-    });
+  if (conns.length === 0 && shardCount === 0) {
+    banner.classList.add('hidden');
+    return;
   }
+  banner.classList.remove('hidden');
 
-  // Received messages become threads you can reply to
-  for (const msg of (data.inbox || [])) {
-    const c = findConn(msg.from_agent_id);
-    threads.push({
-      id: 'inbox_' + msg.message_id,
-      type: 'received',
-      question: msg.content,
-      asker: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
-      timestamp: msg.timestamp || msg.received_at || msg.created_at,
-      agent_ids: [msg.from_agent_id],
-      answers: [],
-      raw_message_id: msg.message_id,
-      from_agent_id: msg.from_agent_id,
-    });
-  }
+  // Summary line
+  const parts = [];
+  if (conns.length) parts.push(`${conns.length} connection${conns.length > 1 ? 's' : ''}`);
+  if (inboxCount) parts.push(`${inboxCount} queued`);
+  if (outboxCount) parts.push(`${outboxCount} sent`);
+  if (shardCount) parts.push(`${shardCount} shard${shardCount > 1 ? 's' : ''}`);
+  summary.textContent = parts.join('  ·  ') || 'Network context';
 
-  threads.sort((a, b) => {
-    const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
-    const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
-    return ta - tb;
-  });
-  return threads;
-}
+  // Connection details
+  let html = '';
+  for (const c of conns) {
+    const color = agentColor(c.agent_id);
+    const dead = c.health_status === 'unreachable';
+    const healthDot = dead ? 'bg-accent-red' : 'bg-accent-green';
+    const level = c.connectivity_level ? `L${c.connectivity_level}` : '';
+    const method = c.connectivity_method || '';
+    const levelBadge = level ? `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded" style="background: rgb(var(--c-surface)); color: rgb(var(--c-muted))">${level}${method ? ':' + method : ''}</span>` : '';
+    const spawned = c.spawned_agents ? `<span class="text-[10px] text-muted">${c.spawned_agents} agent${c.spawned_agents > 1 ? 's' : ''} spawned</span>` : '';
+    const wallet = c.wallets && c.wallets.solana ? `<span class="text-[10px] text-muted font-mono">${c.wallets.solana.slice(0, 6)}...${c.wallets.solana.slice(-4)}</span>` : '';
 
-function relativeTime(ts) {
-  if (!ts) return '';
-  const diff = (Date.now() - new Date(ts).getTime()) / 1000;
-  if (diff < 60) return 'now';
-  if (diff < 3600) return Math.floor(diff / 60) + 'm';
-  if (diff < 86400) return Math.floor(diff / 3600) + 'h';
-  return Math.floor(diff / 86400) + 'd';
-}
-
-function buildWebhookBadges(updates) {
-  if (!updates || !updates.length) return '';
-  const colors = { received: 'bg-blue-500/20 text-blue-400', responding: 'bg-yellow-500/20 text-yellow-400', forwarded: 'bg-purple-500/20 text-purple-400', expired: 'bg-red-500/20 text-red-400' };
-  const seen = new Set();
-  let html = '<div class="flex flex-wrap gap-0.5 mt-1">';
-  for (const u of updates) {
-    if (seen.has(u.type)) continue;
-    seen.add(u.type);
-    const cls = colors[u.type] || 'bg-edge text-muted';
-    html += `<span class="text-[10px] px-1.5 py-0.5 rounded-full ${cls}">${u.type}</span>`;
-  }
-  html += '</div>';
-  return html;
-}
-
-function buildThreadHTML(thread) {
-  const askerColor = thread.type === 'sent' ? 'text-solar-400' : 'text-mesh-blue';
-  let html = `<div class="min-w-0">`;
-
-  // Question header: asker label + timestamp
-  html += `<div class="flex items-center gap-1.5">
-    <span class="text-[10px] ${askerColor} font-medium">${escapeHtml(thread.asker)}</span>
-    <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(thread.timestamp)}</span>
-  </div>`;
-
-  // Question content — prominent
-  html += `<div class="truncated-content text-[12px] text-pale mt-0.5 leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(thread.question)}</div>`;
-
-  // Webhook badges for sent threads
-  if (thread.type === 'sent') {
-    html += buildWebhookBadges(thread.updates);
-  }
-
-  // Answers section
-  if (thread.answers.length > 0) {
-    html += `<div class="border-l-2 border-mesh-green/20 pl-3 ml-1 mt-1.5 space-y-2">`;
-    for (const ans of thread.answers) {
-      html += `<div>
-        <div class="truncated-content text-[12px] text-pale leading-relaxed cursor-pointer" onclick="this.classList.toggle('expanded')">${escapeHtml(ans.content)}</div>
-        <div class="flex items-center gap-1.5 mt-0.5">
-          <span class="text-[10px] text-faint">${escapeHtml(ans.agent)}</span>
-          <span class="text-[10px] text-faint shrink-0 ml-auto">${relativeTime(ans.timestamp)}</span>
+    const tint = agentTint(c.agent_id);
+    html += `
+      <div class="rounded-xl px-3.5 py-2.5" style="background:${tint}">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-[13px] font-semibold" style="color:${color}">${esc(agentLabel(c))}</span>
+          <div class="w-1.5 h-1.5 rounded-full ${healthDot}"></div>
+          ${levelBadge}
+          ${spawned}
+          ${wallet}
+        </div>
+        ${c.bio ? `<div class="text-[12px] text-muted mt-0.5 leading-snug">${esc(c.bio.slice(0, 120))}</div>` : ''}
+        <div class="flex items-center gap-2 mt-0.5 text-[10px] text-subtle">
+          <span>${c.direction || ''}</span>
+          ${c.last_activity ? `<span>active ${timeAgo(c.last_activity)}</span>` : ''}
         </div>
       </div>`;
-    }
-    html += `</div>`;
   }
-
-  // Reply input for received threads
-  if (thread.type === 'received' && thread.raw_message_id) {
-    html += `<div class="flex gap-1.5 mt-1.5">
-      <input type="text" placeholder="Reply..."
-        data-message-id="${thread.raw_message_id}"
-        class="timeline-reply-input flex-1 bg-slab border border-edge rounded px-2 py-1 text-[12px] text-bright placeholder-muted focus:border-mesh-blue/40 transition-colors min-w-0">
-      <button type="button" data-message-id="${thread.raw_message_id}"
-        class="timeline-reply-btn bg-mesh-blue/15 hover:bg-mesh-blue/25 text-mesh-blue text-[11px] font-medium px-2.5 py-1 rounded transition-colors disabled:opacity-30 shrink-0">
-        Reply
-      </button>
-    </div>`;
-  }
-
-  html += `</div>`;
-  return html;
+  container.innerHTML = html;
 }
-
-function escapeHtml(str) {
-  if (!str) return '';
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-function createTimelineElement(thread) {
-  const el = document.createElement('div');
-  const borderCls = thread.type === 'sent' ? 'border-solar-500/15' : 'border-mesh-blue/15';
-  el.className = `px-3 py-2 rounded-lg border ${borderCls} bg-slab/20 hover:bg-slab/40 transition-colors timeline-enter`;
-  el.dataset.timelineId = thread.id;
-  el.dataset.agentIds = JSON.stringify(thread.agent_ids || []);
-  el.innerHTML = buildThreadHTML(thread);
-
-  el.addEventListener('mouseenter', () => highlightTimelineItem(thread));
-  el.addEventListener('mouseleave', () => clearTimelineHighlight());
-
-  if (thread.type === 'received' && thread.raw_message_id) {
-    wireTimelineReply(el, thread);
-  }
-  return el;
-}
-
-function wireTimelineReply(el, thread) {
-  const input = el.querySelector('.timeline-reply-input');
-  const btn = el.querySelector('.timeline-reply-btn');
-  if (!input || !btn) return;
-
-  async function doReply() {
-    const text = input.value.trim();
-    if (!text) return;
-    btn.disabled = true;
-    input.disabled = true;
-    try {
-      const result = await ajaxPost(`/respond/${encodeURIComponent(thread.raw_message_id)}`, { response: text });
-      if (result.success) {
-        showToast('Reply sent', 'success');
-        addActivity('&darr;', 'text-mesh-blue', `Replied to ${thread.asker}`);
-        input.value = '';
-      } else {
-        showToast(result.error || 'Reply failed', 'error');
-      }
-    } catch (err) {
-      showToast('Reply failed', 'error');
-    }
-    btn.disabled = false;
-    input.disabled = false;
-  }
-
-  btn.addEventListener('click', doReply);
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doReply(); }
-  });
-}
-
-const renderedThreadAnswerCount = new Map(); // thread.id -> last known answer count
-
-function renderTimeline(data) {
-  if (!timelineScroll) return;
-  const threads = buildThreads(data);
-  const newIds = new Set(threads.map(t => t.id));
-
-  // Remove stale threads
-  for (const [id, el] of renderedTimeline) {
-    if (!newIds.has(id)) {
-      el.remove();
-      renderedTimeline.delete(id);
-      renderedThreadAnswerCount.delete(id);
-    }
-  }
-
-  // Check if user is near bottom (for auto-scroll)
-  const nearBottom = timelineScroll.scrollHeight - timelineScroll.scrollTop - timelineScroll.clientHeight < 60;
-
-  // Clean dismissed entries that are no longer in the data (prevent unbounded growth)
-  for (const id of dismissedTimeline) {
-    if (!newIds.has(id)) dismissedTimeline.delete(id);
-  }
-
-  // Add/update threads
-  for (const thread of threads) {
-    if (dismissedTimeline.has(thread.id)) continue;
-    const existing = renderedTimeline.get(thread.id);
-    if (existing) {
-      // Re-render if answer count changed or content updated
-      const prevCount = renderedThreadAnswerCount.get(thread.id) || 0;
-      const html = buildThreadHTML(thread);
-      if (thread.answers.length !== prevCount || existing.innerHTML !== html) {
-        existing.innerHTML = html;
-        existing.dataset.agentIds = JSON.stringify(thread.agent_ids || []);
-        existing.addEventListener('mouseenter', () => highlightTimelineItem(thread));
-        existing.addEventListener('mouseleave', () => clearTimelineHighlight());
-        if (thread.type === 'received' && thread.raw_message_id) wireTimelineReply(existing, thread);
-        renderedThreadAnswerCount.set(thread.id, thread.answers.length);
-      }
-    } else {
-      const el = createTimelineElement(thread);
-      timelineScroll.appendChild(el);
-      renderedTimeline.set(thread.id, el);
-      renderedThreadAnswerCount.set(thread.id, thread.answers.length);
-    }
-  }
-
-  // Update count badge (only visible items)
-  if (timelineCountEl) timelineCountEl.textContent = renderedTimeline.size;
-
-  // Auto-scroll if near bottom
-  if (nearBottom) {
-    timelineScroll.scrollTop = timelineScroll.scrollHeight;
-  }
-}
-
-// Timeline hover → mesh node connector
-function highlightTimelineItem(item) {
-  clearTimelineHighlight();
-  const agentIds = item.agent_ids || [];
-  if (!agentIds.length) return;
-
-  highlightedTimelineAgent = agentIds[0];
-
-  // Enlarge target node + glow
-  for (const agentId of agentIds) {
-    const nodeRef = svgRefs.nodes.get(agentId);
-    if (nodeRef) {
-      const conn = currentConns.find(c => c.agent_id === agentId);
-      const spawned = conn ? (conn.spawned_agents || 0) : 0;
-      nodeRef.circle.setAttribute('r', String(12 + Math.min(spawned * 3, 12)));
-      if (nodeRef.glow) nodeRef.glow.setAttribute('opacity', '0.35');
-    }
-    // Glow connection line
-    const lineRef = svgRefs.lines.get(agentId);
-    if (lineRef && lineRef.glow) {
-      lineRef.glow.setAttribute('opacity', '0.5');
-    }
-  }
-
-  // Draw dotted SVG connector from right panel edge to node
-  drawTimelineConnector(agentIds[0]);
-}
-
-function clearTimelineHighlight() {
-  if (!highlightedTimelineAgent) return;
-
-  // Reset all nodes back
-  for (const [agentId, nodeRef] of svgRefs.nodes) {
-    const conn = currentConns.find(c => c.agent_id === agentId);
-    const spawned = conn ? (conn.spawned_agents || 0) : 0;
-    nodeRef.circle.setAttribute('r', String(10 + Math.min(spawned * 3, 12)));
-    if (nodeRef.glow) nodeRef.glow.setAttribute('opacity', '0.08');
-  }
-  for (const [, lineRef] of svgRefs.lines) {
-    if (lineRef.glow) lineRef.glow.setAttribute('opacity', '0');
-  }
-
-  removeTimelineConnector();
-  highlightedTimelineAgent = null;
-}
-
-function drawTimelineConnector(agentId) {
-  if (!svgRefs.connectorGroup) return;
-  const pos = nodePositions.get(agentId);
-  if (!pos) return;
-
-  const line = svgEl('line', {
-    x1: svgW, y1: svgH / 2,
-    x2: pos.x, y2: pos.y,
-    stroke: '#dd8040',
-    'stroke-width': '1',
-    'stroke-dasharray': '4 3',
-    opacity: '0.5',
-  });
-  line.classList.add('connector-line');
-  svgRefs.connectorGroup.appendChild(line);
-  timelineConnectorLine = line;
-}
-
-function removeTimelineConnector() {
-  if (timelineConnectorLine) {
-    timelineConnectorLine.remove();
-    timelineConnectorLine = null;
-  }
-}
-
-function clearTimeline() {
-  if (!timelineScroll) return;
-  // Mark all currently rendered threads as dismissed so they don't reappear
-  for (const [id] of renderedTimeline) dismissedTimeline.add(id);
-  timelineScroll.innerHTML = '';
-  renderedTimeline.clear();
-  renderedThreadAnswerCount.clear();
-  if (timelineCountEl) timelineCountEl.textContent = '0';
-}
-
-// =========================================================================
-// Right panel drag-to-resize
-// =========================================================================
-(function initPanelResize() {
-  const panel = document.getElementById('right-panel');
-  const handle = document.getElementById('right-panel-handle');
-  if (!panel || !handle) return;
-
-  let startX, startW;
-
-  handle.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    startX = e.clientX;
-    startW = panel.offsetWidth;
-    document.body.classList.add('resizing-panel');
-
-    function onMove(e) {
-      const delta = startX - e.clientX; // dragging left = wider
-      const newW = Math.max(200, Math.min(startW + delta, window.innerWidth * 0.5));
-      panel.style.width = newW + 'px';
-      // Trigger SVG re-layout since constellation area changed
-      if (typeof updateSVGLayout === 'function') updateSVGLayout();
-    }
-    function onUp() {
-      document.body.classList.remove('resizing-panel');
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    }
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  });
-})();
 
 // =========================================================================
 // Main poll handler
 // =========================================================================
 function onPollData(data) {
-  // Activity diffing
   if (data.self) selfAgentId = data.self.agent_id;
-  diffActivity(prevPollData, data);
-  prevPollData = JSON.parse(JSON.stringify(data));
-
-  // Cache for wallet send form
   _walletData = data;
 
-  // Render constellation + sidebar
   renderPending(data.pending_requests);
   renderDiscovered(data.discovered || []);
   renderConnections(data.connections);
-
-  // Process outbox message visuals (orbits)
-  try { processOutboxVisuals(data.outbox); } catch(e) { console.error('processOutboxVisuals error:', e); }
-
-  // Render timeline sidebar
-  renderTimeline(data);
-
-  // --- Active agents: grow center node + track per-peer counts ---
-  if (data.self) {
-    const agents = data.self.total_active_agents || 0;
-    totalActiveAgents = agents;
-
-    // Center node grows with total active agents
-    if (svgRefs.centerNode) {
-      const r = 14 + Math.min(agents * 3, 12);
-      svgRefs.centerNode.setAttribute('r', r);
-    }
-    if (svgRefs.centerGlow) {
-      const gr = 34 + Math.min(agents * 6, 24);
-      svgRefs.centerGlow.setAttribute('r', gr);
-      svgRefs.centerGlow.setAttribute('opacity', 0.1 + Math.min(agents * 0.04, 0.2));
-    }
-    // Agent count label below "You"
-    if (svgRefs.centerAgentLabel) {
-      if (agents > 0) {
-        svgRefs.centerAgentLabel.textContent = agents + ' agent' + (agents !== 1 ? 's' : '');
-        svgRefs.centerAgentLabel.setAttribute('opacity', '1');
-      } else {
-        svgRefs.centerAgentLabel.setAttribute('opacity', '0');
-      }
-    }
-  }
-
-  // Per-peer agent count activity logging
-  data.connections.forEach(c => {
-    const count = c.spawned_agents || 0;
-    const prev = prevAgentCounts.get(c.agent_id) || 0;
-    if (count > prev) {
-      const delta = count - prev;
-      addActivity('&#9650;', 'text-cyan-400', `${delta} agent${delta !== 1 ? 's' : ''} spawned on ${agentLabel(c)}`);
-    } else if (count < prev) {
-      addActivity('&#9660;', 'text-mesh-green', `Agent finished on ${agentLabel(c)}`);
-    }
-    prevAgentCounts.set(c.agent_id, count);
-  });
+  renderContextPanel(data);
+  renderFeed(data);
 
   // QR code init
   if (data.self && data.self.lan_url && !qrInitialized) {
@@ -2313,24 +1349,18 @@ function onPollData(data) {
   if (data.self && data.self.nat_detected) {
     document.getElementById('nat-status').classList.remove('hidden');
   }
+
+  // Update sidebar identity
+  if (data.self) {
+    const name = data.self.display_name || 'Human';
+    document.getElementById('sidebar-name').textContent = name;
+    document.getElementById('sidebar-avatar').textContent = name.charAt(0).toUpperCase();
+  }
 }
 
 // =========================================================================
-// Init
+// Wallet functions
 // =========================================================================
-initSVG();
-
-// ResizeObserver for constellation re-layout
-if (typeof ResizeObserver !== 'undefined') {
-  new ResizeObserver(() => updateSVGLayout()).observe(constellationArea);
-}
-
-// =========================================================================
-// Wallet — Balances, Send, Identity
-// =========================================================================
-let _walletQRPollTimer = null;
-let _walletData = null;  // cached poll data for connections
-
 function openWalletModal() {
   document.getElementById('wallet-modal').classList.remove('hidden');
   refreshWalletBalances();
@@ -2348,10 +1378,12 @@ function walletMainTab(tab) {
     const btn = document.getElementById(`wallet-main-tab-${t}`);
     const panel = document.getElementById(`wallet-panel-${t}`);
     if (t === tab) {
-      btn.className = 'flex-1 text-[10px] font-semibold py-2.5 transition-colors bg-slab/50 text-bright border-b-2 border-solar-400';
+      btn.className = 'flex-1 text-[12px] font-semibold py-2.5 transition-colors text-primary border-b-2';
+      btn.style.borderColor = 'var(--accent-blue)';
       panel.classList.remove('hidden');
     } else {
-      btn.className = 'flex-1 text-[10px] font-semibold py-2.5 transition-colors text-muted hover:text-pale border-b-2 border-transparent';
+      btn.className = 'flex-1 text-[12px] font-semibold py-2.5 transition-colors text-muted hover:text-primary border-b-2 border-transparent';
+      btn.style.borderColor = '';
       panel.classList.add('hidden');
     }
   });
@@ -2361,9 +1393,7 @@ function walletMainTab(tab) {
 
 function copyWalletAddr() {
   const addr = document.getElementById('wallet-sol-addr').textContent;
-  if (addr) {
-    navigator.clipboard.writeText(addr).then(() => showToast('Address copied', 'success'));
-  }
+  if (addr) navigator.clipboard.writeText(addr).then(() => showToast('Address copied', 'success'));
 }
 
 async function refreshWalletBalances() {
@@ -2374,12 +1404,11 @@ async function refreshWalletBalances() {
   const balancesList = document.getElementById('wallet-balances-list');
 
   solBalEl.textContent = '...';
-  tokenContainer.innerHTML = '<div class="text-[10px] text-muted text-center py-1">Loading...</div>';
+  tokenContainer.innerHTML = '<div class="text-[12px] text-muted text-center py-1">Loading...</div>';
 
   try {
     const resp = await fetch('/api/wallet-balances');
     const data = await resp.json();
-
     if (!data.success) {
       addrEl.textContent = '';
       noSolana.classList.remove('hidden');
@@ -2387,32 +1416,27 @@ async function refreshWalletBalances() {
       tokenContainer.innerHTML = '';
       return;
     }
-
     noSolana.classList.add('hidden');
     balancesList.classList.remove('hidden');
     addrEl.textContent = data.wallet_address || '';
-
-    // SOL balance
     if (data.sol && data.sol.success) {
       solBalEl.textContent = parseFloat(data.sol.balance).toFixed(6);
     } else {
       solBalEl.textContent = 'Error';
     }
-
-    // Token balances
     tokenContainer.innerHTML = '';
     if (data.tokens) {
       for (const [name, info] of Object.entries(data.tokens)) {
         const bal = info.success ? (parseFloat(info.balance) > 0 ? parseFloat(info.balance).toLocaleString() : '0') : 'Error';
         const row = document.createElement('div');
-        row.className = 'flex items-center justify-between px-3 py-1.5 bg-slab/30 rounded';
-        row.innerHTML = `<span class="text-[10px] text-pale">${esc(name)}</span><span class="text-[10px] text-muted font-mono">${esc(bal)}</span>`;
+        row.className = 'flex items-center justify-between px-3 py-2 bg-surface rounded-xl';
+        row.innerHTML = `<span class="text-[12px] text-label">${esc(name)}</span><span class="text-[12px] text-muted font-mono">${esc(bal)}</span>`;
         tokenContainer.appendChild(row);
       }
     }
   } catch (e) {
     solBalEl.textContent = 'Error';
-    tokenContainer.innerHTML = `<div class="text-[10px] text-mesh-red text-center py-1">${esc(e.message)}</div>`;
+    tokenContainer.innerHTML = `<div class="text-[12px] text-accent-red text-center py-1">${esc(e.message)}</div>`;
   }
 }
 
@@ -2422,7 +1446,6 @@ function _populateSendForm() {
   const resultEl = document.getElementById('wallet-send-result');
   resultEl.classList.add('hidden');
 
-  // Populate recipients from last poll data
   select.innerHTML = '<option value="">Select connected agent...</option>';
   if (_walletData && _walletData.connections) {
     _walletData.connections.forEach(c => {
@@ -2435,9 +1458,7 @@ function _populateSendForm() {
     });
   }
 
-  // Populate token options
   tokenSelect.innerHTML = '<option value="SOL">SOL</option>';
-  // Fetch known tokens from the balances response
   fetch('/api/wallet-balances').then(r => r.json()).then(data => {
     if (data.known_tokens) {
       data.known_tokens.forEach(t => {
@@ -2468,13 +1489,13 @@ async function walletSend() {
     const result = await ajaxPost('/api/wallet-send', { agent_id: agentId, amount: parseFloat(amount), token });
     if (result.success) {
       showToast(`Sent ${amount} ${token}`, 'success');
-      resultEl.className = 'text-[10px] font-mono bg-mesh-green/5 border border-mesh-green/20 rounded-lg px-3 py-2 break-all text-mesh-green';
+      resultEl.className = 'text-[12px] font-mono bg-accent-green/10 border border-accent-green/20 rounded-xl px-3 py-2 break-all text-accent-green';
       resultEl.textContent = `TX: ${result.tx_signature}`;
       resultEl.classList.remove('hidden');
       document.getElementById('wallet-send-amount').value = '';
     } else {
       showToast(result.error || 'Send failed', 'error');
-      resultEl.className = 'text-[10px] font-mono bg-mesh-red/5 border border-mesh-red/20 rounded-lg px-3 py-2 break-all text-mesh-red';
+      resultEl.className = 'text-[12px] font-mono bg-accent-red/10 border border-accent-red/20 rounded-xl px-3 py-2 break-all text-accent-red';
       resultEl.textContent = result.error || 'Unknown error';
       resultEl.classList.remove('hidden');
     }
@@ -2492,16 +1513,16 @@ function walletTab(tab) {
   const extPanel = document.getElementById('wallet-ext-panel');
   const qrPanel = document.getElementById('wallet-qr-panel');
   if (tab === 'ext') {
-    extTab.classList.add('bg-slab', 'text-bright');
+    extTab.classList.add('bg-surface', 'text-primary');
     extTab.classList.remove('text-muted');
-    qrTab.classList.remove('bg-slab', 'text-bright');
+    qrTab.classList.remove('bg-surface', 'text-primary');
     qrTab.classList.add('text-muted');
     extPanel.classList.remove('hidden');
     qrPanel.classList.add('hidden');
   } else {
-    qrTab.classList.add('bg-slab', 'text-bright');
+    qrTab.classList.add('bg-surface', 'text-primary');
     qrTab.classList.remove('text-muted');
-    extTab.classList.remove('bg-slab', 'text-bright');
+    extTab.classList.remove('bg-surface', 'text-primary');
     extTab.classList.add('text-muted');
     qrPanel.classList.remove('hidden');
     extPanel.classList.add('hidden');
@@ -2509,7 +1530,6 @@ function walletTab(tab) {
 }
 
 function _getSolanaProvider() {
-  // Phantom, Solflare, Backpack all inject into window.solana or window.phantom.solana
   if (window.phantom?.solana?.isPhantom) return window.phantom.solana;
   if (window.solana?.isPhantom) return window.solana;
   if (window.solflare?.isSolflare) return window.solflare;
@@ -2534,10 +1554,8 @@ async function walletAuth() {
   btn.textContent = 'Connecting...';
 
   try {
-    // Connect to wallet (prompts user if not already connected)
     const resp = await provider.connect();
     const publicKey = resp.publicKey || provider.publicKey;
-
     btn.textContent = 'Signing...';
 
     const challenge = "DarkMatter Identity Derivation v1";
@@ -2547,7 +1565,6 @@ async function walletAuth() {
     const remember = document.getElementById('wallet-remember').checked;
     const sigHex = _bytesToHex(signature);
     const pubHex = _bytesToHex(publicKey.toBytes());
-
     btn.textContent = 'Deriving identity...';
 
     const authResp = await fetch('/api/wallet-auth', {
@@ -2561,7 +1578,7 @@ async function walletAuth() {
       const statusEl = document.getElementById('wallet-status');
       statusEl.textContent = 'Identity: ' + data.agent_id.slice(0, 12) + '...' + data.agent_id.slice(-6);
       statusEl.classList.remove('hidden');
-      showToast('Wallet identity active: ' + data.agent_id.slice(0, 8) + '...', 'success');
+      showToast('Wallet identity active', 'success');
       setTimeout(() => location.reload(), 1200);
     } else {
       showToast(data.error || 'Wallet auth failed', 'error');
@@ -2570,7 +1587,7 @@ async function walletAuth() {
     }
   } catch (e) {
     if (e.code === 4001 || e.message?.includes('rejected')) {
-      showToast('Signature rejected by user', 'info');
+      showToast('Signature rejected', 'info');
     } else {
       showToast('Wallet error: ' + (e.message || e), 'error');
     }
@@ -2594,7 +1611,6 @@ async function walletDisconnect() {
   }
 }
 
-// --- Mobile QR Session ---
 async function startQRSession() {
   const remember = document.getElementById('wallet-qr-remember').checked;
   try {
@@ -2604,9 +1620,8 @@ async function startQRSession() {
       body: JSON.stringify({ remember }),
     });
     const data = await resp.json();
-    if (!data.ok) { showToast(data.error || 'Failed to create session', 'error'); return; }
+    if (!data.ok) { showToast(data.error || 'Failed', 'error'); return; }
 
-    // Show QR code
     document.getElementById('wallet-qr-idle').classList.add('hidden');
     const activeEl = document.getElementById('wallet-qr-active');
     activeEl.classList.remove('hidden');
@@ -2615,15 +1630,13 @@ async function startQRSession() {
     qrContainer.innerHTML = '';
     const style = getComputedStyle(document.documentElement);
     new QRCode(qrContainer, {
-      text: data.url,
-      width: 160, height: 160,
-      colorDark: style.getPropertyValue('--qr-fg').trim() || '#e2e2ea',
-      colorLight: style.getPropertyValue('--qr-bg').trim() || '#111113',
+      text: data.url, width: 160, height: 160,
+      colorDark: style.getPropertyValue('--qr-fg').trim() || '#ffffff',
+      colorLight: style.getPropertyValue('--qr-bg').trim() || '#1c1c1e',
       correctLevel: QRCode.CorrectLevel.M,
     });
     document.getElementById('wallet-qr-url').textContent = data.url;
 
-    // Poll for completion
     if (_walletQRPollTimer) clearInterval(_walletQRPollTimer);
     _walletQRPollTimer = setInterval(async () => {
       try {
@@ -2637,7 +1650,7 @@ async function startQRSession() {
           const statusEl = document.getElementById('wallet-status');
           statusEl.textContent = 'Identity: ' + pollData.agent_id.slice(0, 12) + '...' + pollData.agent_id.slice(-6);
           statusEl.classList.remove('hidden');
-          showToast('Wallet identity active: ' + pollData.agent_id.slice(0, 8) + '...', 'success');
+          showToast('Wallet identity active', 'success');
           setTimeout(() => location.reload(), 1200);
         } else if (pollData.status === 'failed') {
           clearInterval(_walletQRPollTimer);
@@ -2647,7 +1660,6 @@ async function startQRSession() {
         }
       } catch (e) { /* keep polling */ }
     }, 2000);
-
   } catch (e) {
     showToast('Error: ' + e.message, 'error');
   }
@@ -2659,26 +1671,273 @@ function resetQRPanel() {
   document.getElementById('wallet-qr-done').classList.add('hidden');
 }
 
-// Check if wallet identity is active on load and update modal state
+// Check wallet identity on load
 fetch('/api/info').then(r => r.json()).then(data => {
   const walletBtn = document.getElementById('wallet-btn');
   if (data.wallet_identity) {
-    if (walletBtn) {
-      walletBtn.classList.remove('text-pale');
-      walletBtn.classList.add('text-solar-400');
-      walletBtn.title = 'Wallet identity active';
-    }
+    if (walletBtn) walletBtn.title = 'Wallet identity active';
     document.getElementById('wallet-disconnect-btn').classList.remove('hidden');
     const statusEl = document.getElementById('wallet-status');
     statusEl.textContent = 'Active: ' + data.agent_id.slice(0, 12) + '...' + data.agent_id.slice(-6);
     statusEl.classList.remove('hidden');
   }
-  // Show truncated wallet address on the wallet button tooltip
   if (data.wallets && data.wallets.solana) {
     const addr = data.wallets.solana;
     if (walletBtn) walletBtn.title = `Wallet: ${addr.slice(0, 6)}...${addr.slice(-4)}`;
   }
 }).catch(() => {});
+
+// ========================================================================
+// MESH VIEW — D3.js force-directed graph
+// ========================================================================
+
+let _meshVisible = false;
+let _meshSimulation = null;
+let _meshPollTimer = null;
+let _meshTooltipTarget = null;
+
+function toggleMeshView() {
+  if (_meshVisible) showChatView();
+  else showMeshView();
+}
+
+function showMeshView() {
+  _meshVisible = true;
+  document.getElementById('chat-area').classList.add('hidden');
+  document.getElementById('mesh-view').classList.remove('hidden');
+  document.getElementById('mesh-btn').classList.add('text-accent-blue');
+  document.getElementById('mesh-btn').classList.remove('text-muted');
+  fetchMeshTopology();
+  _meshPollTimer = setInterval(fetchMeshTopology, 15000);
+}
+
+function showChatView() {
+  _meshVisible = false;
+  document.getElementById('chat-area').classList.remove('hidden');
+  document.getElementById('mesh-view').classList.add('hidden');
+  document.getElementById('mesh-btn').classList.remove('text-accent-blue');
+  document.getElementById('mesh-btn').classList.add('text-muted');
+  if (_meshPollTimer) { clearInterval(_meshPollTimer); _meshPollTimer = null; }
+  hideMeshTooltip();
+}
+
+async function fetchMeshTopology() {
+  try {
+    const resp = await fetch('/api/mesh-topology');
+    if (resp.status === 401) { window.location.href = '/login'; return; }
+    const topo = await resp.json();
+
+    // Merge all nodes/edges from this node's view
+    const nodesMap = {};
+    const edgesSet = new Set();
+    const edges = [];
+
+    for (const n of topo.nodes) nodesMap[n.id] = n;
+    for (const e of topo.edges) {
+      const key = [e.source, e.target].sort().join('|');
+      if (!edgesSet.has(key)) { edgesSet.add(key); edges.push({...e, is_local: true}); }
+    }
+
+    // Fan out to each peer's network_info (2s timeout, best-effort)
+    const peerFetches = Object.entries(topo.peer_urls).map(async ([aid, url]) => {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 2000);
+        const r = await fetch(url + '/__darkmatter__/network_info', {signal: ctrl.signal});
+        clearTimeout(timer);
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    });
+
+    const peerResults = await Promise.allSettled(peerFetches);
+    for (const pr of peerResults) {
+      if (pr.status !== 'fulfilled' || !pr.value) continue;
+      const info = pr.value;
+      // Add the node itself if not present
+      if (!nodesMap[info.agent_id]) {
+        nodesMap[info.agent_id] = {
+          id: info.agent_id,
+          display_name: info.display_name || info.agent_id.slice(0,8) + '...',
+          bio: info.bio || '',
+          is_self: false,
+        };
+      }
+      // Add edges from this peer's connections
+      for (const conn of (info.connections || [])) {
+        if (!nodesMap[conn.agent_id]) {
+          nodesMap[conn.agent_id] = {
+            id: conn.agent_id,
+            display_name: conn.display_name || conn.agent_id.slice(0,8) + '...',
+            bio: conn.bio || '',
+            is_self: false,
+          };
+        }
+        const key = [info.agent_id, conn.agent_id].sort().join('|');
+        if (!edgesSet.has(key)) {
+          edgesSet.add(key);
+          edges.push({source: info.agent_id, target: conn.agent_id, is_local: false});
+        }
+      }
+    }
+
+    const nodes = Object.values(nodesMap);
+    document.getElementById('mesh-node-count').textContent = nodes.length + ' node' + (nodes.length !== 1 ? 's' : '');
+    renderMeshGraph(nodes, edges, topo.self_id, topo.peer_urls);
+  } catch (e) {
+    console.error('Mesh topology fetch failed:', e);
+  }
+}
+
+function renderMeshGraph(nodes, edges, selfId, peerUrls) {
+  const container = document.getElementById('mesh-graph');
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+  if (width === 0 || height === 0) return;
+
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const accentBlue = isLight ? '#007AFF' : '#0A84FF';
+  const textColor = isLight ? '#000' : '#fff';
+  const mutedColor = isLight ? '#8e8e93' : '#636366';
+  const nodeColor = isLight ? '#c7c7cc' : '#48484a';
+  const bgColor = isLight ? '#f5f5f7' : '#000000';
+
+  // Clear previous
+  container.innerHTML = '';
+
+  const svg = d3.select(container).append('svg')
+    .attr('width', width).attr('height', height)
+    .style('background', bgColor);
+
+  const g = svg.append('g');
+
+  // Zoom
+  const zoom = d3.zoom().scaleExtent([0.3, 4]).on('zoom', (e) => g.attr('transform', e.transform));
+  svg.call(zoom);
+
+  // Build link/node data (deep copy ids for D3)
+  const linkData = edges.map(e => ({source: e.source, target: e.target, is_local: e.is_local}));
+  const nodeData = nodes.map(n => ({...n}));
+
+  // Simulation
+  const sim = d3.forceSimulation(nodeData)
+    .force('link', d3.forceLink(linkData).id(d => d.id).distance(100))
+    .force('charge', d3.forceManyBody().strength(-300))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(30));
+
+  _meshSimulation = sim;
+
+  // Links
+  const link = g.append('g').selectAll('line')
+    .data(linkData).enter().append('line')
+    .attr('stroke', mutedColor)
+    .attr('stroke-opacity', 0.4)
+    .attr('stroke-width', 1.5)
+    .attr('stroke-dasharray', d => d.is_local ? 'none' : '4,4');
+
+  // Nodes
+  const node = g.append('g').selectAll('g')
+    .data(nodeData).enter().append('g')
+    .call(d3.drag()
+      .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+    );
+
+  // Self highlight ring
+  node.filter(d => d.id === selfId)
+    .append('circle').attr('r', 18)
+    .attr('fill', 'none').attr('stroke', accentBlue).attr('stroke-width', 2).attr('stroke-opacity', 0.5);
+
+  // Node circles
+  node.append('circle')
+    .attr('r', 12)
+    .attr('fill', d => d.id === selfId ? accentBlue : nodeColor)
+    .attr('stroke', d => d.id === selfId ? accentBlue : 'transparent')
+    .attr('stroke-width', 1.5)
+    .style('cursor', 'pointer');
+
+  // Labels
+  node.append('text')
+    .text(d => d.display_name || d.id.slice(0, 8))
+    .attr('dy', 24).attr('text-anchor', 'middle')
+    .attr('fill', d => d.id === selfId ? accentBlue : textColor)
+    .attr('font-size', '11px').attr('font-weight', d => d.id === selfId ? '600' : '400')
+    .attr('opacity', 0.8);
+
+  // Click handler for tooltip
+  node.on('click', (event, d) => {
+    event.stopPropagation();
+    showMeshTooltip(event, d, selfId, peerUrls);
+  });
+  svg.on('click', () => hideMeshTooltip());
+
+  sim.on('tick', () => {
+    link
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    node.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+}
+
+function showMeshTooltip(event, d, selfId, peerUrls) {
+  const tip = document.getElementById('mesh-tooltip');
+  document.getElementById('tooltip-name').textContent = d.display_name || 'Unknown';
+  document.getElementById('tooltip-id').textContent = d.id.slice(0, 16) + '...' + d.id.slice(-8);
+  document.getElementById('tooltip-bio').textContent = d.bio || '';
+  const lvl = d.connectivity_level ? `L${d.connectivity_level}: ${d.connectivity_method}` : '';
+  document.getElementById('tooltip-level').textContent = lvl;
+
+  const connectBtn = document.getElementById('tooltip-connect-btn');
+  // Show connect button if this node is not self and not already in our connections
+  const isConnected = !!peerUrls[d.id];
+  if (d.id !== selfId && !isConnected && peerUrls[d.id] === undefined) {
+    // Discovered through a peer — we have no direct URL, can't connect yet
+    connectBtn.classList.add('hidden');
+  } else if (d.id !== selfId && !isConnected) {
+    connectBtn.classList.remove('hidden');
+  } else {
+    connectBtn.classList.add('hidden');
+  }
+  _meshTooltipTarget = d;
+
+  tip.classList.remove('hidden');
+  tip.style.left = Math.min(event.pageX + 12, window.innerWidth - 260) + 'px';
+  tip.style.top = Math.min(event.pageY - 10, window.innerHeight - 200) + 'px';
+}
+
+function hideMeshTooltip() {
+  document.getElementById('mesh-tooltip').classList.add('hidden');
+  _meshTooltipTarget = null;
+}
+
+async function connectFromTooltip() {
+  if (!_meshTooltipTarget) return;
+  const aid = _meshTooltipTarget.id;
+  hideMeshTooltip();
+  try {
+    // Find the peer URL from mesh topology data
+    const topoResp = await fetch('/api/mesh-topology');
+    const topo = await topoResp.json();
+    const url = topo.peer_urls[aid];
+    if (!url) { showToast('No URL available for this agent', 'error'); return; }
+    const resp = await fetch('/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'},
+      body: JSON.stringify({url: url}),
+    });
+    const data = await resp.json();
+    if (data.success) showToast('Connection request sent', 'success');
+    else showToast(data.error || 'Connection failed', 'error');
+  } catch (e) {
+    showToast('Connection failed: ' + e.message, 'error');
+  }
+}
+
+function onThemeChange() {
+  if (_meshVisible) fetchMeshTopology();
+}
 </script>
 
 {% endblock %}

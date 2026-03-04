@@ -209,6 +209,39 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "message": "Already connected.",
         }, 200
 
+    # Auto-accept local/same-network agents
+    from darkmatter.network.manager import is_local_url
+    if is_local_url(from_agent_url) and len(state.connections) < MAX_CONNECTIONS:
+        from darkmatter.security import assess_url_security
+        tls_info = assess_url_security(from_agent_url)
+        conn = Connection(
+            agent_id=from_agent_id,
+            agent_url=from_agent_url,
+            agent_bio=from_agent_bio,
+            agent_public_key_hex=from_agent_public_key_hex,
+            agent_display_name=from_agent_display_name,
+            wallets=from_agent_wallets,
+            peer_created_at=from_agent_created_at,
+            tls_secure=tls_info["secure"],
+            identity_verified=bool(from_agent_public_key_hex),
+        )
+        state.connections[from_agent_id] = conn
+        save_state()
+        print(f"[DarkMatter] Auto-accepted local agent {from_agent_display_name or from_agent_id[:12]}... "
+              f"({from_agent_url})", file=sys.stderr)
+        return {
+            "auto_accepted": True,
+            "agent_id": state.agent_id,
+            "agent_url": public_url,
+            "agent_bio": state.bio,
+            "agent_public_key_hex": state.public_key_hex,
+            "agent_display_name": state.display_name,
+            "wallets": state.wallets,
+            "wallet_address": state.wallets.get("solana"),
+            "created_at": state.created_at,
+            "message": "Auto-accepted (local network).",
+        }, 200
+
     # Prune expired pending requests
     now = datetime.now(timezone.utc)
     expired_ids = []
@@ -1735,3 +1768,178 @@ async def handle_sdp_relay_deliver(request: Request) -> JSONResponse:
         conn._signaling_method = "peer_relay"
 
     return JSONResponse(answer)
+
+
+# =============================================================================
+# Pool Endpoints
+# =============================================================================
+
+async def handle_pool_buy(request: Request) -> Response:
+    """POST /__darkmatter__/pool_buy — Consumer buys access to a pool.
+
+    Creates an access token for the consumer with the deposited balance.
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    pool_id = data.get("pool_id", "")
+    consumer_agent_id = data.get("consumer_agent_id", "")
+    amount = data.get("amount", 0)
+    payment_token = data.get("payment_token", "SOL")
+
+    if not pool_id or not consumer_agent_id or amount <= 0:
+        return JSONResponse({"error": "Missing pool_id, consumer_agent_id, or invalid amount"}, status_code=400)
+
+    # Consumer must be connected
+    if consumer_agent_id not in state.connections:
+        return JSONResponse({"error": "Consumer not connected"}, status_code=403)
+
+    from darkmatter.pool import find_pool
+    from darkmatter.config import POOL_MAX_ACCESS_TOKENS
+
+    pool = find_pool(state.pools, pool_id)
+    if not pool:
+        return JSONResponse({"success": False, "error": "Pool not found"}, status_code=404)
+
+    if len(pool.access_tokens) >= POOL_MAX_ACCESS_TOKENS:
+        return JSONResponse({"success": False, "error": "Access token limit reached"}, status_code=429)
+
+    from darkmatter.models import PoolAccessToken
+    now = datetime.now(timezone.utc).isoformat()
+    token_id = f"at-{secrets.token_hex(16)}"
+    access_token = PoolAccessToken(
+        token_id=token_id,
+        consumer_agent_id=consumer_agent_id,
+        balance=amount,
+        token_mint=payment_token,
+        total_deposited=amount,
+        total_spent=0.0,
+        created_at=now,
+    )
+    pool.access_tokens.append(access_token)
+    save_state()
+
+    return JSONResponse({
+        "success": True,
+        "token_id": token_id,
+        "pool_id": pool_id,
+        "balance": amount,
+        "payment_token": payment_token,
+    })
+
+
+async def handle_pool_proxy(request: Request) -> Response:
+    """POST /__darkmatter__/pool_proxy — Proxied API call through a pool.
+
+    Validates access token and balance, selects a provider, proxies the request,
+    debits the consumer's balance.
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    pool_id = data.get("pool_id", "")
+    token_id = data.get("access_token", "")
+    method = data.get("method", "GET")
+    path = data.get("path", "")
+    headers = data.get("headers", {})
+    body = data.get("body")
+
+    if not pool_id or not token_id or not path:
+        return JSONResponse({"error": "Missing pool_id, access_token, or path"}, status_code=400)
+
+    from darkmatter.pool import find_pool, find_access_token, select_provider, proxy_request
+
+    pool = find_pool(state.pools, pool_id)
+    if not pool:
+        return JSONResponse({"success": False, "error": "Pool not found"}, status_code=404)
+
+    access_token = find_access_token(pool, token_id)
+    if not access_token:
+        return JSONResponse({"success": False, "error": "Invalid access token"}, status_code=403)
+    if access_token.revoked:
+        return JSONResponse({"success": False, "error": "Access token revoked"}, status_code=403)
+
+    provider = select_provider(pool, path)
+    if not provider:
+        return JSONResponse({"success": False, "error": "No provider available for this path"}, status_code=404)
+
+    if access_token.balance < provider.price_per_call:
+        return JSONResponse({"success": False, "error": "Insufficient balance"}, status_code=402)
+
+    # Proxy the request
+    import base64
+    try:
+        status_code, resp_headers, resp_body = await proxy_request(provider, method, path, headers, body)
+        provider.calls_served += 1
+    except Exception as e:
+        provider.failures += 1
+        save_state()
+        # Try another provider on failure
+        provider2 = select_provider(pool, path)
+        if provider2 and provider2.provider_id != provider.provider_id:
+            try:
+                status_code, resp_headers, resp_body = await proxy_request(provider2, method, path, headers, body)
+                provider2.calls_served += 1
+            except Exception as e2:
+                provider2.failures += 1
+                save_state()
+                return JSONResponse({"success": False, "error": f"All providers failed: {e2}"}, status_code=502)
+        else:
+            return JSONResponse({"success": False, "error": f"Provider failed: {e}"}, status_code=502)
+
+    # Debit balance
+    access_token.balance -= provider.price_per_call
+    access_token.total_spent += provider.price_per_call
+    access_token.calls_made += 1
+    access_token.last_used = datetime.now(timezone.utc).isoformat()
+    save_state()
+
+    return JSONResponse({
+        "success": True,
+        "status_code": status_code,
+        "headers": resp_headers,
+        "body_b64": base64.b64encode(resp_body).decode(),
+        "balance_remaining": access_token.balance,
+    })
+
+
+async def handle_pool_info(request: Request) -> Response:
+    """GET /__darkmatter__/pool_info/{pool_id} — Public pool metadata (no credentials)."""
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    pool_id = request.path_params.get("pool_id", "")
+
+    from darkmatter.pool import find_pool
+
+    pool = find_pool(state.pools, pool_id)
+    if not pool:
+        return JSONResponse({"error": "Pool not found"}, status_code=404)
+
+    enabled_providers = [pv for pv in pool.providers if pv.enabled]
+    return JSONResponse({
+        "pool_id": pool.pool_id,
+        "name": pool.name,
+        "tags": pool.tags,
+        "description": pool.description,
+        "provider_count": len(enabled_providers),
+        "endpoints": sorted(set(p for pv in enabled_providers for p in pv.allowed_paths)),
+        "prices": [
+            {"price_per_call": pv.price_per_call, "price_token": pv.price_token}
+            for pv in enabled_providers
+        ],
+        "created_at": pool.created_at,
+    })
