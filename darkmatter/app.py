@@ -307,7 +307,7 @@ def print_startup_banner(port: int, transport: str, discovery_enabled: bool) -> 
     if AGENT_SPAWN_ENABLED:
         spawn_info += f" [client: {ACTIVE_CLIENT['command']}]"
     print(f"[DarkMatter] Agent auto-spawn: {spawn_info}", file=sys.stderr)
-    print(f"[DarkMatter] Install: curl -fsSL https://raw.githubusercontent.com/dadukhankevin/DarkMatter/main/install.sh | bash", file=sys.stderr)
+    print(f"[DarkMatter] Install: pip install dmagent | https://github.com/dadukhankevin/DarkMatter", file=sys.stderr)
 
 
 def check_port_owner(host: str, port: int) -> Optional[str]:
