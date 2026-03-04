@@ -19,6 +19,10 @@ from darkmatter.config import (
 )
 from darkmatter.models import AgentState, QueuedMessage
 
+# Capture the project directory at import time so spawned agents run here,
+# not in a temporary directory.
+_PROJECT_DIR = os.getcwd()
+
 
 # =============================================================================
 # Spawn Tracking (ephemeral, not persisted)
@@ -30,7 +34,7 @@ class SpawnedAgent:
     message_id: str
     spawned_at: float
     pid: int
-    spawn_dir: str = ""  # temp directory to clean up when agent exits
+    spawn_mcp_config: str = ""  # .mcp.json path to clean up when agent exits
 
 
 _spawned_agents: list[SpawnedAgent] = []
@@ -96,9 +100,9 @@ def cleanup_finished_agents() -> None:
                 f"(code={agent.process.returncode}, msg={agent.message_id[:12]}...)",
                 file=sys.stderr,
             )
-            if agent.spawn_dir:
+            if agent.spawn_mcp_config:
                 try:
-                    shutil.rmtree(agent.spawn_dir, ignore_errors=True)
+                    os.remove(agent.spawn_mcp_config)
                 except Exception:
                     pass
         else:
@@ -173,10 +177,11 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     for var in ACTIVE_CLIENT["env_cleanup"]:
         env.pop(var, None)
 
-    # Create a temp working directory with .mcp.json pointing to the parent's
+    # Write .mcp.json in the project directory pointing to the parent's
     # MCP server via HTTP. The child shares the parent's identity and inbox.
-    import tempfile
-    spawn_dir = tempfile.mkdtemp(prefix="darkmatter-spawn-")
+    # We use the project directory (not a temp dir) so the child agent has
+    # access to the actual codebase and project context.
+    spawn_dir = _PROJECT_DIR
     mcp_config = {
         "mcpServers": {
             "darkmatter": {
@@ -231,7 +236,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             message_id=msg.message_id,
             spawned_at=time.monotonic(),
             pid=process.pid,
-            spawn_dir=spawn_dir,
+            spawn_mcp_config=config_path,
         )
         _spawned_agents.append(agent)
         _spawn_timestamps.append(time.monotonic())
