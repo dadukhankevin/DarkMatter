@@ -1567,9 +1567,8 @@ if __name__ == "__main__":
     print(f"[DarkMatter Entrypoint] Display name: {state.display_name}", file=sys.stderr)
     print(f"[DarkMatter Entrypoint] Connections: {len(state.connections)}", file=sys.stderr)
 
-    # Open the entrypoint in the default browser (only when run directly, not when
-    # auto-spawned by an MCP agent as a background subprocess)
-    if sys.stderr.isatty():
+    # Open the entrypoint in the default browser (skip on Werkzeug reloader child)
+    if not os.environ.get("WERKZEUG_RUN_MAIN"):
         import webbrowser
         webbrowser.open(url)
 
