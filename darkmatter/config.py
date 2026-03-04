@@ -42,7 +42,7 @@ DISCOVERY_PORT = 8470
 DISCOVERY_MCAST_GROUP = "239.77.68.77"  # "M" "D" "M" in ASCII
 DISCOVERY_INTERVAL = 30       # seconds between discovery scans
 DISCOVERY_MAX_AGE = 90        # seconds before a peer is considered stale
-_disc_ports = os.environ.get("DARKMATTER_DISCOVERY_PORTS", "8100-8110")
+_disc_ports = os.environ.get("DARKMATTER_DISCOVERY_PORTS", "8100-8200")
 _disc_lo, _disc_hi = _disc_ports.split("-", 1)
 DISCOVERY_LOCAL_PORTS = range(int(_disc_lo), int(_disc_hi) + 1)
 

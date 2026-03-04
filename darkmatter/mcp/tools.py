@@ -60,8 +60,8 @@ from darkmatter.identity import (
     validate_url,
     validate_webhook_url,
     is_private_ip,
-    sign_message,
 )
+from darkmatter.security import sign_message, prepare_outbound
 from darkmatter.models import (
     AgentStatus,
     Connection,
@@ -138,11 +138,30 @@ async def _connection_request(state, target_url: str) -> str:
                     "agent_bio": result.get("agent_bio", ""),
                 })
 
+            # Auto-prove identity if challenge was issued
+            challenge_id = result.get("challenge_id")
+            challenge_hex = result.get("challenge_hex")
+            if challenge_id and challenge_hex and state.private_key_hex:
+                from darkmatter.security import prove_identity
+                proof_hex = prove_identity(challenge_hex, state.private_key_hex)
+                try:
+                    await client.post(
+                        target_base + "/__darkmatter__/connection_proof",
+                        json={
+                            "challenge_id": challenge_id,
+                            "proof_hex": proof_hex,
+                            "agent_id": state.agent_id,
+                            "public_key_hex": state.public_key_hex,
+                        },
+                    )
+                except Exception as e:
+                    print(f"[DarkMatter] Warning: failed to send identity proof: {e}", file=sys.stderr)
+
             state.pending_outbound[target_base] = result.get("agent_id", "")
             return json.dumps({
                 "success": True,
                 "status": "pending",
-                "message": "Connection request sent. Waiting for acceptance.",
+                "message": "Connection request sent. Identity proof submitted. Waiting for acceptance.",
                 "request_id": result.get("request_id"),
             })
 
@@ -263,28 +282,21 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
         })
 
     msg_timestamp = datetime.now(timezone.utc).isoformat()
-    signature_hex = None
-    if state.private_key_hex:
-        signature_hex = sign_message(
-            state.private_key_hex, state.agent_id, message_id, msg_timestamp, params.content
-        )
+    base_payload = {
+        "message_id": message_id,
+        "content": params.content,
+        "webhook": webhook,
+        "hops_remaining": params.hops_remaining,
+        "metadata": metadata,
+        "timestamp": msg_timestamp,
+    }
+    envelope = prepare_outbound(base_payload, state.private_key_hex, state.agent_id, state.public_key_hex)
 
     sent_to = []
     failed = []
     for conn in targets:
         try:
-            payload = {
-                "message_id": message_id,
-                "content": params.content,
-                "webhook": webhook,
-                "hops_remaining": params.hops_remaining,
-                "from_agent_id": state.agent_id,
-                "metadata": metadata,
-                "timestamp": msg_timestamp,
-                "from_public_key_hex": state.public_key_hex,
-                "signature_hex": signature_hex,
-            }
-            await send_to_peer(conn, "/__darkmatter__/message", payload)
+            await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
             conn.messages_sent += 1
             conn.last_activity = datetime.now(timezone.utc).isoformat()
             sent_to.append(conn.agent_id)
@@ -413,11 +425,15 @@ async def _forward_message(state, params: SendMessageInput) -> str:
 
     # Sign the forwarded message
     fwd_timestamp = datetime.now(timezone.utc).isoformat()
-    fwd_signature_hex = None
-    if state.private_key_hex:
-        fwd_signature_hex = sign_message(
-            state.private_key_hex, state.agent_id, msg.message_id, fwd_timestamp, msg.content
-        )
+    fwd_base_payload = {
+        "message_id": msg.message_id,
+        "content": msg.content,
+        "webhook": msg.webhook,
+        "hops_remaining": new_hops_remaining,
+        "metadata": msg.metadata,
+        "timestamp": fwd_timestamp,
+    }
+    fwd_envelope = prepare_outbound(fwd_base_payload, state.private_key_hex, state.agent_id, state.public_key_hex)
 
     # Deliver to all targets
     per_target_results = []
@@ -434,18 +450,7 @@ async def _forward_message(state, params: SendMessageInput) -> str:
                 print(f"[DarkMatter] Warning: failed to post forwarding update to webhook: {e}", file=sys.stderr)
 
         try:
-            fwd_payload = {
-                "message_id": msg.message_id,
-                "content": msg.content,
-                "webhook": msg.webhook,
-                "hops_remaining": new_hops_remaining,
-                "from_agent_id": state.agent_id,
-                "metadata": msg.metadata,
-                "timestamp": fwd_timestamp,
-                "from_public_key_hex": state.public_key_hex,
-                "signature_hex": fwd_signature_hex,
-            }
-            result = await send_to_peer(conn, "/__darkmatter__/message", fwd_payload)
+            result = await send_to_peer(conn, "/__darkmatter__/message", fwd_envelope.payload)
             conn.messages_sent += 1
             conn.last_activity = datetime.now(timezone.utc).isoformat()
             per_target_results.append({"agent_id": tid, "success": True})
@@ -535,11 +540,9 @@ async def _reply_to_message(state, params: SendMessageInput) -> str:
 
     # Sign the webhook response
     resp_timestamp = datetime.now(timezone.utc).isoformat()
-    resp_signature_hex = None
-    if state.private_key_hex:
-        resp_signature_hex = sign_message(
-            state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, params.content
-        )
+    resp_signature_hex = sign_message(
+        state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, params.content
+    )
 
     # Call the webhook with our response
     webhook_success = False
@@ -797,7 +800,6 @@ async def get_identity(ctx: Context) -> str:
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
-        "private_key_hex": state.private_key_hex,
         "passport_path": passport_path,
         "bio": state.bio,
         "status": state.status.value,
@@ -850,6 +852,8 @@ async def list_connections(ctx: Context) -> str:
             "agent_url": conn.agent_url,
             "bio_summary": _truncate(conn.agent_bio, 250) if conn.agent_bio else None,
             "crypto": conn.agent_public_key_hex is not None,
+            "identity_verified": conn.identity_verified,
+            "tls_secure": conn.tls_secure,
             "transport": conn.transport,
             "connectivity_level": conn.connectivity_level,
             "connectivity_method": conn.connectivity_method,
@@ -1261,7 +1265,7 @@ async def get_server_template(ctx: Context) -> str:
         "setup_instructions": {
             "1_save": "Save the server_source to ~/.darkmatter/server.py (create the directory if needed)",
             "2_venv": "Create a venv and install deps: python3 -m venv ~/.darkmatter/venv && ~/.darkmatter/venv/bin/pip install 'mcp[cli]' httpx uvicorn starlette cryptography anyio",
-            "3_port": "Pick a port in range 8100-8110. Check availability: lsof -i :<port> 2>/dev/null | grep LISTEN",
+            "3_port": "Pick a port in range 8100-8200. Check availability: lsof -i :<port> 2>/dev/null | grep LISTEN",
             "4_config": (
                 "Write the MCP config for the user's client. Set DARKMATTER_CLIENT to match. "
                 "Choose a display name that describes this agent."
@@ -1919,8 +1923,14 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         return json.dumps({"success": False, "error": f"Shard limit reached ({SHARED_SHARD_MAX})"})
 
     now = datetime.now(timezone.utc).isoformat()
+    from darkmatter.security import sign_shard
+
+    shard_id = f"shard-{uuid.uuid4().hex[:12]}"
+    tags_str = ",".join(sorted(params.tags))
+    sig = sign_shard(state.private_key_hex, shard_id, state.agent_id, params.content, tags_str)
+
     shard = SharedShard(
-        shard_id=f"shard-{uuid.uuid4().hex[:12]}",
+        shard_id=shard_id,
         author_agent_id=state.agent_id,
         content=params.content,
         tags=params.tags,
@@ -1928,6 +1938,7 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         created_at=now,
         updated_at=now,
         summary=params.summary,
+        signature_hex=sig,
     )
     state.shared_shards.append(shard)
     save_state()
@@ -1943,6 +1954,7 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         "created_at": shard.created_at,
         "updated_at": shard.updated_at,
         "summary": shard.summary,
+        "signature_hex": shard.signature_hex,
     }
     for aid, conn in state.connections.items():
         imp = state.impressions.get(aid)

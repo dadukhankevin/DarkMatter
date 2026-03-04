@@ -5,9 +5,12 @@ Depends on: config
 """
 
 import os
+import re
 
 from starlette.requests import Request
 from starlette.responses import Response
+
+from darkmatter.config import CLIENT_PROFILES
 
 
 async def handle_bootstrap(request: Request) -> Response:
@@ -20,8 +23,16 @@ async def handle_bootstrap(request: Request) -> Response:
     state = get_state()
     host = request.headers.get("host", f"localhost:{state.port if state else 8100}")
     scheme = request.headers.get("x-forwarded-proto", "http")
+    # Sanitize host/scheme to prevent shell injection in generated script
+    if not re.match(r'^[\w.\-]+(:\d+)?$', host):
+        host = f"localhost:{state.port if state else 8100}"
+    if scheme not in ("http", "https"):
+        scheme = "http"
     source_url = f"{scheme}://{host}/bootstrap/server.py"
+    # Allowlist client against known profiles to prevent shell injection
     client = request.query_params.get("client", "claude-code")
+    if client not in CLIENT_PROFILES:
+        client = "claude-code"
 
     script = f"""#!/bin/bash
 set -e
@@ -65,16 +76,16 @@ fi
 echo "Installing dependencies..."
 "$VENV_DIR/bin/pip" install --quiet "mcp[cli]" httpx uvicorn starlette cryptography anyio
 
-# Find free port in 8100-8110
+# Find free port in 8100-8200
 PORT=8100
-while [ $PORT -le 8110 ]; do
+while [ $PORT -le 8200 ]; do
     if ! lsof -i :$PORT >/dev/null 2>&1; then
         break
     fi
     PORT=$((PORT + 1))
 done
-if [ $PORT -gt 8110 ]; then
-    echo "ERROR: No free ports in 8100-8110 range"
+if [ $PORT -gt 8200 ]; then
+    echo "ERROR: No free ports in 8100-8200 range"
     exit 1
 fi
 echo "Using port $PORT"

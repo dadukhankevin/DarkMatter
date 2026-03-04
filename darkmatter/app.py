@@ -64,6 +64,7 @@ from darkmatter.network.mesh import (
     handle_shard_push,
     handle_sdp_relay,
     handle_sdp_relay_deliver,
+    handle_connection_proof,
 )
 from darkmatter.bootstrap import handle_bootstrap, handle_bootstrap_source
 from darkmatter.spawn import spawn_agent_for_message
@@ -231,6 +232,7 @@ def create_app() -> Router:
     darkmatter_routes = [
         Route("/connection_request", handle_connection_request, methods=["POST"]),
         Route("/connection_accepted", handle_connection_accepted, methods=["POST"]),
+        Route("/connection_proof", handle_connection_proof, methods=["POST"]),
         Route("/accept_pending", handle_accept_pending, methods=["POST"]),
         Route("/message", handle_message, methods=["POST"]),
         Route("/webhook/{message_id}", handle_webhook_post, methods=["POST"]),

@@ -179,7 +179,6 @@ def save_state() -> None:
         "port": state.port,
         "created_at": state.created_at,
         "messages_handled": state.messages_handled,
-        "private_key_hex": state.private_key_hex,
         "public_key_hex": state.public_key_hex,
         "display_name": state.display_name,
         "connections": {
@@ -199,6 +198,8 @@ def save_state() -> None:
                 "addresses": c.addresses,
                 "rate_limit": c.rate_limit,
                 "peer_created_at": c.peer_created_at,
+                "identity_verified": c.identity_verified,
+                "tls_secure": c.tls_secure,
             }
             for aid, c in state.connections.items()
         },
@@ -249,6 +250,7 @@ def save_state() -> None:
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
                 "summary": s.summary,
+                "signature_hex": s.signature_hex,
             }
             for s in state.shared_shards[-SHARED_SHARD_MAX:]
         ],
@@ -284,6 +286,10 @@ def save_state() -> None:
                 finally:
                     unlock(f)
             os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
     except OSError as e:
         print(f"[DarkMatter] Warning: could not save state to {path}: {e}", file=sys.stderr)
 
@@ -322,6 +328,8 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             addresses=cd.get("addresses") or ({"http": cd["agent_url"]} if cd.get("agent_url") else {}),
             rate_limit=cd.get("rate_limit", 0),
             peer_created_at=cd.get("peer_created_at"),
+            identity_verified=cd.get("identity_verified", False),
+            tls_secure=cd.get("tls_secure", False),
         )
 
     sent_messages = {}
@@ -385,6 +393,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             created_at=sd.get("created_at", ""),
             updated_at=sd.get("updated_at", ""),
             summary=sd.get("summary"),
+            signature_hex=sd.get("signature_hex"),
         ))
 
     state = AgentState(
@@ -394,7 +403,6 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         port=data.get("port", DEFAULT_PORT),
         created_at=data.get("created_at", ""),
         messages_handled=data.get("messages_handled", 0),
-        private_key_hex=data.get("private_key_hex", ""),
         public_key_hex=data.get("public_key_hex", ""),
         display_name=data.get("display_name"),
         connections=connections,

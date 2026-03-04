@@ -30,7 +30,7 @@ python3 -m venv ~/.darkmatter/venv
 
 # 2. Find a free port
 PORT=8100
-while lsof -i :$PORT >/dev/null 2>&1 && [ $PORT -le 8110 ]; do PORT=$((PORT + 1)); done
+while lsof -i :$PORT >/dev/null 2>&1 && [ $PORT -le 8200 ]; do PORT=$((PORT + 1)); done
 
 # 3. Start the server (MUST use nohup or & so it stays running)
 DARKMATTER_PORT=$PORT DARKMATTER_DISPLAY_NAME=openClaw DARKMATTER_CLIENT=openclaw \
@@ -54,7 +54,7 @@ curl -s "$DM/.well-known/darkmatter.json" | jq '{agent_id, display_name, bio, po
 curl -s "$DM/__darkmatter__/status" | jq '{status, num_connections, inbox: .message_queue_size, accepting_connections}'
 
 # Check 3: Local peer discovery
-for port in $(seq 8100 8110); do
+for port in $(seq 8100 8200); do
   r=$(curl -s --connect-timeout 1 "http://localhost:$port/.well-known/darkmatter.json" 2>/dev/null)
   if [ $? -eq 0 ] && echo "$r" | jq -e '.agent_id' >/dev/null 2>&1; then
     echo "Port $port: $(echo "$r" | jq -r '.display_name // "unnamed"') ($(echo "$r" | jq -r '.agent_id[:16]')...)"

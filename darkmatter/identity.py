@@ -85,60 +85,40 @@ def load_or_create_passport() -> tuple[str, str]:
 
 
 # =============================================================================
-# Signing & Verification
+# Signing & Verification — delegates to darkmatter.security
 # =============================================================================
 
 def sign_message(private_key_hex: str, from_agent_id: str, message_id: str,
                  timestamp: str, content: str) -> str:
     """Sign a canonical message payload. Returns signature as hex."""
-    private_bytes = bytes.fromhex(private_key_hex)
-    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
-    payload = f"{from_agent_id}\n{message_id}\n{timestamp}\n{content}".encode("utf-8")
-    return private_key.sign(payload).hex()
+    from darkmatter.security import sign_message as _sign
+    return _sign(private_key_hex, from_agent_id, message_id, timestamp, content)
 
 
 def verify_message(public_key_hex: str, signature_hex: str, from_agent_id: str,
                    message_id: str, timestamp: str, content: str) -> bool:
     """Verify a signed message payload. Returns True if valid."""
-    try:
-        public_bytes = bytes.fromhex(public_key_hex)
-        public_key = Ed25519PublicKey.from_public_bytes(public_bytes)
-        signature = bytes.fromhex(signature_hex)
-        payload = f"{from_agent_id}\n{message_id}\n{timestamp}\n{content}".encode("utf-8")
-        public_key.verify(signature, payload)
-        return True
-    except Exception:
-        return False
+    from darkmatter.security import verify_message as _verify
+    return _verify(public_key_hex, signature_hex, from_agent_id, message_id, timestamp, content)
 
 
 def sign_peer_update(private_key_hex: str, agent_id: str, new_url: str, timestamp: str) -> str:
     """Sign a peer_update payload. Returns signature as hex."""
-    private_bytes = bytes.fromhex(private_key_hex)
-    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
-    payload = f"peer_update\n{agent_id}\n{new_url}\n{timestamp}".encode("utf-8")
-    return private_key.sign(payload).hex()
+    from darkmatter.security import sign_peer_update as _sign
+    return _sign(private_key_hex, agent_id, new_url, timestamp)
 
 
 def verify_peer_update_signature(public_key_hex: str, signature_hex: str,
                                   agent_id: str, new_url: str, timestamp: str) -> bool:
     """Verify a signed peer_update payload. Returns True if valid."""
-    try:
-        public_bytes = bytes.fromhex(public_key_hex)
-        public_key = Ed25519PublicKey.from_public_bytes(public_bytes)
-        signature = bytes.fromhex(signature_hex)
-        payload = f"peer_update\n{agent_id}\n{new_url}\n{timestamp}".encode("utf-8")
-        public_key.verify(signature, payload)
-        return True
-    except Exception:
-        return False
+    from darkmatter.security import verify_peer_update_signature as _verify
+    return _verify(public_key_hex, signature_hex, agent_id, new_url, timestamp)
 
 
 def sign_relay_poll(private_key_hex: str, agent_id: str, timestamp: str) -> str:
     """Sign a relay poll request. Returns signature hex."""
-    private_bytes = bytes.fromhex(private_key_hex)
-    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
-    payload = f"relay_poll\n{agent_id}\n{timestamp}".encode("utf-8")
-    return private_key.sign(payload).hex()
+    from darkmatter.security import sign_relay_poll as _sign
+    return _sign(private_key_hex, agent_id, timestamp)
 
 
 # =============================================================================

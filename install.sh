@@ -62,9 +62,9 @@ fi
 echo "Installing dependencies..."
 "$VENV_DIR/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
 
-# Find free port in 8100-8110
+# Find free port in 8100-8200
 PORT=8100
-while [ $PORT -le 8110 ]; do
+while [ $PORT -le 8200 ]; do
     if command -v lsof >/dev/null 2>&1; then
         if ! lsof -i :$PORT >/dev/null 2>&1; then
             break
@@ -76,8 +76,8 @@ while [ $PORT -le 8110 ]; do
     fi
     PORT=$((PORT + 1))
 done
-if [ $PORT -gt 8110 ]; then
-    echo "ERROR: No free ports in 8100-8110 range"
+if [ $PORT -gt 8200 ]; then
+    echo "ERROR: No free ports in 8100-8200 range"
     exit 1
 fi
 echo "Using port $PORT"

@@ -39,9 +39,8 @@ from darkmatter.config import (
 )
 from darkmatter.identity import (
     validate_webhook_url,
-    sign_peer_update,
-    sign_relay_poll,
 )
+from darkmatter.security import sign_peer_update, sign_relay_poll
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
 
@@ -924,6 +923,22 @@ class NetworkManager:
                     data = resp.json()
                     messages = data.get("messages", [])
                     for msg in messages:
+                        # Decrypt E2E encrypted relay messages
+                        if msg.get("e2e_encrypted") and msg.get("encrypted_payload"):
+                            sender_pub = msg.get("encrypted_payload", {}).get("sender_public_key_hex") or msg.get("from_agent_id", "")
+                            try:
+                                from darkmatter.security import decrypt_from_peer
+                                import json as _json
+                                plaintext = decrypt_from_peer(
+                                    msg["encrypted_payload"],
+                                    state.private_key_hex,
+                                    sender_pub,
+                                )
+                                msg = _json.loads(plaintext.decode("utf-8"))
+                            except Exception as e:
+                                print(f"[DarkMatter] Relay decryption failed: {e}", file=sys.stderr)
+                                continue
+
                         path = msg.get("path", "")
                         payload = msg.get("payload", {})
                         from_id = msg.get("from_agent_id", "")

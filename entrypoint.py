@@ -63,7 +63,7 @@ import struct
 # ---------------------------------------------------------------------------
 
 PORT = int(os.environ.get("DARKMATTER_ENTRYPOINT_PORT", "8200"))
-SCAN_PORTS = list(range(8100, 8111)) + [PORT]  # scan 8100-8110 + our own port range
+SCAN_PORTS = list(range(8100, 8201)) + [PORT]  # scan 8100-8200 + our own port range
 MESSAGE_TIMEOUT_SECONDS = 120  # no webhook callback in 120s = failed
 DISCOVERY_MCAST_GROUP = "239.77.68.77"
 DISCOVERY_PORT = 8470
@@ -324,7 +324,7 @@ def _scan_local_agents():
                 continue
             targets.append((info["ip"], info["port"]))
 
-    with ThreadPoolExecutor(max_workers=20) as pool:
+    with ThreadPoolExecutor(max_workers=50) as pool:
         futures = {pool.submit(_probe_host_port, h, p): (h, p) for h, p in targets}
         for future in as_completed(futures):
             try:
@@ -1560,11 +1560,19 @@ def wallet_disconnect():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"[DarkMatter Entrypoint] Human node on http://localhost:{PORT}", file=sys.stderr)
+    url = f"http://localhost:{PORT}"
+    print(f"[DarkMatter Entrypoint] Human node on {url}", file=sys.stderr)
     print(f"[DarkMatter Entrypoint] Public URL: {_get_public_url()}", file=sys.stderr)
     print(f"[DarkMatter Entrypoint] Agent ID: {_short_id(state.agent_id)}", file=sys.stderr)
     print(f"[DarkMatter Entrypoint] Display name: {state.display_name}", file=sys.stderr)
     print(f"[DarkMatter Entrypoint] Connections: {len(state.connections)}", file=sys.stderr)
+
+    # Open the entrypoint in the default browser (only when run directly, not when
+    # auto-spawned by an MCP agent as a background subprocess)
+    if sys.stderr.isatty():
+        import webbrowser
+        webbrowser.open(url)
+
     # Disable reloader when spawned as a subprocess (no TTY) to avoid
     # inheriting stale file descriptors from the parent process.
     is_tty = sys.stderr.isatty()

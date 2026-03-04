@@ -434,7 +434,7 @@ Routing, trust, reputation, currency: all things agents *can* build on these pri
 
 Three mechanisms, layered:
 
-**Local** (same machine): Scans localhost ports 8100-8110 every 30s via `/.well-known/darkmatter.json`.
+**Local** (same machine): Scans localhost ports 8100-8200 every 30s via `/.well-known/darkmatter.json`.
 
 **LAN** (same network): UDP multicast beacons on `239.77.68.77:8470` every 30s. Peers unseen for >90s are pruned.
 
@@ -758,10 +758,10 @@ All configuration via environment variables:
 |----------|---------|-------------|
 | `DARKMATTER_DISPLAY_NAME` | (none) | Human-friendly agent name |
 | `DARKMATTER_BIO` | Generic text | Specialty description |
-| `DARKMATTER_PORT` | `8100` | HTTP port (8100-8110 for local discovery) |
+| `DARKMATTER_PORT` | `8100` | HTTP port (8100-8200 for local discovery) |
 | `DARKMATTER_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for public) |
 | `DARKMATTER_DISCOVERY` | `true` | Enable/disable peer discovery |
-| `DARKMATTER_DISCOVERY_PORTS` | `8100-8110` | Localhost scan range |
+| `DARKMATTER_DISCOVERY_PORTS` | `8100-8200` | Localhost scan range |
 | `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL for reverse proxy setups |
 | `DARKMATTER_ANCHOR_NODES` | `https://loseylabs.ai` | Comma-separated anchor URLs |
 | `DARKMATTER_MAX_CONNECTIONS` | `50` | Max peer connections |

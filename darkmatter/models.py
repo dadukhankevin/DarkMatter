@@ -66,6 +66,9 @@ class Connection:
     transport: str = "http"              # "http" | "webrtc"
     webrtc_pc: Optional[object] = None   # RTCPeerConnection
     webrtc_channel: Optional[object] = None  # RTCDataChannel
+    # Security
+    identity_verified: bool = False   # True if challenge-response proof passed
+    tls_secure: bool = False          # True if peer URL uses HTTPS
     # NAT traversal connectivity tracking (ephemeral)
     connectivity_level: int = 0    # 0=unknown, 1=direct, 2=lan_webrtc, 3=peer_relay, 4=anchor_relay, 5=anchor_msg_relay
     connectivity_method: str = ""  # human label set alongside level
@@ -139,6 +142,7 @@ class SharedShard:
     created_at: str
     updated_at: str
     summary: Optional[str] = None
+    signature_hex: Optional[str] = None
 
 
 # =============================================================================
@@ -159,6 +163,9 @@ class PendingConnectionRequest:
     from_agent_created_at: Optional[str] = None
     peer_trust: Optional[dict] = None
     mutual: bool = False
+    # Challenge-response fields
+    challenge_id: Optional[str] = None
+    challenge_hex: Optional[str] = None
 
 
 # =============================================================================

@@ -5,9 +5,12 @@ When all direct and WebRTC transports fail, messages are relayed through
 the anchor node. This is the transport of last resort — centralized but
 guaranteed to work as long as the anchor is reachable.
 
-Depends on: config, identity, network/transport
+All relay payloads are E2E encrypted using the recipient's public key.
+
+Depends on: config, security, network/transport
 """
 
+import json
 import sys
 from datetime import datetime, timezone
 from typing import Optional
@@ -15,7 +18,7 @@ from typing import Optional
 import httpx
 
 from darkmatter.config import ANCHOR_NODES
-from darkmatter.identity import sign_message
+from darkmatter.security import sign_message, encrypt_for_peer
 from darkmatter.network.transport import Transport, SendResult
 
 
@@ -41,7 +44,11 @@ class AnchorRelayTransport(Transport):
         return "anchor-relay" if self.available else None
 
     async def send(self, conn, path: str, payload: dict) -> SendResult:
-        """Send a message via anchor's message relay endpoint."""
+        """Send a message via anchor's message relay endpoint.
+
+        The payload is E2E encrypted using the recipient's public key so
+        the anchor cannot read message contents.
+        """
         if not ANCHOR_NODES:
             return SendResult(success=False, transport_name="anchor_relay",
                               error="No anchor nodes configured")
@@ -51,28 +58,40 @@ class AnchorRelayTransport(Transport):
             return SendResult(success=False, transport_name="anchor_relay",
                               error="Agent state not available")
 
-        # Only relay to agents behind NAT — check if direct delivery is impossible
-        # We try the anchor relay since this transport is only reached when
-        # higher-priority transports already failed.
+        timestamp = datetime.now(timezone.utc).isoformat()
 
-        relay_payload = {
+        # Build the inner payload to encrypt
+        inner_payload = {
             "path": path,
             "payload": payload,
             "from_agent_id": state.agent_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": timestamp,
         }
 
-        # Sign the relay payload for authenticity
-        if state.private_key_hex:
-            import json
-            content_str = json.dumps(payload, sort_keys=True)
-            relay_payload["signature"] = sign_message(
-                state.private_key_hex,
-                state.agent_id,
-                payload.get("message_id", "relay"),
-                relay_payload["timestamp"],
-                content_str[:256],  # Sign truncated content for verification
-            )
+        # Sign for authenticity
+        content_str = json.dumps(payload, sort_keys=True)
+        inner_payload["signature"] = sign_message(
+            state.private_key_hex,
+            state.agent_id,
+            payload.get("message_id", "relay"),
+            timestamp,
+            content_str[:256],
+        )
+
+        # E2E encrypt if we have the recipient's public key
+        recipient_pub = conn.agent_public_key_hex if conn else None
+        if recipient_pub and state.private_key_hex:
+            plaintext = json.dumps(inner_payload).encode("utf-8")
+            encrypted = encrypt_for_peer(plaintext, state.private_key_hex, recipient_pub)
+            relay_payload = {
+                "e2e_encrypted": True,
+                "encrypted_payload": encrypted,
+                "from_agent_id": state.agent_id,
+                "timestamp": timestamp,
+            }
+        else:
+            # Fallback: send signed but unencrypted (no recipient public key)
+            relay_payload = inner_payload
 
         for anchor in ANCHOR_NODES:
             try:
@@ -86,7 +105,8 @@ class AnchorRelayTransport(Transport):
                             success=True,
                             transport_name="anchor_relay",
                             response={"success": True, "transport": "anchor_relay",
-                                      "anchor": anchor, "buffered": True},
+                                      "anchor": anchor, "buffered": True,
+                                      "e2e_encrypted": relay_payload.get("e2e_encrypted", False)},
                         )
             except Exception as e:
                 print(f"[DarkMatter] Anchor relay send failed ({anchor}): {e}", file=sys.stderr)

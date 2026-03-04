@@ -56,6 +56,7 @@ from darkmatter.identity import (
     check_rate_limit,
     truncate_field,
 )
+from darkmatter.security import verify_inbound
 from darkmatter.state import (
     get_state,
     save_state,
@@ -277,11 +278,21 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         )
         asyncio.create_task(spawn_agent_for_message(state, synthetic_msg))
 
+    # Generate challenge for proof-of-possession
+    from darkmatter.security import create_challenge
+    challenge_id, challenge_hex = create_challenge(from_agent_id)
+    pending_req = state.pending_requests.get(request_id)
+    if pending_req:
+        pending_req.challenge_id = challenge_id
+        pending_req.challenge_hex = challenge_hex
+
     return {
         "auto_accepted": False,
         "request_id": request_id,
         "agent_id": state.agent_id,
-        "message": "Connection request queued. Awaiting agent decision.",
+        "challenge_id": challenge_id,
+        "challenge_hex": challenge_hex,
+        "message": "Connection request queued. Awaiting agent decision. Prove identity with challenge.",
     }, 200
 
 
@@ -324,6 +335,9 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
 
     del state.pending_outbound[matched]
 
+    from darkmatter.security import assess_url_security
+    tls_info = assess_url_security(agent_url)
+
     conn = Connection(
         agent_id=agent_id,
         agent_url=agent_url,
@@ -332,8 +346,13 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
         agent_display_name=agent_display_name,
         wallets=agent_wallets,
         peer_created_at=data.get("created_at"),
+        tls_secure=tls_info["secure"],
     )
     state.connections[agent_id] = conn
+
+    if not tls_info["secure"] and not tls_info["is_local"]:
+        print(f"[DarkMatter] WARNING: Connection to {agent_id[:12]}... uses insecure HTTP: {tls_info.get('warning', '')}", file=sys.stderr)
+
     save_state()
 
     return {"success": True}, 200
@@ -437,6 +456,18 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
     if len(state.connections) >= MAX_CONNECTIONS:
         return {"error": f"Connection limit reached ({MAX_CONNECTIONS})"}, 429, None
 
+    # Check if identity was verified via challenge-response
+    identity_verified = False
+    if pending.challenge_id and pending.from_agent_public_key_hex:
+        # Proof was submitted and verified in handle_connection_proof
+        identity_verified = True
+    elif not pending.challenge_id:
+        # Legacy: no challenge was issued (shouldn't happen with new code)
+        identity_verified = False
+
+    from darkmatter.security import assess_url_security
+    tls_info = assess_url_security(pending.from_agent_url)
+
     conn = Connection(
         agent_id=pending.from_agent_id,
         agent_url=pending.from_agent_url,
@@ -445,8 +476,13 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
         agent_display_name=pending.from_agent_display_name,
         wallets=pending.from_agent_wallets,
         peer_created_at=pending.from_agent_created_at,
+        tls_secure=tls_info["secure"],
+        identity_verified=identity_verified,
     )
     state.connections[pending.from_agent_id] = conn
+
+    if not tls_info["secure"] and not tls_info["is_local"]:
+        print(f"[DarkMatter] WARNING: Connection to {pending.from_agent_id[:12]}... uses insecure HTTP", file=sys.stderr)
 
     notify_payload = {
         "agent_id": state.agent_id,
@@ -796,43 +832,12 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if not isinstance(hops_remaining, int) or hops_remaining < 0:
         hops_remaining = 10
 
-    # Cryptographic verification
+    # Cryptographic verification — all messages must be signed
     msg_timestamp = data.get("timestamp", "")
-    from_public_key_hex = data.get("from_public_key_hex")
-    signature_hex = data.get("signature_hex")
-    verified = False
-    is_connected = from_agent_id in state.connections
-
-    if is_connected:
-        conn = state.connections[from_agent_id]
-        if conn.agent_public_key_hex:
-            # We have a stored public key for this peer — signature is REQUIRED
-            if from_public_key_hex and conn.agent_public_key_hex != from_public_key_hex:
-                return {"error": "Public key mismatch — sender key does not match stored key for this connection."}, 403
-            if not signature_hex or not msg_timestamp:
-                return {"error": "Signature required — this connection has a known public key."}, 403
-            if not verify_message(conn.agent_public_key_hex, signature_hex,
-                                  from_agent_id, message_id, msg_timestamp, content):
-                return {"error": "Invalid signature — message authenticity could not be verified."}, 403
-            verified = True
-        elif from_public_key_hex:
-            # Peer sent a key but we don't have one stored — pin it and verify
-            if signature_hex and msg_timestamp:
-                if not verify_message(from_public_key_hex, signature_hex,
-                                      from_agent_id, message_id, msg_timestamp, content):
-                    return {"error": "Invalid signature — message authenticity could not be verified."}, 403
-                conn.agent_public_key_hex = from_public_key_hex
-                verified = True
-    elif from_public_key_hex and signature_hex and msg_timestamp:
-        # Not connected, but accept if the message is cryptographically signed.
-        # Connections manage trust/rate-limiting; signatures prove identity.
-        if not verify_message(from_public_key_hex, signature_hex,
-                              from_agent_id, message_id, msg_timestamp, content):
-            return {"error": "Invalid signature — message authenticity could not be verified."}, 403
-        verified = True
-    else:
-        # No connection AND no signature — reject
-        return {"error": "Not connected — unsigned messages require a connection."}, 403
+    result = verify_inbound(data, state.connections)
+    if not result.verified:
+        return {"error": result.error}, result.status_code
+    verified = True
 
     # Replay protection: reject messages with stale timestamps
     if verified and msg_timestamp and not is_timestamp_fresh(msg_timestamp):
@@ -1030,6 +1035,55 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
             if webrtc_t and webrtc_t.available:
                 asyncio.create_task(webrtc_t.upgrade(state, conn))
     return JSONResponse(result, status_code=status)
+
+
+async def handle_connection_proof(request: Request) -> JSONResponse:
+    """Verify proof-of-possession for a pending connection request.
+
+    POST /__darkmatter__/connection_proof
+    Body: {challenge_id, proof_hex, agent_id}
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    challenge_id = data.get("challenge_id", "")
+    proof_hex = data.get("proof_hex", "")
+    agent_id = data.get("agent_id", "")
+    public_key_hex = data.get("public_key_hex", "")
+
+    if not challenge_id or not proof_hex or not agent_id or not public_key_hex:
+        return JSONResponse({"error": "Missing required fields"}, status_code=400)
+
+    # Enforce identity binding: public_key_hex must match agent_id (passport invariant)
+    if public_key_hex != agent_id:
+        return JSONResponse({"error": "Public key must match agent_id"}, status_code=400)
+
+    from darkmatter.security import verify_proof
+
+    # Find the pending request with this challenge_id
+    pending = None
+    for req in state.pending_requests.values():
+        if req.challenge_id == challenge_id and req.from_agent_id == agent_id:
+            pending = req
+            break
+
+    if pending is None:
+        return JSONResponse({"error": "No matching pending request for this challenge"}, status_code=404)
+
+    if not verify_proof(agent_id, public_key_hex, challenge_id, pending.challenge_hex):
+        return JSONResponse({"error": "Invalid proof — identity verification failed"}, status_code=403)
+
+    # Mark the pending request as identity-verified
+    pending.from_agent_public_key_hex = public_key_hex
+    save_state()
+
+    return JSONResponse({"success": True, "identity_verified": True})
 
 
 async def handle_accept_pending(request: Request) -> JSONResponse:
@@ -1418,7 +1472,16 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     if from_agent_id not in state.connections:
         return JSONResponse({"error": "Not connected — WebRTC upgrade requires an existing connection."}, status_code=403)
 
+    # Verify SDP signature (mandatory)
+    sdp_sig = data.get("sdp_signature_hex")
+    sdp_pub = data.get("public_key_hex")
     conn = state.connections[from_agent_id]
+    verify_key = conn.agent_public_key_hex or sdp_pub
+    if not sdp_sig or not verify_key:
+        return JSONResponse({"error": "SDP signature required"}, status_code=403)
+    from darkmatter.security import verify_sdp_signature
+    if not verify_sdp_signature(verify_key, sdp_sig, from_agent_id, sdp_offer):
+        return JSONResponse({"error": "Invalid SDP signature"}, status_code=403)
 
     # Grab the registered WebRTC transport for cleanup calls
     _webrtc_t = get_network_manager().get_transport("webrtc")
@@ -1477,9 +1540,16 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
 
     print(f"[DarkMatter] WebRTC: answered offer from {conn.agent_display_name or from_agent_id}", file=sys.stderr)
 
+    from darkmatter.security import sign_sdp
+    answer_sdp = pc.localDescription.sdp
+    answer_sig = sign_sdp(state.private_key_hex, state.agent_id, answer_sdp)
     return JSONResponse({
         "success": True,
-        "sdp_answer": pc.localDescription.sdp,
+        "sdp_answer": answer_sdp,
+        "sdp": answer_sdp,
+        "type": "answer",
+        "sdp_signature_hex": answer_sig,
+        "public_key_hex": state.public_key_hex,
     })
 
 
@@ -1509,6 +1579,23 @@ async def handle_shard_push(request: Request) -> JSONResponse:
     if not author_id or not shard_id:
         return JSONResponse({"error": "Missing required fields"}, status_code=400)
 
+    # Verify shard signature (mandatory)
+    signature_hex = data.get("signature_hex")
+    if not signature_hex:
+        return JSONResponse({"error": "Missing shard signature"}, status_code=403)
+
+    # Look up author's public key
+    author_conn = state.connections.get(author_id)
+    author_pub_key = author_conn.agent_public_key_hex if author_conn else None
+    if not author_pub_key:
+        return JSONResponse({"error": "Unknown shard author — no public key on file"}, status_code=403)
+
+    from darkmatter.security import verify_shard_signature
+    tags_str = ",".join(sorted(data.get("tags", [])))
+    if not verify_shard_signature(author_pub_key, signature_hex, shard_id, author_id,
+                                   data.get("content", ""), tags_str):
+        return JSONResponse({"error": "Invalid shard signature"}, status_code=403)
+
     # Trust gate: verify we trust this peer enough for this shard
     imp = state.impressions.get(author_id)
     our_trust = imp.score if imp else 0.0
@@ -1534,6 +1621,7 @@ async def handle_shard_push(request: Request) -> JSONResponse:
         created_at=data.get("created_at", ""),
         updated_at=data.get("updated_at", ""),
         summary=data.get("summary"),
+        signature_hex=signature_hex,
     )
 
     if existing_idx is not None:

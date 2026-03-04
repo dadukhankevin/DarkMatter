@@ -182,6 +182,17 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         if not peer_id or peer_id == self.state.agent_id:
             return
 
+        # Verify beacon signature (mandatory)
+        beacon_sig = packet.get("beacon_signature_hex")
+        beacon_pub = packet.get("public_key_hex")
+        if not beacon_sig or not beacon_pub:
+            return  # Drop unsigned beacons
+        from darkmatter.security import verify_lan_beacon
+        beacon_ts = str(packet.get("ts", ""))
+        beacon_port = str(packet.get("port", DEFAULT_PORT))
+        if not verify_lan_beacon(beacon_pub, beacon_sig, peer_id, beacon_port, beacon_ts):
+            return  # Drop beacons with invalid signatures
+
         peer_port = packet.get("port", DEFAULT_PORT)
         source_ip = addr[0]
 
@@ -441,6 +452,12 @@ async def discovery_loop(state: AgentState) -> None:
             except Exception:
                 pass
 
+            from darkmatter.security import sign_lan_beacon
+            ts_val = int(time.time())
+            beacon_sig = sign_lan_beacon(
+                state.private_key_hex, state.agent_id, str(state.port), str(ts_val)
+            ) if state.private_key_hex else ""
+
             packet = json.dumps({
                 "proto": "darkmatter",
                 "v": PROTOCOL_VERSION,
@@ -451,7 +468,8 @@ async def discovery_loop(state: AgentState) -> None:
                 "port": state.port,
                 "status": state.status.value,
                 "accepting": len(state.connections) < MAX_CONNECTIONS,
-                "ts": int(time.time()),
+                "ts": ts_val,
+                "beacon_signature_hex": beacon_sig,
             }).encode("utf-8")
 
             try:

@@ -312,10 +312,13 @@ class WebRTCTransport(Transport):
 
             await asyncio.sleep(WEBRTC_ICE_GATHER_TIMEOUT)
 
+            from darkmatter.security import sign_sdp
             offer_data = {
                 "sdp": pc.localDescription.sdp,
                 "type": pc.localDescription.type,
                 "agent_id": state.agent_id,
+                "sdp_signature_hex": sign_sdp(state.private_key_hex, state.agent_id, pc.localDescription.sdp),
+                "public_key_hex": state.public_key_hex,
             }
 
             answer_data = await signaling.send_offer(state, conn, offer_data)
