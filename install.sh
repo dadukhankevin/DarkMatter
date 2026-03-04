@@ -1,9 +1,7 @@
 #!/bin/bash
 set -eu
 
-REPO_URL="https://github.com/dadukhankevin/DarkMatter.git"
 DM_DIR="$HOME/.darkmatter"
-REPO_DIR="$DM_DIR/repo"
 VENV_DIR="$DM_DIR/venv"
 PYTHON_CMD=""
 
@@ -35,32 +33,17 @@ echo "Using $PYTHON_CMD ($PY_VERSION)"
 # Create directory
 mkdir -p "$DM_DIR"
 
-# Clone or update repo
-if [ -d "$REPO_DIR/.git" ]; then
-    echo "Updating DarkMatter..."
-    git -C "$REPO_DIR" fetch origin main
-    git -C "$REPO_DIR" reset --hard origin/main
-else
-    echo "Cloning DarkMatter..."
-    rm -rf "$REPO_DIR"
-    git clone --depth 1 "$REPO_URL" "$REPO_DIR"
-fi
-
-COMMIT=$(git -C "$REPO_DIR" rev-parse --short HEAD)
-echo "Installed commit: $COMMIT"
-
-# Copy entrypoint to canonical per-device location
-cp "$REPO_DIR/entrypoint.py" "$DM_DIR/entrypoint.py"
-echo "Entrypoint installed: $DM_DIR/entrypoint.py"
-
-# Create venv and install dependencies
+# Create venv and install
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
     "$PYTHON_CMD" -m venv "$VENV_DIR"
 fi
 
-echo "Installing dependencies..."
-"$VENV_DIR/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
+echo "Installing DarkMatter..."
+"$VENV_DIR/bin/pip" install --quiet --upgrade dmagent
+
+VERSION=$("$VENV_DIR/bin/python" -c "import darkmatter; print(darkmatter.__version__)")
+echo "Installed dmagent $VERSION"
 
 # Find free port in 8100-8200
 PORT=8100
@@ -93,15 +76,14 @@ else
 fi
 DISPLAY_NAME="${DISPLAY_NAME:-darkmatter-agent}"
 
-# Build the darkmatter MCP entry as JSON — runs python -m darkmatter from cloned repo
+# Build the darkmatter MCP entry as JSON
 DM_ENTRY=$(cat <<JSONEOF
 {
   "command": "$VENV_PYTHON",
   "args": ["-m", "darkmatter"],
   "env": {
     "DARKMATTER_PORT": "$PORT",
-    "DARKMATTER_DISPLAY_NAME": "$DISPLAY_NAME",
-    "PYTHONPATH": "$REPO_DIR"
+    "DARKMATTER_DISPLAY_NAME": "$DISPLAY_NAME"
   }
 }
 JSONEOF
@@ -156,12 +138,12 @@ echo "=== Setup complete ==="
 echo "DarkMatter installed to $INSTALLED location(s)"
 echo "Display name: $DISPLAY_NAME"
 echo "Port: $PORT"
-echo "Commit: $COMMIT"
+echo "Version: $VERSION"
 echo ""
 echo "Restart your MCP client to connect. Auth is automatic."
 echo ""
-echo "To update later:  bash ~/.darkmatter/repo/install.sh"
+echo "To update later:  $VENV_DIR/bin/pip install --upgrade dmagent"
 echo ""
 echo "Alternative: standalone HTTP mode (manual start):"
-echo "  DARKMATTER_PORT=$PORT PYTHONPATH=$REPO_DIR nohup $VENV_PYTHON -m darkmatter > /tmp/darkmatter-$PORT.log 2>&1 &"
+echo "  DARKMATTER_PORT=$PORT nohup $VENV_PYTHON -m darkmatter > /tmp/darkmatter-$PORT.log 2>&1 &"
 echo "  Then set in .mcp.json: {\"type\":\"http\",\"url\":\"http://localhost:$PORT/mcp\"}"

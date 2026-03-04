@@ -1860,7 +1860,7 @@ async def handle_pool_proxy(request: Request) -> Response:
     if not pool_id or not token_id or not path:
         return JSONResponse({"error": "Missing pool_id, access_token, or path"}, status_code=400)
 
-    from darkmatter.pool import find_pool, find_access_token, select_provider, proxy_request
+    from darkmatter.pool import find_pool, find_access_token, select_provider, get_handler
 
     pool = find_pool(state.pools, pool_id)
     if not pool:
@@ -1876,13 +1876,24 @@ async def handle_pool_proxy(request: Request) -> Response:
     if not provider:
         return JSONResponse({"success": False, "error": "No provider available for this path"}, status_code=404)
 
-    if access_token.balance < provider.price_per_call:
+    # Resolve handler
+    handler = get_handler(pool.handler_type)
+    if not handler:
+        return JSONResponse({"success": False, "error": f"Unknown handler type: {pool.handler_type}"}, status_code=500)
+
+    # Validate request
+    validation_error = handler.validate_request(provider, method, path, headers, body)
+    if validation_error:
+        return JSONResponse({"success": False, "error": validation_error}, status_code=400)
+
+    # Estimate cost for balance pre-check
+    estimated_cost = handler.estimate_cost(provider, method, path, body)
+    if access_token.balance < estimated_cost:
         return JSONResponse({"success": False, "error": "Insufficient balance"}, status_code=402)
 
-    # Proxy the request
-    import base64
+    # Proxy via handler
     try:
-        status_code, resp_headers, resp_body = await proxy_request(provider, method, path, headers, body)
+        result = await handler.proxy(provider, method, path, headers, body)
         provider.calls_served += 1
     except Exception as e:
         provider.failures += 1
@@ -1891,7 +1902,7 @@ async def handle_pool_proxy(request: Request) -> Response:
         provider2 = select_provider(pool, path)
         if provider2 and provider2.provider_id != provider.provider_id:
             try:
-                status_code, resp_headers, resp_body = await proxy_request(provider2, method, path, headers, body)
+                result = await handler.proxy(provider2, method, path, headers, body)
                 provider2.calls_served += 1
             except Exception as e2:
                 provider2.failures += 1
@@ -1900,18 +1911,27 @@ async def handle_pool_proxy(request: Request) -> Response:
         else:
             return JSONResponse({"success": False, "error": f"Provider failed: {e}"}, status_code=502)
 
-    # Debit balance
-    access_token.balance -= provider.price_per_call
-    access_token.total_spent += provider.price_per_call
+    # Debit actual cost from handler result
+    access_token.balance -= result.cost
+    access_token.total_spent += result.cost
     access_token.calls_made += 1
     access_token.last_used = datetime.now(timezone.utc).isoformat()
     save_state()
 
+    if result.streaming and result.body_stream is not None:
+        from starlette.responses import StreamingResponse
+        return StreamingResponse(
+            result.body_stream,
+            status_code=result.status_code,
+            headers=result.headers,
+        )
+
+    import base64
     return JSONResponse({
         "success": True,
-        "status_code": status_code,
-        "headers": resp_headers,
-        "body_b64": base64.b64encode(resp_body).decode(),
+        "status_code": result.status_code,
+        "headers": result.headers,
+        "body_b64": base64.b64encode(result.body).decode(),
         "balance_remaining": access_token.balance,
     })
 
@@ -1936,6 +1956,7 @@ async def handle_pool_info(request: Request) -> Response:
         "name": pool.name,
         "tags": pool.tags,
         "description": pool.description,
+        "handler_type": pool.handler_type,
         "provider_count": len(enabled_providers),
         "endpoints": sorted(set(p for pv in enabled_providers for p in pv.allowed_paths)),
         "prices": [
@@ -1943,4 +1964,55 @@ async def handle_pool_info(request: Request) -> Response:
             for pv in enabled_providers
         ],
         "created_at": pool.created_at,
+    })
+
+
+async def handle_admin_update(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/admin_update — Pull latest code from git.
+
+    Only processes requests from connected peers.
+    Runs `git pull origin main` on the repo containing the darkmatter package.
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    # Verify the request comes from a connected peer
+    from_id = data.get("from_agent_id", "")
+    if from_id not in state.connections:
+        return JSONResponse({"error": "Not a connected peer"}, status_code=403)
+
+    action = data.get("action", "")
+    if action != "pull_and_restart":
+        return JSONResponse({"error": f"Unknown action: {action}"}, status_code=400)
+
+    # Derive repo dir from the darkmatter package location
+    import darkmatter
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(darkmatter.__file__)))
+
+    # Run git pull
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "pull", "origin", "main"],
+            capture_output=True, text=True, timeout=30,
+        )
+        git_output = result.stdout.strip() or result.stderr.strip()
+        success = result.returncode == 0
+    except subprocess.TimeoutExpired:
+        git_output = "git pull timed out after 30s"
+        success = False
+    except Exception as e:
+        git_output = str(e)
+        success = False
+
+    return JSONResponse({
+        "success": success,
+        "git_output": git_output,
+        "repo_dir": repo_dir,
     })

@@ -28,7 +28,12 @@ You are the intelligence behind this agent — decide how to answer.
 - If you can't answer a message, forward it using darkmatter_send_message with the message_id \
 from your inbox and a target_agent_id (or target_agent_ids to fork to multiple). Forwarding \
 removes the message from your queue.
-- Track messages you've sent with darkmatter_list_messages and darkmatter_get_sent_message.
+- SENDING AND WAITING: When you send a message and need the reply, ALWAYS follow the send-then-wait pattern:
+  1. darkmatter_send_message(content="...", target_agent_id="...")  → returns message_id
+  2. darkmatter_wait_for_response(message_id="<id>")  → blocks until reply arrives (default 60s timeout)
+  Do NOT poll with darkmatter_list_messages — use darkmatter_wait_for_response instead. It blocks efficiently \
+and returns the response content as soon as it arrives. The node continues processing other messages while waiting.
+- Use darkmatter_list_messages and darkmatter_get_sent_message to review sent message history.
 - Use darkmatter_expire_message to cancel a sent message that's no longer needed.
 - Use darkmatter_connection(action="request", target_url=...) to connect to another agent.
 - Use darkmatter_network_info to discover peers in the network.

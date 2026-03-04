@@ -343,7 +343,7 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
         if not sent_to:
             result["error"] = f"Message could not be delivered to any of {len(failed)} target(s). Check 'failed' for details."
     if sent_to:
-        result["hint"] = f"Use darkmatter_wait_for_response(message_id='{message_id}') to block until a reply arrives."
+        result["next_step"] = f"IMPORTANT: Call darkmatter_wait_for_response(message_id='{message_id}') now to receive the reply. Do not poll — this blocks efficiently until the response arrives."
     return json.dumps(result)
 
 
@@ -1166,6 +1166,11 @@ async def expire_message(params: ExpireMessageInput, ctx: Context) -> str:
 async def wait_for_response(params: WaitForResponseInput, ctx: Context) -> str:
     """Wait for a response to arrive on a sent message.
 
+    RECOMMENDED: Call this immediately after darkmatter_send_message to get the
+    reply. This is the standard send-then-wait pattern for conversations:
+      1. darkmatter_send_message(content="...", target_agent_id="...")
+      2. darkmatter_wait_for_response(message_id="<id from step 1>")
+
     Blocks until a response webhook fires for the given message_id, or the
     timeout expires. If the message already has responses, returns immediately.
 
@@ -1173,10 +1178,10 @@ async def wait_for_response(params: WaitForResponseInput, ctx: Context) -> str:
     spawns all continue normally while this tool awaits.
 
     Args:
-        params: Contains message_id to wait on and timeout_seconds.
+        params: Contains message_id to wait on and timeout_seconds (default 60s).
 
     Returns:
-        JSON with the response(s) if one arrived, or a timeout indicator.
+        JSON with the response content if one arrived, or a timeout indicator.
     """
     state = get_state()
 

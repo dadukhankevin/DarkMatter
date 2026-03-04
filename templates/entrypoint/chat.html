@@ -60,7 +60,15 @@
     <div class="border-b border-border/30">
       <div class="px-3 py-2 flex items-center justify-between">
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Connections</span>
-        <span class="text-[11px] text-muted" id="sidebar-conn-count">0</span>
+        <div class="flex items-center gap-2">
+          <button id="update-all-btn" onclick="updateAllAgents()" title="Git pull &amp; restart all LAN agents"
+            class="text-[10px] px-2 py-0.5 rounded-md font-semibold transition-colors"
+            style="background: var(--accent-blue); color: white; opacity: 0.85;"
+            onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.85'">
+            Update All
+          </button>
+          <span class="text-[11px] text-muted" id="sidebar-conn-count">0</span>
+        </div>
       </div>
       <div id="connections-list" class="px-3 pb-2 space-y-0.5 max-h-48 overflow-y-auto">
         <p class="text-[12px] text-muted">No connections</p>
@@ -77,6 +85,34 @@
         <div id="qr-code" class="flex justify-center mb-2"></div>
         <div id="qr-url" class="text-[11px] text-muted text-center break-all select-all"></div>
         <div id="qr-unavailable" class="text-[11px] text-muted text-center hidden">LAN not available</div>
+      </div>
+    </div>
+
+    <!-- PIN lock setting -->
+    <div id="pin-section" class="border-b border-border/30">
+      <button onclick="togglePinPanel()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
+        <span class="flex items-center gap-1.5">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-muted"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">PIN Lock</span>
+        </span>
+        <span id="pin-status-badge" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted">OFF</span>
+      </button>
+      <div id="pin-panel" class="px-3 pb-3 hidden">
+        <p class="text-[11px] text-muted mb-2">Require a 4-digit PIN for LAN access. Your device is always unlocked.</p>
+        <div class="flex gap-1.5">
+          <input type="number" id="pin-set-input" placeholder="4 digits" maxlength="4" inputmode="numeric"
+            class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted text-center tracking-widest font-semibold focus:border-accent-blue/50 transition-colors min-w-0"
+            style="-moz-appearance:textfield">
+          <button id="pin-set-btn" onclick="setPin()"
+            class="text-white text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
+            style="background: var(--accent-blue)">
+            Set
+          </button>
+          <button id="pin-clear-btn" onclick="clearPin()"
+            class="hidden text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0 border border-border/30 text-muted hover:text-primary">
+            Clear
+          </button>
+        </div>
       </div>
     </div>
 
@@ -136,14 +172,22 @@
 
     <!-- Compose bar -->
     <div id="compose-bar" class="px-4 sm:px-6 py-3">
+      <input type="file" id="file-input" multiple class="hidden">
+      <input type="file" id="camera-input" accept="image/*" capture="environment" class="hidden">
       <form id="compose-form">
-        <div class="compose-ring bg-card/30 relative">
+        <div class="compose-ring bg-card/30 relative" id="compose-drop-zone">
+          <!-- Attachment chips -->
+          <div id="attachment-chips" class="hidden flex flex-wrap gap-1.5 px-4 pt-3 pb-1"></div>
           <!-- Textarea -->
           <textarea name="content" id="compose-input" rows="1"
             placeholder="Send a message..."
             class="w-full bg-transparent text-[15px] text-primary placeholder-muted/50 resize-none leading-relaxed px-4 pt-3 pb-12 border-0 focus:ring-0"
             style="max-height:200px;outline:none;min-height:52px"
             oninput="autoGrow(this)"></textarea>
+          <!-- Drop overlay -->
+          <div id="drop-overlay" class="hidden absolute inset-0 bg-accent-blue/10 border-2 border-dashed border-accent-blue/40 rounded-xl flex items-center justify-center z-10 pointer-events-none">
+            <span class="text-[13px] font-semibold text-accent-blue">Drop files here</span>
+          </div>
           <!-- Bottom toolbar inside textarea -->
           <div class="absolute bottom-0 left-0 right-0 flex items-center justify-between px-3 pb-2.5">
             <div class="flex items-center gap-1.5">
@@ -157,6 +201,16 @@
                 </button>
                 <div id="target-dropdown-menu" class="dropdown-menu absolute bottom-full left-0 mb-1.5 w-56 bg-card/95 backdrop-blur-xl border border-border/30 rounded-xl z-30 py-1 max-h-48 overflow-y-auto" style="box-shadow: 0 8px 32px rgba(0,0,0,0.2)"></div>
               </div>
+              <!-- Attach button -->
+              <button type="button" onclick="document.getElementById('file-input').click()" title="Attach files"
+                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+              </button>
+              <!-- Camera button -->
+              <button type="button" onclick="document.getElementById('camera-input').click()" title="Take photo"
+                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+              </button>
               <!-- Clear button -->
               <button type="button" onclick="clearFeed()" title="Clear messages"
                 class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
@@ -414,6 +468,9 @@ const renderedFeedItems = new Map();  // id -> DOM element
 let clearedAtTs = parseInt(sessionStorage.getItem('dm-cleared-at') || '0', 10);  // items older than this are hidden
 let prevConnIds = new Set();
 
+// File attachments
+let pendingAttachments = [];
+
 // =========================================================================
 // Utilities
 // =========================================================================
@@ -495,6 +552,70 @@ function ajaxPost(url, body) {
 function autoGrow(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function uploadFiles(fileList) {
+  if (!fileList.length) return;
+  const fd = new FormData();
+  for (const f of fileList) fd.append('files', f);
+  try {
+    const resp = await fetch('/api/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (data.success && data.files) {
+      pendingAttachments.push(...data.files);
+      renderAttachmentChips();
+    } else {
+      showToast(data.error || 'Upload failed', 'error');
+    }
+  } catch (err) {
+    showToast('Upload failed', 'error');
+  }
+}
+
+function renderAttachmentChips() {
+  const container = document.getElementById('attachment-chips');
+  if (!pendingAttachments.length) {
+    container.classList.add('hidden');
+    container.innerHTML = '';
+    return;
+  }
+  container.classList.remove('hidden');
+  container.innerHTML = pendingAttachments.map((a, i) => {
+    const isImg = (a.content_type || '').startsWith('image/');
+    return `<div class="flex items-center gap-1.5 bg-surface/80 border border-border/30 rounded-lg px-2.5 py-1 text-[12px] text-label">
+      ${isImg ? `<img src="${esc(a.url)}" class="w-5 h-5 rounded object-cover">` :
+        `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`}
+      <span class="truncate max-w-[120px]">${esc(a.filename)}</span>
+      <span class="text-muted">${formatFileSize(a.size)}</span>
+      <button type="button" onclick="removeAttachment(${i})" class="text-muted hover:text-primary ml-0.5">&times;</button>
+    </div>`;
+  }).join('');
+}
+
+function removeAttachment(idx) {
+  pendingAttachments.splice(idx, 1);
+  renderAttachmentChips();
+}
+
+function renderAttachmentsInMessage(attachments) {
+  if (!attachments || !attachments.length) return '';
+  return '<div class="flex flex-wrap gap-2 mt-2">' + attachments.map(a => {
+    const isImg = (a.content_type || '').startsWith('image/');
+    if (isImg) {
+      return `<a href="${esc(a.url)}" target="_blank" class="block"><img src="${esc(a.url)}" alt="${esc(a.filename)}" class="rounded-lg max-w-[240px] max-h-[180px] object-cover border border-border/20"></a>`;
+    }
+    return `<a href="${esc(a.url)}" target="_blank" class="flex items-center gap-1.5 bg-surface/60 border border-border/30 rounded-lg px-2.5 py-1.5 text-[12px] text-label hover:text-primary transition-colors">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      <span>${esc(a.filename)}</span>
+      <span class="text-muted">${formatFileSize(a.size)}</span>
+    </a>`;
+  }).join('') + '</div>';
 }
 
 let sidebarCollapsed = false;
@@ -582,6 +703,75 @@ function onThemeChange() {
     initQR(document.getElementById('qr-url').textContent);
   }
 }
+
+// =========================================================================
+// PIN lock
+// =========================================================================
+let pinPanelOpen = false;
+
+function togglePinPanel() {
+  pinPanelOpen = !pinPanelOpen;
+  document.getElementById('pin-panel').classList.toggle('hidden', !pinPanelOpen);
+}
+
+async function loadPinStatus() {
+  try {
+    const resp = await fetch('/api/pin');
+    if (!resp.ok) return; // not localhost, hide section
+    const data = await resp.json();
+    const badge = document.getElementById('pin-status-badge');
+    const clearBtn = document.getElementById('pin-clear-btn');
+    const setBtn = document.getElementById('pin-set-btn');
+    if (data.pin_enabled) {
+      badge.textContent = 'ON';
+      badge.className = 'text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-accent-green/15 text-accent-green';
+      clearBtn.classList.remove('hidden');
+    } else {
+      badge.textContent = 'OFF';
+      badge.className = 'text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted';
+      clearBtn.classList.add('hidden');
+    }
+  } catch (e) {
+    // Not localhost or network error — hide PIN section
+    document.getElementById('pin-section').classList.add('hidden');
+  }
+}
+
+async function setPin() {
+  const input = document.getElementById('pin-set-input');
+  const pin = input.value.replace(/\D/g, '').slice(0, 4);
+  if (pin.length !== 4) { showToast('PIN must be 4 digits', 'error'); return; }
+  const resp = await fetch('/api/pin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pin }),
+  });
+  const data = await resp.json();
+  if (data.success) {
+    showToast('PIN set', 'success');
+    input.value = '';
+    loadPinStatus();
+  } else {
+    showToast(data.error || 'Failed', 'error');
+  }
+}
+
+async function clearPin() {
+  const resp = await fetch('/api/pin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pin: '' }),
+  });
+  const data = await resp.json();
+  if (data.success) {
+    showToast('PIN cleared', 'success');
+    loadPinStatus();
+  } else {
+    showToast(data.error || 'Failed', 'error');
+  }
+}
+
+loadPinStatus();
 
 // =========================================================================
 // Target dropdown
@@ -672,6 +862,7 @@ function buildFeedItems(data) {
       updates: msg.updates || [],
       responses: msg.responses || [],
       message_id: msg.message_id,
+      attachments: (msg.metadata || {}).attachments || [],
     });
 
     // Responses to sent messages appear as inbound replies
@@ -700,6 +891,7 @@ function buildFeedItems(data) {
       from_name: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
       from_agent_id: msg.from_agent_id,
       message_id: msg.message_id,
+      attachments: (msg.metadata || {}).attachments || [],
     });
   }
 
@@ -741,6 +933,7 @@ function renderFeedItem(item) {
           <span class="msg-meta ml-auto flex items-center gap-1.5" title="${item.timestamp || ''}">${timeAgo(item.timestamp)} ${buildStatusDot(item.status, item.updates)}</span>
         </div>
         <div class="msg-content">${renderMd(item.content)}</div>
+        ${renderAttachmentsInMessage(item.attachments)}
       </div>`;
   } else if (item.type === 'inbound') {
     const aColor = agentColor(item.from_agent_id);
@@ -756,6 +949,7 @@ function renderFeedItem(item) {
           </button>
         </div>
         <div class="msg-content">${renderMd(item.content)}</div>
+        ${renderAttachmentsInMessage(item.attachments)}
         <div class="reply-area" data-reply-for="${item.message_id}">
           <div class="flex gap-2">
             <input type="text" placeholder="Reply to ${esc(item.from_name)}..." data-message-id="${item.message_id}"
@@ -1008,15 +1202,20 @@ function renderFeed(data) {
 composeForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const content = composeInput.value.trim();
-  if (!content) return;
+  if (!content && !pendingAttachments.length) return;
   const target = targetValue.value;
 
   sendBtn.disabled = true;
   composeInput.value = '';
   composeInput.style.height = 'auto';
+  const attachments = [...pendingAttachments];
+  pendingAttachments = [];
+  renderAttachmentChips();
 
   try {
-    const result = await ajaxPost('/send', { content, target });
+    const body = { content, target };
+    if (attachments.length) body.attachments = attachments;
+    const result = await ajaxPost('/send', body);
     if (!result.success) {
       showToast(result.error || 'Send failed', 'error');
     } else {
@@ -1038,6 +1237,45 @@ composeInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     composeForm.dispatchEvent(new Event('submit'));
+  }
+});
+
+// =========================================================================
+// File attachments: input, drag-drop, paste
+// =========================================================================
+document.getElementById('file-input').addEventListener('change', (e) => {
+  if (e.target.files.length) uploadFiles(e.target.files);
+  e.target.value = '';
+});
+
+document.getElementById('camera-input').addEventListener('change', (e) => {
+  if (e.target.files.length) uploadFiles(e.target.files);
+  e.target.value = '';
+});
+
+const dropZone = document.getElementById('compose-drop-zone');
+const dropOverlay = document.getElementById('drop-overlay');
+let dragCounter = 0;
+dropZone.addEventListener('dragenter', (e) => { e.preventDefault(); dragCounter++; dropOverlay.classList.remove('hidden'); });
+dropZone.addEventListener('dragleave', (e) => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.classList.add('hidden'); } });
+dropZone.addEventListener('dragover', (e) => e.preventDefault());
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  dropOverlay.classList.add('hidden');
+  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+});
+
+composeInput.addEventListener('paste', (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  const files = [];
+  for (const item of items) {
+    if (item.kind === 'file') files.push(item.getAsFile());
+  }
+  if (files.length) {
+    e.preventDefault();
+    uploadFiles(files);
   }
 });
 
@@ -1259,6 +1497,31 @@ function renderConnections(conns) {
 
   document.getElementById('sidebar-conn-count').textContent = conns.length;
   updateDropdownOptions(conns);
+}
+
+async function updateAllAgents() {
+  const btn = document.getElementById('update-all-btn');
+  const origText = btn.textContent;
+  btn.textContent = 'Updating...';
+  btn.disabled = true;
+  try {
+    const data = await ajaxPost('/api/update-agents', {});
+    if (data.results && data.results.length > 0) {
+      const succeeded = data.results.filter(r => r.success).length;
+      showToast(`Updated ${succeeded}/${data.results.length} agents`, succeeded > 0 ? 'success' : 'error');
+      data.results.forEach(r => {
+        const status = r.success ? 'ok' : 'FAILED';
+        console.log(`[Update] ${r.display_name}: ${status} — ${r.git_output}`);
+      });
+    } else {
+      showToast(data.message || 'No local agents found', 'info');
+    }
+  } catch (e) {
+    showToast('Update failed: ' + e.message, 'error');
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
 }
 
 // =========================================================================

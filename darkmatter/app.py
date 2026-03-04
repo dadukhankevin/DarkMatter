@@ -70,6 +70,7 @@ from darkmatter.network.mesh import (
     handle_pool_buy,
     handle_pool_proxy,
     handle_pool_info,
+    handle_admin_update,
 )
 from darkmatter.spawn import spawn_agent_for_message
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
@@ -259,6 +260,7 @@ def create_app() -> Router:
         Route("/pool_buy", handle_pool_buy, methods=["POST"]),
         Route("/pool_proxy", handle_pool_proxy, methods=["POST"]),
         Route("/pool_info/{pool_id}", handle_pool_info, methods=["GET"]),
+        Route("/admin_update", handle_admin_update, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.

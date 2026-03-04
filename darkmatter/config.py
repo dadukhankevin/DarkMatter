@@ -94,6 +94,7 @@ CORE_TOOLS = frozenset({
     "darkmatter_update_bio",
     "darkmatter_status",
     "darkmatter_list_pending_requests",
+    "darkmatter_wait_for_response",
 })
 
 # =============================================================================

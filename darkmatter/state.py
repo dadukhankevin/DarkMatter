@@ -313,6 +313,7 @@ def save_state() -> None:
                 "description": p.description,
                 "created_at": p.created_at,
                 "shard_id": p.shard_id,
+                "handler_type": p.handler_type,
                 "providers": [
                     {
                         "provider_id": pv.provider_id,
@@ -327,6 +328,7 @@ def save_state() -> None:
                         "calls_served": pv.calls_served,
                         "failures": pv.failures,
                         "added_at": pv.added_at,
+                        "handler_config": pv.handler_config,
                     }
                     for pv in p.providers
                 ],
@@ -508,6 +510,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
                 calls_served=pvd.get("calls_served", 0),
                 failures=pvd.get("failures", 0),
                 added_at=pvd.get("added_at", ""),
+                handler_config=pvd.get("handler_config", {}),
             ))
         access_tokens = []
         for atd in pd.get("access_tokens", []):
@@ -532,6 +535,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             access_tokens=access_tokens,
             created_at=pd.get("created_at", ""),
             shard_id=pd.get("shard_id"),
+            handler_type=pd.get("handler_type", "passthrough"),
         ))
 
     state = AgentState(

@@ -164,6 +164,7 @@ class PoolProvider:
     calls_served: int = 0
     failures: int = 0
     added_at: str = ""
+    handler_config: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -192,6 +193,7 @@ class Pool:
     access_tokens: list[PoolAccessToken] = field(default_factory=list)
     created_at: str = ""
     shard_id: Optional[str] = None
+    handler_type: str = "passthrough"
 
 
 # =============================================================================
@@ -245,6 +247,7 @@ class SentMessage:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updates: list[dict] = field(default_factory=list)
     responses: list[dict] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 # =============================================================================

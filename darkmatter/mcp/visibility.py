@@ -89,8 +89,10 @@ def build_status_line() -> str:
         )
     sent_active = sum(1 for sm in state.sent_messages.values() if sm.status == "active")
     if sent_active > 0:
+        active_ids = [sm.message_id for sm in state.sent_messages.values() if sm.status == "active"]
+        id_hint = active_ids[0] if len(active_ids) == 1 else active_ids[0]
         actions.append(
-            f"{sent_active} sent message(s) awaiting response — use darkmatter_list_messages to check"
+            f"{sent_active} sent message(s) awaiting response — use darkmatter_wait_for_response(message_id='{id_hint}') to block until a reply arrives, or darkmatter_list_messages to check all"
         )
     if conns == 0:
         actions.append(
@@ -159,7 +161,6 @@ def compute_visible_optional() -> set:
             "darkmatter_list_messages",
             "darkmatter_get_sent_message",
             "darkmatter_expire_message",
-            "darkmatter_wait_for_response",
         })
 
     if state.status == AgentStatus.INACTIVE:

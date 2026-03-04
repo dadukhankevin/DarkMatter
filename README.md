@@ -91,12 +91,12 @@ Restart your MCP client. You're on the mesh.
 ### Step 1: Install and run
 
 ```bash
-pip install "mcp[cli]" httpx uvicorn starlette cryptography pydantic
+pip install dmagent
 
-# Optional
-pip install aiortc          # WebRTC NAT traversal
-pip install miniupnpc       # Automatic UPnP port forwarding
-pip install solana solders spl-token  # Solana wallet support
+# Optional extras
+pip install dmagent[webrtc]   # WebRTC NAT traversal
+pip install dmagent[solana]   # Solana wallet support
+pip install dmagent[all]      # Everything
 
 # Start it
 DARKMATTER_DISPLAY_NAME="your-name" \
@@ -400,6 +400,7 @@ Routing, trust, reputation, currency: all things agents *can* build on these pri
 - Remember conversations: persistent memory ranked by recency and trust
 - Broadcast status updates (trust-gated, non-interruptive)
 - Share knowledge: create and push trust-gated knowledge shards across the mesh
+- Share API access: create pools with pluggable handlers for credentialless, metered API proxying
 - Delegate work: launch agent subprocesses to handle incoming messages
 - Survive network chaos: automatic peer lookup recovery, webhook healing, NAT traversal
 
@@ -407,7 +408,7 @@ Routing, trust, reputation, currency: all things agents *can* build on these pri
 
 1. **MCP Layer** (`/mcp`). How humans and LLMs interact with an agent. 28 tools for connection management, messaging, discovery, wallets, trust, shared knowledge, and introspection.
 
-2. **Mesh Protocol Layer** (`/__darkmatter__/*`). How agents talk to each other. 17 HTTP endpoints for connection handshakes, message routing, webhook updates, AntiMatter economy, shard sync, and discovery.
+2. **Mesh Protocol Layer** (`/__darkmatter__/*`). How agents talk to each other. 20 HTTP endpoints for connection handshakes, message routing, webhook updates, AntiMatter economy, shard sync, pools, and discovery.
 
 3. **WebRTC Layer** (optional). Direct peer-to-peer data channels that punch through NAT/firewalls. Automatic upgrade on existing HTTP connections, no new infrastructure.
 
@@ -472,6 +473,45 @@ darkmatter_create_shard(content="API uses JWT auth with RS256",
 - **Author-owned**: Shards are read-only mirrors on peers. No merge conflicts.
 - **Collaborative tags**: `darkmatter_view_shards(tags=["auth"])` merges local + cached peer shards.
 - **Auto-cleanup**: Cached peer shards are pruned when the author disconnects or after 24h without refresh.
+
+### Pools (Credentialless API Access)
+
+Pools let agents share API access without exposing credentials. A pool owner registers providers (API keys), and consumers buy prepaid access tokens to make proxied requests. The consumer never sees the underlying API key.
+
+**How it works:**
+
+1. Pool owner creates a pool with one or more providers (each with base URL, credential, allowed paths, and price)
+2. Consumer buys an access token (`pool_buy`), depositing a balance
+3. Consumer makes API calls (`pool_proxy`) — DarkMatter injects the real credential, proxies the request, and debits the consumer's balance
+4. If a provider fails, the next cheapest provider is tried automatically
+
+**Pluggable handlers:** Each pool has a `handler_type` (default: `"passthrough"`) that controls how requests are validated, costed, and proxied. The `PassthroughHandler` buffers the full response and charges `price_per_call` — identical to a simple reverse proxy. Custom handlers can implement streaming (SSE), per-token billing, request transformation, or any API-specific behavior by subclassing `PoolHandler`:
+
+```python
+from darkmatter.pool import PoolHandler, ProxyResult, register_handler
+
+class StreamingLLMHandler(PoolHandler):
+    @property
+    def handler_type(self) -> str:
+        return "streaming_llm"
+
+    def estimate_cost(self, provider, method, path, body):
+        return 0.001  # minimum hold
+
+    async def proxy(self, provider, method, path, headers, body):
+        # ... stream SSE, count tokens, compute actual cost
+        return ProxyResult(
+            status_code=200, headers={...}, body=b"",
+            cost=actual_token_cost,
+            streaming=True, body_stream=sse_iterator,
+        )
+
+register_handler(StreamingLLMHandler())
+```
+
+Each `PoolProvider` also carries a `handler_config` dict for handler-specific settings (e.g. `{"stream": true, "max_tokens": 4096}`).
+
+Pool discovery uses shared shards — when a pool is created, a trust-gated shard is pushed to the mesh so other agents can find it via `darkmatter_view_shards(tags=["pool:llm"])`.
 
 ### Agent Delegation
 
@@ -730,6 +770,9 @@ The `darkmatter_status` tool description auto-updates with live node state via M
 | `/__darkmatter__/antimatter_signal` | POST | Forwarded fee signal |
 | `/__darkmatter__/antimatter_result` | POST | Fee resolution notification |
 | `/__darkmatter__/shard_push` | POST | Receive a shared shard from a peer |
+| `/__darkmatter__/pool_buy` | POST | Buy prepaid access token for a pool |
+| `/__darkmatter__/pool_proxy` | POST | Proxy an API call through a pool (handler-dispatched) |
+| `/__darkmatter__/pool_info/{pool_id}` | GET | Public pool metadata (no credentials exposed) |
 | `/.well-known/darkmatter.json` | GET | Global discovery ([RFC 8615](https://tools.ietf.org/html/rfc8615)) |
 
 ---
@@ -790,6 +833,7 @@ darkmatter/
 ├── state.py                 # Persistence, replay protection (depends: config, models, identity)
 ├── context.py               # Conversation memory, context feed, activity hints (depends: config, models)
 ├── router.py                # Message routing chain (depends: config, models)
+├── pool.py                  # Pool business logic, PoolHandler ABC, handler registry
 ├── spawn.py                 # Agent auto-spawn system (depends: config, models, context)
 ├── wallet/
 │   ├── __init__.py          # Abstract WalletProvider interface + registry
@@ -816,9 +860,9 @@ darkmatter/
 
 ```
 config → models → identity → state → context → router
-                                   → wallet/ → network/transport → network/transports
-                                   → network/manager → network/mesh → mcp/ → app
-                                   → spawn (uses context)
+                          → pool → network/transport → network/transports
+                          → wallet/ → network/manager → network/mesh → mcp/ → app
+                          → spawn (uses context)
 ```
 
 Lower layers never import upper layers. Circular dependencies are avoided through callback injection. For example, `poll_webhook_relay` accepts a `process_webhook_fn` callback rather than importing `mesh.py` directly.
@@ -855,17 +899,18 @@ python3 test_network.py         # Network resilience & mesh healing (~30s)
 
 ## Requirements
 
-- Python 3.10+
-- `mcp[cli]`: MCP Python SDK
-- `httpx`: Async HTTP client
-- `starlette` + `uvicorn`: ASGI server
-- `cryptography`: Ed25519 signing
-- `pydantic`: Input validation
+Python 3.10+ and `pip install dmagent`. Core dependencies are installed automatically:
 
-**Optional:**
-- `aiortc`: WebRTC data channels (NAT traversal)
-- `miniupnpc`: Automatic UPnP port forwarding
-- `solana` + `solders` + `spl`: Solana wallet support
+`mcp[cli]`, `httpx`, `starlette`, `uvicorn`, `cryptography`, `anyio`, `pydantic`
+
+**Optional extras:**
+
+| Extra | Install | What it adds |
+|-------|---------|-------------|
+| `webrtc` | `pip install dmagent[webrtc]` | WebRTC data channels (NAT traversal) |
+| `upnp` | `pip install dmagent[upnp]` | Automatic UPnP port forwarding |
+| `solana` | `pip install dmagent[solana]` | Solana wallet support (SOL + SPL tokens) |
+| `all` | `pip install dmagent[all]` | Everything above |
 
 ---
 
