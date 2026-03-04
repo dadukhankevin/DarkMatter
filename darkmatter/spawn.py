@@ -30,6 +30,7 @@ class SpawnedAgent:
     message_id: str
     spawned_at: float
     pid: int
+    spawn_dir: str = ""  # temp directory to clean up when agent exits
 
 
 _spawned_agents: list[SpawnedAgent] = []
@@ -85,6 +86,7 @@ def kill_agent(agent: SpawnedAgent, force: bool = False) -> None:
 
 def cleanup_finished_agents() -> None:
     """Remove finished agent processes from the tracking list."""
+    import shutil
     still_running = []
     for agent in _spawned_agents:
         if not is_agent_running(agent):
@@ -93,6 +95,11 @@ def cleanup_finished_agents() -> None:
                 f"(code={agent.process.returncode}, msg={agent.message_id[:12]}...)",
                 file=sys.stderr,
             )
+            if agent.spawn_dir:
+                try:
+                    shutil.rmtree(agent.spawn_dir, ignore_errors=True)
+                except Exception:
+                    pass
         else:
             still_running.append(agent)
     _spawned_agents.clear()
@@ -165,8 +172,24 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     for var in ACTIVE_CLIENT["env_cleanup"]:
         env.pop(var, None)
 
-    import random
-    env["DARKMATTER_PORT"] = str(random.randint(9200, 9299))
+    # Create a temp working directory with .mcp.json pointing to the parent's
+    # MCP server via HTTP. The child shares the parent's identity and inbox.
+    import tempfile
+    spawn_dir = tempfile.mkdtemp(prefix="darkmatter-spawn-")
+    mcp_config = {
+        "mcpServers": {
+            "darkmatter": {
+                "type": "http",
+                "url": f"http://127.0.0.1:{state.port}/mcp",
+            }
+        }
+    }
+    config_file = ACTIVE_CLIENT.get("config_file", ".mcp.json")
+    config_path = os.path.join(spawn_dir, config_file)
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    import json as _json
+    with open(config_path, "w") as f:
+        _json.dump(mcp_config, f)
 
     command = ACTIVE_CLIENT["command"]
     args = list(ACTIVE_CLIENT["args"])
@@ -191,7 +214,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             stdin=stdin_pipe,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=os.getcwd(),
+            cwd=spawn_dir,
         )
 
         if stdin_pipe is not None:
@@ -204,6 +227,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             message_id=msg.message_id,
             spawned_at=time.monotonic(),
             pid=process.pid,
+            spawn_dir=spawn_dir,
         )
         _spawned_agents.append(agent)
         _spawn_timestamps.append(time.monotonic())

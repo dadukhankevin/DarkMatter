@@ -56,6 +56,7 @@ from darkmatter.network.mesh import (
 from darkmatter.network.manager import NetworkManager, get_network_manager, set_network_manager
 from darkmatter.wallet.solana import get_solana_balance, send_solana_sol, send_solana_token
 import darkmatter.config
+import struct
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -64,6 +65,8 @@ import darkmatter.config
 PORT = int(os.environ.get("DARKMATTER_ENTRYPOINT_PORT", "8200"))
 SCAN_PORTS = list(range(8100, 8111)) + [PORT]  # scan 8100-8110 + our own port range
 MESSAGE_TIMEOUT_SECONDS = 120  # no webhook callback in 120s = failed
+DISCOVERY_MCAST_GROUP = "239.77.68.77"
+DISCOVERY_PORT = 8470
 
 # ---------------------------------------------------------------------------
 # Initialize DarkMatter state
@@ -273,20 +276,21 @@ def _display_name_for(agent_id):
 
 
 # ---------------------------------------------------------------------------
-# Discovery — scan local ports for DarkMatter agents
+# Discovery — scan local ports + listen for LAN multicast beacons
 # ---------------------------------------------------------------------------
 
 _discovered_agents = {}  # agent_id -> {url, display_name, bio, status, accepting, port}
+_lan_peers = {}  # agent_id -> {ip, port, display_name, bio, status, accepting, ts}
 _discovery_lock = threading.Lock()
 
 
-def _probe_port(port):
-    """Probe a single localhost port for a DarkMatter node."""
-    if port == PORT:
+def _probe_host_port(host, port):
+    """Probe a host:port for a DarkMatter node."""
+    if host in ("127.0.0.1", "localhost") and port == PORT:
         return None
     try:
         with httpx.Client(timeout=httpx.Timeout(0.5, connect=0.25)) as client:
-            resp = client.get(f"http://127.0.0.1:{port}/.well-known/darkmatter.json")
+            resp = client.get(f"http://{host}:{port}/.well-known/darkmatter.json")
             if resp.status_code != 200:
                 return None
             info = resp.json()
@@ -295,7 +299,7 @@ def _probe_port(port):
                 return None
             return {
                 "agent_id": peer_id,
-                "url": f"http://localhost:{port}",
+                "url": f"http://{host}:{port}",
                 "display_name": info.get("display_name") or _short_id(peer_id),
                 "bio": info.get("bio", ""),
                 "status": info.get("status", "active"),
@@ -307,10 +311,21 @@ def _probe_port(port):
 
 
 def _scan_local_agents():
-    """Scan all local ports for DarkMatter agents."""
+    """Scan localhost ports + known LAN peer IPs for DarkMatter agents."""
     results = {}
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        futures = {pool.submit(_probe_port, p): p for p in SCAN_PORTS}
+
+    # Build probe targets: localhost ports + LAN peer ip:port combos
+    targets = [("127.0.0.1", p) for p in SCAN_PORTS]
+    with _discovery_lock:
+        now = time.time()
+        for peer_id, info in list(_lan_peers.items()):
+            if now - info["ts"] > 90:
+                del _lan_peers[peer_id]
+                continue
+            targets.append((info["ip"], info["port"]))
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = {pool.submit(_probe_host_port, h, p): (h, p) for h, p in targets}
         for future in as_completed(futures):
             try:
                 result = future.result()
@@ -326,9 +341,88 @@ def _scan_local_agents():
     return results
 
 
-def _start_discovery_loop():
-    """Background thread that scans for agents every 15 seconds."""
+def _multicast_listener():
+    """Background thread: listen for UDP multicast beacons from LAN agents."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+
+    sock.bind(("", DISCOVERY_PORT))
+
+    # Join multicast group on all interfaces
+    mreq = struct.pack("4sL", socket.inet_aton(DISCOVERY_MCAST_GROUP), socket.INADDR_ANY)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    sock.settimeout(5.0)
+
     while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except Exception:
+            time.sleep(1)
+            continue
+
+        try:
+            packet = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+
+        if packet.get("proto") != "darkmatter":
+            continue
+        peer_id = packet.get("agent_id", "")
+        if not peer_id or peer_id == state.agent_id:
+            continue
+
+        source_ip = addr[0]
+        peer_port = packet.get("port", 8100)
+
+        with _discovery_lock:
+            _lan_peers[peer_id] = {
+                "ip": source_ip,
+                "port": peer_port,
+                "display_name": packet.get("display_name", _short_id(peer_id)),
+                "bio": packet.get("bio", ""),
+                "status": packet.get("status", "active"),
+                "accepting": packet.get("accepting", True),
+                "ts": time.time(),
+            }
+
+
+def _broadcast_beacon():
+    """Send a UDP multicast beacon so other LAN agents/entrypoints can find us."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        packet = json.dumps({
+            "proto": "darkmatter",
+            "v": PROTOCOL_VERSION,
+            "agent_id": state.agent_id,
+            "display_name": state.display_name or "Human",
+            "public_key_hex": getattr(state, "public_key_hex", ""),
+            "bio": (state.bio or "")[:100],
+            "port": PORT,
+            "status": state.status.value if hasattr(state.status, "value") else "active",
+            "accepting": len(state.connections) < MAX_CONNECTIONS,
+            "ts": int(time.time()),
+        }).encode("utf-8")
+        sock.sendto(packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT))
+        sock.close()
+    except Exception:
+        pass
+
+
+def _start_discovery_loop():
+    """Background thread that scans for agents every 15 seconds + broadcasts beacon."""
+    while True:
+        try:
+            _broadcast_beacon()
+        except Exception:
+            pass
         try:
             _scan_local_agents()
         except Exception:
@@ -336,9 +430,11 @@ def _start_discovery_loop():
         time.sleep(15)
 
 
-# Start discovery in background
+# Start discovery + multicast listener in background
 _discovery_thread = threading.Thread(target=_start_discovery_loop, daemon=True)
 _discovery_thread.start()
+_multicast_thread = threading.Thread(target=_multicast_listener, daemon=True)
+_multicast_thread.start()
 
 
 # ---------------------------------------------------------------------------
