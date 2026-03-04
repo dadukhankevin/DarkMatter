@@ -199,14 +199,17 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
     if prompt_style == "positional":
         args.append(prompt)
+        stdin_pipe = asyncio.subprocess.DEVNULL  # Don't inherit parent's stdin (may be MCP pipe)
     elif prompt_style == "stdin":
         stdin_pipe = asyncio.subprocess.PIPE
     elif prompt_style.startswith("flag:"):
         flag_name = prompt_style.split(":", 1)[1]
         args.extend([f"--{flag_name}", prompt])
+        stdin_pipe = asyncio.subprocess.DEVNULL
     else:
         print(f"[DarkMatter] Unknown prompt_style '{prompt_style}', falling back to positional", file=sys.stderr)
         args.append(prompt)
+        stdin_pipe = asyncio.subprocess.DEVNULL
 
     try:
         process = await asyncio.create_subprocess_exec(
