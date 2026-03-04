@@ -22,7 +22,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from darkmatter.config import (
-    AGENT_SPAWN_ENABLED,
     ANCHOR_NODES,
     MAX_AGENT_ID_LENGTH,
     MAX_BIO_LENGTH,
@@ -298,7 +297,8 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         save_state()
 
     # Spawn agent to handle the connection request
-    if AGENT_SPAWN_ENABLED and state.router_mode == "spawn":
+    import darkmatter.config as _cfg
+    if _cfg.AGENT_SPAWN_ENABLED and state.router_mode == "spawn":
         from darkmatter.spawn import spawn_agent_for_message
         display = from_agent_display_name or from_agent_id[:16] + "..."
         synthetic_msg = QueuedMessage(
@@ -783,7 +783,8 @@ async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict
 async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decision: RouterDecision) -> None:
     """Execute a router decision — spawn, forward, respond, or drop."""
     if decision.action == RouterAction.HANDLE:
-        if AGENT_SPAWN_ENABLED:
+        import darkmatter.config as _cfg
+        if _cfg.AGENT_SPAWN_ENABLED:
             from darkmatter.spawn import spawn_agent_for_message
             await spawn_agent_for_message(state, msg)
         # If spawn disabled, message stays in queue for manual handling

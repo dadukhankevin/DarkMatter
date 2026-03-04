@@ -53,6 +53,53 @@ def get_state() -> Optional[AgentState]:
     return _agent_state
 
 
+def sync_message_queue_from_disk() -> None:
+    """Reload message_queue from the on-disk state file into in-memory state.
+
+    This handles the case where the HTTP mesh server (running in a separate
+    process/session) has queued messages that the MCP session doesn't see
+    because its in-memory state was loaded at startup.
+
+    Merges by message_id — new messages from disk are appended, existing
+    messages are left untouched, and messages removed from memory (e.g.
+    by reply_to) are not re-added.
+    """
+    state = _agent_state
+    if state is None:
+        return
+
+    path = state_file_path()
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    disk_queue = data.get("message_queue", [])
+    if not disk_queue:
+        return
+
+    # Build set of message IDs already in memory
+    existing_ids = {m.message_id for m in state.message_queue}
+
+    for qd in disk_queue:
+        mid = qd.get("message_id", "")
+        if mid and mid not in existing_ids:
+            state.message_queue.append(QueuedMessage(
+                message_id=mid,
+                content=qd.get("content", ""),
+                webhook=qd.get("webhook", ""),
+                hops_remaining=qd.get("hops_remaining", 0),
+                metadata=qd.get("metadata", {}),
+                received_at=qd.get("received_at", ""),
+                from_agent_id=qd.get("from_agent_id"),
+                verified=qd.get("verified", False),
+            ))
+
+
 def set_state(state: AgentState) -> None:
     """Set the current agent state."""
     global _agent_state
@@ -225,7 +272,8 @@ def save_state() -> None:
         },
         "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
-        "router_mode": state.router_mode,
+        # router_mode is NOT persisted — it's set from config.AGENT_ROUTER_MODE on startup.
+        # Persisting it caused bugs where stale state files overrode the intended mode.
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
         "superagent_url": state.superagent_url,
         "gas_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
@@ -508,7 +556,8 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         },
         rate_limit_global=data.get("rate_limit_global", 0),
         inactive_until=data.get("inactive_until"),
-        router_mode=data.get("router_mode") or "spawn",
+        # router_mode not loaded from disk — set by config.AGENT_ROUTER_MODE in app.py init_state()
+        router_mode="spawn",  # default; overridden by init_state() immediately after load
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
         superagent_url=data.get("superagent_url"),
         antimatter_log=data.get("gas_log", []),

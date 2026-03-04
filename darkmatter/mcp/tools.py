@@ -41,7 +41,7 @@ from darkmatter.mcp.schemas import (
     CreateShardInput,
     ViewShardsInput,
 )
-from darkmatter.state import get_state, save_state
+from darkmatter.state import get_state, save_state, sync_message_queue_from_disk
 from darkmatter.context import log_conversation
 from darkmatter.config import (
     MAX_CONNECTIONS,
@@ -349,6 +349,7 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
 
 async def _forward_message(state, params: SendMessageInput) -> str:
     """Forward a queued message to one or more connected agents. Removes from queue after delivery."""
+    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
     # Find the message in the queue
     msg = None
     msg_index = None
@@ -492,6 +493,7 @@ async def _forward_message(state, params: SendMessageInput) -> str:
 
 async def _reply_to_message(state, params: SendMessageInput) -> str:
     """Reply to a queued message by calling its webhook with the response content."""
+    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
     # Find and remove the message from the queue
     msg = None
     for i, m in enumerate(state.message_queue):
@@ -800,6 +802,7 @@ async def get_identity(ctx: Context) -> str:
         JSON with agent identity and telemetry.
     """
     track_session(ctx)
+    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
     state = get_state()
     passport_path = os.path.join(os.getcwd(), ".darkmatter", "passport.key")
     result = {
@@ -948,6 +951,7 @@ async def list_inbox(ctx: Context) -> str:
     Returns:
         JSON array of queued messages.
     """
+    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
     state = get_state()
     messages = []
     for msg in state.message_queue:
@@ -991,6 +995,7 @@ async def get_message(params: GetMessageInput, ctx: Context) -> str:
     Returns:
         JSON with message details.
     """
+    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
     state = get_state()
 
     for msg in state.message_queue:
@@ -1991,5 +1996,6 @@ async def live_status(ctx: Context) -> str:
     LIVE STATUS: Waiting for first status update... This will show live node state and action items you should respond to.
     """
     track_session(ctx)
+    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
     from darkmatter.mcp.visibility import build_status_line
     return build_status_line()

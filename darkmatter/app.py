@@ -20,6 +20,7 @@ from darkmatter.config import (
     DISCOVERY_PORT,
     DISCOVERY_MCAST_GROUP,
     DISCOVERY_LOCAL_PORTS,
+    AGENT_ROUTER_MODE,
     AGENT_SPAWN_ENABLED,
     AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
@@ -117,12 +118,13 @@ def init_state(port: int = None) -> None:
     restored = load_state_from_file(path)
 
     if restored:
-        # Restore state but enforce passport-derived identity
+        # Restore state but enforce passport-derived identity and spawn mode
         restored.agent_id = agent_id  # Always use passport-derived ID
         restored.private_key_hex = priv
         restored.public_key_hex = pub
         restored.port = port
         restored.status = AgentStatus.ACTIVE
+        restored.router_mode = AGENT_ROUTER_MODE  # From config — don't let stale state override
         if display_name:
             restored.display_name = display_name
         elif not restored.display_name:

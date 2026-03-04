@@ -86,8 +86,7 @@ os.environ.setdefault("DARKMATTER_PORT", str(PORT))
 
 init_state(PORT)
 os.chdir(_original_cwd)
-get_state().router_mode = "queue_only"
-darkmatter.config.AGENT_SPAWN_ENABLED = False  # human node — no agent spawning
+get_state().router_mode = "queue_only"  # entrypoint queues for human — agents handle their own spawn mode
 
 # Set up a NetworkManager for public URL discovery and NAT detection
 _mgr = NetworkManager(state_getter=get_state, state_saver=save_state)
@@ -764,8 +763,8 @@ def dm_accept_pending():
 def dm_message():
     data = request.get_json(silent=True) or {}
 
-    # Use shared validation/queuing logic. router_mode is "queue_only"
-    # so messages queue for the human to read and respond to.
+    # Use shared validation/queuing logic from darkmatter.network.mesh.
+    # router_mode is "queue_only" — messages queue for the human to read.
     loop = asyncio.new_event_loop()
     try:
         result, status = loop.run_until_complete(_process_incoming_message(state, data))

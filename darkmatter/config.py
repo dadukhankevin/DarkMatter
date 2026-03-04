@@ -165,6 +165,10 @@ SUPERAGENT_DEFAULT_URL = os.environ.get(
 # Agent Auto-Spawn
 # =============================================================================
 
+# Router mode: "spawn" (auto-spawn agents), "queue_only" (hold for manual handling),
+# "rules_first" (rules then queue), "rules_only" (rules only).
+AGENT_ROUTER_MODE = os.environ.get("DARKMATTER_ROUTER_MODE", "spawn")
+
 AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
 AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
 AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "6"))

@@ -48,7 +48,8 @@ def get_spawned_agents() -> list[SpawnedAgent]:
 
 def can_spawn_agent() -> tuple[bool, str]:
     """Check whether we can spawn a new agent subprocess."""
-    if not AGENT_SPAWN_ENABLED:
+    import darkmatter.config as _cfg
+    if not _cfg.AGENT_SPAWN_ENABLED:
         return False, "Agent spawning is disabled (DARKMATTER_AGENT_ENABLED=false)"
 
     cleanup_finished_agents()
