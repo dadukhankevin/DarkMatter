@@ -92,7 +92,7 @@ def build_status_line() -> str:
         active_ids = [sm.message_id for sm in state.sent_messages.values() if sm.status == "active"]
         id_hint = active_ids[0] if len(active_ids) == 1 else active_ids[0]
         actions.append(
-            f"{sent_active} sent message(s) awaiting response — use darkmatter_wait_for_response(message_id='{id_hint}') to block until a reply arrives, or darkmatter_list_messages to check all"
+            f"{sent_active} sent message(s) awaiting response — use darkmatter_wait_for_message(message_id='{id_hint}') to block until a reply arrives"
         )
     if conns == 0:
         actions.append(
@@ -133,56 +133,11 @@ def build_status_line() -> str:
 
 
 def compute_visible_optional() -> set:
-    """Compute which optional tools should be visible based on current agent state."""
-    state = get_state()
-    if state is None:
-        return set()
+    """Compute which optional tools should be visible based on current agent state.
 
-    visible = set()
-    conns = len(state.connections)
-    pending = len(state.pending_requests)
-    has_sent = bool(state.sent_messages)
-
-    if conns > 0 or pending > 0:
-        visible.update({
-            "darkmatter_set_impression",
-            "darkmatter_get_impression",
-        })
-
-    if conns < 2:
-        visible.update({
-            "darkmatter_discover_domain",
-            "darkmatter_discover_local",
-            "darkmatter_network_info",
-        })
-
-    if has_sent:
-        visible.update({
-            "darkmatter_list_messages",
-            "darkmatter_get_sent_message",
-            "darkmatter_expire_message",
-        })
-
-    if state.status == AgentStatus.INACTIVE:
-        visible.add("darkmatter_set_status")
-
-    if conns >= 3:
-        visible.add("darkmatter_set_rate_limit")
-
-    # Shard tools: always show create, show view if any shards exist
-    if conns > 0:
-        visible.add("darkmatter_create_shard")
-    if state.shared_shards:
-        visible.add("darkmatter_view_shards")
-
-    if state.wallets:
-        visible.add("darkmatter_wallet_balances")
-        if "solana" in state.wallets and SOLANA_AVAILABLE:
-            visible.add("darkmatter_get_balance")
-            if conns > 0:
-                visible.update({"darkmatter_send_sol", "darkmatter_send_token", "darkmatter_wallet_send"})
-
-    return visible
+    All tools are now CORE (always visible). Non-core operations moved to HTTP API + skill.
+    """
+    return set()
 
 
 async def notify_tools_changed() -> None:

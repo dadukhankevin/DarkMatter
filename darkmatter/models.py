@@ -318,6 +318,8 @@ class AgentState:
     inactive_until: Optional[str] = None
     # Response waiters (ephemeral)
     _response_events: dict[str, list[asyncio.Event]] = field(default_factory=dict)
+    # Inbox waiters — agents blocking on wait_for_response for new inbound messages
+    _inbox_events: list[asyncio.Event] = field(default_factory=list)
     # Extensible message routing
     routing_rules: list = field(default_factory=list)
     router_mode: str = "spawn"

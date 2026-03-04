@@ -180,3 +180,9 @@ class ViewShardsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     tags: Optional[list[str]] = Field(default=None, description="Filter by tags (ANY match, prefix matching — 'pool' matches 'pool:llm')")
     author: Optional[str] = Field(default=None, description="Filter by author agent ID")
+
+
+class GenomeInstallInput(BaseModel):
+    """Install a peer's genome over the local darkmatter/ package."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., description="The connected agent to install genome from")

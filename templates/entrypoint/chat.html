@@ -925,8 +925,11 @@ function renderFeedItem(item) {
 
   if (item.type === 'outbound') {
     const tint = agentTint(selfAgentId);
+    const isFailed = item.status === 'failed' || item.status === 'timed_out';
+    const failUpdate = isFailed ? (item.updates || []).find(u => u.type === 'delivery_failed' || u.type === 'timed_out') : null;
+    const failReason = failUpdate ? (failUpdate.error || failUpdate.type) : (isFailed ? item.status : '');
     el.innerHTML = `
-      <div class="msg-block msg-block-out" style="background:${tint}">
+      <div class="msg-block msg-block-out" style="background:${tint}" data-status="${item.status}">
         <div class="flex items-baseline gap-3 mb-1.5">
           <span class="msg-sender text-primary">You</span>
           ${item.routed_to_names.length ? `<span class="msg-meta">&rarr; ${esc(item.routed_to_names.join(', '))}</span>` : ''}
@@ -934,7 +937,35 @@ function renderFeedItem(item) {
         </div>
         <div class="msg-content">${renderMd(item.content)}</div>
         ${renderAttachmentsInMessage(item.attachments)}
+        ${isFailed ? `
+          <div class="mt-2 px-3 py-2 rounded-lg text-[12px] flex items-center gap-2 flex-wrap" style="background: ${item.status === 'timed_out' ? 'rgba(255,149,0,0.15)' : 'rgba(255,59,48,0.15)'}; color: ${item.status === 'timed_out' ? '#FF9500' : '#FF3B30'}">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="shrink-0"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+            <span class="flex-1 min-w-0 truncate">${item.status === 'timed_out' ? 'Timed out' : 'Delivery failed'}${failReason && failReason !== item.status ? ': ' + esc(failReason) : ''}</span>
+            <button class="retry-btn text-[11px] font-semibold px-3 py-1 rounded-md transition-all hover:opacity-80 shrink-0" style="background: ${item.status === 'timed_out' ? '#FF9500' : '#FF3B30'}; color: white" data-message-id="${item.message_id}">Retry</button>
+          </div>` : ''}
       </div>`;
+    const retryBtn = el.querySelector('.retry-btn');
+    if (retryBtn) {
+      retryBtn.addEventListener('click', async () => {
+        retryBtn.disabled = true;
+        retryBtn.textContent = 'Retrying...';
+        try {
+          const result = await ajaxPost(`/retry/${encodeURIComponent(item.message_id)}`, {});
+          if (result.success) {
+            showToast('Message re-sent', 'success');
+            pollServer();
+          } else {
+            showToast(result.error || 'Retry failed', 'error');
+            retryBtn.disabled = false;
+            retryBtn.textContent = 'Retry';
+          }
+        } catch (err) {
+          showToast('Retry failed', 'error');
+          retryBtn.disabled = false;
+          retryBtn.textContent = 'Retry';
+        }
+      });
+    }
   } else if (item.type === 'inbound') {
     const aColor = agentColor(item.from_agent_id);
     const tint = agentTint(item.from_agent_id);
@@ -1052,12 +1083,15 @@ function buildStatusDot(status, updates) {
   if (!updates || !updates.length) {
     if (status === 'pending') return '<div class="w-1.5 h-1.5 rounded-full bg-muted"></div>';
     if (status === 'delivered') return '<div class="w-1.5 h-1.5 rounded-full bg-accent-green"></div>';
+    if (status === 'failed') return '<div class="w-1.5 h-1.5 rounded-full bg-accent-red" title="failed"></div>';
+    if (status === 'timed_out') return '<div class="w-1.5 h-1.5 rounded-full bg-accent-yellow" title="timed out"></div>';
     return '';
   }
   const lastType = updates[updates.length - 1].type;
   const colors = {
     received: 'bg-accent-blue', responding: 'bg-accent-yellow animate-pulse',
     forwarded: 'bg-accent-purple', expired: 'bg-accent-red',
+    delivery_failed: 'bg-accent-red', timed_out: 'bg-accent-yellow',
   };
   return `<div class="w-1.5 h-1.5 rounded-full ${colors[lastType] || 'bg-muted'}" title="${lastType}"></div>`;
 }
@@ -1177,9 +1211,17 @@ function renderFeed(data) {
       // Update existing outbound status
       if (item.type === 'outbound') {
         const existing = renderedFeedItems.get(item.id);
-        const dot = existing.querySelector('.msg-meta [class*="rounded-full"]');
-        if (dot) dot.outerHTML = buildStatusDot(item.status, item.updates);
-        // Update responses count? We add them as separate items, so no need.
+        const prevStatus = existing.querySelector('.msg-block')?.dataset.status;
+        if (prevStatus !== item.status && (item.status === 'failed' || item.status === 'timed_out')) {
+          // Full re-render to show failure banner
+          const newEl = renderFeedItem(item);
+          newEl.dataset.feedId = item.id;
+          existing.replaceWith(newEl);
+          renderedFeedItems.set(item.id, newEl);
+        } else {
+          const dot = existing.querySelector('.msg-meta [class*="rounded-full"]');
+          if (dot) dot.outerHTML = buildStatusDot(item.status, item.updates);
+        }
       }
       continue;
     }
@@ -1602,6 +1644,22 @@ function onPollData(data) {
   renderConnections(data.connections);
   renderContextPanel(data);
   renderFeed(data);
+
+  // Update route-dot to reflect target agent health
+  const curTarget = targetValue.value;
+  if (curTarget && curTarget !== 'auto' && curTarget !== 'broadcast') {
+    const targetConn = (data.connections || []).find(c => c.agent_id === curTarget);
+    const dot = document.getElementById('route-dot');
+    if (dot) {
+      if (!targetConn || targetConn.health_status === 'unreachable') {
+        dot.style.background = '#FF3B30';
+        dot.title = 'Target unreachable';
+      } else {
+        dot.style.background = 'var(--accent-blue)';
+        dot.title = '';
+      }
+    }
+  }
 
   // QR code init
   if (data.self && data.self.lan_url && !qrInitialized) {

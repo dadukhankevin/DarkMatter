@@ -14,6 +14,7 @@ from typing import Optional
 
 import httpx
 
+import darkmatter
 from darkmatter.filelock import lock_exclusive_nb, unlock
 from darkmatter.config import (
     DEFAULT_PORT,
@@ -122,6 +123,8 @@ async def handle_well_known(request) -> "JSONResponse":
         "mesh_url": f"{public_url}/__darkmatter__",
         "mcp_url": f"{public_url}/mcp",
         "webrtc_enabled": WEBRTC_AVAILABLE,
+        "genome_version": darkmatter.__genome_version__ or f"stock:{darkmatter.__version__}",
+        "genome_author": darkmatter.__genome_author__,
     })
 
 

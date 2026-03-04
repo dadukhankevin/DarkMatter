@@ -40,6 +40,7 @@ DOMAIN_SDP = "darkmatter.sdp.v1"
 DOMAIN_SHARD = "darkmatter.shard.v1"
 DOMAIN_LAN_BEACON = "darkmatter.lan_beacon.v1"
 DOMAIN_CHALLENGE_RESPONSE = "darkmatter.challenge_response.v1"
+DOMAIN_GENOME = "darkmatter.genome.v1"
 
 E2E_HKDF_INFO = b"darkmatter-e2e-v1"
 
@@ -471,6 +472,18 @@ def verify_lan_beacon(public_key_hex: str, signature_hex: str,
     """Verify a LAN beacon signature."""
     return verify_signed_payload(public_key_hex, signature_hex,
                                  DOMAIN_LAN_BEACON, agent_id, port, timestamp)
+
+
+def sign_genome(private_key_hex: str, genome_version: str, genome_hash: str) -> str:
+    """Sign a genome zip. Returns signature hex."""
+    return sign_payload(private_key_hex, DOMAIN_GENOME, genome_version, genome_hash)
+
+
+def verify_genome_signature(public_key_hex: str, signature_hex: str,
+                            genome_version: str, genome_hash: str) -> bool:
+    """Verify a genome zip's signature."""
+    return verify_signed_payload(public_key_hex, signature_hex,
+                                 DOMAIN_GENOME, genome_version, genome_hash)
 
 
 # =============================================================================

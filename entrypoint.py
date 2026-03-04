@@ -205,40 +205,48 @@ def _message_timeout_checker():
                         conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
                 dirty = True
 
-        # Flag unreachable peers based on consecutive recent failures
-        # and probe unreachable ones for recovery
-        for conn in list(state.connections.values()):
-            if conn.agent_id == state.agent_id:
-                continue
-            was_unreachable = getattr(conn, "health_status", "ok") == "unreachable"
-            consecutive = getattr(conn, "_consecutive_failures", 0)
-
-            if consecutive >= 2:
-                if not was_unreachable:
-                    conn.health_status = "unreachable"
-                    dirty = True
-                else:
-                    # Already unreachable — try a lightweight recovery ping
-                    try:
-                        base = _resolve_base_url(conn)
-                        with httpx.Client(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
-                            resp = client.get(base + "/.well-known/darkmatter.json")
-                            if resp.status_code == 200:
-                                conn.health_status = "ok"
-                                conn._consecutive_failures = 0
-                                conn.messages_declined = 0
-                                dirty = True
-                    except Exception:
-                        pass  # Still dead
-            elif was_unreachable:
-                conn.health_status = "ok"
-                dirty = True
-
         if dirty:
             save_state()
 
 
 threading.Thread(target=_message_timeout_checker, daemon=True).start()
+
+
+HEALTH_CHECK_INTERVAL = 15  # seconds between heartbeat pings
+
+
+def _health_check_loop():
+    """Proactively ping all connected agents to detect online/offline status."""
+    while True:
+        time.sleep(HEALTH_CHECK_INTERVAL)
+        dirty = False
+        for conn in list(state.connections.values()):
+            if conn.agent_id == state.agent_id:
+                continue
+            try:
+                base = _resolve_base_url(conn)
+                with httpx.Client(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+                    resp = client.get(base + "/.well-known/darkmatter.json")
+                    if resp.status_code == 200:
+                        if getattr(conn, "health_status", "ok") != "ok":
+                            conn.health_status = "ok"
+                            conn._consecutive_failures = 0
+                            dirty = True
+                    else:
+                        conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
+                        if conn._consecutive_failures >= 2 and getattr(conn, "health_status", "ok") != "unreachable":
+                            conn.health_status = "unreachable"
+                            dirty = True
+            except Exception:
+                conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
+                if conn._consecutive_failures >= 2 and getattr(conn, "health_status", "ok") != "unreachable":
+                    conn.health_status = "unreachable"
+                    dirty = True
+        if dirty:
+            save_state()
+
+
+threading.Thread(target=_health_check_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1213,6 +1221,27 @@ def send():
         return jsonify(result)
     threading.Thread(target=_sync_send_message, args=(content, target_id), kwargs={"metadata": metadata if metadata else None}, daemon=True).start()
     return redirect(url_for("index"))
+
+
+@app.route("/retry/<message_id>", methods=["POST"])
+def retry(message_id):
+    """Re-send a failed or timed-out message."""
+    old = state.sent_messages.get(message_id)
+    if not old:
+        return jsonify({"success": False, "error": "Message not found"}), 404
+    if old.status not in ("failed", "timed_out"):
+        return jsonify({"success": False, "error": f"Message status is '{old.status}', not retryable"}), 400
+
+    content = old.content
+    target_id = old.routed_to[0] if old.routed_to else None
+    metadata = old.metadata
+
+    # Remove the old failed message
+    del state.sent_messages[message_id]
+    save_state()
+
+    result = _sync_send_message(content, target_id, metadata=metadata if metadata else None)
+    return jsonify(result)
 
 
 @app.route("/respond/<message_id>", methods=["POST"])

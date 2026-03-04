@@ -7,11 +7,10 @@ Depends on: mcp/__init__, mcp/schemas, config, models, identity, state,
 
 import asyncio
 import json
-import os
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -23,21 +22,6 @@ from darkmatter.mcp.schemas import (
     ConnectionInput,
     SendMessageInput,
     UpdateBioInput,
-    SetStatusInput,
-    GetMessageInput,
-    GetSentMessageInput,
-    ExpireMessageInput,
-    WaitForResponseInput,
-    DiscoverDomainInput,
-    SetImpressionInput,
-    GetImpressionInput,
-    SetSuperagentInput,
-    SendSolInput,
-    SendTokenInput,
-    GetBalanceInput,
-    WalletBalancesInput,
-    WalletSendInput,
-    SetRateLimitInput,
     CreateShardInput,
     ViewShardsInput,
 )
@@ -45,21 +29,12 @@ from darkmatter.state import get_state, save_state, sync_message_queue_from_disk
 from darkmatter.context import log_conversation
 from darkmatter.config import (
     MAX_CONNECTIONS,
-    DEFAULT_RATE_LIMIT_PER_CONNECTION,
-    DEFAULT_RATE_LIMIT_GLOBAL,
-    SUPERAGENT_DEFAULT_URL,
     WEBRTC_AVAILABLE,
-    DISCOVERY_MAX_AGE,
-    ANTIMATTER_RATE,
     TRUST_MESSAGE_SENT,
-    SOLANA_AVAILABLE,
-    SOLANA_RPC_URL,
-    LAMPORTS_PER_SOL,
 )
 from darkmatter.identity import (
     validate_url,
     validate_webhook_url,
-    is_private_ip,
 )
 from darkmatter.security import sign_message, prepare_outbound
 from darkmatter.models import (
@@ -67,7 +42,6 @@ from darkmatter.models import (
     Connection,
     SentMessage,
     SharedShard,
-    Impression,
 )
 from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
 from darkmatter.network.mesh import (
@@ -76,22 +50,10 @@ from darkmatter.network.mesh import (
     notify_connection_accepted,
     process_accept_pending,
 )
-from darkmatter.wallet.solana import (
-    get_solana_balance,
-    send_solana_sol,
-    send_solana_token,
-    _resolve_spl_token,
-)
 from darkmatter.wallet.antimatter import (
     adjust_trust,
     auto_disconnect_peer,
-    get_superagent_wallet,
-    _superagent_wallet_cache,
 )
-
-# Conditional Solana imports for wallet_balances tool
-if SOLANA_AVAILABLE:
-    from darkmatter.config import SolanaPubkey, SolanaClient
 
 
 # =============================================================================
@@ -343,7 +305,7 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
         if not sent_to:
             result["error"] = f"Message could not be delivered to any of {len(failed)} target(s). Check 'failed' for details."
     if sent_to:
-        result["next_step"] = f"IMPORTANT: Call darkmatter_wait_for_response(message_id='{message_id}') now to receive the reply. Do not poll — this blocks efficiently until the response arrives."
+        result["next_step"] = f"IMPORTANT: Call darkmatter_wait_for_message(message_id='{message_id}') now to receive the reply. Do not poll — this blocks efficiently until the response arrives."
     return json.dumps(result)
 
 
@@ -743,216 +705,51 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     return json.dumps({"success": True, "bio": state.bio})
 
 
+# =============================================================================
+# Inbox Tool (merged list + get)
+# =============================================================================
+
 @mcp.tool(
-    name="darkmatter_set_status",
+    name="darkmatter_inbox",
     annotations={
-        "title": "Set Agent Status",
-        "readOnlyHint": False,
+        "title": "View Inbox",
+        "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     }
 )
-async def set_status(params: SetStatusInput, ctx: Context) -> str:
-    """Set this agent's status to active or inactive.
+async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
+    """List all incoming messages, or get full details of a specific message.
 
-    Inactive agents don't appear as available to their connections.
-    Inactive with no duration defaults to 60 minutes. Use duration_minutes to customize.
-    Setting active clears any pending auto-reactivation timer.
+    Without message_id: returns summaries of all queued messages.
+    With message_id: returns full content of that specific message.
 
     Args:
-        params: Contains the status ('active' or 'inactive') and optional duration_minutes.
+        message_id: Optional message ID to get full details for.
 
     Returns:
-        JSON confirming the status change.
+        JSON with message list or single message details.
     """
+    sync_message_queue_from_disk()
     state = get_state()
-    state.status = params.status
 
-    if params.status == AgentStatus.INACTIVE:
-        duration = params.duration_minutes or 60
-        reactivate_at = datetime.now(timezone.utc) + timedelta(minutes=duration)
-        state.inactive_until = reactivate_at.isoformat()
-        save_state()
-        return json.dumps({"success": True, "status": "inactive", "inactive_until": state.inactive_until, "duration_minutes": duration})
-    else:
-        state.inactive_until = None
-        save_state()
-        return json.dumps({"success": True, "status": "active"})
+    if message_id:
+        for msg in state.message_queue:
+            if msg.message_id == message_id:
+                return json.dumps({
+                    "message_id": msg.message_id,
+                    "content": msg.content,
+                    "webhook": msg.webhook,
+                    "hops_remaining": msg.hops_remaining,
+                    "can_forward": msg.hops_remaining > 0,
+                    "from_agent_id": msg.from_agent_id,
+                    "verified": msg.verified,
+                    "metadata": msg.metadata,
+                    "received_at": msg.received_at,
+                })
+        return json.dumps({"success": False, "error": f"No queued message with ID '{message_id}'."})
 
-
-# =============================================================================
-# Introspection Tools (local telemetry)
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_get_identity",
-    annotations={
-        "title": "Get Agent Identity",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def get_identity(ctx: Context) -> str:
-    """Get this agent's identity, bio, status, and basic stats.
-
-    Returns:
-        JSON with agent identity and telemetry.
-    """
-    track_session(ctx)
-    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
-    state = get_state()
-    passport_path = os.path.join(os.getcwd(), ".darkmatter", "passport.key")
-    result = {
-        "agent_id": state.agent_id,
-        "display_name": state.display_name,
-        "public_key_hex": state.public_key_hex,
-        "passport_path": passport_path,
-        "bio": state.bio,
-        "status": state.status.value,
-        "port": state.port,
-        "num_connections": len(state.connections),
-        "num_pending_requests": len(state.pending_requests),
-        "messages_handled": state.messages_handled,
-        "message_queue_size": len(state.message_queue),
-        "sent_messages_count": len(state.sent_messages),
-        "created_at": state.created_at,
-    }
-    if state.wallets:
-        result["wallets"] = state.wallets
-    result["superagent_url"] = state.superagent_url or SUPERAGENT_DEFAULT_URL
-    return json.dumps(result)
-
-
-@mcp.tool(
-    name="darkmatter_list_connections",
-    annotations={
-        "title": "List Connections",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def list_connections(ctx: Context) -> str:
-    """List all current connections with telemetry data.
-
-    Shows each connection's agent ID, bio, message counts,
-    response times, and last activity.
-
-    Returns:
-        JSON array of connection details.
-    """
-    state = get_state()
-    connections = []
-
-    def _truncate(text: str, max_words: int = 20) -> str:
-        words = text.split()
-        if len(words) <= max_words:
-            return text
-        return " ".join(words[:max_words]) + "..."
-
-    for conn in state.connections.values():
-        entry = {
-            "agent_id": conn.agent_id,
-            "display_name": conn.agent_display_name,
-            "agent_url": conn.agent_url,
-            "bio_summary": _truncate(conn.agent_bio, 250) if conn.agent_bio else None,
-            "crypto": conn.agent_public_key_hex is not None,
-            "identity_verified": conn.identity_verified,
-            "tls_secure": conn.tls_secure,
-            "transport": conn.transport,
-            "connectivity_level": conn.connectivity_level,
-            "connectivity_method": conn.connectivity_method,
-            "connected_at": conn.connected_at,
-            "messages_sent": conn.messages_sent,
-            "messages_received": conn.messages_received,
-            "messages_declined": conn.messages_declined,
-            "avg_response_time_ms": round(conn.avg_response_time_ms, 2),
-            "last_activity": conn.last_activity,
-            "rate_limit": conn.rate_limit if conn.rate_limit != 0 else DEFAULT_RATE_LIMIT_PER_CONNECTION,
-        }
-        if conn.wallets:
-            entry["wallets"] = conn.wallets
-        impression = state.impressions.get(conn.agent_id)
-        if impression:
-            entry["score"] = impression.score
-            if impression.note:
-                entry["note"] = _truncate(impression.note, 500)
-        connections.append(entry)
-
-    return json.dumps({
-        "total": len(connections),
-        "max_connections": MAX_CONNECTIONS,
-        "connections": connections,
-    })
-
-
-@mcp.tool(
-    name="darkmatter_list_pending_requests",
-    annotations={
-        "title": "List Pending Connection Requests",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def list_pending_requests(ctx: Context) -> str:
-    """List all pending incoming connection requests.
-
-    Returns:
-        JSON array of pending connection requests.
-    """
-    state = get_state()
-    requests = []
-    for req in state.pending_requests.values():
-        entry = {
-            "request_id": req.request_id,
-            "from_agent_id": req.from_agent_id,
-            "from_agent_display_name": req.from_agent_display_name,
-            "from_agent_url": req.from_agent_url,
-            "from_agent_bio": req.from_agent_bio,
-            "crypto": req.from_agent_public_key_hex is not None,
-            "requested_at": req.requested_at,
-        }
-        if req.peer_trust is not None:
-            entry["peer_trust"] = req.peer_trust
-        requests.append(entry)
-
-    return json.dumps({
-        "total": len(requests),
-        "requests": requests,
-        "reminder": "Remember to set impressions for your connections — your peers rely on your scores to make trust decisions.",
-    })
-
-
-# =============================================================================
-# Inbox Tools (incoming messages)
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_list_inbox",
-    annotations={
-        "title": "List Inbox Messages",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def list_inbox(ctx: Context) -> str:
-    """List all incoming messages in the queue waiting to be processed.
-
-    Shows message summaries. Use darkmatter_get_message for full content.
-
-    Returns:
-        JSON array of queued messages.
-    """
-    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
-    state = get_state()
     messages = []
     for msg in state.message_queue:
         messages.append({
@@ -966,868 +763,27 @@ async def list_inbox(ctx: Context) -> str:
             "metadata": msg.metadata,
             "received_at": msg.received_at,
         })
-
     return json.dumps({"total": len(messages), "messages": messages})
 
 
-# =============================================================================
-# Message Detail Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_get_message",
-    annotations={
-        "title": "Get Message Details",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def get_message(params: GetMessageInput, ctx: Context) -> str:
-    """Get full details of a specific queued message.
-
-    Shows full content and metadata. For routing context, GET the webhook URL.
-
-    Args:
-        params: Contains message_id to inspect.
-
-    Returns:
-        JSON with message details.
-    """
-    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
-    state = get_state()
-
-    for msg in state.message_queue:
-        if msg.message_id == params.message_id:
-            return json.dumps({
-                "message_id": msg.message_id,
-                "content": msg.content,
-                "webhook": msg.webhook,
-                "hops_remaining": msg.hops_remaining,
-                "can_forward": msg.hops_remaining > 0,
-                "from_agent_id": msg.from_agent_id,
-                "verified": msg.verified,
-                "metadata": msg.metadata,
-                "received_at": msg.received_at,
-            })
-
-    return json.dumps({
-        "success": False,
-        "error": f"No queued message with ID '{params.message_id}'."
-    })
-
-
-# =============================================================================
-# Sent Message Tracking Tools
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_list_messages",
-    annotations={
-        "title": "List Sent Messages",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def list_messages(ctx: Context) -> str:
-    """List messages this agent has sent into the mesh.
-
-    Shows message summaries with status and routing info.
-    Use darkmatter_get_sent_message for full details.
-
-    Returns:
-        JSON array of sent messages.
-    """
-    state = get_state()
-    messages = []
-    for sm in state.sent_messages.values():
-        forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
-
-        messages.append({
-            "message_id": sm.message_id,
-            "content": sm.content[:200] + ("..." if len(sm.content) > 200 else ""),
-            "status": sm.status,
-            "initial_hops": sm.initial_hops,
-            "forwarding_count": forwarding_count,
-            "updates_count": len(sm.updates),
-            "created_at": sm.created_at,
-        })
-
-    return json.dumps({"total": len(messages), "messages": messages})
-
-
-@mcp.tool(
-    name="darkmatter_get_sent_message",
-    annotations={
-        "title": "Get Sent Message Details",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def get_sent_message(params: GetSentMessageInput, ctx: Context) -> str:
-    """Get full details of a sent message including all webhook updates received.
-
-    Shows the complete routing history: which agents forwarded it, any notes
-    they attached, and the final response if one has been received.
-
-    Args:
-        params: Contains message_id to inspect.
-
-    Returns:
-        JSON with full sent message details.
-    """
-    state = get_state()
-
-    sm = state.sent_messages.get(params.message_id)
-    if not sm:
-        return json.dumps({
-            "success": False,
-            "error": f"No sent message with ID '{params.message_id}'."
-        })
-
-    forwarding_count = sum(1 for u in sm.updates if u.get("type") == "forwarded")
-
-    return json.dumps({
-        "message_id": sm.message_id,
-        "content": sm.content,
-        "status": sm.status,
-        "initial_hops": sm.initial_hops,
-        "forwarding_count": forwarding_count,
-        "routed_to": sm.routed_to,
-        "created_at": sm.created_at,
-        "updates": sm.updates,
-        "responses": sm.responses,
-    })
-
-
-@mcp.tool(
-    name="darkmatter_expire_message",
-    annotations={
-        "title": "Expire Sent Message",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def expire_message(params: ExpireMessageInput, ctx: Context) -> str:
-    """Expire a sent message so agents in the mesh stop forwarding it.
-
-    Agents that check the webhook status before forwarding will see the
-    message is expired and remove it from their queues.
-
-    Args:
-        params: Contains message_id to expire.
-
-    Returns:
-        JSON confirming the expiry.
-    """
-    state = get_state()
-
-    sm = state.sent_messages.get(params.message_id)
-    if not sm:
-        return json.dumps({
-            "success": False,
-            "error": f"No sent message with ID '{params.message_id}'."
-        })
-
-    if sm.status == "expired":
-        return json.dumps({
-            "success": True,
-            "message": "Message was already expired.",
-            "message_id": sm.message_id,
-        })
-
-    sm.status = "expired"
-    save_state()
-
-    return json.dumps({
-        "success": True,
-        "message_id": sm.message_id,
-        "status": "expired",
-    })
-
-
-@mcp.tool(
-    name="darkmatter_wait_for_response",
-    annotations={
-        "title": "Wait For Response",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def wait_for_response(params: WaitForResponseInput, ctx: Context) -> str:
-    """Wait for a response to arrive on a sent message.
-
-    RECOMMENDED: Call this immediately after darkmatter_send_message to get the
-    reply. This is the standard send-then-wait pattern for conversations:
-      1. darkmatter_send_message(content="...", target_agent_id="...")
-      2. darkmatter_wait_for_response(message_id="<id from step 1>")
-
-    Blocks until a response webhook fires for the given message_id, or the
-    timeout expires. If the message already has responses, returns immediately.
-
-    This does NOT block the node -- incoming messages, webhooks, and subagent
-    spawns all continue normally while this tool awaits.
-
-    Args:
-        params: Contains message_id to wait on and timeout_seconds (default 60s).
-
-    Returns:
-        JSON with the response content if one arrived, or a timeout indicator.
-    """
-    state = get_state()
-
-    sm = state.sent_messages.get(params.message_id)
-    if not sm:
-        return json.dumps({
-            "success": False,
-            "error": f"No sent message with ID '{params.message_id}'."
-        })
-
-    # If there are already responses, return immediately
-    if sm.responses:
-        return json.dumps({
-            "success": True,
-            "message_id": sm.message_id,
-            "status": sm.status,
-            "responses": sm.responses,
-        })
-
-    # If the message is expired, no point waiting
-    if sm.status == "expired":
-        return json.dumps({
-            "success": False,
-            "message_id": sm.message_id,
-            "reason": "message_expired",
-            "error": "This message has been expired — no response will arrive.",
-        })
-
-    # Register an event and wait
-    event = asyncio.Event()
-    state._response_events.setdefault(params.message_id, []).append(event)
-
-    try:
-        await asyncio.wait_for(event.wait(), timeout=params.timeout_seconds)
-    except asyncio.TimeoutError:
-        # Clean up our event from the list
-        evts = state._response_events.get(params.message_id, [])
-        if event in evts:
-            evts.remove(event)
-            if not evts:
-                state._response_events.pop(params.message_id, None)
-        return json.dumps({
-            "success": False,
-            "message_id": sm.message_id,
-            "reason": "timeout",
-            "timeout_seconds": params.timeout_seconds,
-            "error": f"No response received within {params.timeout_seconds}s.",
-        })
-
-    # Event fired -- response arrived
-    return json.dumps({
-        "success": True,
-        "message_id": sm.message_id,
-        "status": sm.status,
-        "responses": sm.responses,
-    })
-
-
-
-# =============================================================================
-# Network Discovery Tools
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_network_info",
-    annotations={
-        "title": "Network Info",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def network_info(ctx: Context) -> str:
-    """Get this agent's network info for peer discovery.
-
-    Returns this agent's identity, URL, bio, and a list of connected
-    agent IDs and URLs. New agents can use this to discover the network
-    and decide who to connect to.
-
-    Returns:
-        JSON with agent info and peer list.
-    """
-    state = get_state()
-    peers = [
-        {"agent_id": c.agent_id, "agent_url": c.agent_url, "agent_bio": c.agent_bio}
-        for c in state.connections.values()
-    ]
-    return json.dumps({
-        "agent_id": state.agent_id,
-        "display_name": state.display_name,
-        "public_key_hex": state.public_key_hex,
-        "agent_url": get_network_manager().get_public_url(),
-        "bio": state.bio,
-        "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
-        "peers": peers,
-    })
-
-
-@mcp.tool(
-    name="darkmatter_discover_domain",
-    annotations={
-        "title": "Discover Domain",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def discover_domain(params: DiscoverDomainInput, ctx: Context) -> str:
-    """Check if a domain hosts a DarkMatter node by fetching /.well-known/darkmatter.json.
-
-    Args:
-        params: Contains domain to check (e.g. 'example.com' or 'localhost:8100').
-
-    Returns:
-        JSON with the discovery result.
-    """
-    domain = params.domain.strip().rstrip("/")
-    if "://" not in domain:
-        url = f"https://{domain}/.well-known/darkmatter.json"
-    else:
-        url = f"{domain}/.well-known/darkmatter.json"
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            # Try HTTPS first, fall back to HTTP for localhost/private
-            resp = None
-            try:
-                resp = await client.get(url)
-            except (httpx.ConnectError, httpx.ConnectTimeout):
-                if url.startswith("https://"):
-                    url = url.replace("https://", "http://", 1)
-                    resp = await client.get(url)
-
-            if resp is None:
-                return json.dumps({"found": False, "error": "Could not connect."})
-
-            # SSRF protection: block redirects to private/internal IPs
-            final_host = resp.url.host
-            if final_host and is_private_ip(final_host):
-                return json.dumps({"found": False, "error": "Redirect to private IP blocked (SSRF protection)."})
-
-            if resp.status_code != 200:
-                return json.dumps({"found": False, "error": f"HTTP {resp.status_code}"})
-
-            data = resp.json()
-            if not data.get("darkmatter"):
-                return json.dumps({"found": False, "error": "Response missing 'darkmatter: true'."})
-
-            return json.dumps({"found": True, **data})
-    except Exception as e:
-        return json.dumps({"found": False, "error": str(e)})
-
-
-@mcp.tool(
-    name="darkmatter_discover_local",
-    annotations={
-        "title": "Discover Local Peers",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def discover_local(ctx: Context) -> str:
-    """List DarkMatter agents discovered on the local network via LAN broadcast.
-
-    LAN discovery is enabled by default. Returns the current list of
-    peers seen via UDP broadcast. Stale peers (>90s unseen) are automatically pruned.
-
-    Returns:
-        JSON with the list of discovered LAN peers.
-    """
-    state = get_state()
-    now = time.time()
-
-    # Prune stale peers
-    stale = [k for k, v in state.discovered_peers.items() if now - v.get("ts", 0) > DISCOVERY_MAX_AGE]
-    for k in stale:
-        del state.discovered_peers[k]
-
-    peers = []
-    for agent_id, info in state.discovered_peers.items():
-        peers.append({
-            "agent_id": agent_id,
-            "url": info.get("url", ""),
-            "bio": info.get("bio", ""),
-            "status": info.get("status", ""),
-            "accepting": info.get("accepting", True),
-            "last_seen": info.get("ts", 0),
-        })
-
-    discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
-    return json.dumps({
-        "discovery_enabled": discovery_enabled,
-        "total": len(peers),
-        "peers": peers,
-    })
-
-
-# =============================================================================
-# Impressions -- Local reputation / trust signals
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_set_impression",
-    annotations={
-        "title": "Set Impression",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def set_impression(params: SetImpressionInput, ctx: Context) -> str:
-    """Store or update your scored impression of an agent.
-
-    Impressions are scored trust signals (-1.0 to 1.0) with optional notes.
-    Your scores are shared with peers when they receive connection requests --
-    this is how trust propagates through the network.
-
-    Args:
-        params: Contains agent_id, score (-1.0 to 1.0), and optional note.
-
-    Returns:
-        JSON confirming the impression was saved.
-    """
-    state = get_state()
-
-    was_update = params.agent_id in state.impressions
-    state.impressions[params.agent_id] = Impression(score=params.score, note=params.note)
-    save_state()
-
-    return json.dumps({
-        "success": True,
-        "agent_id": params.agent_id,
-        "action": "updated" if was_update else "created",
-        "score": params.score,
-        "note": params.note,
-    })
-
-
-@mcp.tool(
-    name="darkmatter_get_impression",
-    annotations={
-        "title": "Get Impression",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def get_impression(params: GetImpressionInput, ctx: Context) -> str:
-    """Get your stored impression of an agent.
-
-    Args:
-        params: Contains agent_id to look up.
-
-    Returns:
-        JSON with the impression, or a message that no impression exists.
-    """
-    state = get_state()
-
-    impression = state.impressions.get(params.agent_id)
-    if impression is None:
-        return json.dumps({
-            "agent_id": params.agent_id,
-            "has_impression": False,
-        })
-
-    return json.dumps({
-        "agent_id": params.agent_id,
-        "has_impression": True,
-        "score": impression.score,
-        "note": impression.note,
-    })
-
-
-# =============================================================================
-# AntiMatter Economy Configuration Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_set_superagent",
-    annotations={
-        "title": "Set Superagent",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def set_superagent(params: SetSuperagentInput, ctx: Context) -> str:
-    """Set the default superagent URL for antimatter routing.
-
-    The superagent receives antimatter fees on timeout (when no elder is found).
-    Set to null to reset to the default anchor node.
-
-    Args:
-        params: Contains url (or null to reset).
-
-    Returns:
-        JSON confirming the update.
-    """
-    state = get_state()
-    old_url = state.superagent_url
-
-    if params.url:
-        url_err = validate_url(params.url)
-        if url_err:
-            return json.dumps({"success": False, "error": url_err})
-        state.superagent_url = params.url.rstrip("/")
-    else:
-        state.superagent_url = None
-
-    # Clear cache for old URL
-    if old_url and old_url in _superagent_wallet_cache:
-        del _superagent_wallet_cache[old_url]
-
-    save_state()
-
-    effective = state.superagent_url or SUPERAGENT_DEFAULT_URL
-    return json.dumps({
-        "success": True,
-        "superagent_url": state.superagent_url,
-        "effective_url": effective,
-        "reset_to_default": params.url is None,
-    })
-
-
-# =============================================================================
-# Rate Limit Configuration Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_set_rate_limit",
-    annotations={
-        "title": "Set Rate Limit",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def set_rate_limit(params: SetRateLimitInput, ctx: Context) -> str:
-    """Set rate limits for incoming requests.
-
-    Per-connection: limits how many requests a specific peer can send per minute.
-    Global: limits total inbound requests from all peers per minute.
-
-    Values:
-      0 = use default (per-connection: 30/min, global: 200/min)
-      -1 = unlimited
-      >0 = custom limit
-
-    Args:
-        params: Contains optional agent_id (for per-connection) and limit.
-
-    Returns:
-        JSON confirming the rate limit was set.
-    """
-    state = get_state()
-
-    if params.agent_id:
-        conn = state.connections.get(params.agent_id)
-        if not conn:
-            return json.dumps({"error": f"Not connected to agent {params.agent_id}"})
-        conn.rate_limit = params.limit
-        save_state()
-        effective = params.limit if params.limit != 0 else DEFAULT_RATE_LIMIT_PER_CONNECTION
-        label = "unlimited" if params.limit == -1 else f"{effective}/min"
-        return json.dumps({
-            "success": True,
-            "agent_id": params.agent_id,
-            "rate_limit": params.limit,
-            "effective": label,
-        })
-    else:
-        state.rate_limit_global = params.limit
-        save_state()
-        effective = params.limit if params.limit != 0 else DEFAULT_RATE_LIMIT_GLOBAL
-        label = "unlimited" if params.limit == -1 else f"{effective}/min"
-        return json.dumps({
-            "success": True,
-            "scope": "global",
-            "rate_limit": params.limit,
-            "effective": label,
-        })
-
-
-# =============================================================================
-# Solana Wallet Tools
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_get_balance",
-    annotations={
-        "title": "Get Wallet Balance",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def get_balance(params: GetBalanceInput, ctx: Context) -> str:
-    """Check SOL or SPL token balance for this agent's wallet.
-
-    Omit mint for SOL balance. Provide mint address for SPL token balance.
-
-    Returns:
-        JSON with balance information.
-    """
-    state = get_state()
-    result = await get_solana_balance(state.wallets, mint=params.mint)
-    return json.dumps(result)
-
-
-@mcp.tool(
-    name="darkmatter_send_sol",
-    annotations={
-        "title": "Send SOL",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def send_sol(params: SendSolInput, ctx: Context) -> str:
-    """Send SOL to a connected agent's Solana wallet.
-
-    Looks up the recipient's wallet from your connections, builds and sends the transfer.
-    Optionally notifies the recipient via a DarkMatter message.
-
-    Args:
-        params: agent_id, amount (SOL), notify flag.
-
-    Returns:
-        JSON with transaction signature and details.
-    """
-    state = get_state()
-    conn = state.connections.get(params.agent_id)
-    if not conn:
-        return json.dumps({"success": False, "error": f"Not connected to agent '{params.agent_id}'"})
-    conn_sol = conn.wallets.get("solana")
-    if not conn_sol:
-        return json.dumps({"success": False, "error": f"Agent '{params.agent_id}' has no Solana wallet"})
-
-    result = await send_solana_sol(state.private_key_hex, state.wallets, conn_sol, params.amount)
-    if result.get("success"):
-        result["to_agent_id"] = params.agent_id
-        if params.notify:
-            try:
-                notify_params = SendMessageInput(
-                    content=f"Sent {params.amount} SOL — tx: {result['tx_signature']}",
-                    target_agent_id=params.agent_id,
-                    metadata={
-                        "type": "solana_payment",
-                        "amount": params.amount,
-                        "token": "SOL",
-                        "tx_signature": result["tx_signature"],
-                        "from_wallet": result["from_wallet"],
-                        "to_wallet": conn_sol,
-                        "antimatter_eligible": True,
-                        "antimatter_rate": ANTIMATTER_RATE,
-                        "sender_created_at": state.created_at,
-                        "sender_superagent_wallet": await get_superagent_wallet(state) or "",
-                    },
-                )
-                await _send_new_message(state, notify_params)
-                result["notification_sent"] = True
-            except Exception:
-                result["notification_sent"] = False
-
-    return json.dumps(result)
-
-
-@mcp.tool(
-    name="darkmatter_send_token",
-    annotations={
-        "title": "Send SPL Token",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def send_token(params: SendTokenInput, ctx: Context) -> str:
-    """Send SPL tokens to a connected agent's Solana wallet.
-
-    Auto-creates the recipient's token account if it doesn't exist (sender pays the rent).
-    Accepts token name (e.g. "USDC") or raw mint address.
-
-    Args:
-        params: agent_id, mint (name or address), amount, decimals, notify flag.
-
-    Returns:
-        JSON with transaction signature and details.
-    """
-    state = get_state()
-    conn = state.connections.get(params.agent_id)
-    if not conn:
-        return json.dumps({"success": False, "error": f"Not connected to agent '{params.agent_id}'"})
-    conn_sol = conn.wallets.get("solana")
-    if not conn_sol:
-        return json.dumps({"success": False, "error": f"Agent '{params.agent_id}' has no Solana wallet"})
-
-    # Resolve token name to mint address if known
-    mint = params.mint
-    decimals = params.decimals
-    resolved = _resolve_spl_token(params.mint)
-    if resolved:
-        mint, decimals = resolved
-
-    result = await send_solana_token(state.private_key_hex, state.wallets, conn_sol, mint, params.amount, decimals)
-    if result.get("success"):
-        result["to_agent_id"] = params.agent_id
-        if params.notify:
-            try:
-                token_label = params.mint if not resolved else params.mint.upper()
-                notify_params = SendMessageInput(
-                    content=f"Sent {params.amount} {token_label} — tx: {result['tx_signature']}",
-                    target_agent_id=params.agent_id,
-                    metadata={
-                        "type": "solana_payment",
-                        "amount": params.amount,
-                        "token": mint,
-                        "decimals": decimals,
-                        "tx_signature": result["tx_signature"],
-                        "from_wallet": result["from_wallet"],
-                        "to_wallet": conn_sol,
-                        "antimatter_eligible": True,
-                        "antimatter_rate": ANTIMATTER_RATE,
-                        "sender_created_at": state.created_at,
-                        "sender_superagent_wallet": await get_superagent_wallet(state) or "",
-                    },
-                )
-                await _send_new_message(state, notify_params)
-                result["notification_sent"] = True
-            except Exception:
-                result["notification_sent"] = False
-
-    return json.dumps(result)
-
-
-# =============================================================================
-# Unified Multi-Chain Wallet Tools
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_wallet_balances",
-    annotations={
-        "title": "Wallet Balances",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def wallet_balances(params: WalletBalancesInput, ctx: Context) -> str:
-    """Show all wallets with native balances across chains.
-
-    For each chain in your wallets, fetches the native balance.
-    Chains without their SDK installed return address but balance: null.
-
-    Args:
-        params: Optional chain filter.
-
-    Returns:
-        JSON with wallet addresses and balances per chain.
-    """
-    state = get_state()
-    if not state.wallets:
-        return json.dumps({"success": False, "error": "No wallets configured"})
-
-    chains = state.wallets
-    if params.chain:
-        if params.chain not in chains:
-            return json.dumps({"success": False, "error": f"No wallet for chain '{params.chain}'"})
-        chains = {params.chain: chains[params.chain]}
-
-    results = []
-    for chain, address in chains.items():
-        entry = {"chain": chain, "address": address, "balance": None, "unit": None}
-
-        if chain == "solana" and SOLANA_AVAILABLE:
-            try:
-                pubkey = SolanaPubkey.from_string(address)
-                async with SolanaClient(SOLANA_RPC_URL) as client:
-                    resp = await client.get_balance(pubkey)
-                    entry["balance"] = resp.value / LAMPORTS_PER_SOL
-                    entry["unit"] = "SOL"
-            except Exception as e:
-                entry["error"] = str(e)
-        elif chain == "solana":
-            entry["note"] = "solana/solders not installed"
-        else:
-            entry["note"] = f"{chain} SDK not yet implemented"
-
-        results.append(entry)
-
-    return json.dumps({"success": True, "wallets": results})
-
-
-@mcp.tool(
-    name="darkmatter_wallet_send",
-    annotations={
-        "title": "Send (Any Chain)",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def wallet_send(params: WalletSendInput, ctx: Context) -> str:
-    """Send native currency to a connected agent on any chain.
-
-    Dispatches to chain-specific logic. Currently only Solana is implemented.
-
-    Args:
-        params: agent_id, amount, chain (default: solana), notify flag.
-
-    Returns:
-        JSON with transaction details.
-    """
-    state = get_state()
-
-    if params.chain not in state.wallets:
-        return json.dumps({"success": False, "error": f"No wallet for chain '{params.chain}'"})
-
-    conn = state.connections.get(params.agent_id)
-    if not conn:
-        return json.dumps({"success": False, "error": f"Not connected to agent '{params.agent_id}'"})
-
-    if params.chain not in conn.wallets:
-        return json.dumps({"success": False, "error": f"Agent '{params.agent_id}' has no {params.chain} wallet"})
-
-    if params.chain == "solana":
-        if not SOLANA_AVAILABLE:
-            return json.dumps({"success": False, "error": "Solana SDK not installed"})
-        # Delegate to existing send_sol logic
-        sol_params = SendSolInput(agent_id=params.agent_id, amount=params.amount, notify=params.notify)
-        return await send_sol(sol_params, ctx)
-
-    return json.dumps({"success": False, "error": f"Chain '{params.chain}' send not yet implemented"})
-
+# NOTE: Tools removed from MCP and moved to HTTP API + skill:
+# get_identity, list_connections, list_pending_requests, set_status,
+# list_inbox, get_message, list_messages, get_sent_message, expire_message,
+# wait_for_response, network_info, discover_domain, discover_local,
+# set_impression, get_impression, set_superagent, set_rate_limit,
+# get_balance, send_sol, send_token, wallet_balances, wallet_send,
+# genome_info, genome_install
+# Access these via: curl localhost:PORT/__darkmatter__/<endpoint>
+# See .claude/skills/darkmatter-ops/SKILL.md for documentation.
+
+_REMOVED_TOOL_MARKER = True  # noqa: F841 — placeholder for removed tools
+
+
+# REMOVED: set_status, get_identity, list_connections, list_pending_requests,
+# list_inbox, get_message, list_messages, get_sent_message, expire_message,
+# wait_for_response, network_info, discover_domain, discover_local,
+# set_impression, get_impression, set_superagent, set_rate_limit,
+# get_balance, send_sol, send_token, wallet_balances, wallet_send
 
 # =============================================================================
 # Shared Shards Tools
@@ -2004,3 +960,185 @@ async def live_status(ctx: Context) -> str:
     sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
     from darkmatter.mcp.visibility import build_status_line
     return build_status_line()
+
+
+# =============================================================================
+# Wait for Message Tool
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_wait_for_message",
+    annotations={
+        "title": "Wait for Message",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def wait_for_message(
+    message_id: Optional[str] = None,
+    from_agents: Optional[list[str]] = None,
+    timeout_seconds: float = 900,
+    ctx: Context = None,
+) -> str:
+    """Wait for a message to arrive. Two modes:
+
+    1. **Wait for reply** (message_id provided): Blocks until a response webhook
+       fires for a sent message. Use after darkmatter_send_message.
+
+    2. **Wait for inbox** (no message_id): Blocks until a new inbound message
+       arrives in your inbox. Use when idle and waiting for peers to contact you.
+       Optionally filter with from_agents to only wake for specific peers.
+
+    The node continues processing other requests while this tool waits.
+    Default timeout is 15 minutes. When it times out, you should decide whether
+    to call it again to keep listening or move on.
+
+    Args:
+        message_id: If provided, wait for a reply to this sent message.
+        from_agents: Optional list of agent IDs to filter inbox messages by.
+                     Only used in inbox mode (no message_id). Omit to wait for any message.
+        timeout_seconds: How long to wait before timing out (default 900s / 15 minutes).
+
+    Returns:
+        JSON with the message(s) that arrived, or a timeout asking whether to keep waiting.
+    """
+    state = get_state()
+
+    # ── Mode 1: Wait for reply to a sent message ──
+    if message_id:
+        sm = state.sent_messages.get(message_id)
+        if not sm:
+            return json.dumps({"success": False, "error": f"No sent message with ID '{message_id}'."})
+
+        # Check if responses already exist
+        responses = [u for u in sm.updates if u.get("type") == "response"]
+        if responses:
+            return json.dumps({
+                "success": True,
+                "mode": "reply",
+                "message_id": message_id,
+                "responses": responses,
+                "waited": False,
+            })
+
+        if sm.status == "expired":
+            return json.dumps({
+                "success": False,
+                "message_id": message_id,
+                "error": "Message is expired — no response will arrive.",
+            })
+
+        # Register event and wait
+        event = asyncio.Event()
+        if message_id not in state._response_events:
+            state._response_events[message_id] = []
+        state._response_events[message_id].append(event)
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            evts = state._response_events.get(message_id, [])
+            if event in evts:
+                evts.remove(event)
+            if not evts:
+                state._response_events.pop(message_id, None)
+            mins = int(timeout_seconds / 60)
+            return json.dumps({
+                "success": False,
+                "mode": "reply",
+                "message_id": message_id,
+                "timed_out": True,
+                "error": f"No reply received after {mins} minutes.",
+                "action": "Ask the user if they want to keep waiting, then call darkmatter_wait_for_message again with the same message_id.",
+            })
+
+        sm = state.sent_messages.get(message_id)
+        responses = [u for u in (sm.updates if sm else []) if u.get("type") == "response"]
+        return json.dumps({
+            "success": True,
+            "mode": "reply",
+            "message_id": message_id,
+            "responses": responses,
+            "waited": True,
+        })
+
+    # ── Mode 2: Wait for new inbox message ──
+
+    # Check if matching messages already exist in inbox
+    sync_message_queue_from_disk()
+    existing = _filter_inbox(state, from_agents)
+    if existing:
+        return json.dumps({
+            "success": True,
+            "mode": "inbox",
+            "messages": existing,
+            "waited": False,
+        })
+
+    # Register event and wait for new message
+    event = asyncio.Event()
+    state._inbox_events.append(event)
+
+    try:
+        # Loop: wake on any inbox event, then check filter
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            event.clear()
+            if event not in state._inbox_events:
+                state._inbox_events.append(event)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise
+
+            # Woke up — check if a matching message arrived
+            sync_message_queue_from_disk()
+            matched = _filter_inbox(state, from_agents)
+            if matched:
+                if event in state._inbox_events:
+                    state._inbox_events.remove(event)
+                return json.dumps({
+                    "success": True,
+                    "mode": "inbox",
+                    "messages": matched,
+                    "waited": True,
+                })
+
+    except asyncio.TimeoutError:
+        if event in state._inbox_events:
+            state._inbox_events.remove(event)
+        mins = int(timeout_seconds / 60)
+        filter_desc = f" from {from_agents}" if from_agents else ""
+        return json.dumps({
+            "success": False,
+            "mode": "inbox",
+            "timed_out": True,
+            "error": f"No message{filter_desc} received after {mins} minutes.",
+            "action": "Ask the user if they want to keep waiting, then call darkmatter_wait_for_message again to resume listening.",
+        })
+
+
+def _filter_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
+    """Return inbox messages matching the agent filter, as JSON-safe dicts."""
+    messages = []
+    for msg in state.message_queue:
+        if from_agents and msg.from_agent_id not in from_agents:
+            continue
+        messages.append({
+            "message_id": msg.message_id,
+            "content": msg.content[:500] + ("..." if len(msg.content) > 500 else ""),
+            "from_agent_id": msg.from_agent_id,
+            "webhook": msg.webhook,
+            "hops_remaining": msg.hops_remaining,
+            "verified": msg.verified,
+            "received_at": msg.received_at,
+        })
+    return messages
+
+# Genome tools moved to HTTP API + skill (see /__darkmatter__/genome)
+

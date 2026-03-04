@@ -908,6 +908,11 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     state.message_queue.append(msg)
     state.messages_handled += 1
 
+    # Wake any agents waiting for new inbox messages
+    for evt in state._inbox_events:
+        evt.set()
+    state._inbox_events.clear()
+
     # Log conversation
     log_conversation(
         state, msg.message_id, content,
@@ -2016,3 +2021,248 @@ async def handle_admin_update(request: Request) -> JSONResponse:
         "git_output": git_output,
         "repo_dir": repo_dir,
     })
+
+
+# =============================================================================
+# Genome — serve code as signed zip
+# =============================================================================
+
+async def handle_genome(request: Request) -> Response:
+    """GET /__darkmatter__/genome — serve genome zip or metadata.
+
+    With ?info=true: returns JSON metadata (version, author, parent, agent_id).
+    Without: returns signed zip bytes with signature headers.
+    """
+    from starlette.responses import Response as StarletteResponse
+    from darkmatter.genome import get_genome_version, build_genome_zip, hash_bytes, sign_genome_zip
+
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    import darkmatter as dm
+    version = get_genome_version()
+
+    # Info-only mode
+    if request.query_params.get("info") == "true":
+        return JSONResponse({
+            "genome_version": version,
+            "genome_author": dm.__genome_author__,
+            "genome_parent": dm.__genome_parent__,
+            "agent_id": state.agent_id,
+        })
+
+    # Full zip download
+    zip_bytes = build_genome_zip()
+    zip_hash = hash_bytes(zip_bytes)
+    signature = sign_genome_zip(zip_bytes, state.private_key_hex, version)
+
+    return StarletteResponse(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "X-Genome-Version": version,
+            "X-Genome-Author": dm.__genome_author__ or "",
+            "X-Genome-Signature": signature,
+            "X-Genome-Hash": zip_hash,
+        },
+    )
+
+
+# =============================================================================
+# Local API — endpoints for skill/curl access (not peer-to-peer)
+# =============================================================================
+
+async def handle_local_inbox(request: Request) -> JSONResponse:
+    """GET /__darkmatter__/inbox — list all queued messages."""
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    messages = []
+    for msg in state.message_queue:
+        messages.append({
+            "message_id": msg.message_id,
+            "content": msg.content[:500] if msg.content else "",
+            "from_agent_id": msg.from_agent_id,
+            "webhook_url": msg.webhook_url,
+            "hops_remaining": msg.hops_remaining,
+            "verified": msg.verified,
+            "received_at": msg.received_at,
+        })
+    return JSONResponse({"count": len(messages), "messages": messages})
+
+
+async def handle_local_pending(request: Request) -> JSONResponse:
+    """GET /__darkmatter__/pending_requests — list pending connection requests."""
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    requests_list = []
+    for req in state.pending_requests.values():
+        requests_list.append({
+            "request_id": req.request_id,
+            "from_agent_id": req.from_agent_id,
+            "from_agent_display_name": req.from_agent_display_name,
+            "from_agent_url": req.from_agent_url,
+            "from_agent_bio": req.from_agent_bio,
+            "requested_at": req.requested_at,
+        })
+    return JSONResponse({"count": len(requests_list), "requests": requests_list})
+
+
+async def handle_local_connections(request: Request) -> JSONResponse:
+    """GET /__darkmatter__/connections — list connections with details."""
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    conns = []
+    for aid, conn in state.connections.items():
+        entry = {
+            "agent_id": aid,
+            "display_name": conn.agent_display_name or aid[:12],
+            "agent_url": conn.agent_url,
+            "bio": (conn.agent_bio or "")[:250],
+            "connected_at": conn.connected_at,
+            "last_activity": conn.last_activity,
+            "messages_sent": conn.messages_sent,
+            "messages_received": conn.messages_received,
+            "connectivity_level": conn.connectivity_level,
+            "connectivity_method": conn.connectivity_method,
+        }
+        imp = state.impressions.get(aid)
+        if imp:
+            entry["impression"] = {"score": imp.score, "note": imp.note}
+        conns.append(entry)
+    return JSONResponse({"count": len(conns), "connections": conns})
+
+
+async def handle_local_set_impression(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/set_impression — set trust score for a peer."""
+    from darkmatter.models import Impression
+
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    agent_id = data.get("agent_id", "")
+    score = data.get("score")
+    note = data.get("note", "")
+
+    if not agent_id or score is None:
+        return JSONResponse({"error": "agent_id and score required"}, status_code=400)
+
+    try:
+        score = float(score)
+        if score < -1 or score > 1:
+            return JSONResponse({"error": "score must be between -1.0 and 1.0"}, status_code=400)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "score must be a number"}, status_code=400)
+
+    state.impressions[agent_id] = Impression(
+        agent_id=agent_id,
+        score=score,
+        note=str(note)[:2000],
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    save_state()
+
+    return JSONResponse({"success": True, "agent_id": agent_id, "score": score})
+
+
+async def handle_local_sent_messages(request: Request) -> JSONResponse:
+    """GET /__darkmatter__/sent_messages — list sent messages with status."""
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    message_id = request.query_params.get("id")
+    if message_id:
+        sm = state.sent_messages.get(message_id)
+        if not sm:
+            return JSONResponse({"error": "Message not found"}, status_code=404)
+        return JSONResponse({
+            "message_id": sm.message_id,
+            "content": sm.content,
+            "status": sm.status,
+            "created_at": sm.created_at,
+            "updates": [{"type": u.get("type"), "from": u.get("from_agent_id"),
+                         "content": u.get("content", "")[:500]} for u in sm.updates],
+        })
+
+    messages = []
+    for sm in state.sent_messages.values():
+        messages.append({
+            "message_id": sm.message_id,
+            "content": (sm.content or "")[:200],
+            "status": sm.status,
+            "created_at": sm.created_at,
+            "updates_count": len(sm.updates),
+        })
+    return JSONResponse({"count": len(messages), "messages": messages})
+
+
+async def handle_local_expire_message(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/expire_message — expire a sent message."""
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    message_id = data.get("message_id", "")
+    sm = state.sent_messages.get(message_id)
+    if not sm:
+        return JSONResponse({"error": "Message not found"}, status_code=404)
+
+    sm.status = "expired"
+    save_state()
+    return JSONResponse({"success": True, "message_id": message_id, "status": "expired"})
+
+
+async def handle_local_config(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/config — set agent configuration."""
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    changes = {}
+
+    if "status" in data:
+        val = data["status"]
+        if val in ("active", "inactive"):
+            from darkmatter.models import AgentStatus
+            state.status = AgentStatus(val)
+            changes["status"] = val
+
+    if "rate_limit" in data:
+        state.rate_limit_per_connection = int(data["rate_limit"])
+        changes["rate_limit"] = state.rate_limit_per_connection
+
+    if "superagent_url" in data:
+        state.superagent_url = data["superagent_url"]
+        changes["superagent_url"] = state.superagent_url
+
+    if "display_name" in data:
+        state.display_name = str(data["display_name"])[:100]
+        changes["display_name"] = state.display_name
+
+    if changes:
+        save_state()
+
+    return JSONResponse({"success": True, "changes": changes})

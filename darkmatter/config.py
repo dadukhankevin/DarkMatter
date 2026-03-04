@@ -85,16 +85,14 @@ RATE_LIMIT_WINDOW = 60                    # sliding window in seconds
 # =============================================================================
 
 CORE_TOOLS = frozenset({
-    "darkmatter_get_identity",
-    "darkmatter_list_inbox",
-    "darkmatter_get_message",
     "darkmatter_send_message",
-    "darkmatter_list_connections",
     "darkmatter_connection",
     "darkmatter_update_bio",
+    "darkmatter_inbox",
+    "darkmatter_create_shard",
+    "darkmatter_view_shards",
     "darkmatter_status",
-    "darkmatter_list_pending_requests",
-    "darkmatter_wait_for_response",
+    "darkmatter_wait_for_message",
 })
 
 # =============================================================================

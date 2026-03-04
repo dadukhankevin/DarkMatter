@@ -71,6 +71,14 @@ from darkmatter.network.mesh import (
     handle_pool_proxy,
     handle_pool_info,
     handle_admin_update,
+    handle_genome,
+    handle_local_inbox,
+    handle_local_pending,
+    handle_local_connections,
+    handle_local_set_impression,
+    handle_local_sent_messages,
+    handle_local_expire_message,
+    handle_local_config,
 )
 from darkmatter.spawn import spawn_agent_for_message
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
@@ -261,6 +269,15 @@ def create_app() -> Router:
         Route("/pool_proxy", handle_pool_proxy, methods=["POST"]),
         Route("/pool_info/{pool_id}", handle_pool_info, methods=["GET"]),
         Route("/admin_update", handle_admin_update, methods=["POST"]),
+        Route("/genome", handle_genome, methods=["GET"]),
+        # Local API — for skill/curl access
+        Route("/inbox", handle_local_inbox, methods=["GET"]),
+        Route("/pending_requests", handle_local_pending, methods=["GET"]),
+        Route("/connections", handle_local_connections, methods=["GET"]),
+        Route("/set_impression", handle_local_set_impression, methods=["POST"]),
+        Route("/sent_messages", handle_local_sent_messages, methods=["GET"]),
+        Route("/expire_message", handle_local_expire_message, methods=["POST"]),
+        Route("/config", handle_local_config, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
