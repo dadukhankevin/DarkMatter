@@ -412,10 +412,9 @@ class NetworkManager:
             return True
 
     async def broadcast_peer_update(self) -> None:
-        """Notify all connected peers and anchor nodes of our current URL and bio."""
+        """Notify all connected peers and anchor nodes of our current URL, bio, and display name."""
         state = self._get_state()
-        if not state.public_url:
-            return
+        url = state.public_url or f"http://127.0.0.1:{state.port}"
 
         # Build transport address map
         addresses = {}
@@ -428,10 +427,11 @@ class NetworkManager:
         timestamp = datetime.now(timezone.utc).isoformat()
         payload = {
             "agent_id": state.agent_id,
-            "new_url": state.public_url,
+            "new_url": url,
             "addresses": addresses,
             "timestamp": timestamp,
             "bio": state.bio,
+            "display_name": state.display_name,
         }
         if state.public_key_hex:
             payload["public_key_hex"] = state.public_key_hex

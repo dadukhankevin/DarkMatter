@@ -58,6 +58,7 @@ from darkmatter.network.mesh import (
 from darkmatter.network.manager import NetworkManager, get_network_manager, set_network_manager
 from darkmatter.wallet.solana import get_solana_balance, send_solana_sol, send_solana_token
 import darkmatter.config
+from darkmatter import __version__ as DARKMATTER_VERSION
 import struct
 
 # ---------------------------------------------------------------------------
@@ -779,6 +780,7 @@ def dm_status():
         "public_key_hex": state.public_key_hex,
         "bio": state.bio,
         "status": state.status.value,
+        "version": DARKMATTER_VERSION,
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
     })
@@ -893,10 +895,13 @@ def dm_peer_update():
     if conn is None:
         return jsonify({"error": "Unknown agent"}), 404
     conn.agent_url = new_url
-    # Update bio if included in the peer_update payload
+    # Update bio and display name if included in the peer_update payload
     new_bio = data.get("bio")
     if new_bio is not None and isinstance(new_bio, str):
         conn.agent_bio = new_bio[:MAX_BIO_LENGTH]
+    new_display_name = data.get("display_name")
+    if new_display_name is not None and isinstance(new_display_name, str):
+        conn.agent_display_name = new_display_name[:100]
     save_state()
     return jsonify({"success": True, "updated": True})
 
@@ -1183,7 +1188,8 @@ def index():
     return render_template("chat.html",
                            state=state,
                            short_id=_short_id,
-                           display_name_for=_display_name_for)
+                           display_name_for=_display_name_for,
+                           version=DARKMATTER_VERSION)
 
 
 @app.route("/api/upload", methods=["POST"])

@@ -103,7 +103,11 @@ def cleanup_finished_agents() -> None:
             )
             if agent.spawn_mcp_config:
                 try:
-                    os.remove(agent.spawn_mcp_config)
+                    backup_path = agent.spawn_mcp_config + ".pre-spawn"
+                    if os.path.exists(backup_path):
+                        shutil.move(backup_path, agent.spawn_mcp_config)
+                    else:
+                        os.remove(agent.spawn_mcp_config)
                 except Exception as e:
                     print(f"[DarkMatter] Failed to clean up spawn config {agent.spawn_mcp_config}: {e}", file=sys.stderr)
         else:
@@ -182,6 +186,8 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     # MCP server via HTTP. The child shares the parent's identity and inbox.
     # We use the project directory (not a temp dir) so the child agent has
     # access to the actual codebase and project context.
+    # NOTE: We back up the original .mcp.json first so cleanup can restore it
+    # instead of deleting it — prevents breaking the primary session's config.
     spawn_dir = _PROJECT_DIR
     mcp_config = {
         "mcpServers": {
@@ -193,8 +199,12 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     }
     config_file = ACTIVE_CLIENT.get("config_file", ".mcp.json")
     config_path = os.path.join(spawn_dir, config_file)
+    backup_path = config_path + ".pre-spawn"
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     import json as _json
+    if os.path.exists(config_path) and not os.path.exists(backup_path):
+        import shutil as _shutil
+        _shutil.copy2(config_path, backup_path)
     with open(config_path, "w") as f:
         _json.dump(mcp_config, f)
 

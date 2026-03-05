@@ -1469,10 +1469,13 @@ async def handle_peer_update(request: Request) -> JSONResponse:
     elif new_url:
         conn.addresses["http"] = new_url
 
-    # Update bio if included in the peer_update payload
+    # Update bio and display name if included in the peer_update payload
     new_bio = body.get("bio")
     if new_bio is not None and isinstance(new_bio, str):
         conn.agent_bio = new_bio[:MAX_BIO_LENGTH]
+    new_display_name = body.get("display_name")
+    if new_display_name is not None and isinstance(new_display_name, str):
+        conn.agent_display_name = new_display_name[:100]
 
     save_state()
 
