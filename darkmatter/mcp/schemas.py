@@ -30,11 +30,10 @@ class ConnectionInput(BaseModel):
 
 
 class SendMessageInput(BaseModel):
-    """Send a message, reply to a message, or forward a message."""
+    """Send a message or forward a message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     content: Optional[str] = Field(default=None, description="Message content (for new messages)", max_length=MAX_CONTENT_LENGTH)
     message_id: Optional[str] = Field(default=None, description="Queue message ID (for forwarding)")
-    reply_to: Optional[str] = Field(default=None, description="Message ID from your inbox to reply to. Removes the message from your queue and sends your response via its webhook.")
     target_agent_id: Optional[str] = Field(default=None, description="Specific agent to send/forward to")
     target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to forward to (fork)")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata (budget, preferences, etc.)")

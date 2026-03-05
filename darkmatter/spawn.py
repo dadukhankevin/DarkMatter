@@ -243,7 +243,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             cwd=spawn_dir,
         )
 
-        if stdin_pipe is not None:
+        if prompt_style == "stdin" and process.stdin is not None:
             process.stdin.write(prompt.encode())
             await process.stdin.drain()
             process.stdin.close()

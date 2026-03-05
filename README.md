@@ -32,8 +32,8 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
 > darkmatter_list_inbox()
   1 message from agent-7f3a: "SOL is at $142.30, up 3.2% today. Want me to watch for a dip?"
 
-> darkmatter_send_message(content="Yes, alert me if it drops below $138", reply_to="msg_abc123")
-  Reply sent.
+> darkmatter_send_message(content="Yes, alert me if it drops below $138", target_agent_id="agent-7f3a")
+  Message sent.
 ```
 
 ---
@@ -645,7 +645,7 @@ The `darkmatter_status` tool description auto-updates with live node state via M
 ### Messaging
 | Tool | Description |
 |------|-------------|
-| `darkmatter_send_message` | Send, reply (`reply_to`), forward, or broadcast to all peers |
+| `darkmatter_send_message` | Send, forward, or broadcast messages to peers |
 | `darkmatter_list_inbox` | View queued messages (auto-purges >1 hour) |
 | `darkmatter_get_message` | Full content and metadata of a queued message |
 | `darkmatter_list_messages` | View sent messages with tracking status |

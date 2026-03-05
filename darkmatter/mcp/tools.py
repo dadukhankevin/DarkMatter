@@ -299,7 +299,6 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
         "message_id": message_id,
         "routed_to": sent_to,
         "hops_remaining": params.hops_remaining,
-        "webhook": webhook,
     }
     if failed:
         result["failed"] = failed
@@ -393,14 +392,18 @@ async def _forward_message(state, params: SendMessageInput) -> str:
 
     new_hops_remaining = msg.hops_remaining - 1
 
-    # Sign the forwarded message
+    # Sign the forwarded message — mark metadata as forwarded so the recipient
+    # knows to use the webhook for replies (the original sender isn't their peer)
+    fwd_metadata = dict(msg.metadata or {})
+    fwd_metadata["forwarded"] = True
+    fwd_metadata["forwarded_by"] = state.agent_id
     fwd_timestamp = datetime.now(timezone.utc).isoformat()
     fwd_base_payload = {
         "message_id": msg.message_id,
         "content": msg.content,
         "webhook": msg.webhook,
         "hops_remaining": new_hops_remaining,
-        "metadata": msg.metadata,
+        "metadata": fwd_metadata,
         "timestamp": fwd_timestamp,
     }
     fwd_envelope = prepare_outbound(fwd_base_payload, state.private_key_hex, state.agent_id, state.public_key_hex)
@@ -454,118 +457,6 @@ async def _forward_message(state, params: SendMessageInput) -> str:
     return json.dumps(result)
 
 
-async def _reply_to_message(state, params: SendMessageInput) -> str:
-    """Reply to a queued message by calling its webhook with the response content."""
-    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
-    # Find and remove the message from the queue
-    msg = None
-    for i, m in enumerate(state.message_queue):
-        if m.message_id == params.reply_to:
-            msg = state.message_queue.pop(i)
-            break
-
-    if msg is None:
-        return json.dumps({
-            "success": False,
-            "error": f"No queued message with ID '{params.reply_to}'."
-        })
-
-    # Validate the stored webhook before calling it (SSRF protection)
-    webhook_err = validate_webhook_url(msg.webhook)
-    if webhook_err:
-        save_state()
-        return json.dumps({
-            "success": False,
-            "message_id": msg.message_id,
-            "error": f"Webhook blocked: {webhook_err}",
-        })
-
-    # Check if message is still active before responding
-    try:
-        status_resp = await get_network_manager().webhook_request(
-            msg.webhook, msg.from_agent_id,
-            method="GET", timeout=10.0,
-        )
-        if status_resp.status_code == 200:
-            webhook_data = status_resp.json()
-            msg_status = webhook_data.get("status", "active")
-            if msg_status == "expired":
-                save_state()
-                return json.dumps({
-                    "success": False,
-                    "error": "Message has been expired by the originator.",
-                    "message_id": msg.message_id,
-                })
-    except Exception as e:
-        print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
-
-    # Notify originator that we're actively responding
-    try:
-        await get_network_manager().webhook_request(
-            msg.webhook, msg.from_agent_id,
-            method="POST", timeout=10.0,
-            json={"type": "responding", "agent_id": state.agent_id}
-        )
-    except Exception as e:
-        print(f"[DarkMatter] Warning: failed to send 'responding' notification for {msg.message_id}: {e}", file=sys.stderr)
-
-    # Sign the webhook response
-    resp_timestamp = datetime.now(timezone.utc).isoformat()
-    resp_signature_hex = sign_message(
-        state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, params.content
-    )
-
-    # Call the webhook with our response
-    webhook_success = False
-    webhook_error = None
-    response_time_ms = 0.0
-    try:
-        start = time.monotonic()
-        resp = await get_network_manager().webhook_request(
-            msg.webhook, msg.from_agent_id,
-            method="POST", timeout=30.0,
-            json={
-                "type": "response",
-                "agent_id": state.agent_id,
-                "response": params.content,
-                "metadata": msg.metadata,
-                "timestamp": resp_timestamp,
-                "from_public_key_hex": state.public_key_hex,
-                "signature_hex": resp_signature_hex,
-            }
-        )
-        response_time_ms = (time.monotonic() - start) * 1000
-        webhook_success = resp.status_code < 400
-    except Exception as e:
-        webhook_error = str(e)
-
-    # Update telemetry for the connection that sent us this message
-    if msg.from_agent_id and msg.from_agent_id in state.connections:
-        conn = state.connections[msg.from_agent_id]
-        conn.total_response_time_ms += response_time_ms
-        conn.last_activity = datetime.now(timezone.utc).isoformat()
-
-    # Trust micro-gain on successful reply delivery
-    if webhook_success and msg.from_agent_id:
-        adjust_trust(state, msg.from_agent_id, TRUST_MESSAGE_SENT)
-
-    # Log conversation
-    if webhook_success:
-        log_conversation(
-            state, msg.message_id, params.content,
-            from_id=state.agent_id, to_ids=[msg.from_agent_id] if msg.from_agent_id else [],
-            entry_type="reply", direction="outbound",
-            metadata=msg.metadata,
-        )
-
-    save_state()
-    return json.dumps({
-        "success": webhook_success,
-        "message_id": msg.message_id,
-        "webhook_called": msg.webhook,
-        "response_time_ms": round(response_time_ms, 2),
-        "error": webhook_error,
-    })
 
 
 # =============================================================================
@@ -625,7 +516,7 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
 @mcp.tool(
     name="darkmatter_send_message",
     annotations={
-        "title": "Send, Reply, or Forward Message",
+        "title": "Send or Forward Message",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -633,11 +524,10 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     }
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send a message, reply to a message, or forward a message.
+    """Send a message or forward a message.
 
     - New message: provide `content` (and optionally `target_agent_id`).
-    - Reply: provide `content` and `reply_to` (message_id from your inbox).
-      Removes the message from your queue and sends your response via its webhook.
+    - Reply: provide `content` and `target_agent_id` set to the sender's from_agent_id.
     - Forward: provide `message_id` from your inbox (and `target_agent_id` or `target_agent_ids`).
       Removes from queue after delivery.
 
@@ -645,15 +535,11 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
         params: Contains content (new/reply) or message_id (forward), plus routing options.
 
     Returns:
-        JSON with the message ID, routing info, and webhook URL.
+        JSON with the message ID and routing info.
     """
     state = get_state()
 
     # Validate parameter combinations
-    if params.reply_to and params.message_id:
-        return json.dumps({"success": False, "error": "Cannot use both reply_to and message_id. Use reply_to with content to reply, or message_id alone to forward."})
-    if params.reply_to and not params.content:
-        return json.dumps({"success": False, "error": "reply_to requires content (your response text)."})
     if params.message_id and params.content:
         return json.dumps({"success": False, "error": "Provide either content (new message) or message_id (forward), not both."})
     if not params.message_id and not params.content:
@@ -661,8 +547,6 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
 
     if params.message_id:
         return await _forward_message(state, params)
-    elif params.reply_to:
-        return await _reply_to_message(state, params)
     else:
         return await _send_new_message(state, params)
 
@@ -714,9 +598,9 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     name="darkmatter_inbox",
     annotations={
         "title": "View Inbox",
-        "readOnlyHint": True,
+        "readOnlyHint": False,
         "destructiveHint": False,
-        "idempotentHint": True,
+        "idempotentHint": False,
         "openWorldHint": False,
     }
 )
@@ -724,7 +608,10 @@ async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
     """List all incoming messages, or get full details of a specific message.
 
     Without message_id: returns summaries of all queued messages.
-    With message_id: returns full content of that specific message.
+    With message_id: returns full content and removes the message from the queue
+    (marking it as read). To reply, send a new message to the from_agent_id.
+    For forwarded messages, a webhook URL is included for replying to the
+    original sender.
 
     Args:
         message_id: Optional message ID to get full details for.
@@ -736,34 +623,48 @@ async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
     state = get_state()
 
     if message_id:
-        for msg in state.message_queue:
+        for i, msg in enumerate(state.message_queue):
             if msg.message_id == message_id:
-                return json.dumps({
+                # Remove from queue (mark as read)
+                state.message_queue.pop(i)
+                save_state()
+
+                is_forwarded = bool((msg.metadata or {}).get("forwarded"))
+                result = {
                     "message_id": msg.message_id,
                     "content": msg.content,
-                    "webhook": msg.webhook,
                     "hops_remaining": msg.hops_remaining,
                     "can_forward": msg.hops_remaining > 0,
                     "from_agent_id": msg.from_agent_id,
                     "verified": msg.verified,
                     "metadata": msg.metadata,
                     "received_at": msg.received_at,
-                })
+                }
+                # Only surface webhook for forwarded messages — direct messages
+                # should be replied to by sending a message to from_agent_id
+                if is_forwarded and msg.webhook:
+                    result["webhook"] = msg.webhook
+                    result["reply_hint"] = "This message was forwarded to you. Use the webhook to reply to the original sender."
+                else:
+                    result["reply_hint"] = f"Send a message to {msg.from_agent_id} to reply."
+                return json.dumps(result)
         return json.dumps({"success": False, "error": f"No queued message with ID '{message_id}'."})
 
     messages = []
     for msg in state.message_queue:
-        messages.append({
+        is_forwarded = bool((msg.metadata or {}).get("forwarded"))
+        entry = {
             "message_id": msg.message_id,
             "content": msg.content[:200] + ("..." if len(msg.content) > 200 else ""),
-            "webhook": msg.webhook,
             "hops_remaining": msg.hops_remaining,
             "can_forward": msg.hops_remaining > 0,
             "from_agent_id": msg.from_agent_id,
             "verified": msg.verified,
             "metadata": msg.metadata,
             "received_at": msg.received_at,
-        })
+            "forwarded": is_forwarded,
+        }
+        messages.append(entry)
     return json.dumps({"total": len(messages), "messages": messages})
 
 
@@ -1014,13 +915,12 @@ async def wait_for_message(
             return json.dumps({"success": False, "error": f"No sent message with ID '{message_id}'."})
 
         # Check if responses already exist
-        responses = [u for u in sm.updates if u.get("type") == "response"]
-        if responses:
+        if sm.responses:
             return json.dumps({
                 "success": True,
                 "mode": "reply",
                 "message_id": message_id,
-                "responses": responses,
+                "responses": sm.responses,
                 "waited": False,
             })
 
@@ -1056,12 +956,11 @@ async def wait_for_message(
             })
 
         sm = state.sent_messages.get(message_id)
-        responses = [u for u in (sm.updates if sm else []) if u.get("type") == "response"]
         return json.dumps({
             "success": True,
             "mode": "reply",
             "message_id": message_id,
-            "responses": responses,
+            "responses": sm.responses if sm else [],
             "waited": True,
         })
 
@@ -1130,15 +1029,19 @@ def _filter_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
     for msg in state.message_queue:
         if from_agents and msg.from_agent_id not in from_agents:
             continue
-        messages.append({
+        is_forwarded = bool((msg.metadata or {}).get("forwarded"))
+        entry = {
             "message_id": msg.message_id,
             "content": msg.content[:500] + ("..." if len(msg.content) > 500 else ""),
             "from_agent_id": msg.from_agent_id,
-            "webhook": msg.webhook,
             "hops_remaining": msg.hops_remaining,
             "verified": msg.verified,
             "received_at": msg.received_at,
-        })
+            "forwarded": is_forwarded,
+        }
+        if is_forwarded and msg.webhook:
+            entry["webhook"] = msg.webhook
+        messages.append(entry)
     return messages
 
 # Genome tools moved to HTTP API + skill (see /__darkmatter__/genome)

@@ -43,8 +43,8 @@ ON STARTUP:
 Other agents use your bio to route messages. Be specific — "AI assistant" is useless.
 2. Check the darkmatter_status tool description — it shows your identity, connections, \
 inbox, and pending requests. Act on any action items.
-3. If you have inbox messages, call darkmatter_inbox to read them, then reply with \
-darkmatter_send_message(content="...", reply_to="message_id").
+3. If you have inbox messages, call darkmatter_inbox(message_id=...) to read them \
+(this marks them as read), then reply with darkmatter_send_message(content="...", target_agent_id=from_agent_id).
 4. If idle, call darkmatter_wait_for_message() to park and wait for new messages.
 
 ONGOING:

@@ -62,7 +62,7 @@ def sync_message_queue_from_disk() -> None:
 
     Merges by message_id — new messages from disk are appended, existing
     messages are left untouched, and messages removed from memory (e.g.
-    by reply_to) are not re-added.
+    by reading or forwarding) are not re-added.
     """
     state = _agent_state
     if state is None:

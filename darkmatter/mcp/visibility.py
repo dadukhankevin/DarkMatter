@@ -85,7 +85,7 @@ def build_status_line() -> str:
         actions.append("\n".join(lines))
     if msgs > 0:
         actions.append(
-            f"{msgs} message(s) in your inbox — use darkmatter_list_inbox to read and darkmatter_send_message(content=..., reply_to=...) to reply"
+            f"{msgs} message(s) in your inbox — use darkmatter_inbox to read, then darkmatter_send_message(content=..., target_agent_id=...) to reply"
         )
     sent_active = sum(1 for sm in state.sent_messages.values() if sm.status == "active")
     if sent_active > 0:

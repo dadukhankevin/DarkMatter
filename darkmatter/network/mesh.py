@@ -854,10 +854,13 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
             conn = state.connections.get(target_id)
             if conn:
                 try:
+                    fwd_metadata = dict(msg.metadata or {})
+                    fwd_metadata["forwarded"] = True
+                    fwd_metadata["forwarded_by"] = state.agent_id
                     await send_to_peer(conn, "/__darkmatter__/message", {
                         "from_agent_id": msg.from_agent_id,
                         "content": msg.content,
-                        "metadata": msg.metadata or {},
+                        "metadata": fwd_metadata,
                         "hops_remaining": (msg.hops_remaining or 10) - 1,
                     })
                 except Exception as e:
@@ -866,10 +869,10 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
         state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
 
     elif decision.action == RouterAction.RESPOND:
-        if msg.webhook_url and decision.response:
+        if msg.webhook and decision.response:
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(msg.webhook_url, json={
+                    await client.post(msg.webhook, json={
                         "type": "response",
                         "from_agent_id": state.agent_id,
                         "content": decision.response,
@@ -2172,7 +2175,7 @@ async def handle_local_inbox(request: Request) -> JSONResponse:
             "message_id": msg.message_id,
             "content": msg.content[:500] if msg.content else "",
             "from_agent_id": msg.from_agent_id,
-            "webhook_url": msg.webhook_url,
+            "webhook_url": msg.webhook,
             "hops_remaining": msg.hops_remaining,
             "verified": msg.verified,
             "received_at": msg.received_at,

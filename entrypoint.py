@@ -1001,6 +1001,13 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             state.private_key_hex, state.agent_id, message_id, msg_timestamp, content
         )
 
+    # Pre-register sent message BEFORE delivery so webhook callbacks don't 404
+    sent_msg = SentMessage(
+        message_id=message_id, content=content, status="sending",
+        initial_hops=10, routed_to=[c.agent_id for c in targets], metadata=metadata or {},
+    )
+    state.sent_messages[message_id] = sent_msg
+
     sent_to = []
     failed = []
     for conn in targets:
@@ -1049,19 +1056,14 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             if not relayed:
                 failed.append({"agent_id": conn.agent_id, "error": str(e)})
 
+    # Update the pre-registered sent message with delivery results
     if sent_to:
-        sent_msg = SentMessage(
-            message_id=message_id, content=content, status="active",
-            initial_hops=10, routed_to=sent_to, metadata=metadata or {},
-        )
-        state.sent_messages[message_id] = sent_msg
+        sent_msg.status = "active"
+        sent_msg.routed_to = sent_to
         save_state()
     elif failed:
-        # All deliveries failed — record the failure so UI can show it immediately
-        sent_msg = SentMessage(
-            message_id=message_id, content=content, status="failed",
-            initial_hops=10, routed_to=[f["agent_id"] for f in failed], metadata=metadata or {},
-        )
+        sent_msg.status = "failed"
+        sent_msg.routed_to = [f["agent_id"] for f in failed]
         for f in failed:
             sent_msg.updates.append({
                 "type": "delivery_failed",
@@ -1069,7 +1071,6 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
                 "error": f["error"],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-        state.sent_messages[message_id] = sent_msg
         save_state()
 
     result = {"success": len(sent_to) > 0, "message_id": message_id, "routed_to": sent_to}
