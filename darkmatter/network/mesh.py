@@ -230,10 +230,15 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     if url_err:
         return {"error": url_err}, 400
 
-    # Already connected — update info and return auto_accepted
+    # Already connected — update info (URL, keys, wallets) and return auto_accepted
     if from_agent_id in state.connections:
         existing = state.connections[from_agent_id]
         changed = False
+        if from_agent_url and existing.agent_url != from_agent_url:
+            print(f"[DarkMatter] Updating URL for {from_agent_id[:12]}...: "
+                  f"{existing.agent_url} -> {from_agent_url}", file=sys.stderr)
+            existing.agent_url = from_agent_url
+            changed = True
         if from_agent_public_key_hex and not existing.agent_public_key_hex:
             existing.agent_public_key_hex = from_agent_public_key_hex
             existing.agent_display_name = from_agent_display_name
