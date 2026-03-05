@@ -1108,7 +1108,22 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    public_url = f"{get_network_manager().get_public_url()}/mcp"
+    # Use LAN URL when the requester is on the local network
+    from darkmatter.network.manager import is_local_url
+    from_url = data.get("from_agent_url", "")
+    mgr = get_network_manager()
+    if from_url and is_local_url(from_url):
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            lan_ip = "127.0.0.1"
+        public_url = f"http://{lan_ip}:{state.port}"
+    else:
+        public_url = mgr.get_public_url()
     result, status = await process_connection_request(state, data, public_url)
     return JSONResponse(result, status_code=status)
 

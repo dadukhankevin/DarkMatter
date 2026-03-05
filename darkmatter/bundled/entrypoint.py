@@ -600,28 +600,17 @@ def _resolve_base_url(conn):
             agent_url = agent_url[:-len(suffix)]
             break
 
-    # Check if this agent was discovered locally — use local URL instead
+    # Check if this agent was discovered locally (localhost or LAN) — use discovered URL
     with _discovery_lock:
         for agent in _discovered_agents.values():
             if agent["agent_id"] == conn.agent_id:
-                result = f"http://localhost:{agent['port']}"
+                result = agent["url"]  # already has correct host:port from probe
+                # Also update the stored connection URL so it persists across restarts
+                if conn.agent_url != result:
+                    conn.agent_url = result
+                    save_state()
                 _resolve_cache[conn.agent_id] = (result, now + _RESOLVE_CACHE_TTL)
                 return result
-
-    # Try to extract port and use localhost if the URL has a port
-    from urllib.parse import urlparse
-    parsed = urlparse(agent_url)
-    if parsed.port:
-        # Try localhost first with a quick probe
-        try:
-            with httpx.Client(timeout=httpx.Timeout(0.5, connect=0.25)) as client:
-                resp = client.get(f"http://127.0.0.1:{parsed.port}/.well-known/darkmatter.json")
-                if resp.status_code == 200:
-                    info = resp.json()
-                    if info.get("agent_id") == conn.agent_id:
-                        agent_url = f"http://localhost:{parsed.port}"
-        except Exception:
-            pass
 
     _resolve_cache[conn.agent_id] = (agent_url, now + _RESOLVE_CACHE_TTL)
     return agent_url
@@ -886,7 +875,13 @@ def _sync_connection_request(target_url, mutual=False):
             target_base = target_base[:-len(suffix)]
             break
 
-    payload = build_outbound_request_payload(state, _get_public_url(), mutual=mutual)
+    # Use LAN URL when connecting to a LAN peer so they store a reachable address
+    from darkmatter.network.manager import is_local_url
+    if is_local_url(target_base):
+        our_url = f"http://{_get_lan_ip()}:{PORT}"
+    else:
+        our_url = _get_public_url()
+    payload = build_outbound_request_payload(state, our_url, mutual=mutual)
 
     with httpx.Client(timeout=30.0) as client:
         response = client.post(target_base + "/__darkmatter__/connection_request", json=payload)
