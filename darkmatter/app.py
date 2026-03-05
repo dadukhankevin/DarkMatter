@@ -383,7 +383,7 @@ async def run_stdio_with_http() -> None:
     from mcp.server.stdio import stdio_server
 
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
-    host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
+    host = os.environ.get("DARKMATTER_HOST", "0.0.0.0")
 
     # Load our passport to get our agent_id (if we have one)
     _priv, _pub = load_or_create_passport()
@@ -484,7 +484,7 @@ def main() -> None:
         discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
         print_startup_banner(port, "streamable-http", discovery_enabled)
 
-        host = os.environ.get("DARKMATTER_HOST", "127.0.0.1")
+        host = os.environ.get("DARKMATTER_HOST", "0.0.0.0")
         uvicorn.run(app, host=host, port=port)
 
 
