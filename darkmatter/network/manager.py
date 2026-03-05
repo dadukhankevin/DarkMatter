@@ -357,9 +357,53 @@ class NetworkManager:
         return url
 
     async def check_nat_status(self, public_url: str) -> bool:
-        """Check if we're behind NAT. Returns True if NAT is detected."""
+        """Check if we're behind NAT by asking an anchor to probe our public URL.
+
+        The old self-test (hitting our own public IP) gave false negatives
+        because NAT hairpinning lets the request succeed locally even when
+        external clients can't reach us.  Now we ask the anchor to try.
+        Falls back to self-test if no anchor is available.
+        """
         if "localhost" in public_url or "127.0.0.1" in public_url:
             return True
+
+        # Ask anchor to probe our public URL
+        for anchor in ANCHOR_NODES:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        f"{anchor}/__darkmatter__/probe_reachability",
+                        json={"url": f"{public_url}/__darkmatter__/status"},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        reachable = data.get("reachable", False)
+                        print(f"[DarkMatter] Anchor reachability probe: {'reachable' if reachable else 'UNREACHABLE'}", file=sys.stderr)
+                        return not reachable
+            except Exception:
+                pass  # Anchor doesn't support probe yet, fall back
+
+        # Fallback: compare local LAN IP vs public URL IP
+        # If they differ, we're likely behind NAT
+        try:
+            from urllib.parse import urlparse
+            import socket
+            parsed = urlparse(public_url)
+            public_host = parsed.hostname
+            # Get actual LAN IP by connecting to an external address (no data sent)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+            finally:
+                s.close()
+            if public_host and local_ip and public_host != local_ip:
+                print(f"[DarkMatter] NAT inferred: local={local_ip} != public={public_host}", file=sys.stderr)
+                return True
+        except Exception:
+            pass
+
+        # Last resort: self-test (unreliable due to hairpinning)
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
                 resp = await client.get(f"{public_url}/__darkmatter__/status")

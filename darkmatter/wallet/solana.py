@@ -27,15 +27,62 @@ def _resolve_spl_token(token_or_mint: str) -> Optional[tuple[str, int]]:
 
 if SOLANA_AVAILABLE:
     import hashlib as _hashlib
+    import struct as _struct
     from solders.keypair import Keypair as SolanaKeypair
     from solders.pubkey import Pubkey as SolanaPubkey
     from solders.system_program import transfer as sol_transfer, TransferParams as SolTransferParams
     from solders.transaction import VersionedTransaction
     from solders.message import MessageV0
+    from solders.instruction import Instruction as SolInstruction, AccountMeta
     from solana.rpc.async_api import AsyncClient as SolanaClient
-    from spl.token.instructions import transfer_checked, TransferCheckedParams
-    from spl.token.constants import TOKEN_PROGRAM_ID
-    from spl.token.instructions import create_associated_token_account
+
+    # Well-known program IDs (replaces spl-token constants)
+    TOKEN_PROGRAM_ID = SolanaPubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    ASSOCIATED_TOKEN_PROGRAM_ID = SolanaPubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    SYSTEM_PROGRAM_ID = SolanaPubkey.from_string("11111111111111111111111111111111")
+    SYSVAR_RENT_ID = SolanaPubkey.from_string("SysvarRent111111111111111111111111111111111")
+
+    def _get_associated_token_address(owner: SolanaPubkey, mint: SolanaPubkey) -> SolanaPubkey:
+        """Derive the associated token account address for an owner + mint."""
+        return SolanaPubkey.find_program_address(
+            [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
+            ASSOCIATED_TOKEN_PROGRAM_ID,
+        )[0]
+
+    def _create_associated_token_account_ix(payer: SolanaPubkey, owner: SolanaPubkey,
+                                             mint: SolanaPubkey) -> SolInstruction:
+        """Build a CreateAssociatedTokenAccount instruction using raw solders."""
+        ata = _get_associated_token_address(owner, mint)
+        return SolInstruction(
+            program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+            accounts=[
+                AccountMeta(pubkey=payer, is_signer=True, is_writable=True),
+                AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=owner, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=SYSVAR_RENT_ID, is_signer=False, is_writable=False),
+            ],
+            data=b"",
+        )
+
+    def _transfer_checked_ix(source: SolanaPubkey, mint: SolanaPubkey,
+                              dest: SolanaPubkey, owner: SolanaPubkey,
+                              amount: int, decimals: int) -> SolInstruction:
+        """Build a TransferChecked instruction (SPL Token instruction #12)."""
+        # Instruction layout: u8 tag (12) + u64 amount + u8 decimals
+        data = _struct.pack("<BQB", 12, amount, decimals)
+        return SolInstruction(
+            program_id=TOKEN_PROGRAM_ID,
+            accounts=[
+                AccountMeta(pubkey=source, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=dest, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=owner, is_signer=True, is_writable=False),
+            ],
+            data=data,
+        )
 
     def _derive_solana_keypair(private_key_hex: str) -> SolanaKeypair:
         """Derive a Solana keypair from the passport private key with domain separation."""
@@ -68,10 +115,7 @@ if SOLANA_AVAILABLE:
                     }
                 else:
                     mint_pubkey = SolanaPubkey.from_string(mint)
-                    ata = SolanaPubkey.find_program_address(
-                        [bytes(pubkey), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)],
-                        SolanaPubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
-                    )[0]
+                    ata = _get_associated_token_address(pubkey, mint_pubkey)
                     resp = await client.get_token_account_balance(ata)
                     if resp.value is None:
                         return {
@@ -154,15 +198,8 @@ if SOLANA_AVAILABLE:
         recipient_pubkey = SolanaPubkey.from_string(recipient_wallet)
         mint_pubkey = SolanaPubkey.from_string(mint)
 
-        ata_program = SolanaPubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-        sender_ata = SolanaPubkey.find_program_address(
-            [bytes(sender_pubkey), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)],
-            ata_program,
-        )[0]
-        recipient_ata = SolanaPubkey.find_program_address(
-            [bytes(recipient_pubkey), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)],
-            ata_program,
-        )[0]
+        sender_ata = _get_associated_token_address(sender_pubkey, mint_pubkey)
+        recipient_ata = _get_associated_token_address(recipient_pubkey, mint_pubkey)
 
         raw_amount = int(amount * (10 ** decimals))
 
@@ -173,23 +210,21 @@ if SOLANA_AVAILABLE:
 
                 ata_info = await client.get_account_info(recipient_ata)
                 if ata_info.value is None:
-                    create_ata_ix = create_associated_token_account(
+                    instructions.append(_create_associated_token_account_ix(
                         payer=sender_pubkey,
                         owner=recipient_pubkey,
                         mint=mint_pubkey,
-                    )
-                    instructions.append(create_ata_ix)
+                    ))
                     created_ata = True
 
-                instructions.append(transfer_checked(TransferCheckedParams(
-                    program_id=TOKEN_PROGRAM_ID,
+                instructions.append(_transfer_checked_ix(
                     source=sender_ata,
                     mint=mint_pubkey,
                     dest=recipient_ata,
                     owner=sender_pubkey,
                     amount=raw_amount,
                     decimals=decimals,
-                )))
+                ))
 
                 bh_resp = await client.get_latest_blockhash()
                 blockhash = bh_resp.value.blockhash

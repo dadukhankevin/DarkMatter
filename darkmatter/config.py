@@ -313,9 +313,6 @@ try:
     from solders.transaction import VersionedTransaction  # noqa: F401
     from solders.message import MessageV0  # noqa: F401
     from solana.rpc.async_api import AsyncClient as SolanaClient  # noqa: F401
-    from spl.token.instructions import transfer_checked, TransferCheckedParams  # noqa: F401
-    from spl.token.constants import TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID  # noqa: F401
-    from spl.token.instructions import create_associated_token_account  # noqa: F401
     SOLANA_AVAILABLE = True
 except ImportError:
     SOLANA_AVAILABLE = False

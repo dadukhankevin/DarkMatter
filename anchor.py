@@ -277,6 +277,34 @@ def anchor_well_known():
     })
 
 
+@anchor_bp.route("/__darkmatter__/probe_reachability", methods=["POST"])
+def probe_reachability():
+    """Probe whether a URL is reachable from the anchor's perspective.
+
+    Agents use this to detect NAT — they can't reliably self-test because
+    NAT hairpinning makes their own public IP appear reachable locally.
+    """
+    from urllib.request import urlopen, Request
+    from urllib.error import URLError, HTTPError
+    data = request.get_json(silent=True)
+    if not data or not data.get("url"):
+        return jsonify({"error": "Missing 'url' field"}), 400
+
+    target_url = data["url"]
+    url_err = _validate_url(target_url)
+    if url_err:
+        return jsonify({"error": url_err}), 400
+
+    try:
+        req = Request(target_url, method="GET")
+        resp = urlopen(req, timeout=5)
+        return jsonify({"reachable": resp.status == 200, "status_code": resp.status})
+    except HTTPError as e:
+        return jsonify({"reachable": False, "status_code": e.code})
+    except Exception:
+        return jsonify({"reachable": False, "status_code": None})
+
+
 # ---------------------------------------------------------------------------
 # Webhook Relay — buffer webhook callbacks for NAT-ed agents
 #
@@ -765,6 +793,7 @@ CSRF_EXEMPT_VIEWS = [
     "darkmatter_anchor.sdp_relay_poll",
     "darkmatter_anchor.message_relay_post",
     "darkmatter_anchor.message_relay_poll",
+    "darkmatter_anchor.probe_reachability",
 ]
 
 
