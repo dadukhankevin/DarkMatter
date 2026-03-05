@@ -1026,7 +1026,28 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
         except Exception as e:
             conn.messages_declined += 1
             conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
-            failed.append({"agent_id": conn.agent_id, "error": str(e)})
+            # Try anchor message relay as fallback
+            relayed = False
+            if ANCHOR_NODES:
+                for anchor in ANCHOR_NODES:
+                    try:
+                        with httpx.Client(timeout=10.0) as relay_client:
+                            resp = relay_client.post(
+                                f"{anchor}/__darkmatter__/message_relay/{conn.agent_id}",
+                                json=payload,
+                            )
+                            if resp.status_code < 400:
+                                conn.messages_sent += 1
+                                conn._consecutive_failures = 0
+                                conn.last_activity = datetime.now(timezone.utc).isoformat()
+                                sent_to.append(conn.agent_id)
+                                relayed = True
+                                print(f"[DarkMatter Entrypoint] Message relayed via {anchor} to {conn.agent_id[:12]}...", file=sys.stderr)
+                                break
+                    except Exception:
+                        continue
+            if not relayed:
+                failed.append({"agent_id": conn.agent_id, "error": str(e)})
 
     if sent_to:
         sent_msg = SentMessage(
