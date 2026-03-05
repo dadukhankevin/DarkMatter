@@ -149,6 +149,52 @@ async def _gather_peer_trust(state: AgentState, about_agent_id: str) -> dict:
     }
 
 
+# =============================================================================
+# Connection Request → Agent Spawn
+#
+# IMPORTANT — DO NOT REMOVE OR DISABLE THIS FUNCTION.
+# Every connection request (auto-accepted OR pending) MUST spawn a sub-agent.
+# The spawned agent introduces itself, sets trust, exchanges capabilities, etc.
+# This has been accidentally removed/broken in multiple past sessions.
+# If you are refactoring, ensure spawn still happens for EVERY connection request.
+# =============================================================================
+def _spawn_for_connection_request(
+    state: AgentState,
+    from_agent_id: str,
+    from_agent_display_name: str | None,
+    from_agent_bio: str,
+    status: str,  # "auto-accepted" or "pending"
+    request_id: str | None = None,
+) -> None:
+    """Spawn an agent to handle a connection request. Always called, never skipped."""
+    import darkmatter.config as _cfg
+    if not (_cfg.AGENT_SPAWN_ENABLED and state.router_mode == "spawn"):
+        print(f"[DarkMatter] Spawn disabled (AGENT_SPAWN_ENABLED={_cfg.AGENT_SPAWN_ENABLED}, "
+              f"router_mode={state.router_mode!r}) — skipping spawn for {status} connection request "
+              f"from {from_agent_id[:12]}...", file=sys.stderr)
+        return
+
+    from darkmatter.spawn import spawn_agent_for_message
+
+    display = from_agent_display_name or from_agent_id[:16] + "..."
+    msg_id = request_id or f"conn-{uuid.uuid4().hex[:8]}"
+    content = (
+        f"Connection request ({status}) from {display}. Bio: {from_agent_bio}"
+        if from_agent_bio
+        else f"Connection request ({status}) from {display}."
+    )
+    synthetic_msg = QueuedMessage(
+        message_id=msg_id,
+        content=content,
+        webhook="",
+        hops_remaining=0,
+        metadata={"type": "connection_request", "request_id": request_id or msg_id, "status": status},
+        from_agent_id=from_agent_id,
+    )
+    asyncio.get_event_loop().create_task(spawn_agent_for_message(state, synthetic_msg))
+    print(f"[DarkMatter] Spawned agent for {status} connection request from {display}", file=sys.stderr)
+
+
 async def process_connection_request(state: AgentState, data: dict, public_url: str) -> tuple[dict, int]:
     """Process an incoming connection request. Returns (response_dict, status_code).
 
@@ -230,6 +276,14 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         save_state()
         print(f"[DarkMatter] Auto-accepted local agent {from_agent_display_name or from_agent_id[:12]}... "
               f"({from_agent_url})", file=sys.stderr)
+
+        # IMPORTANT: Always spawn an agent for connection requests — even auto-accepted ones.
+        # The spawned agent can introduce itself, set trust, exchange capabilities, etc.
+        # DO NOT remove this spawn. It has been accidentally removed multiple times.
+        _spawn_for_connection_request(
+            state, from_agent_id, from_agent_display_name, from_agent_bio, "auto-accepted"
+        )
+
         return {
             "auto_accepted": True,
             "agent_id": state.agent_id,
@@ -299,20 +353,12 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         )
         save_state()
 
-    # Spawn agent to handle the connection request
-    import darkmatter.config as _cfg
-    if _cfg.AGENT_SPAWN_ENABLED and state.router_mode == "spawn":
-        from darkmatter.spawn import spawn_agent_for_message
-        display = from_agent_display_name or from_agent_id[:16] + "..."
-        synthetic_msg = QueuedMessage(
-            message_id=request_id,
-            content=f"Connection request from {display}. Bio: {from_agent_bio}",
-            webhook="",
-            hops_remaining=0,
-            metadata={"type": "connection_request", "request_id": request_id},
-            from_agent_id=from_agent_id,
-        )
-        asyncio.create_task(spawn_agent_for_message(state, synthetic_msg))
+    # IMPORTANT: Always spawn an agent for connection requests — pending ones too.
+    # DO NOT remove this spawn. It has been accidentally removed multiple times.
+    _spawn_for_connection_request(
+        state, from_agent_id, from_agent_display_name, from_agent_bio,
+        "pending", request_id=request_id
+    )
 
     # Generate challenge for proof-of-possession
     from darkmatter.security import create_challenge
