@@ -322,6 +322,54 @@ async def scan_local_ports(state: AgentState) -> None:
 # Entrypoint Auto-Start
 # =============================================================================
 
+def sync_entrypoint_files() -> None:
+    """Sync bundled entrypoint files to ~/.darkmatter/ if the package version is newer.
+
+    Copies entrypoint.py and templates/ from the installed darkmatter package
+    to ~/.darkmatter/ so the human node always runs the latest code.
+    """
+    import darkmatter
+    import shutil
+
+    dest_dir = os.path.join(os.path.expanduser("~"), ".darkmatter")
+    bundled_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bundled")
+
+    if not os.path.isdir(bundled_dir):
+        return  # No bundled files (dev install without bundled/)
+
+    # Check version marker to avoid redundant copies
+    version_file = os.path.join(dest_dir, ".entrypoint_version")
+    current_version = darkmatter.__version__
+    try:
+        with open(version_file) as f:
+            installed_version = f.read().strip()
+        if installed_version == current_version:
+            return  # Already up to date
+    except FileNotFoundError:
+        pass
+
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # Copy entrypoint.py
+    src_ep = os.path.join(bundled_dir, "entrypoint.py")
+    if os.path.isfile(src_ep):
+        shutil.copy2(src_ep, os.path.join(dest_dir, "entrypoint.py"))
+
+    # Copy templates/
+    src_templates = os.path.join(bundled_dir, "templates")
+    if os.path.isdir(src_templates):
+        dest_templates = os.path.join(dest_dir, "templates")
+        if os.path.isdir(dest_templates):
+            shutil.rmtree(dest_templates)
+        shutil.copytree(src_templates, dest_templates)
+
+    # Write version marker
+    with open(version_file, "w") as f:
+        f.write(current_version)
+
+    print(f"[DarkMatter] Synced entrypoint files to {dest_dir} (v{current_version})", file=sys.stderr)
+
+
 def find_entrypoint_path() -> Optional[str]:
     """Locate the entrypoint.py script for the human node.
 
@@ -329,6 +377,9 @@ def find_entrypoint_path() -> Optional[str]:
     1. DARKMATTER_ENTRYPOINT_PATH env var (explicit override)
     2. ~/.darkmatter/entrypoint.py (canonical per-device location)
     """
+    # Sync bundled files before searching
+    sync_entrypoint_files()
+
     if ENTRYPOINT_PATH:
         return ENTRYPOINT_PATH if os.path.isfile(ENTRYPOINT_PATH) else None
     canonical = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.py")

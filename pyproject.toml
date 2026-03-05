@@ -61,3 +61,6 @@ include = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["darkmatter"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"darkmatter/bundled" = "darkmatter/bundled"
