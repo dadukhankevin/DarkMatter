@@ -478,38 +478,49 @@ async def ensure_entrypoint_running() -> None:
 
         entrypoint_dir = os.path.dirname(os.path.abspath(path))
         log_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.log")
-        log_file = open(log_path, "a")
 
-        print(f"[DarkMatter] Spawning entrypoint: {path}", file=sys.stderr)
         spawn_env = {k: v for k, v in os.environ.items()
                      if not k.startswith("WERKZEUG_")}
         popen_kwargs = dict(
             cwd=entrypoint_dir,
-            stdout=log_file,
-            stderr=log_file,
             env=spawn_env,
         )
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
-        proc = subprocess.Popen([sys.executable, path], **popen_kwargs)
-        _entrypoint_pid = proc.pid
 
-        # Wait up to 10s for the entrypoint to start responding
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            # Check if the process crashed immediately
-            if proc.poll() is not None:
-                print(f"[DarkMatter] Entrypoint process exited with code {proc.returncode} (check {log_path})", file=sys.stderr)
+        # Retry up to 3 times — handles port conflicts from recently-killed processes
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(2)
+                if await _is_entrypoint_responding():
+                    return
+            print(f"[DarkMatter] Spawning entrypoint: {path}" + (f" (attempt {attempt + 1})" if attempt else ""), file=sys.stderr)
+            log_file_handle = open(log_path, "a")
+            popen_kwargs["stdout"] = log_file_handle
+            popen_kwargs["stderr"] = log_file_handle
+            proc = subprocess.Popen([sys.executable, path], **popen_kwargs)
+            _entrypoint_pid = proc.pid
+
+            # Wait up to 10s for the entrypoint to start responding
+            started = False
+            for _ in range(20):
+                await asyncio.sleep(0.5)
+                if proc.poll() is not None:
+                    print(f"[DarkMatter] Entrypoint exited with code {proc.returncode} (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
+                    _entrypoint_pid = None
+                    break
+                if await _is_entrypoint_responding():
+                    print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
+                    started = True
+                    break
+
+            if started:
+                return
+            if _entrypoint_pid is not None:
+                print(f"[DarkMatter] Entrypoint failed to respond within 10s (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
                 _entrypoint_pid = None
-                return
-            if await _is_entrypoint_responding():
-                print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
-                return
-
-        print(f"[DarkMatter] Entrypoint failed to respond within 10s (check {log_path})", file=sys.stderr)
-        _entrypoint_pid = None
     finally:
         unlock(lock_fd)
         os.close(lock_fd)
