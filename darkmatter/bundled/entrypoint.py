@@ -192,20 +192,46 @@ def _message_timeout_checker():
             age = (now - created).total_seconds()
             has_ack = any(u.get("type") == "received" for u in sm.updates)
             timeout = MESSAGE_RESPONSE_TIMEOUT_SECONDS if has_ack else MESSAGE_TIMEOUT_SECONDS
-            if age > timeout and not sm.responses:
-                reason = "No response received" if has_ack else "No acknowledgement received"
-                sm.status = "timed_out"
-                sm.updates.append({
-                    "type": "timed_out",
-                    "timestamp": now.isoformat(),
-                    "reason": reason,
-                })
-                # Count timeout as a failure for each routed-to peer
-                for agent_id in sm.routed_to:
-                    conn = state.connections.get(agent_id)
-                    if conn:
-                        conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
-                dirty = True
+            if age <= timeout:
+                continue
+
+            # Check if we got webhook responses
+            if sm.responses:
+                continue
+
+            # Check if any routed-to peer had activity after we sent the message
+            # (replies may come as regular messages, not webhook responses)
+            got_activity = False
+            for agent_id in sm.routed_to:
+                conn = state.connections.get(agent_id)
+                if conn and conn.last_activity:
+                    try:
+                        last = datetime.fromisoformat(conn.last_activity)
+                        if last > created:
+                            got_activity = True
+                            break
+                    except Exception:
+                        pass
+            if got_activity:
+                # Peer was active after we sent — mark as delivered, not timed out
+                if sm.status == "active":
+                    sm.status = "delivered"
+                    dirty = True
+                continue
+
+            reason = "No response received" if has_ack else "No acknowledgement received"
+            sm.status = "timed_out"
+            sm.updates.append({
+                "type": "timed_out",
+                "timestamp": now.isoformat(),
+                "reason": reason,
+            })
+            # Count timeout as a failure for each routed-to peer
+            for agent_id in sm.routed_to:
+                conn = state.connections.get(agent_id)
+                if conn:
+                    conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
+            dirty = True
 
         if dirty:
             save_state()
