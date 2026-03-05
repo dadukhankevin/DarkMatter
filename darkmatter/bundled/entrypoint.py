@@ -338,27 +338,29 @@ def api_security_post():
 
 @app.route("/api/security/push", methods=["POST"])
 def api_security_push():
-    """Push security config to all connected LAN agents."""
+    """Push security config to all connected LAN agents via mesh messages."""
     from darkmatter.network.manager import is_local_url
     ss = state.security_settings
-    payload = {
+    metadata = {
+        "type": "security_push",
         "auto_accept_local": ss.get("auto_accept_local", True),
         "sandbox_enabled": ss.get("sandbox_enabled", False),
         "sandbox_network": ss.get("sandbox_network", True),
     }
     pushed = []
+    errors = []
     for aid, conn in state.connections.items():
         if is_local_url(conn.agent_url):
-            try:
-                resp = httpx.post(
-                    conn.agent_url.rstrip("/") + "/__darkmatter__/security_push",
-                    json=payload, timeout=5.0,
-                )
-                if resp.status_code == 200:
-                    pushed.append(aid[:12])
-            except Exception:
-                pass
-    return jsonify({"success": True, "pushed_to": pushed})
+            result = _sync_send_message(
+                content="Security settings update from mesh peer.",
+                target_agent_id=aid,
+                metadata=metadata,
+            )
+            if result.get("success"):
+                pushed.append(aid[:12])
+            else:
+                errors.append(f"{aid[:12]}: {result.get('error', 'unknown')}")
+    return jsonify({"success": True, "pushed_to": pushed, "errors": errors})
 
 
 def _get_public_url():
@@ -848,6 +850,7 @@ def dm_message():
     data = request.get_json(silent=True) or {}
 
     # Use shared validation/queuing logic from darkmatter.network.mesh.
+    # security_push messages are intercepted in _process_incoming_message (mesh.py).
     # router_mode is "queue_only" — messages queue for the human to read.
     loop = asyncio.new_event_loop()
     try:
@@ -943,23 +946,6 @@ def dm_gas_result():
     data = request.get_json(silent=True) or {}
     result, status = asyncio.run(process_antimatter_result(state, data))
     return jsonify(result), status
-
-
-@app.route("/__darkmatter__/security_push", methods=["POST"])
-def dm_security_push():
-    """Receive security settings pushed from a LAN peer."""
-    data = request.get_json(silent=True) or {}
-    ss = state.security_settings
-    if "auto_accept_local" in data:
-        ss["auto_accept_local"] = bool(data["auto_accept_local"])
-    if "sandbox_enabled" in data:
-        ss["sandbox_enabled"] = bool(data["sandbox_enabled"])
-        _dm_config.AGENT_SANDBOX = ss["sandbox_enabled"]
-    if "sandbox_network" in data:
-        ss["sandbox_network"] = bool(data["sandbox_network"])
-        _dm_config.AGENT_SANDBOX_NETWORK = ss["sandbox_network"]
-    save_state()
-    return jsonify({"accepted": True})
 
 
 # ---------------------------------------------------------------------------

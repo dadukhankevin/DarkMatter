@@ -956,6 +956,19 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         save_state()
         return {"status": "broadcast_received"}, 200
 
+    # Security push: apply settings at the node level, don't queue or spawn
+    if msg_metadata.get("type") == "security_push":
+        import darkmatter.config as _cfg
+        ss = state.security_settings
+        for key in ("auto_accept_local", "sandbox_enabled", "sandbox_network"):
+            if key in msg_metadata:
+                ss[key] = bool(msg_metadata[key])
+        _cfg.AGENT_SANDBOX = ss.get("sandbox_enabled", False)
+        _cfg.AGENT_SANDBOX_NETWORK = ss.get("sandbox_network", True)
+        save_state()
+        print(f"[DarkMatter] Applied security push from {from_agent_id[:12]}", file=sys.stderr)
+        return {"status": "security_push_applied"}, 200
+
     msg = QueuedMessage(
         message_id=truncate_field(message_id, 128),
         content=content,
