@@ -257,17 +257,41 @@ class NetworkManager:
     def build_webhook_url(self, message_id: str, peer_url: str = None) -> str:
         """Build the webhook URL, using anchor relay if behind NAT.
 
-        If peer_url is local (private IP / localhost), bypass the anchor relay
-        and use a direct localhost webhook URL instead.
+        If peer_url is local (private IP / localhost / LAN), bypass the anchor
+        relay and use a direct URL the peer can reach us on.
         """
         state = self._get_state()
         if state.nat_detected and ANCHOR_NODES:
             # Local peers don't need anchor relay
             if peer_url and is_local_url(peer_url):
-                return f"http://localhost:{state.port}/__darkmatter__/webhook/{message_id}"
+                # Determine the right host for the webhook:
+                # - Same machine (localhost/127.x) → use localhost
+                # - LAN peer (10.x, 192.168.x, etc.) → use our LAN IP
+                try:
+                    peer_host = urlparse(peer_url).hostname or ""
+                    if peer_host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+                        webhook_host = "localhost"
+                    else:
+                        webhook_host = self._get_lan_ip()
+                except Exception:
+                    webhook_host = "localhost"
+                return f"http://{webhook_host}:{state.port}/__darkmatter__/webhook/{message_id}"
             anchor = self.get_active_anchor()
             return f"{anchor}/__darkmatter__/webhook_relay/{state.agent_id}/{message_id}"
         return f"{self.get_public_url()}/__darkmatter__/webhook/{message_id}"
+
+    @staticmethod
+    def _get_lan_ip() -> str:
+        """Get the LAN IP address of this machine."""
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "localhost"
 
     # -- Peer resolution --
 

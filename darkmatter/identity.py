@@ -159,6 +159,32 @@ def is_private_ip(hostname: str) -> bool:
     return False
 
 
+def _origin(parsed) -> str:
+    """Extract origin (scheme://host:port) from a parsed URL."""
+    return f"{parsed.scheme}://{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
+
+
+_LOCALHOST_ALIASES = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _origins_match(a: str, b: str) -> bool:
+    """Check if two origins match, treating all localhost variants as equivalent."""
+    if a == b:
+        return True
+    try:
+        a_parsed, b_parsed = urlparse(a), urlparse(b)
+        a_host, b_host = a_parsed.hostname or "", b_parsed.hostname or ""
+        a_port = a_parsed.port or (443 if a_parsed.scheme == "https" else 80)
+        b_port = b_parsed.port or (443 if b_parsed.scheme == "https" else 80)
+        if a_port != b_port:
+            return False
+        if a_host in _LOCALHOST_ALIASES and b_host in _LOCALHOST_ALIASES:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def is_darkmatter_webhook(url: str, get_state_fn=None, get_public_url_fn=None) -> bool:
     """Check if a URL is a known DarkMatter webhook endpoint on a known peer.
 
@@ -169,7 +195,20 @@ def is_darkmatter_webhook(url: str, get_state_fn=None, get_public_url_fn=None) -
         if "/__darkmatter__/webhook/" not in (parsed.path or ""):
             return False
 
-        webhook_origin = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
+        webhook_origin = _origin(parsed)
+
+        # Always allow DarkMatter webhooks targeting local/private IPs.
+        # These are legitimate mesh traffic between agents on the same
+        # machine or same LAN — no reason to route through an anchor.
+        webhook_host = parsed.hostname or ""
+        if webhook_host in _LOCALHOST_ALIASES:
+            return True
+        try:
+            import ipaddress
+            if ipaddress.ip_address(webhook_host).is_private:
+                return True
+        except (ValueError, TypeError):
+            pass
 
         if get_state_fn is not None:
             state = get_state_fn()
@@ -177,14 +216,12 @@ def is_darkmatter_webhook(url: str, get_state_fn=None, get_public_url_fn=None) -
                 if get_public_url_fn is not None:
                     own_url = get_public_url_fn(state.port)
                     own_parsed = urlparse(own_url)
-                    own_origin = f"{own_parsed.scheme}://{own_parsed.hostname}:{own_parsed.port or (443 if own_parsed.scheme == 'https' else 80)}"
-                    if webhook_origin == own_origin:
+                    if _origins_match(webhook_origin, _origin(own_parsed)):
                         return True
 
                 for conn in state.connections.values():
                     peer_parsed = urlparse(conn.agent_url)
-                    peer_origin = f"{peer_parsed.scheme}://{peer_parsed.hostname}:{peer_parsed.port or (443 if peer_parsed.scheme == 'https' else 80)}"
-                    if webhook_origin == peer_origin:
+                    if _origins_match(webhook_origin, _origin(peer_parsed)):
                         return True
 
         return False
