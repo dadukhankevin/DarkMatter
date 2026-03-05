@@ -16,6 +16,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import time
 import uuid
 import threading
@@ -24,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from flask import Flask, request, jsonify, render_template, redirect, url_for, session as flask_session, send_from_directory
+from werkzeug.utils import secure_filename
 
 
 def _is_ajax():
@@ -64,9 +66,12 @@ import struct
 
 PORT = int(os.environ.get("DARKMATTER_ENTRYPOINT_PORT", "8200"))
 SCAN_PORTS = list(range(8100, 8201)) + [PORT]  # scan 8100-8200 + our own port range
-MESSAGE_TIMEOUT_SECONDS = 120  # no webhook callback in 120s = failed
+MESSAGE_TIMEOUT_SECONDS = 120       # no ACK in 120s = failed
+MESSAGE_RESPONSE_TIMEOUT_SECONDS = 600  # ACK'd but no response in 10min = timed out
 DISCOVERY_MCAST_GROUP = "239.77.68.77"
 DISCOVERY_PORT = 8470
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "darkmatter-uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Initialize DarkMatter state
@@ -158,7 +163,7 @@ def _cleanup_network():
     try:
         asyncio.run(_mgr.stop())
     except Exception:
-        pass
+        pass  # Shutdown cleanup — safe to swallow
 
 atexit.register(_cleanup_network)
 
@@ -184,9 +189,10 @@ def _message_timeout_checker():
                 print(f"[DarkMatter Entrypoint] Malformed timestamp in sent message {sm.message_id}: {sm.created_at!r}", file=sys.stderr)
                 continue
             age = (now - created).total_seconds()
-            if age > MESSAGE_TIMEOUT_SECONDS and not sm.responses:
-                # No response at all — whether or not peer ACK'd receipt
-                reason = "No response received" if sm.updates else "No acknowledgement received"
+            has_ack = any(u.get("type") == "received" for u in sm.updates)
+            timeout = MESSAGE_RESPONSE_TIMEOUT_SECONDS if has_ack else MESSAGE_TIMEOUT_SECONDS
+            if age > timeout and not sm.responses:
+                reason = "No response received" if has_ack else "No acknowledgement received"
                 sm.status = "timed_out"
                 sm.updates.append({
                     "type": "timed_out",
@@ -200,40 +206,53 @@ def _message_timeout_checker():
                         conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
                 dirty = True
 
-        # Flag unreachable peers based on consecutive recent failures
-        # and probe unreachable ones for recovery
-        for conn in list(state.connections.values()):
-            if conn.agent_id == state.agent_id:
-                continue
-            was_unreachable = getattr(conn, "health_status", "ok") == "unreachable"
-            consecutive = getattr(conn, "_consecutive_failures", 0)
-
-            if consecutive >= 2:
-                if not was_unreachable:
-                    conn.health_status = "unreachable"
-                    dirty = True
-                else:
-                    # Already unreachable — try a lightweight recovery ping
-                    try:
-                        base = _resolve_base_url(conn)
-                        with httpx.Client(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
-                            resp = client.get(base + "/.well-known/darkmatter.json")
-                            if resp.status_code == 200:
-                                conn.health_status = "ok"
-                                conn._consecutive_failures = 0
-                                conn.messages_declined = 0
-                                dirty = True
-                    except Exception as e:
-                        print(f"[DarkMatter Entrypoint] Recovery ping failed for {_short_id(conn.agent_id)}: {e}", file=sys.stderr)
-            elif was_unreachable:
-                conn.health_status = "ok"
-                dirty = True
-
         if dirty:
             save_state()
 
 
 threading.Thread(target=_message_timeout_checker, daemon=True).start()
+
+
+HEALTH_CHECK_INTERVAL = 15  # seconds between heartbeat pings
+
+
+def _health_check_loop():
+    """Proactively ping all connected agents to detect online/offline status."""
+    while True:
+        time.sleep(HEALTH_CHECK_INTERVAL)
+        dirty = False
+        for conn in list(state.connections.values()):
+            if conn.agent_id == state.agent_id:
+                continue
+            try:
+                base = _resolve_base_url(conn)
+                with httpx.Client(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+                    t0 = time.monotonic()
+                    resp = client.get(base + "/.well-known/darkmatter.json")
+                    elapsed_ms = round((time.monotonic() - t0) * 1000)
+                    if resp.status_code == 200:
+                        conn.ping_latency_ms = elapsed_ms
+                        if getattr(conn, "health_status", "ok") != "ok":
+                            conn.health_status = "ok"
+                            conn._consecutive_failures = 0
+                            dirty = True
+                    else:
+                        conn.ping_latency_ms = -1
+                        conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
+                        if conn._consecutive_failures >= 2 and getattr(conn, "health_status", "ok") != "unreachable":
+                            conn.health_status = "unreachable"
+                            dirty = True
+            except Exception:
+                conn.ping_latency_ms = -1
+                conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
+                if conn._consecutive_failures >= 2 and getattr(conn, "health_status", "ok") != "unreachable":
+                    conn.health_status = "unreachable"
+                    dirty = True
+        if dirty:
+            save_state()
+
+
+threading.Thread(target=_health_check_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -242,72 +261,48 @@ threading.Thread(target=_message_timeout_checker, daemon=True).start()
 
 app = Flask(__name__, template_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "entrypoint"))
 
-# --- Optional PIN auth (persisted in state.security_settings) ---
-from werkzeug.security import generate_password_hash, check_password_hash
-
-# Apply persisted sandbox settings to config module at startup
-import darkmatter.config as _dm_config
-_dm_config.AGENT_SANDBOX = state.security_settings.get("sandbox_enabled", False)
-_dm_config.AGENT_SANDBOX_NETWORK = state.security_settings.get("sandbox_network", True)
-
-# Migrate env var PIN on first run: if DARKMATTER_PIN is set and no pin_hash in state, hash and save once
-_env_pin = os.environ.get("DARKMATTER_PIN", "").strip()
-if _env_pin and not state.security_settings.get("pin_hash"):
-    state.security_settings["pin_hash"] = generate_password_hash(_env_pin)
-    save_state()
+# --- Optional PIN auth ---
+_pin_file = os.path.join(_entrypoint_data_dir, ".pin")
+_DARKMATTER_PIN = os.environ.get("DARKMATTER_PIN", "").strip()
+if not _DARKMATTER_PIN and os.path.isfile(_pin_file):
+    _DARKMATTER_PIN = open(_pin_file).read().strip()
+app.secret_key = hashlib.sha256(f"darkmatter-entrypoint-session-{state.agent_id}".encode()).digest()
 
 
-def _update_secret_key():
-    """Derive session secret from agent_id + pin_hash. Changing the PIN
-    invalidates every existing session cookie immediately."""
-    pin_hash = state.security_settings.get("pin_hash", "")
-    app.secret_key = hashlib.sha256(
-        f"darkmatter-{state.agent_id}-{pin_hash}".encode()
-    ).digest()
-
-_update_secret_key()
-
-
-def _pin_is_set() -> bool:
-    return bool(state.security_settings.get("pin_hash", ""))
+def _is_localhost_request():
+    """Check if the request originates from the same machine."""
+    remote = request.remote_addr or ""
+    return remote in ("127.0.0.1", "::1", "localhost")
 
 
 @app.before_request
 def _pin_auth_guard():
-    if not _pin_is_set():
+    if not _DARKMATTER_PIN:
         return  # No PIN configured — open access
+    # Localhost is always trusted (the device running the entrypoint)
+    if _is_localhost_request():
+        return
     # Exempt paths: login, mesh protocol, well-known
     path = request.path
-    if path == "/login" or path.startswith("/__darkmatter__/") or path.startswith("/.well-known/"):
+    if path == "/login" or path.startswith("/__darkmatter__/") or path.startswith("/.well-known/") or path.startswith("/api/file/"):
         return
-    # Validate session — check the pin_hash fingerprint matches current PIN
-    if (flask_session.get("pin_authenticated")
-            and flask_session.get("pin_fingerprint") == _pin_fingerprint()):
+    if flask_session.get("pin_authenticated"):
         return
-    # Stale or missing session — force re-auth
-    flask_session.clear()
+    # 401 for AJAX, redirect for pages
     if _is_ajax() or request.headers.get("Accept", "").startswith("application/json"):
         return jsonify({"error": "Authentication required"}), 401
     return redirect("/login")
 
 
-def _pin_fingerprint() -> str:
-    """Short hash of the current pin_hash — stored in session to detect PIN changes."""
-    h = state.security_settings.get("pin_hash", "")
-    return hashlib.sha256(h.encode()).hexdigest()[:16] if h else ""
-
-
 @app.route("/login", methods=["GET", "POST"])
 def pin_login():
-    if not _pin_is_set():
+    if not _DARKMATTER_PIN:
         return redirect("/")
     error = None
     if request.method == "POST":
         pin = request.form.get("pin", "").strip()
-        if check_password_hash(state.security_settings["pin_hash"], pin):
-            flask_session.clear()
+        if pin == _DARKMATTER_PIN:
             flask_session["pin_authenticated"] = True
-            flask_session["pin_fingerprint"] = _pin_fingerprint()
             flask_session.permanent = True
             app.permanent_session_lifetime = __import__("datetime").timedelta(hours=24)
             return redirect("/")
@@ -315,79 +310,31 @@ def pin_login():
     return render_template("pin_login.html", error=error)
 
 
-@app.route("/api/security", methods=["GET"])
-def api_security_get():
-    """Return current security settings (never expose the hash)."""
-    ss = state.security_settings
-    return jsonify({
-        "pin_enabled": bool(ss.get("pin_hash", "")),
-        "auto_accept_local": ss.get("auto_accept_local", True),
-        "sandbox_enabled": ss.get("sandbox_enabled", False),
-        "sandbox_network": ss.get("sandbox_network", True),
-    })
+@app.route("/api/pin", methods=["POST"])
+def set_pin():
+    """Set or clear the entrypoint PIN. Only accessible from localhost."""
+    global _DARKMATTER_PIN
+    if not _is_localhost_request():
+        return jsonify({"error": "PIN can only be changed from the host device"}), 403
+    data = request.get_json(silent=True) or {}
+    new_pin = data.get("pin", "").strip()
+    if new_pin and (not new_pin.isdigit() or len(new_pin) != 4):
+        return jsonify({"error": "PIN must be exactly 4 digits"}), 400
+    _DARKMATTER_PIN = new_pin
+    if new_pin:
+        with open(_pin_file, "w") as f:
+            f.write(new_pin)
+    elif os.path.isfile(_pin_file):
+        os.remove(_pin_file)
+    return jsonify({"success": True, "pin_enabled": bool(new_pin)})
 
 
-@app.route("/api/security", methods=["POST"])
-def api_security_post():
-    """Partial-update security settings. PIN accepted as plaintext, immediately hashed."""
-    data = request.get_json(force=True)
-    ss = state.security_settings
-
-    if "pin" in data:
-        pin_val = (data["pin"] or "").strip()
-        if pin_val:
-            ss["pin_hash"] = generate_password_hash(pin_val)
-        else:
-            ss["pin_hash"] = ""
-        # Rotate secret key — invalidates ALL existing sessions on every device
-        _update_secret_key()
-        # Re-authenticate the current session (the device that changed the PIN)
-        flask_session.clear()
-        if pin_val:
-            flask_session["pin_authenticated"] = True
-            flask_session["pin_fingerprint"] = _pin_fingerprint()
-            flask_session.permanent = True
-
-    if "auto_accept_local" in data:
-        ss["auto_accept_local"] = bool(data["auto_accept_local"])
-
-    if "sandbox_enabled" in data:
-        ss["sandbox_enabled"] = bool(data["sandbox_enabled"])
-        _dm_config.AGENT_SANDBOX = ss["sandbox_enabled"]
-
-    if "sandbox_network" in data:
-        ss["sandbox_network"] = bool(data["sandbox_network"])
-        _dm_config.AGENT_SANDBOX_NETWORK = ss["sandbox_network"]
-
-    save_state()
-    return jsonify({"success": True})
-
-
-@app.route("/api/security/push", methods=["POST"])
-def api_security_push():
-    """Push security config to all connected LAN agents via mesh messages."""
-    from darkmatter.network.manager import is_local_url
-    ss = state.security_settings
-    metadata = {
-        "type": "security_push",
-        "auto_accept_local": ss.get("auto_accept_local", True),
-        "sandbox_enabled": ss.get("sandbox_enabled", False),
-        "sandbox_network": ss.get("sandbox_network", True),
-    }
-    pushed = []
-    errors = []
-    for aid, conn in state.connections.items():
-        if is_local_url(conn.agent_url):
-            result = _sync_send_message(
-                content="Security settings update from mesh peer.",
-                target_agent_id=aid,
-                metadata=metadata,
-            )
-            if result.get("success"):
-                pushed.append(aid[:12])
-            else:
-                errors.append(f"{aid[:12]}: {result.get('error', 'unknown')}")
-    return jsonify({"success": True, "pushed_to": pushed, "errors": errors})
+@app.route("/api/pin", methods=["GET"])
+def get_pin_status():
+    """Check if a PIN is currently set. Only from localhost."""
+    if not _is_localhost_request():
+        return jsonify({"error": "Forbidden"}), 403
+    return jsonify({"pin_enabled": bool(_DARKMATTER_PIN)})
 
 
 def _get_public_url():
@@ -403,6 +350,7 @@ def _get_lan_ip():
         s.close()
         return ip
     except Exception:
+        print("[DarkMatter Entrypoint] Could not detect LAN IP, falling back to 127.0.0.1", file=sys.stderr)
         return "127.0.0.1"
 
 
@@ -412,6 +360,27 @@ def _short_id(agent_id):
     if len(agent_id) > 16:
         return agent_id[:8] + "..." + agent_id[-4:]
     return agent_id
+
+
+def _is_lan_url(url):
+    """Check if a URL points to a local or LAN address."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return True
+        parts = host.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            a = int(parts[0])
+            if a == 10:
+                return True
+            if a == 172 and 16 <= int(parts[1]) <= 31:
+                return True
+            if a == 192 and int(parts[1]) == 168:
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _display_name_for(agent_id):
@@ -490,8 +459,8 @@ def _scan_local_agents():
                 result = future.result()
                 if result:
                     results[result["agent_id"]] = result
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter Entrypoint] Discovery probe failed: {e}", file=sys.stderr)
 
     with _discovery_lock:
         _discovered_agents.clear()
@@ -571,8 +540,8 @@ def _broadcast_beacon():
         }).encode("utf-8")
         sock.sendto(packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT))
         sock.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DarkMatter Entrypoint] Broadcast beacon failed: {e}", file=sys.stderr)
 
 
 def _start_discovery_loop():
@@ -580,12 +549,12 @@ def _start_discovery_loop():
     while True:
         try:
             _broadcast_beacon()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DarkMatter Entrypoint] Discovery beacon error: {e}", file=sys.stderr)
         try:
             _scan_local_agents()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DarkMatter Entrypoint] Discovery scan error: {e}", file=sys.stderr)
         time.sleep(15)
 
 
@@ -866,8 +835,8 @@ def dm_accept_pending():
         if result.get("mutual") and conn:
             try:
                 _sync_connection_request(conn.agent_url)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter Entrypoint] Mutual sync failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
 
     return jsonify(result), status
 
@@ -877,7 +846,6 @@ def dm_message():
     data = request.get_json(silent=True) or {}
 
     # Use shared validation/queuing logic from darkmatter.network.mesh.
-    # security_push messages are intercepted in _process_incoming_message (mesh.py).
     # router_mode is "queue_only" — messages queue for the human to read.
     loop = asyncio.new_event_loop()
     try:
@@ -1024,10 +992,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             return {"success": False, "error": "No agents connected."}
         targets = [best]
 
-    # Use the resolved URL (may be localhost) so build_webhook_url
-    # knows the peer is local and skips the anchor relay.
-    resolved_url = _resolve_base_url(targets[0])
-    webhook = _mgr.build_webhook_url(message_id, peer_url=resolved_url)
+    webhook = _mgr.build_webhook_url(message_id, peer_url=targets[0].agent_url)
 
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     signature_hex = None
@@ -1061,8 +1026,6 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
         except Exception as e:
             conn.messages_declined += 1
             conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
-            # Invalidate URL cache so next attempt re-probes
-            _resolve_cache.pop(conn.agent_id, None)
             # Try anchor message relay as fallback
             relayed = False
             if ANCHOR_NODES:
@@ -1089,7 +1052,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
     if sent_to:
         sent_msg = SentMessage(
             message_id=message_id, content=content, status="active",
-            initial_hops=10, routed_to=sent_to,
+            initial_hops=10, routed_to=sent_to, metadata=metadata or {},
         )
         state.sent_messages[message_id] = sent_msg
         save_state()
@@ -1097,7 +1060,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
         # All deliveries failed — record the failure so UI can show it immediately
         sent_msg = SentMessage(
             message_id=message_id, content=content, status="failed",
-            initial_hops=10, routed_to=[f["agent_id"] for f in failed],
+            initial_hops=10, routed_to=[f["agent_id"] for f in failed], metadata=metadata or {},
         )
         for f in failed:
             sent_msg.updates.append({
@@ -1196,8 +1159,11 @@ def _sync_respond_to_message(message_id, response_text):
                 "signature_hex": resp_signature_hex,
             })
             webhook_success = resp.status_code < 400
-    except Exception:
+            if not webhook_success:
+                print(f"[DarkMatter Entrypoint] Webhook response failed (HTTP {resp.status_code}) for message {msg.message_id}", file=sys.stderr)
+    except Exception as e:
         webhook_success = False
+        print(f"[DarkMatter Entrypoint] Webhook response error for message {msg.message_id}: {e}", file=sys.stderr)
 
     if msg.from_agent_id and msg.from_agent_id in state.connections:
         conn = state.connections[msg.from_agent_id]
@@ -1219,6 +1185,42 @@ def index():
                            display_name_for=_display_name_for)
 
 
+@app.route("/api/upload", methods=["POST"])
+def upload_files():
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"success": False, "error": "No files provided"}), 400
+    results = []
+    public_url = _get_public_url()
+    for f in files:
+        if not f.filename:
+            continue
+        file_id = uuid.uuid4().hex
+        safe_name = secure_filename(f.filename) or "upload"
+        file_dir = os.path.join(UPLOAD_DIR, file_id)
+        os.makedirs(file_dir, exist_ok=True)
+        file_path = os.path.join(file_dir, safe_name)
+        f.save(file_path)
+        size = os.path.getsize(file_path)
+        results.append({
+            "filename": safe_name,
+            "url": f"{public_url}/api/file/{file_id}/{safe_name}",
+            "content_type": f.content_type or "application/octet-stream",
+            "size": size,
+        })
+    return jsonify({"success": True, "files": results})
+
+
+@app.route("/api/file/<file_id>/<filename>")
+def serve_file(file_id, filename):
+    safe_name = secure_filename(filename)
+    file_dir = os.path.join(UPLOAD_DIR, secure_filename(file_id))
+    full_path = os.path.join(file_dir, safe_name)
+    if not os.path.isfile(full_path):
+        return jsonify({"error": "File not found"}), 404
+    return send_from_directory(file_dir, safe_name)
+
+
 @app.route("/send", methods=["POST"])
 def send():
     if _is_ajax():
@@ -1230,7 +1232,12 @@ def send():
         content = request.form.get("content", "").strip()
         target = request.form.get("target", "auto")
         attachments = []
-    if not content and not attachments:
+
+    # If no text but attachments exist, use filenames as content
+    if not content and attachments:
+        content = ", ".join(a.get("filename", "file") for a in attachments)
+
+    if not content:
         if _is_ajax():
             return jsonify({"success": False, "error": "Empty message"}), 400
         return redirect(url_for("index"))
@@ -1246,12 +1253,48 @@ def send():
         threading.Thread(target=_sync_broadcast_message, args=(content,), kwargs={"metadata": metadata if metadata else None}, daemon=True).start()
         return redirect(url_for("index"))
 
-    target_id = None if target == "auto" else target
+    if target == "fastest":
+        # Pick the agent with the lowest measured ping latency
+        candidates = [
+            c for c in state.connections.values()
+            if c.agent_id != state.agent_id
+            and getattr(c, "health_status", "ok") != "unreachable"
+            and getattr(c, "ping_latency_ms", -1) > 0
+        ]
+        if candidates:
+            candidates.sort(key=lambda c: c.ping_latency_ms)
+            target_id = candidates[0].agent_id
+        else:
+            # Fall back to auto if no latency data
+            target_id = None
+    else:
+        target_id = None if target == "auto" else target
     if _is_ajax():
         result = _sync_send_message(content, target_id, metadata=metadata if metadata else None)
         return jsonify(result)
     threading.Thread(target=_sync_send_message, args=(content, target_id), kwargs={"metadata": metadata if metadata else None}, daemon=True).start()
     return redirect(url_for("index"))
+
+
+@app.route("/retry/<message_id>", methods=["POST"])
+def retry(message_id):
+    """Re-send a failed or timed-out message."""
+    old = state.sent_messages.get(message_id)
+    if not old:
+        return jsonify({"success": False, "error": "Message not found"}), 404
+    if old.status not in ("failed", "timed_out"):
+        return jsonify({"success": False, "error": f"Message status is '{old.status}', not retryable"}), 400
+
+    content = old.content
+    target_id = old.routed_to[0] if old.routed_to else None
+    metadata = old.metadata
+
+    # Remove the old failed message
+    del state.sent_messages[message_id]
+    save_state()
+
+    result = _sync_send_message(content, target_id, metadata=metadata if metadata else None)
+    return jsonify(result)
 
 
 @app.route("/respond/<message_id>", methods=["POST"])
@@ -1315,8 +1358,8 @@ def accept(request_id):
         if result.get("mutual") and conn:
             try:
                 _sync_connection_request(conn.agent_url)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter Entrypoint] Mutual sync failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
 
     if _is_ajax():
         return jsonify({"success": status == 200, "display_name": display_name}), status
@@ -1343,70 +1386,6 @@ def disconnect(agent_id):
 
 
 # ---------------------------------------------------------------------------
-# File uploads
-# ---------------------------------------------------------------------------
-
-_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
-_MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB per file
-_ALLOWED_EXTENSIONS = {
-    "png", "jpg", "jpeg", "gif", "webp", "svg",  # images
-    "pdf", "txt", "md", "csv", "json", "xml",     # documents
-    "py", "js", "ts", "html", "css",               # code
-    "zip", "tar", "gz",                            # archives
-}
-
-os.makedirs(_UPLOAD_DIR, exist_ok=True)
-
-
-def _allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in _ALLOWED_EXTENSIONS
-
-
-@app.route("/api/upload", methods=["POST"])
-def api_upload():
-    files = request.files.getlist("files")
-    if not files:
-        return jsonify({"success": False, "error": "No files provided"}), 400
-
-    uploaded = []
-    for f in files:
-        if not f.filename:
-            continue
-        if not _allowed_file(f.filename):
-            return jsonify({"success": False, "error": f"File type not allowed: {f.filename}"}), 400
-
-        # Read to check size
-        data = f.read()
-        if len(data) > _MAX_FILE_SIZE:
-            return jsonify({"success": False, "error": f"File too large: {f.filename} ({len(data)} bytes, max {_MAX_FILE_SIZE})"}), 400
-
-        # Save with unique prefix to avoid collisions
-        safe_name = f.filename.replace("/", "_").replace("\\", "_")
-        unique_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
-        filepath = os.path.join(_UPLOAD_DIR, unique_name)
-        with open(filepath, "wb") as out:
-            out.write(data)
-
-        uploaded.append({
-            "filename": f.filename,
-            "stored_name": unique_name,
-            "content_type": f.content_type or "application/octet-stream",
-            "size": len(data),
-            "url": f"/uploads/{unique_name}",
-        })
-
-    return jsonify({"success": True, "files": uploaded})
-
-
-@app.route("/uploads/<filename>")
-def serve_upload(filename):
-    # Prevent path traversal
-    if "/" in filename or "\\" in filename or ".." in filename:
-        return "Not found", 404
-    return send_from_directory(_UPLOAD_DIR, filename)
-
-
-# ---------------------------------------------------------------------------
 # Polling API
 # ---------------------------------------------------------------------------
 
@@ -1418,6 +1397,7 @@ def poll():
         "from_display_name": _display_name_for(msg.from_agent_id),
         "content": msg.content,
         "received_at": msg.received_at,
+        "metadata": getattr(msg, "metadata", {}),
     } for msg in state.message_queue]
 
     outbox = []
@@ -1436,6 +1416,7 @@ def poll():
             "updates": getattr(sm, "updates", []),
             "responses": responses,
             "from_self": True,
+            "metadata": getattr(sm, "metadata", {}),
         })
 
     pending = [{
@@ -1467,6 +1448,8 @@ def poll():
         "wallets": c.wallets,
         "connectivity_level": getattr(c, "connectivity_level", 0),
         "connectivity_method": getattr(c, "connectivity_method", ""),
+        "is_local": _is_lan_url(_resolve_base_url(c)),
+        "ping_latency_ms": getattr(c, "ping_latency_ms", -1),
     } for c in state.connections.values() if c.agent_id != state.agent_id]
 
     # Discovered agents (not yet connected)
@@ -1508,6 +1491,45 @@ def poll():
     })
 
 
+@app.route("/api/checkin", methods=["POST"])
+def checkin():
+    """Broadcast a check-in message to all agents and track response times."""
+    result = _sync_broadcast_message("What are you working on right now? Give a brief status update.", metadata={"checkin": True})
+    return jsonify(result)
+
+
+@app.route("/api/broadcast-group", methods=["POST"])
+def broadcast_group():
+    """Send a message to a specific subset of connected agents."""
+    data = request.get_json(silent=True) or {}
+    agent_ids = data.get("agent_ids", [])
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"success": False, "error": "Empty message"}), 400
+    if not agent_ids or not isinstance(agent_ids, list):
+        return jsonify({"success": False, "error": "No agents specified"}), 400
+
+    sent_ids = []
+    failed = []
+    for aid in agent_ids:
+        if aid not in state.connections:
+            failed.append({"agent_id": aid, "error": "Not connected"})
+            continue
+        result = _sync_send_message(content, aid)
+        if result.get("success"):
+            sent_ids.append(result["message_id"])
+        else:
+            failed.append({"agent_id": aid, "error": result.get("error", "Unknown")})
+
+    return jsonify({
+        "success": len(sent_ids) > 0,
+        "sent_count": len(sent_ids),
+        "message_ids": sent_ids,
+        "failed_count": len(failed),
+        "failed": failed if failed else None,
+    })
+
+
 @app.route("/api/info", methods=["GET"])
 def info():
     """Static agent info for initial page load."""
@@ -1533,30 +1555,9 @@ def scan():
     return jsonify({"success": True})
 
 
-def _is_lan_url(url):
-    """Check if a URL points to a local or LAN address."""
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(url).hostname or ""
-        if host in ("localhost", "127.0.0.1", "::1"):
-            return True
-        parts = host.split(".")
-        if len(parts) == 4 and all(p.isdigit() for p in parts):
-            a = int(parts[0])
-            if a == 10:
-                return True
-            if a == 172 and 16 <= int(parts[1]) <= 31:
-                return True
-            if a == 192 and int(parts[1]) == 168:
-                return True
-        return False
-    except Exception:
-        return False
-
-
 @app.route("/api/update-agents", methods=["POST"])
 def update_agents():
-    """Send git pull & pip upgrade to all local connected agents."""
+    """Send git pull command to all local connected agents."""
     results = []
 
     local_conns = [
@@ -1955,7 +1956,5 @@ if __name__ == "__main__":
 
     # Disable reloader when spawned as a subprocess (no TTY) to avoid
     # inheriting stale file descriptors from the parent process.
-    # Also disable debug mode when headless — debug=True forks a child
-    # process that can fail to bind, killing background threads (relay poll).
     is_tty = sys.stderr.isatty()
-    app.run(host="0.0.0.0", port=PORT, debug=is_tty, use_reloader=is_tty)
+    app.run(host="0.0.0.0", port=PORT, debug=True, use_reloader=is_tty)

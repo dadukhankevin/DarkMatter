@@ -61,6 +61,12 @@
       <div class="px-3 py-2 flex items-center justify-between">
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Connections</span>
         <div class="flex items-center gap-2">
+          <button id="checkin-btn" onclick="checkinAll()" title="Ask all agents for a status update"
+            class="text-[10px] px-2 py-0.5 rounded-md font-semibold transition-colors"
+            style="background: var(--accent-green); color: white; opacity: 0.85;"
+            onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.85'">
+            Check In
+          </button>
           <button id="update-all-btn" onclick="updateAllAgents()" title="Git pull &amp; restart all LAN agents"
             class="text-[10px] px-2 py-0.5 rounded-md font-semibold transition-colors"
             style="background: var(--accent-blue); color: white; opacity: 0.85;"
@@ -188,6 +194,21 @@
       </div>
     </div>
 
+    <!-- Drawing canvas -->
+    <div id="draw-panel" class="hidden border-t border-border/30 px-4 py-3">
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-2">
+          <span class="text-[12px] font-semibold text-muted">Draw</span>
+          <input type="color" id="draw-color" value="#ffffff" class="w-5 h-5 rounded cursor-pointer border-0 p-0 bg-transparent">
+          <input type="range" id="draw-size" min="1" max="20" value="3" class="w-16 h-1 accent-[var(--accent-blue)]">
+          <button onclick="clearDrawCanvas()" class="text-[10px] text-muted hover:text-primary px-1.5 py-0.5 rounded border border-border/30">Clear</button>
+          <button onclick="undoDrawCanvas()" class="text-[10px] text-muted hover:text-primary px-1.5 py-0.5 rounded border border-border/30">Undo</button>
+        </div>
+        <button onclick="sendDrawing()" class="text-[11px] font-semibold px-3 py-1 rounded-lg text-white" style="background: var(--accent-blue)">Send Drawing</button>
+      </div>
+      <canvas id="draw-canvas" width="600" height="200" class="w-full rounded-lg cursor-crosshair" style="background: #1a1a2e; touch-action: none;"></canvas>
+    </div>
+
     <!-- Compose bar -->
     <div id="compose-bar" class="px-4 sm:px-6 py-3">
       <input type="file" id="file-input" multiple class="hidden">
@@ -228,6 +249,11 @@
               <button type="button" onclick="document.getElementById('camera-input').click()" title="Take photo"
                 class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+              </button>
+              <!-- Draw button -->
+              <button type="button" onclick="toggleDrawCanvas()" title="Draw a sketch" id="draw-toggle-btn"
+                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>
               </button>
               <!-- Clear button -->
               <button type="button" onclick="clearFeed()" title="Clear messages"
@@ -844,6 +870,8 @@ function selectTarget(el) {
     dot.className = 'w-2 h-2 rounded-full bg-accent-yellow shrink-0';
   } else if (val === 'auto') {
     dot.className = 'w-2 h-2 rounded-full bg-accent-green shrink-0';
+  } else if (val === 'fastest') {
+    dot.className = 'w-2 h-2 rounded-full bg-[#06b6d4] shrink-0';
   } else {
     dot.style.background = 'var(--accent-blue)';
     dot.className = 'w-2 h-2 rounded-full shrink-0';
@@ -866,6 +894,10 @@ function updateDropdownOptions(conns) {
     <div class="w-2 h-2 rounded-full bg-accent-green shrink-0"></div>auto
   </div>
   <div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
+    data-value="fastest" onclick="selectTarget(this)">
+    <div class="w-2 h-2 rounded-full bg-[#06b6d4] shrink-0"></div>fastest
+  </div>
+  <div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
     data-value="broadcast" onclick="selectTarget(this)">
     <div class="w-2 h-2 rounded-full bg-accent-yellow shrink-0"></div>broadcast all
   </div>`;
@@ -884,7 +916,7 @@ function updateDropdownOptions(conns) {
     });
   }
   targetMenu.innerHTML = html;
-  const validValues = ['auto', 'broadcast', ...conns.map(c => c.agent_id)];
+  const validValues = ['auto', 'fastest', 'broadcast', ...conns.map(c => c.agent_id)];
   if (!validValues.includes(cur)) {
     targetValue.value = 'auto';
     targetLabel.textContent = 'auto';
@@ -1590,6 +1622,138 @@ function renderConnections(conns) {
 
   document.getElementById('sidebar-conn-count').textContent = conns.length;
   updateDropdownOptions(conns);
+}
+
+// =========================================================================
+// Check In — broadcast status request to all agents
+// =========================================================================
+async function checkinAll() {
+  const btn = document.getElementById('checkin-btn');
+  const origText = btn.textContent;
+  btn.textContent = 'Checking...';
+  btn.disabled = true;
+  try {
+    const data = await ajaxPost('/api/checkin', {});
+    if (data.success) {
+      showToast(`Check-in sent to ${data.sent_count || 0} agent(s)`, 'success');
+    } else {
+      showToast(data.error || 'Check-in failed', 'error');
+    }
+  } catch (e) {
+    showToast('Check-in failed: ' + e.message, 'error');
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
+}
+
+// =========================================================================
+// Drawing Canvas
+// =========================================================================
+let drawCanvasOpen = false;
+let drawCtx = null;
+let drawing = false;
+let drawHistory = [];
+
+function toggleDrawCanvas() {
+  drawCanvasOpen = !drawCanvasOpen;
+  const panel = document.getElementById('draw-panel');
+  const btn = document.getElementById('draw-toggle-btn');
+  panel.classList.toggle('hidden', !drawCanvasOpen);
+  btn.classList.toggle('text-accent-blue', drawCanvasOpen);
+  if (drawCanvasOpen && !drawCtx) initDrawCanvas();
+}
+
+function initDrawCanvas() {
+  const canvas = document.getElementById('draw-canvas');
+  drawCtx = canvas.getContext('2d');
+  // Set canvas resolution to match display
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * 2;
+  canvas.height = rect.height * 2;
+  drawCtx.scale(2, 2);
+  drawCtx.lineCap = 'round';
+  drawCtx.lineJoin = 'round';
+
+  function getPos(e) {
+    const r = canvas.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return { x: t.clientX - r.left, y: t.clientY - r.top };
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    drawing = true;
+    drawCtx.strokeStyle = document.getElementById('draw-color').value;
+    drawCtx.lineWidth = document.getElementById('draw-size').value;
+    const p = getPos(e);
+    drawCtx.beginPath();
+    drawCtx.moveTo(p.x, p.y);
+    // Save state for undo
+    drawHistory.push(canvas.toDataURL());
+    if (drawHistory.length > 50) drawHistory.shift();
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!drawing) return;
+    const p = getPos(e);
+    drawCtx.lineTo(p.x, p.y);
+    drawCtx.stroke();
+  });
+
+  canvas.addEventListener('pointerup', () => drawing = false);
+  canvas.addEventListener('pointerleave', () => drawing = false);
+}
+
+function clearDrawCanvas() {
+  if (!drawCtx) return;
+  const canvas = document.getElementById('draw-canvas');
+  drawHistory.push(canvas.toDataURL());
+  drawCtx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function undoDrawCanvas() {
+  if (!drawCtx || drawHistory.length === 0) return;
+  const canvas = document.getElementById('draw-canvas');
+  const img = new Image();
+  img.onload = () => {
+    drawCtx.clearRect(0, 0, canvas.width, canvas.height);
+    drawCtx.drawImage(img, 0, 0, canvas.width / 2, canvas.height / 2);
+  };
+  img.src = drawHistory.pop();
+}
+
+async function sendDrawing() {
+  const canvas = document.getElementById('draw-canvas');
+  canvas.toBlob(async (blob) => {
+    if (!blob) return;
+    const formData = new FormData();
+    formData.append('files', blob, 'drawing.png');
+    try {
+      const uploadResp = await fetch('/api/upload', { method: 'POST', body: formData });
+      const uploadData = await uploadResp.json();
+      if (!uploadData.success || !uploadData.files.length) {
+        showToast('Failed to upload drawing', 'error');
+        return;
+      }
+      // Send as a message with attachment
+      const file = uploadData.files[0];
+      const target = targetValue.value;
+      const sendResp = await ajaxPost('/send', {
+        content: '[drawing]',
+        target: target,
+        attachments: JSON.stringify([file]),
+      });
+      if (sendResp.success) {
+        showToast('Drawing sent', 'success');
+        clearDrawCanvas();
+        toggleDrawCanvas();
+      } else {
+        showToast(sendResp.error || 'Send failed', 'error');
+      }
+    } catch (e) {
+      showToast('Failed to send drawing: ' + e.message, 'error');
+    }
+  }, 'image/png');
 }
 
 async function updateAllAgents() {
