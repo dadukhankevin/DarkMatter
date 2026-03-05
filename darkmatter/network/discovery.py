@@ -416,21 +416,46 @@ def find_entrypoint_path() -> Optional[str]:
 _entrypoint_pid: Optional[int] = None  # PID of entrypoint we spawned (so we can shut it down)
 
 
+async def _is_entrypoint_responding() -> bool:
+    """Check if the entrypoint is responding on its port."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(1.0, connect=0.5)) as client:
+            resp = await client.get(f"http://127.0.0.1:{ENTRYPOINT_PORT}/.well-known/darkmatter.json")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _is_entrypoint_process_alive() -> bool:
+    """Check if the entrypoint process we spawned is still alive."""
+    if _entrypoint_pid is None:
+        return False
+    try:
+        os.kill(_entrypoint_pid, 0)  # signal 0 = check if process exists
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 async def ensure_entrypoint_running() -> None:
-    """Auto-start the entrypoint (human node) on port 8200 if not already running."""
+    """Auto-start the entrypoint (human node) on port 8200 if not already running.
+
+    Called on startup and every discovery loop iteration (~30s). Acts as a
+    watchdog — if the entrypoint crashes, it will be restarted on the next call.
+    """
     global _entrypoint_pid
 
     if not ENTRYPOINT_AUTOSTART:
         return
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.5)) as client:
-            resp = await client.get(f"http://127.0.0.1:{ENTRYPOINT_PORT}/.well-known/darkmatter.json")
-            if resp.status_code == 200:
-                print(f"[DarkMatter] Entrypoint already running on port {ENTRYPOINT_PORT}", file=sys.stderr)
-                return
-    except Exception:
-        pass
+    # Check if entrypoint is responding
+    if await _is_entrypoint_responding():
+        return
+
+    # Not responding — check if our spawned process died
+    if _entrypoint_pid is not None and not _is_entrypoint_process_alive():
+        print(f"[DarkMatter] Entrypoint process (PID {_entrypoint_pid}) died, will restart", file=sys.stderr)
+        _entrypoint_pid = None
 
     import subprocess
     lockfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.lock")
@@ -442,6 +467,10 @@ async def ensure_entrypoint_running() -> None:
         return
 
     try:
+        # Double-check after acquiring lock (another agent may have started it)
+        if await _is_entrypoint_responding():
+            return
+
         path = find_entrypoint_path()
         if not path:
             print(f"[DarkMatter] Entrypoint script not found, cannot auto-start", file=sys.stderr)
@@ -467,18 +496,19 @@ async def ensure_entrypoint_running() -> None:
         proc = subprocess.Popen([sys.executable, path], **popen_kwargs)
         _entrypoint_pid = proc.pid
 
+        # Wait up to 10s for the entrypoint to start responding
         for _ in range(20):
             await asyncio.sleep(0.5)
-            try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.5)) as client:
-                    resp = await client.get(f"http://127.0.0.1:{ENTRYPOINT_PORT}/.well-known/darkmatter.json")
-                    if resp.status_code == 200:
-                        print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
-                        return
-            except Exception:
-                pass
+            # Check if the process crashed immediately
+            if proc.poll() is not None:
+                print(f"[DarkMatter] Entrypoint process exited with code {proc.returncode} (check {log_path})", file=sys.stderr)
+                _entrypoint_pid = None
+                return
+            if await _is_entrypoint_responding():
+                print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
+                return
 
-        print(f"[DarkMatter] Entrypoint failed to start within 10s (check {log_path})", file=sys.stderr)
+        print(f"[DarkMatter] Entrypoint failed to respond within 10s (check {log_path})", file=sys.stderr)
         _entrypoint_pid = None
     finally:
         unlock(lock_fd)
