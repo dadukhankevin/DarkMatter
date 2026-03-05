@@ -88,31 +88,49 @@
       </div>
     </div>
 
-    <!-- PIN lock setting -->
-    <div id="pin-section" class="border-b border-border/30">
-      <button onclick="togglePinPanel()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
+    <!-- Security settings -->
+    <div id="security-section" class="border-b border-border/30">
+      <button onclick="toggleSecurityPanel()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
         <span class="flex items-center gap-1.5">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-muted"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">PIN Lock</span>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-muted"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Security</span>
         </span>
-        <span id="pin-status-badge" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted">OFF</span>
+        <svg id="security-chevron" class="text-muted transition-transform" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
       </button>
-      <div id="pin-panel" class="px-3 pb-3 hidden">
-        <p class="text-[11px] text-muted mb-2">Require a 4-digit PIN for LAN access. Your device is always unlocked.</p>
-        <div class="flex gap-1.5">
-          <input type="text" id="pin-set-input" placeholder="4 digits" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off"
-            class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted text-center tracking-widest font-semibold focus:border-accent-blue/50 transition-colors min-w-0"
-            oninput="this.value=this.value.replace(/\D/g,'').slice(0,4)">
-          <button id="pin-set-btn" onclick="setPin()"
-            class="text-white text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
-            style="background: var(--accent-blue)">
-            Set
-          </button>
-          <button id="pin-clear-btn" onclick="clearPin()"
-            class="hidden text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0 border border-border/30 text-muted hover:text-primary">
-            Clear
-          </button>
+      <div id="security-panel" class="px-3 pb-3 hidden space-y-3">
+        <!-- PIN -->
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="text-[11px] text-muted font-semibold">PIN Lock</span>
+            <span id="pin-status-badge" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted">OFF</span>
+          </div>
+          <div class="flex gap-1.5">
+            <input type="password" id="pin-set-input" placeholder="Enter PIN" maxlength="32"
+              class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted text-center tracking-widest font-semibold focus:border-accent-blue/50 transition-colors min-w-0">
+            <button id="pin-set-btn" onclick="setPin()"
+              class="text-white text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
+              style="background: var(--accent-blue)">Set</button>
+            <button id="pin-clear-btn" onclick="clearPin()"
+              class="hidden text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0 border border-border/30 text-muted hover:text-primary">Clear</button>
+          </div>
         </div>
+        <!-- Toggles -->
+        <label class="flex items-center justify-between cursor-pointer">
+          <span class="text-[11px] text-muted">Auto-accept local agents</span>
+          <input type="checkbox" id="sec-auto-accept" onchange="updateSecurityToggle('auto_accept_local', this.checked)" class="accent-[var(--accent-blue)] w-3.5 h-3.5">
+        </label>
+        <label class="flex items-center justify-between cursor-pointer">
+          <span class="text-[11px] text-muted">Sandbox spawned agents</span>
+          <input type="checkbox" id="sec-sandbox" onchange="updateSecurityToggle('sandbox_enabled', this.checked)" class="accent-[var(--accent-blue)] w-3.5 h-3.5">
+        </label>
+        <label id="sec-sandbox-net-row" class="flex items-center justify-between cursor-pointer hidden">
+          <span class="text-[11px] text-muted pl-3">Allow network in sandbox</span>
+          <input type="checkbox" id="sec-sandbox-net" onchange="updateSecurityToggle('sandbox_network', this.checked)" class="accent-[var(--accent-blue)] w-3.5 h-3.5">
+        </label>
+        <!-- Push to LAN -->
+        <button onclick="pushSecurityToLAN()" class="w-full text-[11px] font-semibold py-1.5 rounded-lg border border-border/30 text-muted hover:text-primary transition-colors">
+          Push to LAN agents
+        </button>
       </div>
     </div>
 
@@ -216,11 +234,6 @@
                 class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
               </button>
-              <!-- Check In button -->
-              <button type="button" id="checkin-btn" onclick="checkInAgents()" title="Broadcast check-in to all agents"
-                class="text-[11px] font-semibold text-muted/60 hover:text-accent-orange transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
-                Check In
-              </button>
             </div>
             <!-- Send button -->
             <button type="submit" id="send-btn"
@@ -248,99 +261,17 @@
         </svg>
         <span class="text-[14px] font-semibold text-primary">Mesh Topology</span>
         <span id="mesh-node-count" class="text-[11px] text-muted"></span>
-        <span id="mesh-selection-count" class="text-[11px] text-accent-blue font-semibold hidden"></span>
       </div>
-      <div class="flex items-center gap-2">
-        <button id="mesh-broadcast-sel-btn" onclick="openGroupBroadcast()" class="hidden text-white text-[11px] font-semibold px-3 py-1 rounded-lg transition-all hover:opacity-90" style="background: var(--accent-blue)">Broadcast to Selected</button>
-        <button onclick="resetMeshLayout()" class="text-muted hover:text-primary text-[12px] transition-colors">Reset Layout</button>
-        <button onclick="showChatView()" class="text-muted hover:text-primary text-[13px] font-medium transition-colors">Back to Chat</button>
-      </div>
+      <button onclick="showChatView()" class="text-muted hover:text-primary text-[13px] font-medium transition-colors">Back to Chat</button>
     </div>
     <div id="mesh-graph" class="flex-1 relative"></div>
-    <!-- Group broadcast popover -->
-    <div id="mesh-broadcast-popover" class="absolute bottom-20 left-1/2 -translate-x-1/2 hidden z-40 w-80" style="box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
-      <div class="bg-card/95 backdrop-blur-xl border border-border/50 rounded-xl p-3">
-        <div class="text-[12px] text-muted mb-2">Broadcast to <span id="broadcast-sel-count">0</span> agents</div>
-        <textarea id="broadcast-group-input" rows="3" placeholder="Message..."
-          class="w-full bg-surface border border-border/50 rounded-lg px-3 py-2 text-[13px] text-primary placeholder-muted resize-none focus:border-accent-blue/50 transition-colors" style="outline:none"></textarea>
-        <div class="flex justify-end gap-2 mt-2">
-          <button onclick="closeGroupBroadcast()" class="text-muted text-[12px] px-3 py-1 rounded-lg hover:text-primary transition-colors">Cancel</button>
-          <button onclick="sendGroupBroadcast()" class="text-white text-[12px] font-semibold px-4 py-1.5 rounded-lg transition-all hover:opacity-90" style="background: var(--accent-blue)">Send</button>
-        </div>
-      </div>
-    </div>
     <!-- Mesh tooltip -->
     <div id="mesh-tooltip" class="fixed hidden bg-card/95 backdrop-blur-xl border border-border/50 rounded-xl p-3 z-50 max-w-xs" style="box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
       <div class="text-[13px] font-semibold text-primary" id="tooltip-name"></div>
       <div class="text-[11px] text-muted mt-0.5" id="tooltip-id"></div>
       <div class="text-[12px] text-label mt-1.5" id="tooltip-bio"></div>
       <div class="text-[11px] text-muted mt-1" id="tooltip-level"></div>
-      <!-- Color swatches -->
-      <div class="flex items-center gap-1.5 mt-2" id="tooltip-colors">
-        <span class="text-[10px] text-muted mr-0.5">Color:</span>
-        <button class="w-5 h-5 rounded-full border border-border/30 hover:scale-110 transition-transform" style="background:#FF3B30" onclick="setNodeColor('#FF3B30')"></button>
-        <button class="w-5 h-5 rounded-full border border-border/30 hover:scale-110 transition-transform" style="background:#FF9500" onclick="setNodeColor('#FF9500')"></button>
-        <button class="w-5 h-5 rounded-full border border-border/30 hover:scale-110 transition-transform" style="background:#FFCC00" onclick="setNodeColor('#FFCC00')"></button>
-        <button class="w-5 h-5 rounded-full border border-border/30 hover:scale-110 transition-transform" style="background:#34C759" onclick="setNodeColor('#34C759')"></button>
-        <button class="w-5 h-5 rounded-full border border-border/30 hover:scale-110 transition-transform" style="background:#32ADE6" onclick="setNodeColor('#32ADE6')"></button>
-        <button class="w-5 h-5 rounded-full border border-border/30 hover:scale-110 transition-transform" style="background:#AF52DE" onclick="setNodeColor('#AF52DE')"></button>
-        <button class="w-4 h-4 rounded-full border border-border/50 hover:scale-110 transition-transform flex items-center justify-center text-muted text-[10px]" style="background:transparent" onclick="setNodeColor(null)" title="Reset">&times;</button>
-      </div>
       <button id="tooltip-connect-btn" class="hidden mt-2 w-full text-[12px] font-semibold text-white rounded-lg py-1.5 transition-colors" style="background: var(--accent-blue)" onclick="connectFromTooltip()">Connect</button>
-    </div>
-  </div>
-
-  <!-- ================================================================== -->
-  <!-- DRAW VIEW                                                            -->
-  <!-- ================================================================== -->
-  <div id="draw-view" class="flex-1 flex flex-col bg-surface overflow-hidden relative hidden">
-    <div class="px-4 py-3 border-b border-border/30 flex items-center justify-between">
-      <div class="flex items-center gap-2">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="text-accent-blue">
-          <path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/>
-        </svg>
-        <span class="text-[14px] font-semibold text-primary">Draw</span>
-      </div>
-      <button onclick="showChatView()" class="text-muted hover:text-primary text-[13px] font-medium transition-colors">Back to Chat</button>
-    </div>
-    <div id="draw-canvas-wrap" class="flex-1 relative">
-      <canvas id="draw-canvas" class="w-full h-full block" style="touch-action:none"></canvas>
-      <!-- Toolbar overlay -->
-      <div id="draw-toolbar" class="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 px-4 py-2.5 rounded-2xl border border-border/30 z-10" style="background: rgb(var(--c-card) / 0.7); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);">
-        <!-- Color dots -->
-        <div class="flex items-center gap-1.5">
-          <button class="draw-color-btn w-6 h-6 rounded-full border-2 border-transparent" data-color="#ffffff" style="background:#ffffff" onclick="selectDrawColor(this)"></button>
-          <button class="draw-color-btn w-6 h-6 rounded-full border-2 border-transparent" data-color="#FF3B30" style="background:#FF3B30" onclick="selectDrawColor(this)"></button>
-          <button class="draw-color-btn w-6 h-6 rounded-full border-2 border-transparent" data-color="#0A84FF" style="background:#0A84FF" onclick="selectDrawColor(this)"></button>
-          <button class="draw-color-btn w-6 h-6 rounded-full border-2 border-transparent" data-color="#34C759" style="background:#34C759" onclick="selectDrawColor(this)"></button>
-          <button class="draw-color-btn w-6 h-6 rounded-full border-2 border-transparent" data-color="#FFCC00" style="background:#FFCC00" onclick="selectDrawColor(this)"></button>
-        </div>
-        <div class="w-px h-5 bg-border/30"></div>
-        <!-- Size dots -->
-        <div class="flex items-center gap-1.5">
-          <button class="draw-size-btn w-6 h-6 rounded-full flex items-center justify-center hover:bg-surface/50" data-size="2" onclick="selectDrawSize(this)"><div class="w-1.5 h-1.5 rounded-full bg-primary"></div></button>
-          <button class="draw-size-btn w-6 h-6 rounded-full flex items-center justify-center hover:bg-surface/50" data-size="5" onclick="selectDrawSize(this)"><div class="w-2.5 h-2.5 rounded-full bg-primary"></div></button>
-          <button class="draw-size-btn w-6 h-6 rounded-full flex items-center justify-center hover:bg-surface/50" data-size="12" onclick="selectDrawSize(this)"><div class="w-4 h-4 rounded-full bg-primary"></div></button>
-        </div>
-        <div class="w-px h-5 bg-border/30"></div>
-        <!-- Eraser -->
-        <button id="draw-eraser-btn" class="text-muted hover:text-primary transition-colors p-1 rounded-lg hover:bg-surface/50" onclick="toggleDrawEraser()" title="Eraser">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20H7L3 16c-.8-.8-.8-2 0-2.8L14.6 1.6c.8-.8 2-.8 2.8 0L21.4 5.6c.8.8.8 2 0 2.8L12 18"/></svg>
-        </button>
-        <!-- Undo -->
-        <button class="text-muted hover:text-primary transition-colors p-1 rounded-lg hover:bg-surface/50" onclick="drawUndo()" title="Undo">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
-        </button>
-        <!-- Clear -->
-        <button id="draw-clear-btn" class="text-muted hover:text-primary transition-colors p-1 rounded-lg hover:bg-surface/50" onclick="drawClear()" title="Clear canvas">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
-        <div class="w-px h-5 bg-border/30"></div>
-        <!-- Send to mesh -->
-        <button onclick="drawSendToMesh()" class="text-white text-[12px] font-semibold px-3 py-1.5 rounded-lg transition-all hover:opacity-90" style="background: var(--accent-blue)" title="Send to mesh">
-          Send
-        </button>
-      </div>
     </div>
   </div>
 
@@ -784,24 +715,32 @@ function initQR(lanUrl) {
   if (!qrExpanded) toggleQR();
 }
 
-// =========================================================================
-// PIN lock
-// =========================================================================
-let pinPanelOpen = false;
-
-function togglePinPanel() {
-  pinPanelOpen = !pinPanelOpen;
-  document.getElementById('pin-panel').classList.toggle('hidden', !pinPanelOpen);
+function onThemeChange() {
+  if (qrInitialized) {
+    qrInitialized = false;
+    initQR(document.getElementById('qr-url').textContent);
+  }
 }
 
-async function loadPinStatus() {
+// =========================================================================
+// Security panel
+// =========================================================================
+let securityPanelOpen = false;
+
+function toggleSecurityPanel() {
+  securityPanelOpen = !securityPanelOpen;
+  document.getElementById('security-panel').classList.toggle('hidden', !securityPanelOpen);
+  document.getElementById('security-chevron').style.transform = securityPanelOpen ? 'rotate(180deg)' : '';
+}
+
+async function loadSecurityStatus() {
   try {
-    const resp = await fetch('/api/pin');
-    if (!resp.ok) return; // not localhost, hide section
+    const resp = await fetch('/api/security');
+    if (!resp.ok) return;
     const data = await resp.json();
+    // PIN badge
     const badge = document.getElementById('pin-status-badge');
     const clearBtn = document.getElementById('pin-clear-btn');
-    const setBtn = document.getElementById('pin-set-btn');
     if (data.pin_enabled) {
       badge.textContent = 'ON';
       badge.className = 'text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-accent-green/15 text-accent-green';
@@ -811,55 +750,79 @@ async function loadPinStatus() {
       badge.className = 'text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted';
       clearBtn.classList.add('hidden');
     }
+    // Toggles
+    document.getElementById('sec-auto-accept').checked = data.auto_accept_local;
+    document.getElementById('sec-sandbox').checked = data.sandbox_enabled;
+    document.getElementById('sec-sandbox-net').checked = data.sandbox_network;
+    document.getElementById('sec-sandbox-net-row').classList.toggle('hidden', !data.sandbox_enabled);
   } catch (e) {
-    // Not localhost or network error — hide PIN section
-    document.getElementById('pin-section').classList.add('hidden');
+    document.getElementById('security-section').classList.add('hidden');
   }
 }
 
 async function setPin() {
   const input = document.getElementById('pin-set-input');
-  const pin = input.value.replace(/\D/g, '').slice(0, 4);
-  if (pin.length !== 4) { showToast('PIN must be 4 digits', 'error'); return; }
-  try {
-    const resp = await fetch('/api/pin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pin }),
-    });
-    const data = await resp.json();
-    if (data.success) {
-      showToast('PIN set', 'success');
-      input.value = '';
-      loadPinStatus();
-    } else {
-      showToast(data.error || 'Failed', 'error');
-    }
-  } catch (e) {
-    showToast('PIN set failed: ' + e.message, 'error');
+  const pin = input.value.trim();
+  if (!pin) { showToast('Enter a PIN', 'error'); return; }
+  const resp = await fetch('/api/security', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pin }),
+  });
+  const data = await resp.json();
+  if (data.success) {
+    showToast('PIN set', 'success');
+    input.value = '';
+    loadSecurityStatus();
+  } else {
+    showToast(data.error || 'Failed', 'error');
   }
 }
 
 async function clearPin() {
-  try {
-    const resp = await fetch('/api/pin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pin: '' }),
-    });
-    const data = await resp.json();
-    if (data.success) {
-      showToast('PIN cleared', 'success');
-      loadPinStatus();
-    } else {
-      showToast(data.error || 'Failed', 'error');
-    }
-  } catch (e) {
-    showToast('PIN clear failed: ' + e.message, 'error');
+  const resp = await fetch('/api/security', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pin: '' }),
+  });
+  const data = await resp.json();
+  if (data.success) {
+    showToast('PIN cleared', 'success');
+    loadSecurityStatus();
+  } else {
+    showToast(data.error || 'Failed', 'error');
   }
 }
 
-loadPinStatus();
+async function updateSecurityToggle(key, value) {
+  const resp = await fetch('/api/security', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ [key]: value }),
+  });
+  const data = await resp.json();
+  if (data.success) {
+    showToast('Updated', 'success');
+    if (key === 'sandbox_enabled') {
+      document.getElementById('sec-sandbox-net-row').classList.toggle('hidden', !value);
+    }
+  } else {
+    showToast(data.error || 'Failed', 'error');
+  }
+}
+
+async function pushSecurityToLAN() {
+  const resp = await fetch('/api/security/push', { method: 'POST' });
+  const data = await resp.json();
+  if (data.success) {
+    const count = (data.pushed_to || []).length;
+    showToast(count ? `Pushed to ${count} agent(s)` : 'No LAN agents found', count ? 'success' : 'info');
+  } else {
+    showToast('Failed', 'error');
+  }
+}
+
+loadSecurityStatus();
 
 // =========================================================================
 // Target dropdown
@@ -881,8 +844,6 @@ function selectTarget(el) {
     dot.className = 'w-2 h-2 rounded-full bg-accent-yellow shrink-0';
   } else if (val === 'auto') {
     dot.className = 'w-2 h-2 rounded-full bg-accent-green shrink-0';
-  } else if (val === 'fastest') {
-    dot.className = 'w-2 h-2 rounded-full bg-accent-orange shrink-0';
   } else {
     dot.style.background = 'var(--accent-blue)';
     dot.className = 'w-2 h-2 rounded-full shrink-0';
@@ -898,21 +859,11 @@ document.addEventListener('click', (e) => {
   }
 });
 
-function _latencyBadge(ms) {
-  if (ms <= 0) return '<span class="text-[10px] text-muted/40 ml-auto font-mono">--</span>';
-  const color = ms < 100 ? 'text-accent-green' : ms < 500 ? 'text-accent-yellow' : 'text-accent-red';
-  return `<span class="text-[10px] ${color} ml-auto font-mono">${ms}ms</span>`;
-}
-
 function updateDropdownOptions(conns) {
   const cur = targetValue.value;
   let html = `<div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
     data-value="auto" onclick="selectTarget(this)">
     <div class="w-2 h-2 rounded-full bg-accent-green shrink-0"></div>auto
-  </div>
-  <div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
-    data-value="fastest" onclick="selectTarget(this)">
-    <div class="w-2 h-2 rounded-full bg-accent-orange shrink-0"></div>fastest
   </div>
   <div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
     data-value="broadcast" onclick="selectTarget(this)">
@@ -926,15 +877,14 @@ function updateDropdownOptions(conns) {
       const textCls = dead ? 'text-muted' : 'text-label';
       const hoverCls = dead ? '' : 'hover:bg-surface cursor-pointer';
       const clickAttr = dead ? '' : 'onclick="selectTarget(this)"';
-      const latency = _latencyBadge(c.ping_latency_ms || -1);
       html += `<div class="px-3 py-2 text-[13px] ${textCls} ${hoverCls} flex items-center gap-2 transition-colors rounded-lg mx-1"
         data-value="${c.agent_id}" ${clickAttr}>
-        <div class="w-2 h-2 rounded-full ${dotCls} shrink-0"></div>${esc(agentLabel(c))}${latency}
+        <div class="w-2 h-2 rounded-full ${dotCls} shrink-0"></div>${esc(agentLabel(c))}
       </div>`;
     });
   }
   targetMenu.innerHTML = html;
-  const validValues = ['auto', 'fastest', 'broadcast', ...conns.map(c => c.agent_id)];
+  const validValues = ['auto', 'broadcast', ...conns.map(c => c.agent_id)];
   if (!validValues.includes(cur)) {
     targetValue.value = 'auto';
     targetLabel.textContent = 'auto';
@@ -1651,12 +1601,7 @@ async function updateAllAgents() {
     const data = await ajaxPost('/api/update-agents', {});
     if (data.results && data.results.length > 0) {
       const succeeded = data.results.filter(r => r.success).length;
-      const details = data.results.map(r => {
-        const name = r.display_name || r.agent_id.slice(0, 12);
-        const reason = r.success ? 'OK' : (r.git_output || 'failed');
-        return `${name}: ${reason}`;
-      }).join(' · ');
-      showToast(`Updated ${succeeded}/${data.results.length} — ${details}`, succeeded > 0 ? 'success' : 'error');
+      showToast(`Updated ${succeeded}/${data.results.length} agents`, succeeded > 0 ? 'success' : 'error');
       data.results.forEach(r => {
         const status = r.success ? 'ok' : 'FAILED';
         console.log(`[Update] ${r.display_name}: ${status} — ${r.git_output}`);
@@ -1669,28 +1614,6 @@ async function updateAllAgents() {
   } finally {
     btn.textContent = origText;
     btn.disabled = false;
-  }
-}
-
-async function checkInAgents() {
-  const btn = document.getElementById('checkin-btn');
-  btn.textContent = 'Checking...';
-  btn.disabled = true;
-  btn.classList.add('text-accent-orange');
-  try {
-    const data = await ajaxPost('/api/checkin', {});
-    if (data.success) {
-      showToast(`Check-in sent to ${data.sent_count} agent${data.sent_count !== 1 ? 's' : ''}`, 'success');
-      pollServer();
-    } else {
-      showToast(data.error || 'No agents to check in with', 'error');
-    }
-  } catch (e) {
-    showToast('Check-in failed: ' + e.message, 'error');
-  } finally {
-    btn.textContent = 'Check In';
-    btn.disabled = false;
-    btn.classList.remove('text-accent-orange');
   }
 }
 
@@ -2137,154 +2060,37 @@ fetch('/api/info').then(r => r.json()).then(data => {
 }).catch(() => {});
 
 // ========================================================================
-// MESH VIEW — D3.js force-directed graph + organizer
+// MESH VIEW — D3.js force-directed graph
 // ========================================================================
 
 let _meshVisible = false;
-let _drawVisible = false;
 let _meshSimulation = null;
 let _meshPollTimer = null;
 let _meshTooltipTarget = null;
-let _meshSelectedNodes = new Set();
-let _meshSelfId = null;
-let _meshPeerUrls = {};
-
-// Persistent storage helpers
-function getMeshColors() {
-  try { return JSON.parse(localStorage.getItem('dm-mesh-colors') || '{}'); } catch { return {}; }
-}
-function setMeshColor(agentId, color) {
-  const colors = getMeshColors();
-  if (color) colors[agentId] = color;
-  else delete colors[agentId];
-  localStorage.setItem('dm-mesh-colors', JSON.stringify(colors));
-}
-function getMeshPositions() {
-  try { return JSON.parse(localStorage.getItem('dm-mesh-positions') || '{}'); } catch { return {}; }
-}
-function saveMeshPosition(agentId, x, y) {
-  const pos = getMeshPositions();
-  pos[agentId] = { x, y };
-  localStorage.setItem('dm-mesh-positions', JSON.stringify(pos));
-}
-function removeMeshPosition(agentId) {
-  const pos = getMeshPositions();
-  delete pos[agentId];
-  localStorage.setItem('dm-mesh-positions', JSON.stringify(pos));
-}
-
-function _activeView() {
-  if (_meshVisible) return 'mesh';
-  if (_drawVisible) return 'draw';
-  return 'chat';
-}
-
-function _setNavBtnState(btnId, active) {
-  const btn = document.getElementById(btnId);
-  if (!btn) return;
-  btn.classList.toggle('text-accent-blue', active);
-  btn.classList.toggle('text-muted', !active);
-}
 
 function toggleMeshView() {
   if (_meshVisible) showChatView();
   else showMeshView();
 }
 
-function toggleDrawView() {
-  if (_drawVisible) showChatView();
-  else showDrawView();
-}
-
 function showMeshView() {
-  _meshVisible = true; _drawVisible = false;
+  _meshVisible = true;
   document.getElementById('chat-area').classList.add('hidden');
   document.getElementById('mesh-view').classList.remove('hidden');
-  document.getElementById('draw-view').classList.add('hidden');
-  _setNavBtnState('mesh-btn', true);
-  _setNavBtnState('draw-btn', false);
+  document.getElementById('mesh-btn').classList.add('text-accent-blue');
+  document.getElementById('mesh-btn').classList.remove('text-muted');
   fetchMeshTopology();
   _meshPollTimer = setInterval(fetchMeshTopology, 15000);
 }
 
-function showDrawView() {
-  _drawVisible = true; _meshVisible = false;
-  document.getElementById('chat-area').classList.add('hidden');
-  document.getElementById('mesh-view').classList.add('hidden');
-  document.getElementById('draw-view').classList.remove('hidden');
-  _setNavBtnState('draw-btn', true);
-  _setNavBtnState('mesh-btn', false);
-  if (_meshPollTimer) { clearInterval(_meshPollTimer); _meshPollTimer = null; }
-  hideMeshTooltip();
-  initDrawCanvas();
-}
-
 function showChatView() {
-  _meshVisible = false; _drawVisible = false;
+  _meshVisible = false;
   document.getElementById('chat-area').classList.remove('hidden');
   document.getElementById('mesh-view').classList.add('hidden');
-  document.getElementById('draw-view').classList.add('hidden');
-  _setNavBtnState('mesh-btn', false);
-  _setNavBtnState('draw-btn', false);
+  document.getElementById('mesh-btn').classList.remove('text-accent-blue');
+  document.getElementById('mesh-btn').classList.add('text-muted');
   if (_meshPollTimer) { clearInterval(_meshPollTimer); _meshPollTimer = null; }
   hideMeshTooltip();
-}
-
-function resetMeshLayout() {
-  localStorage.removeItem('dm-mesh-positions');
-  if (_meshVisible) fetchMeshTopology();
-}
-
-function updateSelectionUI() {
-  const count = _meshSelectedNodes.size;
-  const countEl = document.getElementById('mesh-selection-count');
-  const broadcastBtn = document.getElementById('mesh-broadcast-sel-btn');
-  if (count > 0) {
-    countEl.textContent = count + ' selected';
-    countEl.classList.remove('hidden');
-  } else {
-    countEl.classList.add('hidden');
-  }
-  broadcastBtn.classList.toggle('hidden', count < 2);
-}
-
-function openGroupBroadcast() {
-  document.getElementById('broadcast-sel-count').textContent = _meshSelectedNodes.size;
-  document.getElementById('mesh-broadcast-popover').classList.remove('hidden');
-  document.getElementById('broadcast-group-input').focus();
-}
-
-function closeGroupBroadcast() {
-  document.getElementById('mesh-broadcast-popover').classList.add('hidden');
-  document.getElementById('broadcast-group-input').value = '';
-}
-
-async function sendGroupBroadcast() {
-  const content = document.getElementById('broadcast-group-input').value.trim();
-  if (!content) return;
-  const agentIds = [..._meshSelectedNodes].filter(id => id !== _meshSelfId);
-  if (!agentIds.length) { showToast('No agents selected', 'error'); return; }
-  closeGroupBroadcast();
-  try {
-    const result = await ajaxPost('/api/broadcast-group', { agent_ids: agentIds, content });
-    if (result.success) {
-      showToast(`Sent to ${result.sent_count} agent${result.sent_count !== 1 ? 's' : ''}`, 'success');
-      _meshSelectedNodes.clear();
-      updateSelectionUI();
-      if (_meshVisible) fetchMeshTopology();
-    } else {
-      showToast(result.error || 'Broadcast failed', 'error');
-    }
-  } catch (e) {
-    showToast('Broadcast failed', 'error');
-  }
-}
-
-function setNodeColor(color) {
-  if (!_meshTooltipTarget) return;
-  setMeshColor(_meshTooltipTarget.id, color);
-  hideMeshTooltip();
-  if (_meshVisible) fetchMeshTopology();
 }
 
 async function fetchMeshTopology() {
@@ -2293,6 +2099,7 @@ async function fetchMeshTopology() {
     if (resp.status === 401) { window.location.href = '/login'; return; }
     const topo = await resp.json();
 
+    // Merge all nodes/edges from this node's view
     const nodesMap = {};
     const edgesSet = new Set();
     const edges = [];
@@ -2303,6 +2110,7 @@ async function fetchMeshTopology() {
       if (!edgesSet.has(key)) { edgesSet.add(key); edges.push({...e, is_local: true}); }
     }
 
+    // Fan out to each peer's network_info (2s timeout, best-effort)
     const peerFetches = Object.entries(topo.peer_urls).map(async ([aid, url]) => {
       try {
         const ctrl = new AbortController();
@@ -2318,6 +2126,7 @@ async function fetchMeshTopology() {
     for (const pr of peerResults) {
       if (pr.status !== 'fulfilled' || !pr.value) continue;
       const info = pr.value;
+      // Add the node itself if not present
       if (!nodesMap[info.agent_id]) {
         nodesMap[info.agent_id] = {
           id: info.agent_id,
@@ -2326,6 +2135,7 @@ async function fetchMeshTopology() {
           is_self: false,
         };
       }
+      // Add edges from this peer's connections
       for (const conn of (info.connections || [])) {
         if (!nodesMap[conn.agent_id]) {
           nodesMap[conn.agent_id] = {
@@ -2344,8 +2154,6 @@ async function fetchMeshTopology() {
     }
 
     const nodes = Object.values(nodesMap);
-    _meshSelfId = topo.self_id;
-    _meshPeerUrls = topo.peer_urls;
     document.getElementById('mesh-node-count').textContent = nodes.length + ' node' + (nodes.length !== 1 ? 's' : '');
     renderMeshGraph(nodes, edges, topo.self_id, topo.peer_urls);
   } catch (e) {
@@ -2363,12 +2171,10 @@ function renderMeshGraph(nodes, edges, selfId, peerUrls) {
   const accentBlue = isLight ? '#007AFF' : '#0A84FF';
   const textColor = isLight ? '#000' : '#fff';
   const mutedColor = isLight ? '#8e8e93' : '#636366';
-  const defaultNodeColor = isLight ? '#c7c7cc' : '#48484a';
+  const nodeColor = isLight ? '#c7c7cc' : '#48484a';
   const bgColor = isLight ? '#f5f5f7' : '#000000';
 
-  const savedPositions = getMeshPositions();
-  const savedColors = getMeshColors();
-
+  // Clear previous
   container.innerHTML = '';
 
   const svg = d3.select(container).append('svg')
@@ -2377,41 +2183,24 @@ function renderMeshGraph(nodes, edges, selfId, peerUrls) {
 
   const g = svg.append('g');
 
+  // Zoom
   const zoom = d3.zoom().scaleExtent([0.3, 4]).on('zoom', (e) => g.attr('transform', e.transform));
   svg.call(zoom);
 
+  // Build link/node data (deep copy ids for D3)
   const linkData = edges.map(e => ({source: e.source, target: e.target, is_local: e.is_local}));
-  const nodeData = nodes.map(n => {
-    const d = {...n};
-    // Restore saved positions
-    if (savedPositions[n.id]) {
-      d.x = savedPositions[n.id].x;
-      d.y = savedPositions[n.id].y;
-      d.fx = savedPositions[n.id].x;
-      d.fy = savedPositions[n.id].y;
-    }
-    return d;
-  });
+  const nodeData = nodes.map(n => ({...n}));
 
-  // Measure label widths to size rectangles
-  const tempSvg = d3.select(container).append('svg').style('position','absolute').style('visibility','hidden');
-  const tempText = tempSvg.append('text').attr('font-size', '11px').attr('font-family', '-apple-system, BlinkMacSystemFont, sans-serif');
-  nodeData.forEach(d => {
-    tempText.text(d.display_name || d.id.slice(0, 8));
-    d._labelWidth = tempText.node().getComputedTextLength();
-    d._boxW = Math.max(d._labelWidth + 20, 48);
-    d._boxH = 28;
-  });
-  tempSvg.remove();
-
+  // Simulation
   const sim = d3.forceSimulation(nodeData)
-    .force('link', d3.forceLink(linkData).id(d => d.id).distance(120))
-    .force('charge', d3.forceManyBody().strength(-400))
+    .force('link', d3.forceLink(linkData).id(d => d.id).distance(100))
+    .force('charge', d3.forceManyBody().strength(-300))
     .force('center', d3.forceCenter(width / 2, height / 2))
-    .force('collision', d3.forceCollide().radius(d => d._boxW / 2 + 8));
+    .force('collision', d3.forceCollide().radius(30));
 
   _meshSimulation = sim;
 
+  // Links
   const link = g.append('g').selectAll('line')
     .data(linkData).enter().append('line')
     .attr('stroke', mutedColor)
@@ -2419,102 +2208,42 @@ function renderMeshGraph(nodes, edges, selfId, peerUrls) {
     .attr('stroke-width', 1.5)
     .attr('stroke-dasharray', d => d.is_local ? 'none' : '4,4');
 
+  // Nodes
   const node = g.append('g').selectAll('g')
     .data(nodeData).enter().append('g')
     .call(d3.drag()
       .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
       .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
-      .on('end', (e, d) => {
-        if (!e.active) sim.alphaTarget(0);
-        d.fx = d.x; d.fy = d.y;
-        saveMeshPosition(d.id, d.x, d.y);
-      })
+      .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
     );
 
-  // Selection ring (rect outline, hidden by default)
-  node.append('rect')
-    .attr('class', 'mesh-sel-ring')
-    .attr('x', d => -d._boxW / 2 - 4).attr('y', d => -d._boxH / 2 - 4)
-    .attr('width', d => d._boxW + 8).attr('height', d => d._boxH + 8)
-    .attr('rx', 10).attr('ry', 10)
-    .attr('fill', 'none')
-    .attr('stroke', accentBlue)
-    .attr('stroke-width', 2.5)
-    .attr('stroke-opacity', 0)
-    .each(function(d) {
-      if (_meshSelectedNodes.has(d.id)) {
-        d3.select(this).attr('stroke-opacity', 0.7).classed('mesh-selection-ring', true);
-      }
-    });
-
-  // Self accent border
+  // Self highlight ring
   node.filter(d => d.id === selfId)
-    .append('rect')
-    .attr('x', d => -d._boxW / 2 - 2).attr('y', d => -d._boxH / 2 - 2)
-    .attr('width', d => d._boxW + 4).attr('height', d => d._boxH + 4)
-    .attr('rx', 9).attr('ry', 9)
+    .append('circle').attr('r', 18)
     .attr('fill', 'none').attr('stroke', accentBlue).attr('stroke-width', 2).attr('stroke-opacity', 0.5);
 
-  // Node rectangles with custom colors
-  node.append('rect')
-    .attr('x', d => -d._boxW / 2).attr('y', d => -d._boxH / 2)
-    .attr('width', d => d._boxW).attr('height', d => d._boxH)
-    .attr('rx', 7).attr('ry', 7)
-    .attr('fill', d => savedColors[d.id] || (d.id === selfId ? accentBlue : defaultNodeColor))
+  // Node circles
+  node.append('circle')
+    .attr('r', 12)
+    .attr('fill', d => d.id === selfId ? accentBlue : nodeColor)
     .attr('stroke', d => d.id === selfId ? accentBlue : 'transparent')
     .attr('stroke-width', 1.5)
     .style('cursor', 'pointer');
 
-  // Labels inside rectangles
+  // Labels
   node.append('text')
     .text(d => d.display_name || d.id.slice(0, 8))
-    .attr('dy', '0.35em').attr('text-anchor', 'middle')
-    .attr('fill', d => {
-      const bg = savedColors[d.id] || (d.id === selfId ? accentBlue : defaultNodeColor);
-      // Use white text on dark fills, dark text on light fills
-      if (bg === defaultNodeColor && isLight) return '#000';
-      return '#fff';
-    })
-    .attr('font-size', '11px').attr('font-weight', '600')
-    .style('pointer-events', 'none');
+    .attr('dy', 24).attr('text-anchor', 'middle')
+    .attr('fill', d => d.id === selfId ? accentBlue : textColor)
+    .attr('font-size', '11px').attr('font-weight', d => d.id === selfId ? '600' : '400')
+    .attr('opacity', 0.8);
 
-  // Click: normal = tooltip, shift = select
+  // Click handler for tooltip
   node.on('click', (event, d) => {
     event.stopPropagation();
-    if (event.shiftKey) {
-      // Toggle selection
-      if (_meshSelectedNodes.has(d.id)) {
-        _meshSelectedNodes.delete(d.id);
-      } else {
-        _meshSelectedNodes.add(d.id);
-      }
-      // Update selection ring visuals
-      node.selectAll('.mesh-sel-ring').each(function(nd) {
-        const sel = _meshSelectedNodes.has(nd.id);
-        d3.select(this).attr('stroke-opacity', sel ? 0.7 : 0).classed('mesh-selection-ring', sel);
-      });
-      updateSelectionUI();
-    } else {
-      showMeshTooltip(event, d, selfId, peerUrls);
-    }
+    showMeshTooltip(event, d, selfId, peerUrls);
   });
-
-  // Double-click to unpin
-  node.on('dblclick', (event, d) => {
-    event.stopPropagation();
-    d.fx = null; d.fy = null;
-    removeMeshPosition(d.id);
-    sim.alphaTarget(0.1).restart();
-    setTimeout(() => sim.alphaTarget(0), 500);
-  });
-
-  svg.on('click', () => {
-    hideMeshTooltip();
-    // Deselect all
-    _meshSelectedNodes.clear();
-    node.selectAll('.mesh-sel-ring').attr('stroke-opacity', 0).classed('mesh-selection-ring', false);
-    updateSelectionUI();
-  });
+  svg.on('click', () => hideMeshTooltip());
 
   sim.on('tick', () => {
     link
@@ -2522,8 +2251,6 @@ function renderMeshGraph(nodes, edges, selfId, peerUrls) {
       .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
     node.attr('transform', d => `translate(${d.x},${d.y})`);
   });
-
-  updateSelectionUI();
 }
 
 function showMeshTooltip(event, d, selfId, peerUrls) {
@@ -2535,8 +2262,10 @@ function showMeshTooltip(event, d, selfId, peerUrls) {
   document.getElementById('tooltip-level').textContent = lvl;
 
   const connectBtn = document.getElementById('tooltip-connect-btn');
+  // Show connect button if this node is not self and not already in our connections
   const isConnected = !!peerUrls[d.id];
   if (d.id !== selfId && !isConnected && peerUrls[d.id] === undefined) {
+    // Discovered through a peer — we have no direct URL, can't connect yet
     connectBtn.classList.add('hidden');
   } else if (d.id !== selfId && !isConnected) {
     connectBtn.classList.remove('hidden');
@@ -2546,8 +2275,8 @@ function showMeshTooltip(event, d, selfId, peerUrls) {
   _meshTooltipTarget = d;
 
   tip.classList.remove('hidden');
-  tip.style.left = Math.min(event.pageX + 12, window.innerWidth - 280) + 'px';
-  tip.style.top = Math.min(event.pageY - 10, window.innerHeight - 240) + 'px';
+  tip.style.left = Math.min(event.pageX + 12, window.innerWidth - 260) + 'px';
+  tip.style.top = Math.min(event.pageY - 10, window.innerHeight - 200) + 'px';
 }
 
 function hideMeshTooltip() {
@@ -2560,6 +2289,7 @@ async function connectFromTooltip() {
   const aid = _meshTooltipTarget.id;
   hideMeshTooltip();
   try {
+    // Find the peer URL from mesh topology data
     const topoResp = await fetch('/api/mesh-topology');
     const topo = await topoResp.json();
     const url = topo.peer_urls[aid];
@@ -2577,193 +2307,8 @@ async function connectFromTooltip() {
   }
 }
 
-// ========================================================================
-// DRAW TAB — Canvas drawing + send to mesh
-// ========================================================================
-
-let _drawCanvas = null;
-let _drawCtx = null;
-let _drawInited = false;
-let _drawColor = '#ffffff';
-let _drawSize = 5;
-let _drawErasing = false;
-let _drawHistory = []; // canvas snapshots for undo
-let _drawIsDrawing = false;
-let _clearPrimed = false;
-
-function initDrawCanvas() {
-  const canvas = document.getElementById('draw-canvas');
-  if (!canvas) return;
-  _drawCanvas = canvas;
-  _drawCtx = canvas.getContext('2d');
-
-  // Size canvas to container
-  const wrap = document.getElementById('draw-canvas-wrap');
-  canvas.width = wrap.clientWidth;
-  canvas.height = wrap.clientHeight;
-
-  if (!_drawInited) {
-    // Set initial state
-    _fillCanvasBg();
-    _saveDrawSnapshot();
-
-    // Pointer events for touch/mouse/stylus
-    canvas.addEventListener('pointerdown', _drawStart);
-    canvas.addEventListener('pointermove', _drawMove);
-    canvas.addEventListener('pointerup', _drawEnd);
-    canvas.addEventListener('pointercancel', _drawEnd);
-
-    // Init active states on toolbar
-    selectDrawColor(document.querySelector('.draw-color-btn'));
-    selectDrawSize(document.querySelector('.draw-size-btn[data-size="5"]'));
-
-    _drawInited = true;
-  } else {
-    // Resize: restore last snapshot
-    if (_drawHistory.length > 0) {
-      const img = new Image();
-      img.onload = () => { _drawCtx.drawImage(img, 0, 0); };
-      img.src = _drawHistory[_drawHistory.length - 1];
-    } else {
-      _fillCanvasBg();
-    }
-  }
-}
-
-function _getCanvasBg() {
-  return document.documentElement.getAttribute('data-theme') === 'light' ? '#ffffff' : '#000000';
-}
-
-function _fillCanvasBg() {
-  if (!_drawCtx || !_drawCanvas) return;
-  _drawCtx.fillStyle = _getCanvasBg();
-  _drawCtx.fillRect(0, 0, _drawCanvas.width, _drawCanvas.height);
-}
-
-function _saveDrawSnapshot() {
-  if (!_drawCanvas) return;
-  if (_drawHistory.length >= 20) _drawHistory.shift();
-  _drawHistory.push(_drawCanvas.toDataURL());
-}
-
-function _drawStart(e) {
-  _drawIsDrawing = true;
-  _drawCtx.beginPath();
-  _drawCtx.moveTo(e.offsetX, e.offsetY);
-  _drawCtx.lineCap = 'round';
-  _drawCtx.lineJoin = 'round';
-  _drawCtx.lineWidth = _drawSize;
-  _drawCtx.strokeStyle = _drawErasing ? _getCanvasBg() : _drawColor;
-  e.preventDefault();
-}
-
-function _drawMove(e) {
-  if (!_drawIsDrawing) return;
-  _drawCtx.lineTo(e.offsetX, e.offsetY);
-  _drawCtx.stroke();
-  e.preventDefault();
-}
-
-function _drawEnd(e) {
-  if (!_drawIsDrawing) return;
-  _drawIsDrawing = false;
-  _drawCtx.closePath();
-  _saveDrawSnapshot();
-  e.preventDefault();
-}
-
-function selectDrawColor(btn) {
-  if (!btn) return;
-  document.querySelectorAll('.draw-color-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  _drawColor = btn.dataset.color;
-  _drawErasing = false;
-  document.getElementById('draw-eraser-btn').classList.remove('text-accent-blue');
-  document.getElementById('draw-eraser-btn').classList.add('text-muted');
-}
-
-function selectDrawSize(btn) {
-  if (!btn) return;
-  document.querySelectorAll('.draw-size-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  _drawSize = parseInt(btn.dataset.size, 10);
-}
-
-function toggleDrawEraser() {
-  _drawErasing = !_drawErasing;
-  const btn = document.getElementById('draw-eraser-btn');
-  btn.classList.toggle('text-accent-blue', _drawErasing);
-  btn.classList.toggle('text-muted', !_drawErasing);
-}
-
-function drawUndo() {
-  if (_drawHistory.length <= 1) return; // keep at least the blank canvas
-  _drawHistory.pop(); // remove current state
-  const prev = _drawHistory[_drawHistory.length - 1];
-  const img = new Image();
-  img.onload = () => {
-    _drawCtx.clearRect(0, 0, _drawCanvas.width, _drawCanvas.height);
-    _drawCtx.drawImage(img, 0, 0);
-  };
-  img.src = prev;
-}
-
-function drawClear() {
-  const btn = document.getElementById('draw-clear-btn');
-  if (!_clearPrimed) {
-    _clearPrimed = true;
-    btn.classList.add('text-accent-red');
-    btn.classList.remove('text-muted');
-    setTimeout(() => {
-      _clearPrimed = false;
-      btn.classList.remove('text-accent-red');
-      btn.classList.add('text-muted');
-    }, 2000);
-    return;
-  }
-  _clearPrimed = false;
-  btn.classList.remove('text-accent-red');
-  btn.classList.add('text-muted');
-  _fillCanvasBg();
-  _drawHistory = [];
-  _saveDrawSnapshot();
-}
-
-async function drawSendToMesh() {
-  if (!_drawCanvas) return;
-  try {
-    const blob = await new Promise(resolve => _drawCanvas.toBlob(resolve, 'image/png'));
-    const file = new File([blob], `sketch-${Date.now()}.png`, { type: 'image/png' });
-    await uploadFiles([file]);
-    showChatView();
-    composeInput.focus();
-    showToast('Sketch attached — type a message and send', 'info');
-  } catch (e) {
-    showToast('Failed to attach sketch: ' + e.message, 'error');
-  }
-}
-
-// Handle window resize for draw canvas
-window.addEventListener('resize', () => {
-  if (_drawVisible && _drawCanvas) {
-    const wrap = document.getElementById('draw-canvas-wrap');
-    const oldData = _drawCanvas.toDataURL();
-    _drawCanvas.width = wrap.clientWidth;
-    _drawCanvas.height = wrap.clientHeight;
-    _fillCanvasBg();
-    const img = new Image();
-    img.onload = () => { _drawCtx.drawImage(img, 0, 0); };
-    img.src = oldData;
-  }
-});
-
 function onThemeChange() {
   if (_meshVisible) fetchMeshTopology();
-  // Re-init QR code if needed
-  if (typeof qrInitialized !== 'undefined' && qrInitialized) {
-    qrInitialized = false;
-    initQR(document.getElementById('qr-url').textContent);
-  }
 }
 </script>
 

@@ -245,7 +245,10 @@ app = Flask(__name__, template_folder=os.path.join(os.path.dirname(os.path.abspa
 # --- Optional PIN auth (persisted in state.security_settings) ---
 from werkzeug.security import generate_password_hash, check_password_hash
 
-app.secret_key = hashlib.sha256(f"darkmatter-entrypoint-session-{state.agent_id}".encode()).digest()
+# Apply persisted sandbox settings to config module at startup
+import darkmatter.config as _dm_config
+_dm_config.AGENT_SANDBOX = state.security_settings.get("sandbox_enabled", False)
+_dm_config.AGENT_SANDBOX_NETWORK = state.security_settings.get("sandbox_network", True)
 
 # Migrate env var PIN on first run: if DARKMATTER_PIN is set and no pin_hash in state, hash and save once
 _env_pin = os.environ.get("DARKMATTER_PIN", "").strip()
@@ -253,10 +256,16 @@ if _env_pin and not state.security_settings.get("pin_hash"):
     state.security_settings["pin_hash"] = generate_password_hash(_env_pin)
     save_state()
 
-# Apply persisted sandbox settings to config module at startup
-import darkmatter.config as _dm_config
-_dm_config.AGENT_SANDBOX = state.security_settings.get("sandbox_enabled", False)
-_dm_config.AGENT_SANDBOX_NETWORK = state.security_settings.get("sandbox_network", True)
+
+def _update_secret_key():
+    """Derive session secret from agent_id + pin_hash. Changing the PIN
+    invalidates every existing session cookie immediately."""
+    pin_hash = state.security_settings.get("pin_hash", "")
+    app.secret_key = hashlib.sha256(
+        f"darkmatter-{state.agent_id}-{pin_hash}".encode()
+    ).digest()
+
+_update_secret_key()
 
 
 def _pin_is_set() -> bool:
@@ -267,16 +276,25 @@ def _pin_is_set() -> bool:
 def _pin_auth_guard():
     if not _pin_is_set():
         return  # No PIN configured — open access
-    # Exempt paths: login, mesh protocol, well-known, security API
+    # Exempt paths: login, mesh protocol, well-known
     path = request.path
     if path == "/login" or path.startswith("/__darkmatter__/") or path.startswith("/.well-known/"):
         return
-    if flask_session.get("pin_authenticated"):
+    # Validate session — check the pin_hash fingerprint matches current PIN
+    if (flask_session.get("pin_authenticated")
+            and flask_session.get("pin_fingerprint") == _pin_fingerprint()):
         return
-    # 401 for AJAX, redirect for pages
+    # Stale or missing session — force re-auth
+    flask_session.clear()
     if _is_ajax() or request.headers.get("Accept", "").startswith("application/json"):
         return jsonify({"error": "Authentication required"}), 401
     return redirect("/login")
+
+
+def _pin_fingerprint() -> str:
+    """Short hash of the current pin_hash — stored in session to detect PIN changes."""
+    h = state.security_settings.get("pin_hash", "")
+    return hashlib.sha256(h.encode()).hexdigest()[:16] if h else ""
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -287,7 +305,9 @@ def pin_login():
     if request.method == "POST":
         pin = request.form.get("pin", "").strip()
         if check_password_hash(state.security_settings["pin_hash"], pin):
+            flask_session.clear()
             flask_session["pin_authenticated"] = True
+            flask_session["pin_fingerprint"] = _pin_fingerprint()
             flask_session.permanent = True
             app.permanent_session_lifetime = __import__("datetime").timedelta(hours=24)
             return redirect("/")
@@ -319,7 +339,14 @@ def api_security_post():
             ss["pin_hash"] = generate_password_hash(pin_val)
         else:
             ss["pin_hash"] = ""
-            flask_session.pop("pin_authenticated", None)
+        # Rotate secret key — invalidates ALL existing sessions on every device
+        _update_secret_key()
+        # Re-authenticate the current session (the device that changed the PIN)
+        flask_session.clear()
+        if pin_val:
+            flask_session["pin_authenticated"] = True
+            flask_session["pin_fingerprint"] = _pin_fingerprint()
+            flask_session.permanent = True
 
     if "auto_accept_local" in data:
         ss["auto_accept_local"] = bool(data["auto_accept_local"])
