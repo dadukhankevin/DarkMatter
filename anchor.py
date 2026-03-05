@@ -34,11 +34,11 @@ if sys.platform == "win32":
 else:
     import fcntl
     def _flock_sh(f):
-        _flock_sh(f)
+        fcntl.flock(f, fcntl.LOCK_SH)
     def _flock_ex(f):
-        _flock_ex(f)
+        fcntl.flock(f, fcntl.LOCK_EX)
     def _flock_un(f):
-        _flock_un(f)
+        fcntl.flock(f, fcntl.LOCK_UN)
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
