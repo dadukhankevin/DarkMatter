@@ -25,7 +25,7 @@ from darkmatter.mcp.schemas import (
     CreateShardInput,
     ViewShardsInput,
 )
-from darkmatter.state import get_state, save_state, sync_message_queue_from_disk
+from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, consume_message
 from darkmatter.context import log_conversation
 from darkmatter.config import (
     MAX_CONNECTIONS,
@@ -357,6 +357,7 @@ async def _forward_message(state, params: SendMessageInput) -> str:
                 msg_status = webhook_data.get("status", "active")
                 if msg_status in ("expired", "responded"):
                     state.message_queue.pop(msg_index)
+                    consume_message(msg.message_id)
                     save_state()
                     return json.dumps({
                         "success": False,
@@ -378,6 +379,7 @@ async def _forward_message(state, params: SendMessageInput) -> str:
     # TTL check
     if msg.hops_remaining <= 0:
         state.message_queue.pop(msg_index)
+        consume_message(msg.message_id)
         if not webhook_err:
             try:
                 await get_network_manager().webhook_request(
@@ -443,6 +445,7 @@ async def _forward_message(state, params: SendMessageInput) -> str:
 
     # Remove from queue after delivery attempts
     state.message_queue.pop(msg_index)
+    consume_message(msg.message_id)
     save_state()
 
     any_success = any(r["success"] for r in per_target_results)
@@ -626,6 +629,7 @@ async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
             if msg.message_id == message_id:
                 # Remove from queue (mark as read)
                 state.message_queue.pop(i)
+                consume_message(message_id)
                 save_state()
 
                 is_forwarded = bool((msg.metadata or {}).get("forwarded"))

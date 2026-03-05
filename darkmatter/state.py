@@ -47,10 +47,18 @@ _state_write_lock = threading.Lock()
 # Replay dedup: track recently seen message IDs for REPLAY_WINDOW seconds
 _seen_message_ids: dict[str, float] = {}
 
+# Track consumed (read/forwarded) message IDs so disk sync doesn't re-add them
+_consumed_message_ids: set[str] = set()
+
 
 def get_state() -> Optional[AgentState]:
     """Get the current agent state."""
     return _agent_state
+
+
+def consume_message(message_id: str) -> None:
+    """Mark a message as consumed so disk sync won't re-add it."""
+    _consumed_message_ids.add(message_id)
 
 
 def sync_message_queue_from_disk() -> None:
@@ -84,7 +92,7 @@ def sync_message_queue_from_disk() -> None:
         print(f"[DarkMatter] Queue sync: no message_queue in state file (missing or empty)", file=sys.stderr)
         return
 
-    # Build set of message IDs already in memory
+    # Build set of message IDs already in memory + already consumed
     existing_ids = {m.message_id for m in state.message_queue}
 
     for qd in disk_queue:
@@ -92,7 +100,7 @@ def sync_message_queue_from_disk() -> None:
         if not mid:
             print(f"[DarkMatter] Queue sync: skipping queued message with empty message_id", file=sys.stderr)
             continue
-        if mid not in existing_ids:
+        if mid not in existing_ids and mid not in _consumed_message_ids:
             state.message_queue.append(QueuedMessage(
                 message_id=mid,
                 content=qd.get("content", ""),
