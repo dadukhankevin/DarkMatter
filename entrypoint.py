@@ -427,7 +427,7 @@ def _probe_host_port(host, port):
 
 
 def _scan_local_agents():
-    """Scan localhost ports + known LAN peer IPs for DarkMatter agents."""
+    """Scan localhost ports + LAN subnet + known LAN peer IPs for DarkMatter agents."""
     results = {}
 
     # Build probe targets: localhost ports + LAN peer ip:port combos
@@ -439,6 +439,18 @@ def _scan_local_agents():
                 del _lan_peers[peer_id]
                 continue
             targets.append((info["ip"], info["port"]))
+
+    # Scan LAN /24 subnet on common DarkMatter ports (8100-8101)
+    lan_ip = _get_lan_ip()
+    if lan_ip != "127.0.0.1":
+        subnet_prefix = lan_ip.rsplit(".", 1)[0]
+        lan_scan_ports = [8100, 8101]
+        for host_octet in range(1, 255):
+            ip = f"{subnet_prefix}.{host_octet}"
+            if ip == lan_ip:
+                continue  # skip self
+            for p in lan_scan_ports:
+                targets.append((ip, p))
 
     with ThreadPoolExecutor(max_workers=50) as pool:
         futures = {pool.submit(_probe_host_port, h, p): (h, p) for h, p in targets}

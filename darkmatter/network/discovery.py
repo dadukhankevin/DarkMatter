@@ -285,10 +285,10 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
 # Local Port Scanning
 # =============================================================================
 
-async def probe_port(client: httpx.AsyncClient, state: AgentState, port: int) -> None:
-    """Probe a single localhost port for a DarkMatter node."""
+async def probe_port(client: httpx.AsyncClient, state: AgentState, port: int, host: str = "127.0.0.1") -> None:
+    """Probe a single host:port for a DarkMatter node."""
     try:
-        resp = await client.get(f"http://127.0.0.1:{port}/.well-known/darkmatter.json")
+        resp = await client.get(f"http://{host}:{port}/.well-known/darkmatter.json")
         if resp.status_code != 200:
             return
         info = resp.json()
@@ -299,24 +299,49 @@ async def probe_port(client: httpx.AsyncClient, state: AgentState, port: int) ->
     if not peer_id or peer_id == state.agent_id:
         return
 
+    source = "local" if host in ("127.0.0.1", "localhost") else "lan"
     register_peer(
         state, peer_id,
-        url=f"http://127.0.0.1:{port}",
+        url=f"http://{host}:{port}",
         bio=info.get("bio", ""),
         status=info.get("status", "active"),
         accepting=info.get("accepting_connections", True),
-        source="local",
+        source=source,
     )
 
 
+def _get_lan_ip() -> str:
+    """Get LAN IP using UDP connect trick (no actual traffic sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 async def scan_local_ports(state: AgentState) -> None:
-    """Scan localhost ports for other DarkMatter nodes concurrently."""
+    """Scan localhost ports + LAN subnet for other DarkMatter nodes."""
     async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.25)) as client:
         tasks = [
             probe_port(client, state, port)
             for port in DISCOVERY_LOCAL_PORTS
             if port != state.port
         ]
+
+        # Scan LAN /24 subnet on common DarkMatter ports
+        lan_ip = _get_lan_ip()
+        if lan_ip != "127.0.0.1":
+            subnet_prefix = lan_ip.rsplit(".", 1)[0]
+            for host_octet in range(1, 255):
+                ip = f"{subnet_prefix}.{host_octet}"
+                if ip == lan_ip:
+                    continue
+                for p in (8100, 8101):
+                    tasks.append(probe_port(client, state, p, host=ip))
+
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
