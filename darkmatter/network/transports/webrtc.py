@@ -129,8 +129,9 @@ class PeerRelaySignaling(SignalingChannel):
                         data = resp.json()
                         if data.get("sdp"):
                             return data
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter] PeerRelaySignaling: relay via {relay_conn.agent_id[:12]}... failed: {e}",
+                      file=sys.stderr)
             return None
 
         # Race — first answer wins
@@ -218,9 +219,11 @@ class AnchorRelaySignaling(SignalingChannel):
                                 answer_data = signal.get("answer_data")
                                 if answer_data and answer_data.get("sdp"):
                                     return answer_data
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter] AnchorRelaySignaling: poll failed: {e}", file=sys.stderr)
 
+        print(f"[DarkMatter] AnchorRelaySignaling: timed out waiting for SDP answer from {conn.agent_id[:12]}...",
+              file=sys.stderr)
         return None
 
 

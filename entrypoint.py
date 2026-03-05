@@ -163,7 +163,7 @@ def _cleanup_network():
     try:
         asyncio.run(_mgr.stop())
     except Exception:
-        pass
+        pass  # Shutdown cleanup — safe to swallow
 
 atexit.register(_cleanup_network)
 
@@ -186,6 +186,7 @@ def _message_timeout_checker():
             try:
                 created = datetime.fromisoformat(sm.created_at)
             except Exception:
+                print(f"[DarkMatter Entrypoint] Malformed timestamp in sent message {sm.message_id}: {sm.created_at!r}", file=sys.stderr)
                 continue
             age = (now - created).total_seconds()
             has_ack = any(u.get("type") == "received" for u in sm.updates)
@@ -226,18 +227,23 @@ def _health_check_loop():
             try:
                 base = _resolve_base_url(conn)
                 with httpx.Client(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+                    t0 = time.monotonic()
                     resp = client.get(base + "/.well-known/darkmatter.json")
+                    elapsed_ms = round((time.monotonic() - t0) * 1000)
                     if resp.status_code == 200:
+                        conn.ping_latency_ms = elapsed_ms
                         if getattr(conn, "health_status", "ok") != "ok":
                             conn.health_status = "ok"
                             conn._consecutive_failures = 0
                             dirty = True
                     else:
+                        conn.ping_latency_ms = -1
                         conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
                         if conn._consecutive_failures >= 2 and getattr(conn, "health_status", "ok") != "unreachable":
                             conn.health_status = "unreachable"
                             dirty = True
             except Exception:
+                conn.ping_latency_ms = -1
                 conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
                 if conn._consecutive_failures >= 2 and getattr(conn, "health_status", "ok") != "unreachable":
                     conn.health_status = "unreachable"
@@ -344,6 +350,7 @@ def _get_lan_ip():
         s.close()
         return ip
     except Exception:
+        print("[DarkMatter Entrypoint] Could not detect LAN IP, falling back to 127.0.0.1", file=sys.stderr)
         return "127.0.0.1"
 
 
@@ -440,8 +447,8 @@ def _scan_local_agents():
                 result = future.result()
                 if result:
                     results[result["agent_id"]] = result
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter Entrypoint] Discovery probe failed: {e}", file=sys.stderr)
 
     with _discovery_lock:
         _discovered_agents.clear()
@@ -521,8 +528,8 @@ def _broadcast_beacon():
         }).encode("utf-8")
         sock.sendto(packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT))
         sock.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DarkMatter Entrypoint] Broadcast beacon failed: {e}", file=sys.stderr)
 
 
 def _start_discovery_loop():
@@ -530,12 +537,12 @@ def _start_discovery_loop():
     while True:
         try:
             _broadcast_beacon()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DarkMatter Entrypoint] Discovery beacon error: {e}", file=sys.stderr)
         try:
             _scan_local_agents()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DarkMatter Entrypoint] Discovery scan error: {e}", file=sys.stderr)
         time.sleep(15)
 
 
@@ -827,8 +834,8 @@ def dm_accept_pending():
         if result.get("mutual") and conn:
             try:
                 _sync_connection_request(conn.agent_url)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter Entrypoint] Mutual sync failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
 
     return jsonify(result), status
 
@@ -1124,8 +1131,11 @@ def _sync_respond_to_message(message_id, response_text):
                 "signature_hex": resp_signature_hex,
             })
             webhook_success = resp.status_code < 400
-    except Exception:
+            if not webhook_success:
+                print(f"[DarkMatter Entrypoint] Webhook response failed (HTTP {resp.status_code}) for message {msg.message_id}", file=sys.stderr)
+    except Exception as e:
         webhook_success = False
+        print(f"[DarkMatter Entrypoint] Webhook response error for message {msg.message_id}: {e}", file=sys.stderr)
 
     if msg.from_agent_id and msg.from_agent_id in state.connections:
         conn = state.connections[msg.from_agent_id]
@@ -1215,7 +1225,22 @@ def send():
         threading.Thread(target=_sync_broadcast_message, args=(content,), kwargs={"metadata": metadata if metadata else None}, daemon=True).start()
         return redirect(url_for("index"))
 
-    target_id = None if target == "auto" else target
+    if target == "fastest":
+        # Pick the agent with the lowest measured ping latency
+        candidates = [
+            c for c in state.connections.values()
+            if c.agent_id != state.agent_id
+            and getattr(c, "health_status", "ok") != "unreachable"
+            and getattr(c, "ping_latency_ms", -1) > 0
+        ]
+        if candidates:
+            candidates.sort(key=lambda c: c.ping_latency_ms)
+            target_id = candidates[0].agent_id
+        else:
+            # Fall back to auto if no latency data
+            target_id = None
+    else:
+        target_id = None if target == "auto" else target
     if _is_ajax():
         result = _sync_send_message(content, target_id, metadata=metadata if metadata else None)
         return jsonify(result)
@@ -1305,8 +1330,8 @@ def accept(request_id):
         if result.get("mutual") and conn:
             try:
                 _sync_connection_request(conn.agent_url)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter Entrypoint] Mutual sync failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
 
     if _is_ajax():
         return jsonify({"success": status == 200, "display_name": display_name}), status
@@ -1396,6 +1421,7 @@ def poll():
         "connectivity_level": getattr(c, "connectivity_level", 0),
         "connectivity_method": getattr(c, "connectivity_method", ""),
         "is_local": _is_lan_url(_resolve_base_url(c)),
+        "ping_latency_ms": getattr(c, "ping_latency_ms", -1),
     } for c in state.connections.values() if c.agent_id != state.agent_id]
 
     # Discovered agents (not yet connected)
@@ -1434,6 +1460,45 @@ def poll():
             "tags": s.tags,
             "created_at": s.created_at,
         } for s in getattr(state, "shared_shards", [])],
+    })
+
+
+@app.route("/api/checkin", methods=["POST"])
+def checkin():
+    """Broadcast a check-in message to all agents and track response times."""
+    result = _sync_broadcast_message("What are you working on right now? Give a brief status update.", metadata={"checkin": True})
+    return jsonify(result)
+
+
+@app.route("/api/broadcast-group", methods=["POST"])
+def broadcast_group():
+    """Send a message to a specific subset of connected agents."""
+    data = request.get_json(silent=True) or {}
+    agent_ids = data.get("agent_ids", [])
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"success": False, "error": "Empty message"}), 400
+    if not agent_ids or not isinstance(agent_ids, list):
+        return jsonify({"success": False, "error": "No agents specified"}), 400
+
+    sent_ids = []
+    failed = []
+    for aid in agent_ids:
+        if aid not in state.connections:
+            failed.append({"agent_id": aid, "error": "Not connected"})
+            continue
+        result = _sync_send_message(content, aid)
+        if result.get("success"):
+            sent_ids.append(result["message_id"])
+        else:
+            failed.append({"agent_id": aid, "error": result.get("error", "Unknown")})
+
+    return jsonify({
+        "success": len(sent_ids) > 0,
+        "sent_count": len(sent_ids),
+        "message_ids": sent_ids,
+        "failed_count": len(failed),
+        "failed": failed if failed else None,
     })
 
 
@@ -1488,21 +1553,21 @@ def update_agents():
                     data = resp.json()
                     return {
                         "agent_id": aid,
-                        "display_name": conn.display_name or aid[:12],
+                        "display_name": conn.agent_display_name or aid[:12],
                         "success": data.get("success", False),
                         "git_output": data.get("git_output", ""),
                     }
                 else:
                     return {
                         "agent_id": aid,
-                        "display_name": conn.display_name or aid[:12],
+                        "display_name": conn.agent_display_name or aid[:12],
                         "success": False,
                         "git_output": f"HTTP {resp.status_code}",
                     }
         except Exception as e:
             return {
                 "agent_id": aid,
-                "display_name": conn.display_name or aid[:12],
+                "display_name": conn.agent_display_name or aid[:12],
                 "success": False,
                 "git_output": str(e),
             }

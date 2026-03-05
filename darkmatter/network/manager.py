@@ -94,11 +94,12 @@ def try_upnp_mapping(local_port: int) -> Optional[tuple]:
                 )
                 url = f"http://{external_ip}:{ext_port}"
                 return (url, upnp, ext_port)
-            except Exception:
+            except Exception as e:
+                print(f"[DarkMatter] UPnP port mapping attempt failed (port {ext_port}): {e}", file=sys.stderr)
                 continue
 
         return None
-    except Exception as e:
+    except (ImportError, OSError) as e:
         print(f"[DarkMatter] UPnP mapping failed: {e}", file=sys.stderr)
         return None
 
@@ -219,18 +220,21 @@ class NetworkManager:
 
             new_base = await self.lookup_peer_url(from_agent_id, exclude_urls=urls_tried)
             if not new_base:
+                print(f"[DarkMatter] Webhook recovery: no alternative URL found for {from_agent_id[:12]}… (attempt {attempt})", file=sys.stderr)
                 break
 
             parsed = urlparse(current_url if attempt == 1 else webhook_url)
             path = parsed.path
             if not (path.startswith("/__darkmatter__/webhook/") or
                     path.startswith("/__darkmatter__/webhook_relay/")):
+                print(f"[DarkMatter] Webhook recovery: unexpected path {path}, aborting", file=sys.stderr)
                 break
 
             new_base = strip_base_url(new_base)
             new_webhook = f"{new_base}{path}"
 
             if new_webhook in urls_tried:
+                print(f"[DarkMatter] Webhook recovery: already tried {new_webhook}, aborting", file=sys.stderr)
                 break
             urls_tried.add(new_webhook)
 
@@ -239,6 +243,7 @@ class NetworkManager:
                 get_public_url_fn=lambda port: self.get_public_url(),
             )
             if err:
+                print(f"[DarkMatter] Webhook recovery: validation failed for {new_webhook}: {err}", file=sys.stderr)
                 break
 
             print(f"[DarkMatter] Webhook recovery: {webhook_url} -> {new_webhook} "
@@ -458,6 +463,8 @@ class NetworkManager:
         url_scores: dict[str, float] = {}
         for peer_id, url in responses:
             imp = state.impressions.get(peer_id)
+            if not imp:
+                print(f"[DarkMatter] Peer lookup: no impression for {peer_id[:12]}…, using default trust 0.5", file=sys.stderr)
             weight = imp.score if imp else 0.5  # Default trust for unscored peers
             weight = max(weight, 0.1)  # Floor so even low-trust peers count
             url_scores[url] = url_scores.get(url, 0.0) + weight
@@ -974,7 +981,10 @@ class NetworkManager:
                     for msg in messages:
                         # Decrypt E2E encrypted relay messages
                         if msg.get("e2e_encrypted") and msg.get("encrypted_payload"):
-                            sender_pub = msg.get("encrypted_payload", {}).get("sender_public_key_hex") or msg.get("from_agent_id", "")
+                            sender_pub = msg.get("encrypted_payload", {}).get("sender_public_key_hex")
+                            if not sender_pub:
+                                sender_pub = msg.get("from_agent_id", "")
+                                print(f"[DarkMatter] Relay decrypt: no sender_public_key_hex in encrypted_payload, falling back to from_agent_id {sender_pub[:12]}…", file=sys.stderr)
                             try:
                                 from darkmatter.security import decrypt_from_peer
                                 import json as _json

@@ -108,8 +108,8 @@ async def _gather_peer_trust(state: AgentState, about_agent_id: str) -> dict:
                             "score": data.get("score", 0.0),
                             "note": data.get("note", ""),
                         }
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DarkMatter] Peer trust query failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
         return None
 
     tasks = [_query_peer(conn) for conn in state.connections.values()]
@@ -166,14 +166,16 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     from_agent_bio = data.get("from_agent_bio", "")
     from_agent_public_key_hex = data.get("from_agent_public_key_hex")
     from_agent_display_name = data.get("from_agent_display_name")
-    from_agent_wallets = data.get("wallets") or (
+    _wallets_raw = data.get("wallets")
+    from_agent_wallets = _wallets_raw if _wallets_raw is not None else (
         {"solana": data["from_agent_wallet_address"]} if data.get("from_agent_wallet_address") else {}
     )
     from_agent_created_at = data.get("created_at")
     mutual = data.get("mutual", False)
 
     if not from_agent_id or not from_agent_url:
-        return {"error": "Missing required fields"}, 400
+        missing = [f for f, v in [("from_agent_id", from_agent_id), ("from_agent_url", from_agent_url)] if not v]
+        return {"error": f"Missing required fields: {', '.join(missing)}"}, 400
     if len(from_agent_id) > MAX_AGENT_ID_LENGTH:
         return {"error": "agent_id too long"}, 400
     if len(from_agent_bio) > MAX_BIO_LENGTH:
@@ -250,6 +252,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             if (now - req_time).total_seconds() > REQUEST_EXPIRY_S:
                 expired_ids.append(rid)
         except (ValueError, TypeError):
+            print(f"[DarkMatter] Malformed timestamp in pending request {rid}: {req.requested_at!r}, marking expired", file=sys.stderr)
             expired_ids.append(rid)
     for rid in expired_ids:
         del state.pending_requests[rid]
@@ -336,12 +339,14 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
     agent_bio = data.get("agent_bio", "")
     agent_public_key_hex = data.get("agent_public_key_hex")
     agent_display_name = data.get("agent_display_name")
-    agent_wallets = data.get("wallets") or (
+    _wallets_raw = data.get("wallets")
+    agent_wallets = _wallets_raw if _wallets_raw is not None else (
         {"solana": data["wallet_address"]} if data.get("wallet_address") else {}
     )
 
     if not agent_id or not agent_url:
-        return {"error": "Missing required fields"}, 400
+        missing = [f for f, v in [("agent_id", agent_id), ("agent_url", agent_url)] if not v]
+        return {"error": f"Missing required fields: {', '.join(missing)}"}, 400
     if len(agent_id) > MAX_AGENT_ID_LENGTH:
         return {"error": "agent_id too long"}, 400
     if len(agent_bio) > MAX_BIO_LENGTH:
@@ -470,7 +475,8 @@ async def notify_connection_accepted(conn: Connection, payload: dict) -> None:
                     if resp.status_code < 400:
                         print(f"[DarkMatter] Connection accept relayed via {anchor} for {conn.agent_id[:12]}...", file=sys.stderr)
                         return
-            except Exception:
+            except Exception as e:
+                print(f"[DarkMatter] Anchor relay {anchor} failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
                 continue
 
     print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... (transports + all anchors failed)", file=sys.stderr)
@@ -559,7 +565,8 @@ def build_outbound_request_payload(state: AgentState, public_url: str, mutual: b
 
 def build_connection_from_accepted(result_data: dict) -> Connection:
     """Build a Connection from an auto-accepted or accepted response."""
-    peer_wallets = result_data.get("wallets") or (
+    _wallets_raw = result_data.get("wallets")
+    peer_wallets = _wallets_raw if _wallets_raw is not None else (
         {"solana": result_data["wallet_address"]} if result_data.get("wallet_address") else {}
     )
     return Connection(
@@ -670,7 +677,7 @@ async def process_antimatter_signal(state: AgentState, data: dict) -> tuple[dict
             if age > ANTIMATTER_MAX_AGE_S:
                 return {"error": "Signal expired (age)"}, 400
         except (ValueError, TypeError):
-            pass
+            print(f"[DarkMatter] Malformed antimatter signal timestamp: {sig.created_at!r}, skipping age check", file=sys.stderr)
 
     if state.agent_id in sig.path:
         return {"error": "Loop detected"}, 400
@@ -766,8 +773,8 @@ async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict
                     "destination": sa_wallet,
                     "amount": amount,
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter] Antimatter timeout send to {sa_wallet[:12]}... failed: {e}", file=sys.stderr)
     else:
         log_antimatter_event(state, {
             "type": "antimatter_kept",
@@ -840,7 +847,8 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     from_agent_id = data.get("from_agent_id")
 
     if not message_id or not content or not webhook:
-        return {"error": "Missing required fields"}, 400
+        missing = [f for f, v in [("message_id", message_id), ("content", content), ("webhook", webhook)] if not v]
+        return {"error": f"Missing required fields: {', '.join(missing)}"}, 400
     if check_message_replay(message_id):
         return {"error": "Duplicate message — already received"}, 409
     if len(content) > MAX_CONTENT_LENGTH:
@@ -1097,7 +1105,8 @@ async def handle_connection_proof(request: Request) -> JSONResponse:
     public_key_hex = data.get("public_key_hex", "")
 
     if not challenge_id or not proof_hex or not agent_id or not public_key_hex:
-        return JSONResponse({"error": "Missing required fields"}, status_code=400)
+        missing = [f for f, v in [("challenge_id", challenge_id), ("proof_hex", proof_hex), ("agent_id", agent_id), ("public_key_hex", public_key_hex)] if not v]
+        return JSONResponse({"error": f"Missing required fields: {', '.join(missing)}"}, status_code=400)
 
     # Enforce identity binding: public_key_hex must match agent_id (passport invariant)
     if public_key_hex != agent_id:
@@ -1616,7 +1625,8 @@ async def handle_shard_push(request: Request) -> JSONResponse:
     trust_threshold = data.get("trust_threshold", 0.0)
 
     if not author_id or not shard_id:
-        return JSONResponse({"error": "Missing required fields"}, status_code=400)
+        missing = [f for f, v in [("author_agent_id", author_id), ("shard_id", shard_id)] if not v]
+        return JSONResponse({"error": f"Missing required fields: {', '.join(missing)}"}, status_code=400)
 
     # Verify shard signature (mandatory)
     signature_hex = data.get("signature_hex")
@@ -1996,30 +2006,27 @@ async def handle_admin_update(request: Request) -> JSONResponse:
     if action != "pull_and_restart":
         return JSONResponse({"error": f"Unknown action: {action}"}, status_code=400)
 
-    # Derive repo dir from the darkmatter package location
-    import darkmatter
-    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(darkmatter.__file__)))
-
-    # Run git pull
     import subprocess
+    import sys
+
+    # Use pip upgrade since DarkMatter is pip-installed
     try:
         result = subprocess.run(
-            ["git", "-C", repo_dir, "pull", "origin", "main"],
-            capture_output=True, text=True, timeout=30,
+            [sys.executable, "-m", "pip", "install", "--upgrade", "dmagent"],
+            capture_output=True, text=True, timeout=60,
         )
-        git_output = result.stdout.strip() or result.stderr.strip()
+        output = result.stdout.strip() or result.stderr.strip()
         success = result.returncode == 0
     except subprocess.TimeoutExpired:
-        git_output = "git pull timed out after 30s"
+        output = "pip upgrade timed out after 60s"
         success = False
     except Exception as e:
-        git_output = str(e)
+        output = str(e)
         success = False
 
     return JSONResponse({
         "success": success,
-        "git_output": git_output,
-        "repo_dir": repo_dir,
+        "git_output": output,
     })
 
 

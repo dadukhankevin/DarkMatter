@@ -95,6 +95,10 @@
     .slide-up { animation: slide-up 0.3s ease-out; }
 
     @keyframes glow-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+    @keyframes selection-pulse { 0%, 100% { stroke-opacity: 0.4; } 50% { stroke-opacity: 1; } }
+    .mesh-selection-ring { animation: selection-pulse 1.2s ease-in-out infinite; }
+    .draw-color-btn.active { border-color: rgb(var(--c-primary)); }
+    .draw-size-btn.active { background: rgb(var(--c-surface) / 0.7); }
 
     @keyframes toast-in { from { opacity: 0; transform: translateY(12px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
     @keyframes toast-out { from { opacity: 1; transform: translateY(0) scale(1); } to { opacity: 0; transform: translateY(12px) scale(0.95); } }
@@ -281,6 +285,12 @@
       <button id="mesh-btn" onclick="if(typeof toggleMeshView==='function')toggleMeshView()" class="text-muted hover:text-primary transition-colors p-1.5 rounded-lg hover:bg-card/50" title="Mesh view">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><line x1="12" y1="7" x2="5" y2="17"/><line x1="12" y1="7" x2="19" y2="17"/><line x1="7" y1="19" x2="17" y2="19"/>
+        </svg>
+      </button>
+      <!-- Draw tab toggle -->
+      <button id="draw-btn" onclick="if(typeof toggleDrawView==='function')toggleDrawView()" class="text-muted hover:text-primary transition-colors p-1.5 rounded-lg hover:bg-card/50" title="Draw">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/>
         </svg>
       </button>
       <!-- Wallet -->

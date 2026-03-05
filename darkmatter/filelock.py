@@ -33,7 +33,7 @@ if sys.platform == "win32":
         try:
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         except OSError:
-            pass
+            pass  # Unlock may fail if fd was already closed or never locked; safe to ignore
 
 else:
     import fcntl

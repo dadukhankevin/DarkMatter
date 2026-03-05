@@ -4,6 +4,8 @@ MCP app setup, session tracking.
 Depends on: config
 """
 
+import sys
+
 from mcp.server.fastmcp import FastMCP
 
 MCP_INSTRUCTIONS = """\
@@ -76,5 +78,5 @@ def track_session(ctx) -> None:
     """Track an MCP session so we can send notifications later."""
     try:
         _active_sessions.add(ctx.session)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DarkMatter] Warning: failed to track MCP session: {e}", file=sys.stderr)

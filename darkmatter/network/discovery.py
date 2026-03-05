@@ -189,12 +189,14 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         beacon_sig = packet.get("beacon_signature_hex")
         beacon_pub = packet.get("public_key_hex")
         if not beacon_sig or not beacon_pub:
-            return  # Drop unsigned beacons
+            print(f"[DarkMatter] Dropped unsigned beacon from {peer_id[:12]}…", file=sys.stderr)
+            return
         from darkmatter.security import verify_lan_beacon
         beacon_ts = str(packet.get("ts", ""))
         beacon_port = str(packet.get("port", DEFAULT_PORT))
         if not verify_lan_beacon(beacon_pub, beacon_sig, peer_id, beacon_port, beacon_ts):
-            return  # Drop beacons with invalid signatures
+            print(f"[DarkMatter] Dropped beacon with invalid signature from {peer_id[:12]}…", file=sys.stderr)
+            return
 
         peer_port = packet.get("port", DEFAULT_PORT)
         source_ip = addr[0]
@@ -255,8 +257,8 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
                         None, _mcast_sock.sendto, response,
                         (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT),
                     )
-                except OSError:
-                    pass
+                except OSError as e:
+                    print(f"[DarkMatter] LAN SDP answer multicast failed: {e}", file=sys.stderr)
 
         except Exception as e:
             print(f"[DarkMatter] LAN SDP offer processing failed: {e}", file=sys.stderr)
@@ -498,13 +500,13 @@ async def discovery_loop(state: AgentState) -> None:
         while True:
             try:
                 await scan_local_ports(state)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter] Local port scan failed: {e}", file=sys.stderr)
 
             try:
                 await ensure_entrypoint_running()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter] Entrypoint auto-start failed: {e}", file=sys.stderr)
 
             from darkmatter.security import sign_lan_beacon
             ts_val = int(time.time())
@@ -530,8 +532,8 @@ async def discovery_loop(state: AgentState) -> None:
                 await loop.run_in_executor(
                     None, mcast_sock.sendto, packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT)
                 )
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"[DarkMatter] Beacon multicast send failed: {e}", file=sys.stderr)
 
             await asyncio.sleep(DISCOVERY_INTERVAL)
     finally:

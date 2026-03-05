@@ -103,8 +103,8 @@ def cleanup_finished_agents() -> None:
             if agent.spawn_mcp_config:
                 try:
                     os.remove(agent.spawn_mcp_config)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[DarkMatter] Failed to clean up spawn config {agent.spawn_mcp_config}: {e}", file=sys.stderr)
         else:
             still_running.append(agent)
     _spawned_agents.clear()

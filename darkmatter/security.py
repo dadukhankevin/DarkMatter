@@ -7,6 +7,7 @@ Depends on: config
 
 import os
 import secrets
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -74,7 +75,8 @@ def verify_signed_payload(public_key_hex: str, signature_hex: str,
         canonical = "\n".join([domain] + list(fields)).encode("utf-8")
         public_key.verify(signature, canonical)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[DarkMatter] Signature verification failed for domain={domain}: {e}", file=sys.stderr)
         return False
 
 
@@ -500,7 +502,8 @@ def assess_url_security(url: str) -> dict:
     """
     try:
         parsed = urlparse(url)
-    except Exception:
+    except Exception as e:
+        print(f"[DarkMatter] URL parse failed for assess_url_security: {e}", file=sys.stderr)
         return {"secure": False, "warning": "Invalid URL", "is_local": False}
 
     scheme = parsed.scheme.lower()
@@ -510,8 +513,8 @@ def assess_url_security(url: str) -> dict:
     is_local = False
     try:
         is_local = is_private_ip(hostname) or hostname in ("localhost", "127.0.0.1", "::1")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DarkMatter] Security assessment failed for hostname={hostname}: {e}", file=sys.stderr)
 
     if scheme == "https":
         return {"secure": True, "warning": None, "is_local": is_local}

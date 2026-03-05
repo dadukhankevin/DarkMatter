@@ -79,7 +79,8 @@ def _verify_peer_update_signature(public_key_hex: str, signature_hex: str,
         payload = f"peer_update\n{agent_id}\n{new_url}\n{timestamp}".encode("utf-8")
         public_key.verify(signature, payload)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[DarkMatter Anchor] peer_update signature verification failed for {agent_id[:16]}...: {e}", file=sys.stderr)
         return False
 
 
@@ -88,8 +89,11 @@ def _is_timestamp_fresh(timestamp: str) -> bool:
     try:
         ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         age = abs((datetime.now(timezone.utc) - ts).total_seconds())
+        if age > PEER_UPDATE_MAX_AGE:
+            print(f"[DarkMatter Anchor] Timestamp rejected: age={age:.1f}s exceeds max={PEER_UPDATE_MAX_AGE}s", file=sys.stderr)
         return age <= PEER_UPDATE_MAX_AGE
-    except Exception:
+    except Exception as e:
+        print(f"[DarkMatter Anchor] Timestamp parse failed for '{timestamp}': {e}", file=sys.stderr)
         return False
 
 def _validate_url(url: str) -> str | None:
@@ -331,7 +335,8 @@ def _verify_relay_poll_signature(agent_id: str, signature_hex: str, timestamp: s
         payload = f"relay_poll\n{agent_id}\n{timestamp}".encode("utf-8")
         public_key.verify(signature, payload)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[DarkMatter Anchor] relay_poll signature verification failed for {agent_id[:16]}...: {e}", file=sys.stderr)
         return False
 
 

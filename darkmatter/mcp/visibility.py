@@ -146,7 +146,8 @@ async def notify_tools_changed() -> None:
     for session in list(_active_sessions):
         try:
             await session.send_tool_list_changed()
-        except Exception:
+        except Exception as e:
+            print(f"[DarkMatter] Warning: failed to notify session of tool list change: {e}", file=sys.stderr)
             dead.add(session)
     _active_sessions -= dead
 
@@ -283,7 +284,8 @@ def purge_stale_inbox(state: AgentState) -> None:
                 keep.append(msg)
             else:
                 print(f"[DarkMatter] Auto-purged stale message {msg.message_id} (age: {int(age)}s)", file=sys.stderr)
-        except Exception:
+        except Exception as e:
+            print(f"[DarkMatter] Warning: failed to parse received_at for message {msg.message_id}, keeping: {e}", file=sys.stderr)
             keep.append(msg)
     if len(keep) != len(state.message_queue):
         state.message_queue = keep
@@ -301,8 +303,8 @@ def check_auto_reactivate(state: AgentState) -> None:
             state.inactive_until = None
             save_state()
             print("[DarkMatter] Auto-reactivated (inactive timer expired)", file=sys.stderr)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DarkMatter] Warning: failed to parse inactive_until timestamp: {e}", file=sys.stderr)
 
 
 async def status_updater() -> None:

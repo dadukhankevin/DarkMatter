@@ -70,10 +70,12 @@ class HttpTransport(Transport):
                     try:
                         result = await self._http_post(conn, path, payload)
                         return SendResult(success=True, transport_name="http", response=result)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as e2:
+                        print(f"[DarkMatter] HTTP retry after URL recovery also failed for "
+                              f"{conn.agent_id[:12]}...: {e2}", file=sys.stderr)
+            except Exception as e3:
+                print(f"[DarkMatter] Peer URL lookup failed for {conn.agent_id[:12]}...: {e3}",
+                      file=sys.stderr)
 
         return SendResult(success=False, transport_name="http", error=str(last_error))
 

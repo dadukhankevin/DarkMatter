@@ -75,11 +75,13 @@ def sync_message_queue_from_disk() -> None:
     try:
         with open(path, "r") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[DarkMatter] Warning: state file JSON corrupt during queue sync ({path}): {e}", file=sys.stderr)
         return
 
     disk_queue = data.get("message_queue", [])
     if not disk_queue:
+        print(f"[DarkMatter] Queue sync: no message_queue in state file (missing or empty)", file=sys.stderr)
         return
 
     # Build set of message IDs already in memory
@@ -87,7 +89,10 @@ def sync_message_queue_from_disk() -> None:
 
     for qd in disk_queue:
         mid = qd.get("message_id", "")
-        if mid and mid not in existing_ids:
+        if not mid:
+            print(f"[DarkMatter] Queue sync: skipping queued message with empty message_id", file=sys.stderr)
+            continue
+        if mid not in existing_ids:
             state.message_queue.append(QueuedMessage(
                 message_id=mid,
                 content=qd.get("content", ""),

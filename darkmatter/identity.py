@@ -154,8 +154,8 @@ def is_private_ip(hostname: str) -> bool:
             addr = ipaddress.ip_address(ip_str)
             if addr.is_private or addr.is_loopback or addr.is_link_local:
                 return True
-    except socket.gaierror:
-        pass
+    except socket.gaierror as e:
+        print(f"[DarkMatter] DNS resolution failed for {hostname}: {e}", file=sys.stderr)
     return False
 
 

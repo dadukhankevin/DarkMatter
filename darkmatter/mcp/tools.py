@@ -195,7 +195,8 @@ async def _connection_disconnect(state, agent_id: str) -> str:
     # Send disconnect announcement (best-effort)
     try:
         await auto_disconnect_peer(state, agent_id)
-    except Exception:
+    except Exception as e:
+        print(f"[DarkMatter] Warning: disconnect announcement failed for {agent_id}: {e}", file=sys.stderr)
         # Fallback: just delete the connection
         if agent_id in state.connections:
             del state.connections[agent_id]
@@ -385,8 +386,8 @@ async def _forward_message(state, params: SendMessageInput) -> str:
                     method="POST", timeout=30.0,
                     json={"type": "expired", "agent_id": state.agent_id, "note": "Message expired — no hops remaining."}
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter] Warning: failed to notify webhook of TTL expiry for {msg.message_id}: {e}", file=sys.stderr)
         save_state()
         return json.dumps({"success": False, "error": "Message expired — hops_remaining is 0."})
 
@@ -505,8 +506,8 @@ async def _reply_to_message(state, params: SendMessageInput) -> str:
             method="POST", timeout=10.0,
             json={"type": "responding", "agent_id": state.agent_id}
         )
-    except Exception:
-        pass  # Best-effort notification
+    except Exception as e:
+        print(f"[DarkMatter] Warning: failed to send 'responding' notification for {msg.message_id}: {e}", file=sys.stderr)
 
     # Sign the webhook response
     resp_timestamp = datetime.now(timezone.utc).isoformat()
@@ -859,8 +860,8 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
             try:
                 await send_to_peer(conn, "/__darkmatter__/shard_push", shard_payload)
                 pushed_to.append(aid)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DarkMatter] Warning: failed to push shard {shard.shard_id} to peer {aid}: {e}", file=sys.stderr)
 
     return json.dumps({
         "success": True,

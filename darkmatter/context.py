@@ -5,6 +5,7 @@ Depends on: config, models, state
 """
 
 import math
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -77,6 +78,7 @@ def _score_entry(entry: ConversationEntry, agent_id: str,
     try:
         entry_time = datetime.fromisoformat(entry.timestamp.replace("Z", "+00:00")).timestamp()
     except Exception:
+        print(f"[DarkMatter] Warning: malformed timestamp in conversation entry: {entry.timestamp!r}, falling back to 1h ago", file=sys.stderr)
         entry_time = now - 3600  # fallback to 1h ago
 
     age_seconds = max(0, now - entry_time)
@@ -146,6 +148,7 @@ def _format_time(iso_ts: str) -> str:
         dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         return dt.strftime("%H:%M:%SZ")
     except Exception:
+        print(f"[DarkMatter] Warning: truncating malformed timestamp for display: {iso_ts!r}", file=sys.stderr)
         return iso_ts[:19]
 
 
