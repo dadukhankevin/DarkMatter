@@ -285,24 +285,38 @@ def anchor_well_known():
 # ---------------------------------------------------------------------------
 
 def _read_relay_buffer() -> dict[str, list[dict]]:
-    """Read the relay buffer from disk. Returns empty dict if missing/corrupt."""
+    """Read the webhook relay buffer from disk. Returns empty dict if missing/corrupt."""
     try:
         with open(_relay_buffer_path) as f:
             _flock_sh(f)
             data = json.load(f)
             _flock_un(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        top = data.get("webhooks")
+        return top if isinstance(top, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
 def _write_relay_buffer(buf: dict[str, list[dict]]) -> None:
-    """Write the relay buffer to disk atomically with exclusive lock."""
+    """Write the webhook relay buffer back into the shared relay buffer file."""
     try:
         Path(_relay_buffer_path).parent.mkdir(parents=True, exist_ok=True)
+        # Read existing file to preserve other relay buffers
+        try:
+            with open(_relay_buffer_path) as f:
+                _flock_sh(f)
+                full = json.load(f)
+                _flock_un(f)
+            if not isinstance(full, dict):
+                full = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            full = {}
+        full["webhooks"] = buf
         with open(_relay_buffer_path, "w") as f:
             _flock_ex(f)
-            json.dump(buf, f)
+            json.dump(full, f)
             _flock_un(f)
     except Exception as e:
         print(f"[DarkMatter Anchor] Failed to write relay buffer: {e}", file=sys.stderr)
