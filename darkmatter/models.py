@@ -334,3 +334,10 @@ class AgentState:
     shared_shards: list[SharedShard] = field(default_factory=list)
     # Pools
     pools: list = field(default_factory=list)  # list[Pool]
+    # Security settings (persisted)
+    security_settings: dict = field(default_factory=lambda: {
+        "pin_hash": "",
+        "auto_accept_local": True,
+        "sandbox_enabled": False,
+        "sandbox_network": True,
+    })

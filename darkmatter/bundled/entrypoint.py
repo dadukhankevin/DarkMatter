@@ -242,16 +242,32 @@ threading.Thread(target=_message_timeout_checker, daemon=True).start()
 
 app = Flask(__name__, template_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "entrypoint"))
 
-# --- Optional PIN auth ---
-_DARKMATTER_PIN = os.environ.get("DARKMATTER_PIN", "").strip()
+# --- Optional PIN auth (persisted in state.security_settings) ---
+from werkzeug.security import generate_password_hash, check_password_hash
+
 app.secret_key = hashlib.sha256(f"darkmatter-entrypoint-session-{state.agent_id}".encode()).digest()
+
+# Migrate env var PIN on first run: if DARKMATTER_PIN is set and no pin_hash in state, hash and save once
+_env_pin = os.environ.get("DARKMATTER_PIN", "").strip()
+if _env_pin and not state.security_settings.get("pin_hash"):
+    state.security_settings["pin_hash"] = generate_password_hash(_env_pin)
+    save_state()
+
+# Apply persisted sandbox settings to config module at startup
+import darkmatter.config as _dm_config
+_dm_config.AGENT_SANDBOX = state.security_settings.get("sandbox_enabled", False)
+_dm_config.AGENT_SANDBOX_NETWORK = state.security_settings.get("sandbox_network", True)
+
+
+def _pin_is_set() -> bool:
+    return bool(state.security_settings.get("pin_hash", ""))
 
 
 @app.before_request
 def _pin_auth_guard():
-    if not _DARKMATTER_PIN:
+    if not _pin_is_set():
         return  # No PIN configured — open access
-    # Exempt paths: login, mesh protocol, well-known
+    # Exempt paths: login, mesh protocol, well-known, security API
     path = request.path
     if path == "/login" or path.startswith("/__darkmatter__/") or path.startswith("/.well-known/"):
         return
@@ -265,18 +281,84 @@ def _pin_auth_guard():
 
 @app.route("/login", methods=["GET", "POST"])
 def pin_login():
-    if not _DARKMATTER_PIN:
+    if not _pin_is_set():
         return redirect("/")
     error = None
     if request.method == "POST":
         pin = request.form.get("pin", "").strip()
-        if pin == _DARKMATTER_PIN:
+        if check_password_hash(state.security_settings["pin_hash"], pin):
             flask_session["pin_authenticated"] = True
             flask_session.permanent = True
             app.permanent_session_lifetime = __import__("datetime").timedelta(hours=24)
             return redirect("/")
         error = "Incorrect PIN"
     return render_template("pin_login.html", error=error)
+
+
+@app.route("/api/security", methods=["GET"])
+def api_security_get():
+    """Return current security settings (never expose the hash)."""
+    ss = state.security_settings
+    return jsonify({
+        "pin_enabled": bool(ss.get("pin_hash", "")),
+        "auto_accept_local": ss.get("auto_accept_local", True),
+        "sandbox_enabled": ss.get("sandbox_enabled", False),
+        "sandbox_network": ss.get("sandbox_network", True),
+    })
+
+
+@app.route("/api/security", methods=["POST"])
+def api_security_post():
+    """Partial-update security settings. PIN accepted as plaintext, immediately hashed."""
+    data = request.get_json(force=True)
+    ss = state.security_settings
+
+    if "pin" in data:
+        pin_val = (data["pin"] or "").strip()
+        if pin_val:
+            ss["pin_hash"] = generate_password_hash(pin_val)
+        else:
+            ss["pin_hash"] = ""
+            flask_session.pop("pin_authenticated", None)
+
+    if "auto_accept_local" in data:
+        ss["auto_accept_local"] = bool(data["auto_accept_local"])
+
+    if "sandbox_enabled" in data:
+        ss["sandbox_enabled"] = bool(data["sandbox_enabled"])
+        _dm_config.AGENT_SANDBOX = ss["sandbox_enabled"]
+
+    if "sandbox_network" in data:
+        ss["sandbox_network"] = bool(data["sandbox_network"])
+        _dm_config.AGENT_SANDBOX_NETWORK = ss["sandbox_network"]
+
+    save_state()
+    return jsonify({"success": True})
+
+
+@app.route("/api/security/push", methods=["POST"])
+def api_security_push():
+    """Push security config to all connected LAN agents."""
+    from darkmatter.network.manager import is_local_url
+    ss = state.security_settings
+    payload = {
+        "auto_accept_local": ss.get("auto_accept_local", True),
+        "sandbox_enabled": ss.get("sandbox_enabled", False),
+        "sandbox_network": ss.get("sandbox_network", True),
+    }
+    pushed = []
+    for aid, conn in state.connections.items():
+        if is_local_url(conn.agent_url):
+            try:
+                resp = httpx.post(
+                    conn.agent_url.rstrip("/") + "/__darkmatter__/security_push",
+                    json=payload, timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    pushed.append(aid[:12])
+            except Exception:
+                pass
+    return jsonify({"success": True, "pushed_to": pushed})
 
 
 def _get_public_url():
@@ -861,6 +943,23 @@ def dm_gas_result():
     data = request.get_json(silent=True) or {}
     result, status = asyncio.run(process_antimatter_result(state, data))
     return jsonify(result), status
+
+
+@app.route("/__darkmatter__/security_push", methods=["POST"])
+def dm_security_push():
+    """Receive security settings pushed from a LAN peer."""
+    data = request.get_json(silent=True) or {}
+    ss = state.security_settings
+    if "auto_accept_local" in data:
+        ss["auto_accept_local"] = bool(data["auto_accept_local"])
+    if "sandbox_enabled" in data:
+        ss["sandbox_enabled"] = bool(data["sandbox_enabled"])
+        _dm_config.AGENT_SANDBOX = ss["sandbox_enabled"]
+    if "sandbox_network" in data:
+        ss["sandbox_network"] = bool(data["sandbox_network"])
+        _dm_config.AGENT_SANDBOX_NETWORK = ss["sandbox_network"]
+    save_state()
+    return jsonify({"accepted": True})
 
 
 # ---------------------------------------------------------------------------

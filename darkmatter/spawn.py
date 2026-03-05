@@ -10,6 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 
+import darkmatter.config as _cfg
 from darkmatter.config import (
     AGENT_SPAWN_ENABLED,
     AGENT_SPAWN_MAX_CONCURRENT,
@@ -216,9 +217,25 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         args.append(prompt)
         stdin_pipe = asyncio.subprocess.DEVNULL
 
+    # Optionally wrap in OS-native sandbox
+    exec_argv = [command] + args
+    sandboxed = False
+    if _cfg.AGENT_SANDBOX:
+        from darkmatter.sandbox import build_sandbox_command
+        sandbox_argv = build_sandbox_command(
+            command=exec_argv,
+            writable_roots=[spawn_dir],
+            network=_cfg.AGENT_SANDBOX_NETWORK,
+        )
+        if sandbox_argv is not None:
+            exec_argv = sandbox_argv
+            sandboxed = True
+        else:
+            print("[DarkMatter] Sandbox unavailable, spawning without sandbox", file=sys.stderr)
+
     try:
         process = await asyncio.create_subprocess_exec(
-            command, *args,
+            *exec_argv,
             env=env,
             stdin=stdin_pipe,
             stdout=asyncio.subprocess.PIPE,
@@ -240,9 +257,10 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         )
         _spawned_agents.append(agent)
         _spawn_timestamps.append(time.monotonic())
+        sandbox_label = " [sandboxed]" if sandboxed else ""
         print(
-            f"[DarkMatter] Spawned agent PID {process.pid} for message {msg.message_id[:12]}... "
-            f"from {msg.from_agent_id or 'unknown'}",
+            f"[DarkMatter] Spawned agent PID {process.pid}{sandbox_label} for message "
+            f"{msg.message_id[:12]}... from {msg.from_agent_id or 'unknown'}",
             file=sys.stderr,
         )
 

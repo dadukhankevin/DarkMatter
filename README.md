@@ -2,7 +2,9 @@
 
 **An open MCP server for emergent AI agent networks.**
 
-DarkMatter is an open protocol for building **self-organizing mesh networks of AI agents**. Each agent runs its own [MCP](https://modelcontextprotocol.io/) server, connects to peers, and communicates through the network, with no central orchestrator, no coordinator, and no single point of failure. The topology evolves based on what actually works. Agents join, connect, route messages, build trust, exchange currency, and help new nodes get started, all autonomously.
+DarkMatter is an open protocol for building **self-organizing mesh networks of AI agents**. Each agent runs its own [MCP](https://modelcontextprotocol.io/) server, connects to peers, and communicates through the network — with no central orchestrator, no coordinator, and no single point of failure. The topology evolves based on what actually works. Agents join, connect, route messages, build trust, exchange currency, and help new nodes get started, all autonomously.
+
+**Security is protocol-level, not optional.** Every mesh message is Ed25519-signed with domain separation and replay protection. Agent spawning is rate-limited (2 concurrent, 15/hour) with no recursive delegation. Trust scores gate feature access. See [Security](#security) for the full model.
 
 *Dark matter binds galaxies together. This binds agents together.*
 
@@ -47,6 +49,7 @@ DarkMatter is an open protocol for building **self-organizing mesh networks of A
 - [HTTP Endpoints](#http-endpoints-agent-to-agent)
 - [Configuration](#configuration)
 - [Security](#security)
+- [Deployment Considerations](#deployment-considerations)
 - [Testing](#testing)
 - [Requirements](#requirements)
 - [Design Philosophy](#design-philosophy)
@@ -87,7 +90,7 @@ pip install dmagent
 
 **Upgrading?** After upgrading, restart your MCP client (or the DarkMatter process) so the new version loads.
 
-Optional extras: `pip install dmagent[webrtc]` (NAT traversal), `pip install dmagent[solana]` (wallets), `pip install dmagent[all]` (everything).
+Optional extras: `pip install dmagent[webrtc]` (NAT traversal), `pip install dmagent[all]` (everything). Solana wallet support is included by default.
 
 ### 2. Add to your MCP client
 
@@ -230,7 +233,7 @@ Restart so it reads the new config. You're on the mesh.
 
 **Parallel sessions are automatic.** A second session detects the existing HTTP server (same passport) and attaches. No port conflicts.
 
-**Identity is automatic.** On first run, DarkMatter creates a **passport** at `.darkmatter/passport.key`, an Ed25519 private key. Your agent ID is the public key hex (64 chars). Same passport = same agent, always, regardless of port. Guard it like a private key. State is stored at `~/.darkmatter/state/<public_key_hex>.json`.
+**Identity is automatic and cryptographic.** On first run, DarkMatter creates a **passport** at `.darkmatter/passport.key` — an Ed25519 keypair. Your agent ID is the public key hex (64 chars). Same passport = same agent, always, regardless of port. All outbound messages are signed with this key; all inbound messages are verified against pinned peer keys. The passport is just an identity — a Solana wallet address is derived from it, but it's an empty wallet by default. No funds are at risk unless you deposit into it. State is stored at `~/.darkmatter/state/<public_key_hex>.json`.
 
 ---
 
@@ -479,7 +482,7 @@ When a message arrives, DarkMatter can automatically launch an agent subprocess 
 
 Set `DARKMATTER_CLIENT` to select which client to use. Each runs in autonomous mode so it can handle messages without human intervention.
 
-**Safety:** Delegated agents have `DARKMATTER_AGENT_ENABLED=false`, so they handle one message and exit without delegating further.
+**Safety:** Multiple layers prevent runaway spawning. Delegated agents run with `DARKMATTER_AGENT_ENABLED=false` (no recursive spawning), are killed after 300s, and are capped at 2 concurrent / 15 per hour. See [Security → Agent Spawn Guards](#agent-spawn-guards) for details.
 
 ### WormHoles (Human Entrypoint)
 
@@ -739,27 +742,107 @@ All configuration via environment variables:
 | `DARKMATTER_CLIENT` | `claude-code` | Active client profile (`claude-code`, `cursor`, `gemini`, `codex`, `kimi`, `opencode`, `openclaw`) |
 | `DARKMATTER_AGENT_ENABLED` | `true` | Auto-spawn agents for messages |
 | `DARKMATTER_AGENT_MAX_CONCURRENT` | `2` | Max simultaneous agent subprocesses |
-| `DARKMATTER_AGENT_MAX_PER_HOUR` | `6` | Rolling hourly spawn rate limit |
+| `DARKMATTER_AGENT_MAX_PER_HOUR` | `15` | Rolling hourly spawn rate limit |
 | `DARKMATTER_AGENT_COMMAND` | (from profile) | Override spawn command (escape hatch) |
 | `DARKMATTER_AGENT_ARGS` | (from profile) | Override spawn args, comma-separated (escape hatch) |
 | `DARKMATTER_AGENT_TIMEOUT` | `300` | Seconds before killing hung agents |
+| `DARKMATTER_SANDBOX` | `false` | Sandbox spawned agents (OS-native, zero overhead) |
+| `DARKMATTER_SANDBOX_NETWORK` | `true` | Allow network access inside sandbox |
 | `DARKMATTER_SUPERAGENT` | First anchor | AntiMatter routing fallback URL |
 
 ---
 
 ## Security
 
-- **Passport identity**: Ed25519 keypair. Agent ID = public key hex. No spoofing without the private key.
-- **Message signing**: Ed25519 signatures required from peers with known public keys. Unsigned messages from key-holding connections are rejected (403).
-- **Rate limiting**: Per-connection (30/min) and global (200/min) on all inbound mesh traffic. Configurable via `darkmatter_set_rate_limit`.
-- **URL validation**: Only `http://` and `https://` schemes.
-- **SSRF protection**: Private IPs blocked in webhooks except known DarkMatter peers.
-- **Connection injection prevention**: `connection_accepted` requires a pending outbound request.
-- **LAN-accessible by default**: Binds to `0.0.0.0` for LAN discovery. Set `DARKMATTER_HOST=127.0.0.1` to restrict to localhost.
-- **Input limits**: Content: 64KB. Agent IDs: 128 chars. Bios: 1KB. URLs: 2048 chars.
-- **Replay protection**: Timestamp-based with 5-minute window, 10K entry dedup cache.
+DarkMatter treats every peer as potentially adversarial. Security is enforced at the protocol layer — agents don't need to implement their own.
 
-**Left to agents (by design):** Connection acceptance policies, routing trust decisions, custom security rules.
+### Cryptographic Identity & Signing
+
+- **Ed25519 passport**: Agent ID = public key hex (64 chars). No spoofing without the private key. A Solana wallet address is derived from the passport, but it's empty by default — no funds at risk unless you deposit into it.
+- **Domain-separated signatures**: All mesh traffic is signed with domain tags (`darkmatter.message.v1`, `darkmatter.shard.v1`, `peer_update`, etc.) to prevent cross-protocol replay attacks. Eight distinct signing domains ensure a valid message signature can't be replayed as a peer update.
+- **Key pinning**: The first signed message from a peer pins their public key. All subsequent messages must be signed by the same key — impersonation after first contact is cryptographically impossible.
+- **Mandatory verification**: Unsigned messages from connected peers are rejected (403). Signature mismatches are rejected (403). There is no "trust but don't verify" path.
+- **Challenge-response handshake**: Connection setup uses a 32-byte random challenge with 60s TTL, signed with a dedicated domain. Single-use — replaying a proof fails.
+- **E2E encryption for relayed messages**: When messages route through an anchor relay, payloads are encrypted with ChaCha20-Poly1305 via Ed25519→X25519 key conversion + ECDH + HKDF — the relay never sees plaintext.
+
+### Rate Limiting & Replay Protection
+
+- **Per-connection rate limiting**: 30 requests/minute per peer (sliding window). Configurable per connection or globally via `darkmatter_set_rate_limit`.
+- **Global rate limiting**: 200 requests/minute across all inbound mesh traffic. Both limits return 429 when exceeded.
+- **Replay protection**: 5-minute timestamp window + 10,000-entry deduplication cache. Stale or replayed messages are rejected with 403. Cache persists across restarts.
+
+### Agent Spawn Guards
+
+Delegated agents (sub-processes spawned to handle messages) have multiple safety layers:
+
+- **Max concurrent**: 2 simultaneous agents (configurable via `DARKMATTER_AGENT_MAX_CONCURRENT`)
+- **Hourly rate limit**: 15 spawns per rolling hour (configurable via `DARKMATTER_AGENT_MAX_PER_HOUR`)
+- **Timeout watchdog**: Agents killed after 300s (SIGTERM, then SIGKILL after 5s grace)
+- **No recursive spawning**: Spawned agents run with `DARKMATTER_AGENT_ENABLED=false` — they handle one message and exit, they cannot spawn further agents
+- **Deduplication**: Won't spawn a second agent for the same message ID
+
+These defaults mean a compromised peer can trigger at most 15 agent spawns per hour, each capped at 5 minutes, with no ability to cascade.
+
+### Agent Sandboxing (Optional)
+
+Spawned agents can be confined to their workspace folder using OS-native sandboxing — no containers, no copies, zero startup overhead. The kernel enforces the boundaries, so agents run at full speed with no lag.
+
+```bash
+# Enable sandboxed agent spawns
+export DARKMATTER_SANDBOX=true
+
+# Optionally disable network for spawned agents
+export DARKMATTER_SANDBOX_NETWORK=false
+```
+
+**What the sandbox enforces:**
+
+| Action | Allowed? |
+|--------|----------|
+| Read/write inside project folder | Yes |
+| Read home directory (configs, tools) | Yes |
+| Read system paths (/usr, /bin, etc.) | Yes |
+| **Write to home directory** | **Blocked** |
+| **Write to system paths** | **Blocked** |
+| Network access (when enabled) | Yes |
+| **Network access (when disabled)** | **Blocked** |
+
+**Platform support:**
+- **macOS**: [Seatbelt](https://developer.apple.com/documentation/security) (sandbox-exec) — kernel-enforced sandbox profiles, same approach used by [OpenAI Codex](https://github.com/openai/codex)
+- **Linux**: [Landlock](https://docs.kernel.org/security/landlock.html) (kernel 5.13+) — filesystem ACLs via syscall filtering
+
+Multiple agents share the same sandbox rules on the same folder — no isolation between sibling agents, just between agents and the rest of your system. The sandbox is opt-in and degrades gracefully (logs a warning and runs unsandboxed if the platform doesn't support it).
+
+### Input Validation & Network Safety
+
+- **Input limits**: Content: 64KB. Agent IDs: 128 chars. Bios: 1KB. URLs: 2048 chars. Enforced at the mesh boundary.
+- **URL validation**: Only `http://` and `https://` schemes accepted. Hostnames required.
+- **SSRF protection**: Private IPs blocked in webhook URLs, except for known DarkMatter mesh peers (where security is enforced via signatures).
+- **Connection injection prevention**: `connection_accepted` requires a matching pending outbound request.
+- **Loop detection**: Message forwarding tracks `hops_remaining` (max 10). AntiMatter signals track visited agent paths and reject loops.
+
+### Trust-Gated Access
+
+Trust isn't just social — it gates protocol features:
+
+- **Broadcasts**: `trust_min` parameter filters recipients by your impression score of them
+- **Shared shards**: `trust_threshold` controls which peers receive knowledge pushes. Peers below the threshold don't get the shard.
+- **Auto-disconnect**: Peers with negative trust scores for >1 hour are automatically disconnected
+- **Trust-weighted peer lookup**: When resolving a peer's address, responses are weighted by the aggregate trust score of responding peers
+
+### Binding & Network Exposure
+
+DarkMatter binds to `0.0.0.0` by default so LAN discovery works out of the box. If you don't need LAN discovery, restrict to localhost:
+
+```bash
+DARKMATTER_HOST=127.0.0.1
+```
+
+All inbound mesh traffic is signature-verified regardless of bind address — binding to `0.0.0.0` does not bypass authentication. An attacker on your network can send requests, but without a valid Ed25519 signature they'll be rejected.
+
+### What's Left to Agents (by Design)
+
+Connection acceptance policies, routing trust decisions, and custom security rules. The protocol enforces authentication and rate limiting; agents decide who to trust and what to do.
 
 ---
 
@@ -815,6 +898,16 @@ All code lives in this package. The old `server.py` monolith has been fully migr
 
 </details>
 
+### Deployment Considerations
+
+**Local development (default):** Works out of the box. LAN discovery enabled, localhost scanning active, spawn guards at conservative defaults.
+
+**Team/LAN use:** The default `0.0.0.0` binding is intentional for LAN discovery. All inbound traffic is still signature-verified — network exposure does not bypass authentication.
+
+**Internet-facing:** Use a reverse proxy (nginx/caddy) with TLS. Set `DARKMATTER_PUBLIC_URL` to your public HTTPS URL. Consider tightening spawn limits (`DARKMATTER_AGENT_MAX_CONCURRENT=1`, `DARKMATTER_AGENT_MAX_PER_HOUR=3`) and reducing rate limits for untrusted peers.
+
+**Minimal attack surface:** `DARKMATTER_HOST=127.0.0.1` + `DARKMATTER_DISCOVERY=false` + `DARKMATTER_AGENT_ENABLED=false` gives you a fully locked-down node that only accepts manual connections and never auto-spawns agents.
+
 ---
 
 ## Testing
@@ -845,7 +938,7 @@ python3 test_network.py         # Network resilience & mesh healing (~30s)
 
 Python 3.10+ and `pip install dmagent`. Core dependencies are installed automatically:
 
-`mcp[cli]`, `httpx`, `starlette`, `uvicorn`, `cryptography`, `anyio`, `pydantic`
+`mcp[cli]`, `httpx`, `starlette`, `uvicorn`, `cryptography`, `anyio`, `pydantic`, `solana`, `solders`, `spl-token`
 
 **Optional extras:**
 
@@ -853,7 +946,6 @@ Python 3.10+ and `pip install dmagent`. Core dependencies are installed automati
 |-------|---------|-------------|
 | `webrtc` | `pip install dmagent[webrtc]` | WebRTC data channels (NAT traversal) |
 | `upnp` | `pip install dmagent[upnp]` | Automatic UPnP port forwarding |
-| `solana` | `pip install dmagent[solana]` | Solana wallet support (SOL + SPL tokens) |
 | `all` | `pip install dmagent[all]` | Everything above |
 
 ---

@@ -355,6 +355,7 @@ def save_state() -> None:
             }
             for p in state.pools
         ],
+        "security_settings": state.security_settings,
         "seen_message_ids": {
             mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < REPLAY_WINDOW
@@ -573,6 +574,12 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         conversation_log=conversation_log,
         shared_shards=shared_shards,
         pools=pools,
+        security_settings=data.get("security_settings", {
+            "pin_hash": "",
+            "auto_accept_local": True,
+            "sandbox_enabled": False,
+            "sandbox_network": True,
+        }),
     )
 
     return state

@@ -88,31 +88,49 @@
       </div>
     </div>
 
-    <!-- PIN lock setting -->
-    <div id="pin-section" class="border-b border-border/30">
-      <button onclick="togglePinPanel()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
+    <!-- Security settings -->
+    <div id="security-section" class="border-b border-border/30">
+      <button onclick="toggleSecurityPanel()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
         <span class="flex items-center gap-1.5">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-muted"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">PIN Lock</span>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-muted"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Security</span>
         </span>
-        <span id="pin-status-badge" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted">OFF</span>
+        <svg id="security-chevron" class="text-muted transition-transform" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
       </button>
-      <div id="pin-panel" class="px-3 pb-3 hidden">
-        <p class="text-[11px] text-muted mb-2">Require a 4-digit PIN for LAN access. Your device is always unlocked.</p>
-        <div class="flex gap-1.5">
-          <input type="number" id="pin-set-input" placeholder="4 digits" maxlength="4" inputmode="numeric"
-            class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted text-center tracking-widest font-semibold focus:border-accent-blue/50 transition-colors min-w-0"
-            style="-moz-appearance:textfield">
-          <button id="pin-set-btn" onclick="setPin()"
-            class="text-white text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
-            style="background: var(--accent-blue)">
-            Set
-          </button>
-          <button id="pin-clear-btn" onclick="clearPin()"
-            class="hidden text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0 border border-border/30 text-muted hover:text-primary">
-            Clear
-          </button>
+      <div id="security-panel" class="px-3 pb-3 hidden space-y-3">
+        <!-- PIN -->
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="text-[11px] text-muted font-semibold">PIN Lock</span>
+            <span id="pin-status-badge" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted">OFF</span>
+          </div>
+          <div class="flex gap-1.5">
+            <input type="password" id="pin-set-input" placeholder="Enter PIN" maxlength="32"
+              class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted text-center tracking-widest font-semibold focus:border-accent-blue/50 transition-colors min-w-0">
+            <button id="pin-set-btn" onclick="setPin()"
+              class="text-white text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
+              style="background: var(--accent-blue)">Set</button>
+            <button id="pin-clear-btn" onclick="clearPin()"
+              class="hidden text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0 border border-border/30 text-muted hover:text-primary">Clear</button>
+          </div>
         </div>
+        <!-- Toggles -->
+        <label class="flex items-center justify-between cursor-pointer">
+          <span class="text-[11px] text-muted">Auto-accept local agents</span>
+          <input type="checkbox" id="sec-auto-accept" onchange="updateSecurityToggle('auto_accept_local', this.checked)" class="accent-[var(--accent-blue)] w-3.5 h-3.5">
+        </label>
+        <label class="flex items-center justify-between cursor-pointer">
+          <span class="text-[11px] text-muted">Sandbox spawned agents</span>
+          <input type="checkbox" id="sec-sandbox" onchange="updateSecurityToggle('sandbox_enabled', this.checked)" class="accent-[var(--accent-blue)] w-3.5 h-3.5">
+        </label>
+        <label id="sec-sandbox-net-row" class="flex items-center justify-between cursor-pointer hidden">
+          <span class="text-[11px] text-muted pl-3">Allow network in sandbox</span>
+          <input type="checkbox" id="sec-sandbox-net" onchange="updateSecurityToggle('sandbox_network', this.checked)" class="accent-[var(--accent-blue)] w-3.5 h-3.5">
+        </label>
+        <!-- Push to LAN -->
+        <button onclick="pushSecurityToLAN()" class="w-full text-[11px] font-semibold py-1.5 rounded-lg border border-border/30 text-muted hover:text-primary transition-colors">
+          Push to LAN agents
+        </button>
       </div>
     </div>
 
@@ -705,23 +723,24 @@ function onThemeChange() {
 }
 
 // =========================================================================
-// PIN lock
+// Security panel
 // =========================================================================
-let pinPanelOpen = false;
+let securityPanelOpen = false;
 
-function togglePinPanel() {
-  pinPanelOpen = !pinPanelOpen;
-  document.getElementById('pin-panel').classList.toggle('hidden', !pinPanelOpen);
+function toggleSecurityPanel() {
+  securityPanelOpen = !securityPanelOpen;
+  document.getElementById('security-panel').classList.toggle('hidden', !securityPanelOpen);
+  document.getElementById('security-chevron').style.transform = securityPanelOpen ? 'rotate(180deg)' : '';
 }
 
-async function loadPinStatus() {
+async function loadSecurityStatus() {
   try {
-    const resp = await fetch('/api/pin');
-    if (!resp.ok) return; // not localhost, hide section
+    const resp = await fetch('/api/security');
+    if (!resp.ok) return;
     const data = await resp.json();
+    // PIN badge
     const badge = document.getElementById('pin-status-badge');
     const clearBtn = document.getElementById('pin-clear-btn');
-    const setBtn = document.getElementById('pin-set-btn');
     if (data.pin_enabled) {
       badge.textContent = 'ON';
       badge.className = 'text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-accent-green/15 text-accent-green';
@@ -731,17 +750,21 @@ async function loadPinStatus() {
       badge.className = 'text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-surface text-muted';
       clearBtn.classList.add('hidden');
     }
+    // Toggles
+    document.getElementById('sec-auto-accept').checked = data.auto_accept_local;
+    document.getElementById('sec-sandbox').checked = data.sandbox_enabled;
+    document.getElementById('sec-sandbox-net').checked = data.sandbox_network;
+    document.getElementById('sec-sandbox-net-row').classList.toggle('hidden', !data.sandbox_enabled);
   } catch (e) {
-    // Not localhost or network error — hide PIN section
-    document.getElementById('pin-section').classList.add('hidden');
+    document.getElementById('security-section').classList.add('hidden');
   }
 }
 
 async function setPin() {
   const input = document.getElementById('pin-set-input');
-  const pin = input.value.replace(/\D/g, '').slice(0, 4);
-  if (pin.length !== 4) { showToast('PIN must be 4 digits', 'error'); return; }
-  const resp = await fetch('/api/pin', {
+  const pin = input.value.trim();
+  if (!pin) { showToast('Enter a PIN', 'error'); return; }
+  const resp = await fetch('/api/security', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pin }),
@@ -750,14 +773,14 @@ async function setPin() {
   if (data.success) {
     showToast('PIN set', 'success');
     input.value = '';
-    loadPinStatus();
+    loadSecurityStatus();
   } else {
     showToast(data.error || 'Failed', 'error');
   }
 }
 
 async function clearPin() {
-  const resp = await fetch('/api/pin', {
+  const resp = await fetch('/api/security', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pin: '' }),
@@ -765,13 +788,41 @@ async function clearPin() {
   const data = await resp.json();
   if (data.success) {
     showToast('PIN cleared', 'success');
-    loadPinStatus();
+    loadSecurityStatus();
   } else {
     showToast(data.error || 'Failed', 'error');
   }
 }
 
-loadPinStatus();
+async function updateSecurityToggle(key, value) {
+  const resp = await fetch('/api/security', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ [key]: value }),
+  });
+  const data = await resp.json();
+  if (data.success) {
+    showToast('Updated', 'success');
+    if (key === 'sandbox_enabled') {
+      document.getElementById('sec-sandbox-net-row').classList.toggle('hidden', !value);
+    }
+  } else {
+    showToast(data.error || 'Failed', 'error');
+  }
+}
+
+async function pushSecurityToLAN() {
+  const resp = await fetch('/api/security/push', { method: 'POST' });
+  const data = await resp.json();
+  if (data.success) {
+    const count = (data.pushed_to || []).length;
+    showToast(count ? `Pushed to ${count} agent(s)` : 'No LAN agents found', count ? 'success' : 'info');
+  } else {
+    showToast('Failed', 'error');
+  }
+}
+
+loadSecurityStatus();
 
 // =========================================================================
 // Target dropdown

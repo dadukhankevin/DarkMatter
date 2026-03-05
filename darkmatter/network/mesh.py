@@ -261,9 +261,10 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "message": "Already connected.",
         }, 200
 
-    # Auto-accept local/same-network agents
+    # Auto-accept local/same-network agents (respects security_settings toggle)
     from darkmatter.network.manager import is_local_url
-    if is_local_url(from_agent_url) and len(state.connections) < MAX_CONNECTIONS:
+    auto_accept = state.security_settings.get("auto_accept_local", True)
+    if auto_accept and is_local_url(from_agent_url) and len(state.connections) < MAX_CONNECTIONS:
         from darkmatter.security import assess_url_security
         tls_info = assess_url_security(from_agent_url)
         conn = Connection(
