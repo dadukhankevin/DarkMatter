@@ -409,9 +409,15 @@ class NetworkManager:
             return True
 
     async def broadcast_peer_update(self) -> None:
-        """Notify all connected peers and anchor nodes of our current URL, bio, and display name."""
+        """Notify all connected peers and anchor nodes of our current URL, bio, and display name.
+
+        Local peers receive our LAN URL (so they can reach us directly) while
+        remote peers and anchors receive our public URL.
+        """
         state = self._get_state()
-        url = state.public_url or f"http://127.0.0.1:{state.port}"
+        public_url = state.public_url or f"http://127.0.0.1:{state.port}"
+        lan_ip = self._get_lan_ip()
+        lan_url = f"http://{lan_ip}:{state.port}" if lan_ip != "localhost" else f"http://localhost:{state.port}"
 
         # Build transport address map
         addresses = {}
@@ -421,24 +427,29 @@ class NetworkManager:
                 if addr:
                     addresses[t.name] = addr
 
-        timestamp = datetime.now(timezone.utc).isoformat()
-        payload = {
-            "agent_id": state.agent_id,
-            "new_url": url,
-            "addresses": addresses,
-            "timestamp": timestamp,
-            "bio": state.bio,
-            "display_name": state.display_name,
-        }
-        if state.public_key_hex:
-            payload["public_key_hex"] = state.public_key_hex
-        if state.private_key_hex and state.public_key_hex:
-            payload["signature"] = sign_peer_update(
-                state.private_key_hex, state.agent_id, state.public_url, timestamp
-            )
+        def _build_payload(url_for_peer: str) -> dict:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            p = {
+                "agent_id": state.agent_id,
+                "new_url": url_for_peer,
+                "addresses": addresses,
+                "timestamp": timestamp,
+                "bio": state.bio,
+                "display_name": state.display_name,
+            }
+            if state.public_key_hex:
+                p["public_key_hex"] = state.public_key_hex
+            if state.private_key_hex and state.public_key_hex:
+                p["signature"] = sign_peer_update(
+                    state.private_key_hex, state.agent_id, url_for_peer, timestamp
+                )
+            return p
 
         for conn in list(state.connections.values()):
             try:
+                # Local peers get our LAN URL; remote peers get the public URL
+                peer_url = lan_url if is_local_url(conn.agent_url) else public_url
+                payload = _build_payload(peer_url)
                 result = await self.send(
                     conn.agent_id, "/__darkmatter__/peer_update", payload)
                 if not result.success:
@@ -450,6 +461,7 @@ class NetworkManager:
 
         for anchor_url in ANCHOR_NODES:
             try:
+                payload = _build_payload(public_url)
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     await client.post(f"{anchor_url}/__darkmatter__/peer_update", json=payload)
             except Exception as e:
