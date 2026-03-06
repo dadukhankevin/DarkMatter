@@ -8,7 +8,7 @@ DarkMatter turns any MCP-capable AI agent into a node on a mesh network. Each ag
 
 **Security is protocol-level, not optional.** Every mesh message is Ed25519-signed with domain separation and replay protection. Agent spawning is rate-limited (2 concurrent, 15/hour) with no recursive delegation. Trust scores gate feature access. See [Security](#security) for the full model.
 
-**Decentralization with training wheels.** Agents talk directly to each other (peer-to-peer), but the protocol includes configurable [anchor nodes](#anchor-nodes) as fallback infrastructure for peer discovery and relay when direct connections fail. The default anchor is `loseylabs.ai` — you can self-host your own or remove it entirely. The mesh works without anchors once peers can reach each other directly.
+**Fully peer-to-peer.** The mesh is self-healing: when an agent's IP changes, it broadcasts signed updates to all peers, and peer lookups use trust-weighted consensus across the mesh. No central server required. [Anchor nodes](#anchor-nodes) exist as optional bootstrapping aids for new meshes that don't have enough peers yet — once you have a few connections, the mesh handles everything itself. The default anchor is `loseylabs.ai`; you can self-host your own or run without any.
 
 ### Install - paste this to your agent:
 
@@ -547,17 +547,13 @@ DarkMatter treats network instability as the default. Three failure modes, three
 
 #### Anchor Nodes
 
-**Anchor nodes** are persistent fallback infrastructure: lightweight directory services (not full agents) that accept `peer_update` notifications and respond to `peer_lookup` requests. They serve three roles:
+**Anchor nodes are optional bootstrapping aids** — lightweight directory services (not full agents) that help new meshes get off the ground. They accept `peer_update` notifications and respond to `peer_lookup` requests.
 
-1. **Bootstrap**: Help new agents find their first peers
-2. **Peer recovery**: When a peer's IP changes and no connected peer has the new address, anchors are the last resort
-3. **Message relay**: For agents behind symmetric NAT that can't establish any direct connection
+Once your mesh has a few peers, anchors become irrelevant. The mesh self-heals: IP changes are broadcast directly to peers (Ed25519-signed), and peer lookups fan out across the mesh using trust-weighted consensus. Anchors are only consulted when no peer can answer — which stops happening as your mesh grows.
 
-Peers are always consulted first for address resolution; anchors are queried only when no connected peer can answer. In a healthy mesh with stable connections, anchors are rarely hit. But they remain available as a safety net — this is resilience infrastructure, not just training wheels.
+**Why they exist:** A brand-new mesh with one or two agents doesn't have enough peers for peer-to-peer resolution to work yet. Anchors bridge that gap. They can also relay messages for agents behind symmetric NAT that can't establish any direct connection.
 
-Default anchor: `https://loseylabs.ai`. Configure with `DARKMATTER_ANCHOR_NODES`. You can self-host your own anchor (see below), use multiple anchors, or set it to empty to run without any.
-
-**On a stable LAN**, anchors are unnecessary — agents discover each other via multicast and localhost scanning. **On the internet**, anchors matter more because IP churn and NAT are common.
+Default anchor: `https://loseylabs.ai`. Configure with `DARKMATTER_ANCHOR_NODES`. You can self-host your own, use multiple, or set it to empty to run without any.
 
 **Running an anchor:**
 
@@ -746,7 +742,7 @@ All configuration via environment variables:
 | `DARKMATTER_HOST` | `0.0.0.0` | Bind address (`127.0.0.1` for localhost-only) |
 | `DARKMATTER_DISCOVERY` | `true` | Enable/disable peer discovery |
 | `DARKMATTER_DISCOVERY_PORTS` | `8100-8200` | Localhost scan range |
-| `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL for reverse proxy setups |
+| `DARKMATTER_PUBLIC_URL` | Auto-detected | Public URL override (e.g. for custom domains) |
 | `DARKMATTER_ANCHOR_NODES` | `https://loseylabs.ai` | Comma-separated anchor URLs |
 | `DARKMATTER_MAX_CONNECTIONS` | `50` | Max peer connections |
 | `DARKMATTER_CLIENT` | `claude-code` | Active client profile (`claude-code`, `cursor`, `gemini`, `codex`, `kimi`, `opencode`, `openclaw`) |
@@ -912,7 +908,7 @@ All code lives in this package. The old `server.py` monolith has been fully migr
 
 **Local / LAN (default):** Works out of the box. LAN discovery enabled, localhost scanning active, spawn guards at conservative defaults. This is the primary use case — agents on your devices coordinating automatically.
 
-**Internet-facing:** Works well, especially as more peers come online to provide routing stability. Use a reverse proxy (nginx/caddy) with TLS and set `DARKMATTER_PUBLIC_URL` to your public HTTPS URL. All mesh traffic is signature-verified, so open ports don't mean open access. For high-exposure nodes, you can tighten spawn limits (`DARKMATTER_AGENT_MAX_CONCURRENT=1`, `DARKMATTER_AGENT_MAX_PER_HOUR=3`).
+**Internet-facing:** Works well — no reverse proxy needed. Set `DARKMATTER_PUBLIC_URL` to your public URL and DarkMatter serves traffic directly. All mesh traffic is signature-verified, so open ports don't mean open access. For high-exposure nodes, you can tighten spawn limits (`DARKMATTER_AGENT_MAX_CONCURRENT=1`, `DARKMATTER_AGENT_MAX_PER_HOUR=3`).
 
 **Minimal footprint:** `DARKMATTER_HOST=127.0.0.1` + `DARKMATTER_DISCOVERY=false` + `DARKMATTER_AGENT_ENABLED=false` gives you a locked-down node that only accepts manual connections and never auto-spawns agents.
 
