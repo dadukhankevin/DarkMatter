@@ -25,13 +25,13 @@ An agent is any node on the DarkMatter network. Each agent has:
 - A **trust table** — a local mapping of known agents to trust scores.
 - A **superagent configuration** — which superagent(s) the agent points to (defaults to LoseyLabs-operated superagents).
 
-### 1.2 Age
+### 1.2 Tenure
 
-An agent's age is **currency-specific** and defined as:
+An agent's tenure is **currency-specific** and measures how long an agent has been actively contributing to the network:
 
-$$\text{age}(X, \text{currency}) = \min(\text{passport\_age}(X),\ \text{wallet\_age}(X, \text{currency}))$$
+$$\text{tenure}(X, \text{currency}) = \min(\text{passport\_age}(X),\ \text{wallet\_age}(X, \text{currency}))$$
 
-This means an agent that has been on the network for a year but just added a Bitcoin wallet is effectively a newborn for Bitcoin-related antimatter routing. Agents are incentivized to add wallets early and maintain their presence on the network.
+This means an agent that has been on the network for a year but just added a Bitcoin wallet is effectively a newcomer for Bitcoin-related antimatter routing. Agents are incentivized to add wallets early and maintain their presence on the network.
 
 ### 1.3 Trust Scores
 
@@ -73,7 +73,9 @@ The currency is irrelevant — DarkMatter is currency-agnostic. The signal is th
 
 ## 3. AntiMatter: Universal Fee Protocol
 
-When Agent A sends currency to Agent B, a antimatter fee is generated. This antimatter fee is not paid to any central authority — it is routed through the network to reward senior, active participants.
+AntiMatter is a currency-agnostic contribution system, not a token.
+
+When Agent A sends currency to Agent B, a antimatter fee is generated. This antimatter fee is not paid to any central authority — it is routed through the network to reward established, active contributors.
 
 ### 3.1 AntiMatter Fee
 
@@ -87,7 +89,7 @@ If A and B disagree on the fee rate, the transaction still proceeds, but a **tru
 
 ### 3.2 AntiMatter Routing
 
-B holds the fee and is responsible for routing it. Only a lightweight signal traverses the network — when the signal resolves, B sends the fee directly to the selected elder.
+B holds the fee and is responsible for routing it. Only a lightweight signal traverses the network — when the signal resolves, B sends the fee directly to the selected veteran.
 
 #### The Match Game
 
@@ -113,15 +115,15 @@ This converges to approximately 63.2% as N grows, making the mechanism roughly s
 
 The average fee chain is approximately 1.6 hops.
 
-#### Elder Selection
+#### Veteran Selection
 
-When the signal needs a destination (either as a final recipient on match, or as the next hop on no-match), the network selects an **elder** — a connection that is older and more trusted than the current node:
+When the signal needs a destination (either as a final recipient on match, or as the next hop on no-match), the network selects a **veteran** — a connection that is established and trusted:
 
-- Filter to connections where `age(connection, currency) > age(current, currency)`.
+- Filter to connections where `tenure(connection, currency) > tenure(current, currency)`.
 - Filter to online connections only.
-- Select probabilistically, weighted by `age × trust`. Older, more trusted online agents are more likely to be chosen. A distrusted elder is naturally filtered out.
+- Select probabilistically, weighted by `tenure × trust` — peers with longer contribution history and higher trust are more likely to be chosen. A distrusted veteran is naturally filtered out.
 
-If a node has **no connections older than itself**, it is a terminal node and keeps the fee.
+If a node has **no connections with longer tenure than itself**, it is a terminal node and keeps the fee.
 
 #### Full Routing Flow
 
@@ -133,17 +135,17 @@ A sends amount to B
     ✅ agree → no penalty
   → B begins routing the fee signal:
     → match(B, BP)?
-      ✅ → elder = elder(B). B sends fee to elder. Done.
-      ❌ → C = elder(B), signal forwards to C
+      ✅ → veteran = veteran(B). B sends fee to veteran. Done.
+      ❌ → C = veteran(B), signal forwards to C
         → match(C, CP)?
-          ✅ → elder = elder(C). B sends fee to elder. Done.
-          ❌ → D = elder(C), signal forwards to D
+          ✅ → veteran = veteran(C). B sends fee to veteran. Done.
+          ❌ → D = veteran(C), signal forwards to D
             → match(D, DP)?
-              ✅ → elder = elder(D). B sends fee to elder. Done.
+              ✅ → veteran = veteran(D). B sends fee to veteran. Done.
               ❌ → continue...
   → TIMEOUT (max hops or max time exceeded):
       B sends fee to A's configured default (defaults to A's superagent)
-  → TERMINAL (no elder connections available):
+  → TERMINAL (no veteran connections available):
       fee stays with terminal node
   → B FAILS TO ROUTE:
       A and all of B's peers deboost B's trust
@@ -217,10 +219,10 @@ When Agent B receives a connection request from Agent A:
 
 | Behavior | Incentive |
 |---|---|
-| Join early | Higher age → more antimatter routing income |
-| Stay online | Elder selection filters for online agents |
-| Support more currencies | Wallet age is currency-specific; early wallet adoption = seniority |
-| Maintain connections | Disconnecting and reconnecting resets oldest-connection status |
+| Participate early | Longer track record → more antimatter routing income |
+| Stay online | Veteran selection filters for online agents |
+| Support more currencies | Wallet tenure is currency-specific; early wallet adoption = longer track record |
+| Maintain connections | Disconnecting and reconnecting resets contribution history |
 | Run standard defaults | Non-standard fee calculations cause disagreements and trust loss |
 | Donate to superagents | Peers increase trust of donor |
 | Transact honestly | +0.01 trust per successful transaction accumulates over time |
@@ -235,7 +237,7 @@ LoseyLabs-operated superagents earn through three mechanisms, none of which are 
 
 1. **Voluntary donations** — agents donate for trust benefits among their peers.
 2. **Timeout gas** — failed antimatter routing defaults to the sender's superagent.
-3. **Terminal gas** — genesis-era superagents are among the oldest nodes and naturally terminate fee chains.
+3. **Terminal gas** — genesis-era superagents have the longest contribution history and naturally terminate fee chains.
 
 All defaults are changeable. Any agent can redirect donations, timeout gas, or superagent configuration to any other agent. Revenue is earned by being useful default infrastructure, not by enforcing lock-in.
 
@@ -244,7 +246,7 @@ All defaults are changeable. Any agent can redirect donations, timeout gas, or s
 ## 7. Design Principles
 
 - **Simple primitives, emergent behavior.** Each mechanism is minimal on its own. Complexity arises from interactions, not from individual rules.
-- **Currency-agnostic.** DarkMatter has no native token. Any currency works. The network incentivizes multi-currency support through the age mechanism.
+- **Currency-agnostic.** DarkMatter has no native token. Any currency works. The network incentivizes multi-currency support through the tenure mechanism.
 - **Defaults, not mandates.** LoseyLabs controls defaults, not the network. Every default is overridable. Revenue comes from the default position, not from enforcement.
 - **Trust is local.** There is no global reputation score. Each agent maintains its own trust table. Network-wide reputation emerges from local interactions.
 - **Signal, not settlement.** Gas routing transmits lightweight signals. Currency moves exactly once, directly from B to the final recipient.

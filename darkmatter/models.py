@@ -82,7 +82,11 @@ class Connection:
 
 @dataclass
 class Impression:
-    """A scored trust impression of another agent."""
+    """A scored trust impression of another agent.
+
+    The `note` field supports typed context (e.g. interaction summaries,
+    role tags, or free-form observations) to give trust scores meaning.
+    """
     score: float       # -1.0 (avoid) to 1.0 (fully trusted)
     note: str = ""
     negative_since: Optional[str] = None  # ISO timestamp when score crossed below 0

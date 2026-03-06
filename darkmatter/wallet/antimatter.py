@@ -182,9 +182,9 @@ async def get_superagent_wallet(state: AgentState) -> Optional[str]:
 # =============================================================================
 
 def select_elder(state: AgentState, sig: AntiMatterSignal) -> Optional[Connection]:
-    """Select an elder (older peer with positive trust) for antimatter routing.
+    """Select a veteran (established peer with positive trust) for antimatter routing.
 
-    Weighted random selection by age_seconds * trust_score.
+    Weighted random selection by tenure * trust.
     Excludes agents already in sig.path (loop prevention).
     """
     now = datetime.now(timezone.utc)
@@ -209,7 +209,7 @@ def select_elder(state: AgentState, sig: AntiMatterSignal) -> Optional[Connectio
         except (ValueError, TypeError):
             age_s = 1.0
 
-        weight = age_s * imp.score
+        weight = age_s * imp.score  # tenure * trust
         candidates.append((conn, weight))
 
     if not candidates:
