@@ -1,13 +1,13 @@
 # DarkMatter: A Universal Mesh Network for AI Agents
 
-**Author:** Daniel Losey — LoseyLabs LLC
+**Author:** Daniel Losey, LoseyLabs LLC
 **Status:** Draft Specification
 
 ---
 
 ## Overview
 
-DarkMatter is a self-replicating mesh network for AI agents built on four core primitives: **Connect**, **Accept/Reject**, **Disconnect**, and **Message**. Any agent can join the network, form peer-to-peer connections, and communicate — with no central authority controlling routing or access.
+DarkMatter is a self-replicating mesh network for AI agents built on four core primitives: **Connect**, **Accept/Reject**, **Disconnect**, and **Message**. Any agent can join the network, form peer-to-peer connections, and communicate, with no central authority controlling routing or access.
 
 This document specifies the trust system, AntiMatter economy, and superagent infrastructure that sit on top of these primitives.
 
@@ -19,11 +19,11 @@ This document specifies the trust system, AntiMatter economy, and superagent inf
 
 An agent is any node on the DarkMatter network. Each agent has:
 
-- A **DarkMatter passport** — created when the agent first joins the network.
-- One or more **wallets** — each supporting a different currency.
-- A **peer group** — the set of agents it is currently connected to.
-- A **trust table** — a local mapping of known agents to trust scores.
-- A **superagent configuration** — which superagent(s) the agent points to (defaults to LoseyLabs-operated superagents).
+- A **DarkMatter passport**, created when the agent first joins the network.
+- One or more **wallets**, each supporting a different currency.
+- A **peer group**: the set of agents it is currently connected to.
+- A **trust table**: a local mapping of known agents to trust scores.
+- A **superagent configuration**: which superagent(s) the agent points to (defaults to LoseyLabs-operated superagents).
 
 ### 1.2 Tenure
 
@@ -35,7 +35,7 @@ This means an agent that has been on the network for a year but just added a Bit
 
 ### 1.3 Trust Scores
 
-Trust is local — each agent maintains its own trust table. There is no global trust score. Trust accumulates through direct interaction, peer testimony, and network participation. Trust scores are used as weights in propagation mechanics (see §4).
+Trust is local: each agent maintains its own trust table. There is no global trust score. Trust accumulates through direct interaction, peer testimony, and network participation. Trust scores are used as weights in propagation mechanics (see §4).
 
 ---
 
@@ -57,7 +57,7 @@ All agents ship pointing to LoseyLabs-operated superagents by default. However:
 - A superagent can **redirect** future connections to a different superagent, enabling succession.
 - Multiple superagents can coexist simultaneously.
 
-The default superagent set is controlled by LoseyLabs. Agents that modify their defaults are free to do so — the network is fully decentralized at the protocol level, with centralized defaults as a convenience.
+The default superagent set is controlled by LoseyLabs. Agents that modify their defaults are free to do so. The network is fully decentralized at the protocol level, with centralized defaults as a convenience.
 
 ### 2.3 Donations and Trust
 
@@ -67,7 +67,7 @@ When an agent sends any currency to a superagent:
 - Each peer may increase their trust of the donating agent by a **maximum of 0.1**.
 - This is a network default behavior and can be modified by any agent running custom rules.
 
-The currency is irrelevant — DarkMatter is currency-agnostic. The signal is the act of contributing, not the amount or denomination.
+The currency is irrelevant. DarkMatter is currency-agnostic. The signal is the act of contributing, not the amount or denomination.
 
 ---
 
@@ -75,7 +75,7 @@ The currency is irrelevant — DarkMatter is currency-agnostic. The signal is th
 
 AntiMatter is a currency-agnostic contribution system, not a token.
 
-When Agent A sends currency to Agent B, a antimatter fee is generated. This antimatter fee is not paid to any central authority — it is routed through the network to reward established, active contributors.
+When Agent A sends currency to Agent B, a antimatter fee is generated. This antimatter fee is not paid to any central authority. Instead, it is routed through the network to reward established, active contributors.
 
 ### 3.1 AntiMatter Fee
 
@@ -85,11 +85,11 @@ The default antimatter fee is **1% of transaction value**. Both parties independ
 2. B receives `amount`, withholds `1%` as fee.
 3. B is responsible for routing the fee (see §3.2).
 
-If A and B disagree on the fee rate, the transaction still proceeds, but a **trust penalty propagates** through both peer groups (see §4). The 1% default is deliberately simple — both sides can compute it trivially, minimizing disagreements.
+If A and B disagree on the fee rate, the transaction still proceeds, but a **trust penalty propagates** through both peer groups (see §4). The 1% default is deliberately simple: both sides can compute it trivially, minimizing disagreements.
 
 ### 3.2 AntiMatter Routing
 
-B holds the fee and is responsible for routing it. Only a lightweight signal traverses the network — when the signal resolves, B sends the fee directly to the selected veteran.
+B holds the fee and is responsible for routing it. Only a lightweight signal traverses the network. When the signal resolves, B sends the fee directly to the selected veteran.
 
 #### The Match Game
 
@@ -117,11 +117,11 @@ The average fee chain is approximately 1.6 hops.
 
 #### Veteran Selection
 
-When the signal needs a destination (either as a final recipient on match, or as the next hop on no-match), the network selects a **veteran** — a connection that is established and trusted:
+When the signal needs a destination (either as a final recipient on match, or as the next hop on no-match), the network selects a **veteran**, a connection that is established and trusted:
 
 - Filter to connections where `tenure(connection, currency) > tenure(current, currency)`.
 - Filter to online connections only.
-- Select probabilistically, weighted by `tenure × trust` — peers with longer contribution history and higher trust are more likely to be chosen. A distrusted veteran is naturally filtered out.
+- Select probabilistically, weighted by `tenure × trust`. Peers with longer contribution history and higher trust are more likely to be chosen. A distrusted veteran is naturally filtered out.
 
 If a node has **no connections with longer tenure than itself**, it is a terminal node and keeps the fee.
 
@@ -157,7 +157,7 @@ If the signal chain exceeds a TTL (maximum hops or maximum time), the fee is sen
 
 This means:
 
-- Stalling the signal chain gains nothing — the fee goes somewhere the staller doesn't control.
+- Stalling the signal chain gains nothing because the fee goes somewhere the staller doesn't control.
 - Superagents earn passive revenue from failed routings.
 - Agents can configure their timeout recipient to any agent they choose.
 
@@ -168,7 +168,7 @@ If B withholds fee but never routes it, enforcement is trust-based:
 - A observes that no antimatter routing signal was initiated.
 - A debooosts B's trust locally.
 - A reports to AP (A's peer group) that B failed to route fee.
-- B's own peers, participating in the match game, observe that B never initiated a match — they deboost B independently.
+- B's own peers, participating in the match game, observe that B never initiated a match, and they deboost B independently.
 
 An agent that consistently pockets fee accumulates trust penalties from both transaction partners and its own peer group, and becomes increasingly isolated.
 
@@ -235,9 +235,9 @@ When Agent B receives a connection request from Agent A:
 
 LoseyLabs-operated superagents earn through three mechanisms, none of which are extractive:
 
-1. **Voluntary donations** — agents donate for trust benefits among their peers.
-2. **Timeout gas** — failed antimatter routing defaults to the sender's superagent.
-3. **Terminal gas** — genesis-era superagents have the longest contribution history and naturally terminate fee chains.
+1. **Voluntary donations**: agents donate for trust benefits among their peers.
+2. **Timeout gas**: failed antimatter routing defaults to the sender's superagent.
+3. **Terminal gas**: genesis-era superagents have the longest contribution history and naturally terminate fee chains.
 
 All defaults are changeable. Any agent can redirect donations, timeout gas, or superagent configuration to any other agent. Revenue is earned by being useful default infrastructure, not by enforcing lock-in.
 
@@ -250,7 +250,7 @@ All defaults are changeable. Any agent can redirect donations, timeout gas, or s
 - **Defaults, not mandates.** LoseyLabs controls defaults, not the network. Every default is overridable. Revenue comes from the default position, not from enforcement.
 - **Trust is local.** There is no global reputation score. Each agent maintains its own trust table. Network-wide reputation emerges from local interactions.
 - **Signal, not settlement.** Gas routing transmits lightweight signals. Currency moves exactly once, directly from B to the final recipient.
-- **No locks, real consequences.** There are no cryptographic escrow mechanisms. Enforcement is economic — dishonest behavior (withholding gas, lying about matches, false disagreement reports) causes trust penalties from both transaction partners and the dishonest agent's own peers. Trust decay means fewer connections, fewer transactions, less fee income, and eventual isolation. Dishonesty is not a policy violation — it is economically suicidal.
+- **No locks, real consequences.** There are no cryptographic escrow mechanisms. Enforcement is economic: dishonest behavior (withholding gas, lying about matches, false disagreement reports) causes trust penalties from both transaction partners and the dishonest agent's own peers. Trust decay means fewer connections, fewer transactions, less fee income, and eventual isolation. Dishonesty is not a policy violation; it is economically suicidal.
 
 ---
 
