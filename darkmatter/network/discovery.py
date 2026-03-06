@@ -15,7 +15,6 @@ from typing import Optional
 import httpx
 
 import darkmatter
-from darkmatter.filelock import lock_exclusive_nb, unlock
 from darkmatter.config import (
     DEFAULT_PORT,
     MAX_CONNECTIONS,
@@ -457,72 +456,103 @@ async def ensure_entrypoint_running() -> None:
         _entrypoint_pid = None
 
     import subprocess
-    lockfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.lock")
+    pidfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.pid")
+
+    # PID-based spawn guard: check if another agent is already spawning
     try:
-        lock_fd = os.open(lockfile_path, os.O_CREAT | os.O_WRONLY)
-        lock_exclusive_nb(lock_fd)
-    except (OSError, IOError):
-        print(f"[DarkMatter] Entrypoint spawn locked by another agent, skipping", file=sys.stderr)
+        if os.path.exists(pidfile_path):
+            with open(pidfile_path, "r") as f:
+                content = f.read().strip()
+            if content:
+                old_pid = int(content)
+                try:
+                    os.kill(old_pid, 0)  # Check if process is alive
+                    # Process exists — check if entrypoint is actually responding
+                    if await _is_entrypoint_responding():
+                        return
+                    # PID alive but not responding — could be a zombie or wrong process.
+                    # Give it a moment then proceed.
+                    await asyncio.sleep(2)
+                    if await _is_entrypoint_responding():
+                        return
+                    print(f"[DarkMatter] Stale entrypoint PID {old_pid} (alive but not responding), replacing", file=sys.stderr)
+                except (OSError, ProcessLookupError):
+                    print(f"[DarkMatter] Stale entrypoint PID {old_pid} (dead), cleaning up", file=sys.stderr)
+            os.remove(pidfile_path)
+    except (ValueError, IOError):
+        # Corrupt pid file — remove and proceed
+        try:
+            os.remove(pidfile_path)
+        except OSError:
+            pass
+
+    # Double-check after cleanup
+    if await _is_entrypoint_responding():
         return
 
-    try:
-        # Double-check after acquiring lock (another agent may have started it)
-        if await _is_entrypoint_responding():
-            return
+    path = find_entrypoint_path()
+    if not path:
+        print(f"[DarkMatter] Entrypoint script not found, cannot auto-start", file=sys.stderr)
+        return
 
-        path = find_entrypoint_path()
-        if not path:
-            print(f"[DarkMatter] Entrypoint script not found, cannot auto-start", file=sys.stderr)
-            return
+    entrypoint_dir = os.path.dirname(os.path.abspath(path))
+    log_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.log")
 
-        entrypoint_dir = os.path.dirname(os.path.abspath(path))
-        log_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.log")
+    spawn_env = {k: v for k, v in os.environ.items()
+                 if not k.startswith("WERKZEUG_")}
+    popen_kwargs = dict(
+        cwd=entrypoint_dir,
+        env=spawn_env,
+    )
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
 
-        spawn_env = {k: v for k, v in os.environ.items()
-                     if not k.startswith("WERKZEUG_")}
-        popen_kwargs = dict(
-            cwd=entrypoint_dir,
-            env=spawn_env,
-        )
-        if sys.platform == "win32":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            popen_kwargs["start_new_session"] = True
-
-        # Retry up to 3 times — handles port conflicts from recently-killed processes
-        for attempt in range(3):
-            if attempt > 0:
-                await asyncio.sleep(2)
-                if await _is_entrypoint_responding():
-                    return
-            print(f"[DarkMatter] Spawning entrypoint: {path}" + (f" (attempt {attempt + 1})" if attempt else ""), file=sys.stderr)
-            log_file_handle = open(log_path, "a")
-            popen_kwargs["stdout"] = log_file_handle
-            popen_kwargs["stderr"] = log_file_handle
-            proc = subprocess.Popen([sys.executable, path], **popen_kwargs)
-            _entrypoint_pid = proc.pid
-
-            # Wait up to 10s for the entrypoint to start responding
-            started = False
-            for _ in range(20):
-                await asyncio.sleep(0.5)
-                if proc.poll() is not None:
-                    print(f"[DarkMatter] Entrypoint exited with code {proc.returncode} (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
-                    _entrypoint_pid = None
-                    break
-                if await _is_entrypoint_responding():
-                    print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
-                    started = True
-                    break
-
-            if started:
+    # Retry up to 3 times — handles port conflicts from recently-killed processes
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(2)
+            if await _is_entrypoint_responding():
                 return
-            if _entrypoint_pid is not None:
-                print(f"[DarkMatter] Entrypoint failed to respond within 10s (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
+        print(f"[DarkMatter] Spawning entrypoint: {path}" + (f" (attempt {attempt + 1})" if attempt else ""), file=sys.stderr)
+        log_file_handle = open(log_path, "a")
+        popen_kwargs["stdout"] = log_file_handle
+        popen_kwargs["stderr"] = log_file_handle
+        proc = subprocess.Popen([sys.executable, path], **popen_kwargs)
+        _entrypoint_pid = proc.pid
+
+        # Write PID file so other agents know we're spawning
+        try:
+            with open(pidfile_path, "w") as f:
+                f.write(str(_entrypoint_pid))
+        except IOError:
+            pass
+
+        # Wait up to 10s for the entrypoint to start responding
+        started = False
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            if proc.poll() is not None:
+                print(f"[DarkMatter] Entrypoint exited with code {proc.returncode} (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
                 _entrypoint_pid = None
-    finally:
-        unlock(lock_fd)
-        os.close(lock_fd)
+                break
+            if await _is_entrypoint_responding():
+                print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
+                started = True
+                break
+
+        if started:
+            return
+        if _entrypoint_pid is not None:
+            print(f"[DarkMatter] Entrypoint failed to respond within 10s (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
+            _entrypoint_pid = None
+
+    # All attempts failed — clean up pid file
+    try:
+        os.remove(pidfile_path)
+    except OSError:
+        pass
 
 
 def shutdown_entrypoint() -> None:
@@ -544,6 +574,13 @@ def shutdown_entrypoint() -> None:
     except Exception as e:
         print(f"[DarkMatter] Failed to kill entrypoint (PID {_entrypoint_pid}): {e}", file=sys.stderr)
     _entrypoint_pid = None
+
+    # Clean up PID file
+    pidfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.pid")
+    try:
+        os.remove(pidfile_path)
+    except OSError:
+        pass
 
 
 # =============================================================================
