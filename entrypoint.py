@@ -158,8 +158,15 @@ if os.path.exists(_wallet_passport_path):
     save_state()
     print(f"[DarkMatter Entrypoint] Wallet identity loaded: {_wallet_pub[:16]}...", file=sys.stderr)
 
+# Broadcast peer update on startup so connected peers have our current URL
+if state.connections:
+    try:
+        asyncio.run(_mgr.broadcast_peer_update())
+        print(f"[DarkMatter Entrypoint] Broadcast peer update to {len(state.connections)} peer(s)", file=sys.stderr)
+    except Exception as _e:
+        print(f"[DarkMatter Entrypoint] Peer update broadcast failed: {_e}", file=sys.stderr)
+
 # Clean up UPnP mapping on exit
-# Clean up UPnP mapping on exit (async stop → sync wrapper)
 def _cleanup_network():
     try:
         asyncio.run(_mgr.stop())
@@ -784,6 +791,56 @@ def _relay_poll_loop():
                                 if isinstance(cb_data, dict) and cb_data.get("agent_id"):
                                     process_connection_relay_callback(state, cb_data)
                                     print(f"[DarkMatter Entrypoint] Relay: connection accepted by {cb_data['agent_id'][:12]}...", file=sys.stderr)
+
+                        # Poll for relayed messages (Level 5 anchor relay)
+                        resp3 = client.get(
+                            f"{anchor}/__darkmatter__/message_relay_poll/{state.agent_id}",
+                            params={"signature": sig, "timestamp": ts},
+                        )
+                        if resp3.status_code == 200:
+                            data3 = resp3.json()
+                            messages = data3.get("messages", [])
+                            for relay_msg in messages:
+                                # Decrypt E2E encrypted relay messages
+                                if relay_msg.get("e2e_encrypted") and relay_msg.get("encrypted_payload"):
+                                    sender_pub = relay_msg.get("encrypted_payload", {}).get("sender_public_key_hex")
+                                    if not sender_pub:
+                                        sender_pub = relay_msg.get("from_agent_id", "")
+                                    try:
+                                        from darkmatter.security import decrypt_from_peer
+                                        plaintext = decrypt_from_peer(
+                                            relay_msg["encrypted_payload"],
+                                            state.private_key_hex,
+                                            sender_pub,
+                                        )
+                                        relay_msg = json.loads(plaintext.decode("utf-8"))
+                                    except Exception as e:
+                                        print(f"[DarkMatter Entrypoint] Relay decryption failed: {e}", file=sys.stderr)
+                                        continue
+
+                                path = relay_msg.get("path", "")
+                                payload = relay_msg.get("payload", {})
+                                from_id = relay_msg.get("from_agent_id", "")
+                                if path == "/__darkmatter__/message" and payload:
+                                    loop = asyncio.new_event_loop()
+                                    try:
+                                        result, status = loop.run_until_complete(
+                                            _process_incoming_message(state, payload)
+                                        )
+                                        pending = asyncio.all_tasks(loop)
+                                        if pending:
+                                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                                        if result.get("success"):
+                                            print(f"[DarkMatter Entrypoint] Relay: message from {from_id[:12]}... queued", file=sys.stderr)
+                                    except Exception as e:
+                                        print(f"[DarkMatter Entrypoint] Relay message processing failed: {e}", file=sys.stderr)
+                                    finally:
+                                        loop.close()
+                                elif path and payload:
+                                    print(f"[DarkMatter Entrypoint] Relay: unhandled path {path} from {from_id[:12]}...", file=sys.stderr)
+                            if messages:
+                                print(f"[DarkMatter Entrypoint] Relay poll: got {len(messages)} message(s)", file=sys.stderr)
+
                         break  # success — don't try other anchors
                 except Exception:
                     continue
