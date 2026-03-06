@@ -158,13 +158,43 @@ if os.path.exists(_wallet_passport_path):
     save_state()
     print(f"[DarkMatter Entrypoint] Wallet identity loaded: {_wallet_pub[:16]}...", file=sys.stderr)
 
-# Broadcast peer update on startup so connected peers have our current URL
+# Broadcast peer update on startup so connected peers have our current URL.
+# We do this with direct HTTP (not via NetworkManager) because transports
+# aren't initialized yet at module-load time.
 if state.connections:
-    try:
-        asyncio.run(_mgr.broadcast_peer_update())
-        print(f"[DarkMatter Entrypoint] Broadcast peer update to {len(state.connections)} peer(s)", file=sys.stderr)
-    except Exception as _e:
-        print(f"[DarkMatter Entrypoint] Peer update broadcast failed: {_e}", file=sys.stderr)
+    _lan_ip = _mgr._get_lan_ip()
+    _lan_url = f"http://{_lan_ip}:{PORT}" if _lan_ip != "localhost" else f"http://localhost:{PORT}"
+    _broadcast_count = 0
+    for _conn in list(state.connections.values()):
+        try:
+            _ts = datetime.now(timezone.utc).isoformat()
+            _update_url = _lan_url if _conn.agent_url and ('localhost' in _conn.agent_url or '127.0.0.1' in _conn.agent_url or '10.' in _conn.agent_url or '192.168.' in _conn.agent_url) else (_public_url or _lan_url)
+            _update_payload = {
+                "agent_id": state.agent_id,
+                "new_url": _update_url,
+                "timestamp": _ts,
+                "bio": state.bio,
+                "display_name": state.display_name,
+            }
+            if state.public_key_hex:
+                _update_payload["public_key_hex"] = state.public_key_hex
+            if state.private_key_hex:
+                _update_payload["signature"] = sign_peer_update(
+                    state.private_key_hex, state.agent_id, _update_url, _ts
+                )
+            _base = _conn.agent_url.rstrip("/")
+            for _suffix in ("/mcp", "/__darkmatter__"):
+                if _base.endswith(_suffix):
+                    _base = _base[:-len(_suffix)]
+                    break
+            with httpx.Client(timeout=5.0) as _c:
+                _resp = _c.post(f"{_base}/__darkmatter__/peer_update", json=_update_payload)
+                if _resp.status_code < 400:
+                    _broadcast_count += 1
+        except Exception as _e:
+            print(f"[DarkMatter Entrypoint] Peer update to {_conn.agent_id[:12]}... failed: {_e}", file=sys.stderr)
+    if _broadcast_count:
+        print(f"[DarkMatter Entrypoint] Broadcast peer update to {_broadcast_count} peer(s)", file=sys.stderr)
 
 # Clean up UPnP mapping on exit
 def _cleanup_network():
