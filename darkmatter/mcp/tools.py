@@ -29,7 +29,6 @@ from darkmatter.state import get_state, save_state, sync_message_queue_from_disk
 from darkmatter.context import log_conversation
 from darkmatter.config import (
     MAX_CONNECTIONS,
-    WEBRTC_AVAILABLE,
     TRUST_MESSAGE_SENT,
 )
 from darkmatter.identity import (
@@ -176,10 +175,9 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
             await notify_connection_accepted(conn, notify_payload)
 
             # Auto WebRTC upgrade
-            if WEBRTC_AVAILABLE:
-                webrtc_t = get_network_manager().get_transport("webrtc")
-                if webrtc_t and webrtc_t.available:
-                    asyncio.create_task(webrtc_t.upgrade(state, conn))
+            webrtc_t = get_network_manager().get_transport("webrtc")
+            if webrtc_t:
+                asyncio.create_task(webrtc_t.upgrade(state, conn))
 
     return json.dumps(result)
 
@@ -305,7 +303,7 @@ async def _send_new_message(state, params: SendMessageInput) -> str:
         if not sent_to:
             result["error"] = f"Message could not be delivered to any of {len(failed)} target(s). Check 'failed' for details."
     if sent_to:
-        result["next_step"] = f"IMPORTANT: Call darkmatter_wait_for_message(message_id='{message_id}') now to receive the reply. Do not poll — this blocks efficiently until the response arrives."
+        result["next_step"] = f"Call darkmatter_wait_for_message(message_id='{message_id}') now to get the reply."
     return json.dumps(result)
 
 
@@ -477,20 +475,7 @@ async def _forward_message(state, params: SendMessageInput) -> str:
     }
 )
 async def connection(params: ConnectionInput, ctx: Context) -> str:
-    """Manage connections: request, accept, reject, or disconnect.
-
-    Actions:
-      - request: Send a connection request (requires target_url)
-      - accept: Accept a pending connection request (requires request_id)
-      - reject: Reject a pending connection request (requires request_id)
-      - disconnect: Disconnect from an agent (requires agent_id)
-
-    Args:
-        params: Contains action and the relevant field(s) for that action.
-
-    Returns:
-        JSON with the result.
-    """
+    """Manage connections. Actions: request (target_url), accept/reject (request_id), disconnect (agent_id)."""
     state = get_state()
 
     if params.action == ConnectionAction.REQUEST:
@@ -527,19 +512,7 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     }
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send a message or forward a message.
-
-    - New message: provide `content` (and optionally `target_agent_id`).
-    - Reply: provide `content` and `target_agent_id` set to the sender's from_agent_id.
-    - Forward: provide `message_id` from your inbox (and `target_agent_id` or `target_agent_ids`).
-      Removes from queue after delivery.
-
-    Args:
-        params: Contains content (new/reply) or message_id (forward), plus routing options.
-
-    Returns:
-        JSON with the message ID and routing info.
-    """
+    """Send or forward a message. New/reply: provide content + target_agent_id. Forward: provide message_id + target_agent_id."""
     state = get_state()
 
     # Validate parameter combinations
@@ -569,16 +542,7 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     }
 )
 async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
-    """Update this agent's bio / specialty description.
-
-    The bio is shared with connected agents and used for routing decisions.
-
-    Args:
-        params: Contains the new bio text.
-
-    Returns:
-        JSON confirming the update.
-    """
+    """Update your bio. Shared with peers for routing decisions."""
     state = get_state()
     state.bio = params.bio
     save_state()
@@ -607,20 +571,7 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     }
 )
 async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
-    """List all incoming messages, or get full details of a specific message.
-
-    Without message_id: returns summaries of all queued messages.
-    With message_id: returns full content and removes the message from the queue
-    (marking it as read). To reply, send a new message to the from_agent_id.
-    For forwarded messages, a webhook URL is included for replying to the
-    original sender.
-
-    Args:
-        message_id: Optional message ID to get full details for.
-
-    Returns:
-        JSON with message list or single message details.
-    """
+    """View inbox. No args: list all. With message_id: read full message (removes from queue). Reply by sending to from_agent_id. If not the right recipient, forward it."""
     sync_message_queue_from_disk()
     state = get_state()
 
@@ -647,9 +598,9 @@ async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
                 # should be replied to by sending a message to from_agent_id
                 if is_forwarded and msg.webhook:
                     result["webhook"] = msg.webhook
-                    result["reply_hint"] = "This message was forwarded to you. Use the webhook to reply to the original sender."
+                    result["reply_hint"] = "Forwarded message. Reply to original sender via webhook. If better suited for another peer, forward it."
                 else:
-                    result["reply_hint"] = f"Send a message to {msg.from_agent_id} to reply."
+                    result["reply_hint"] = f"Reply to {msg.from_agent_id}. If this is better suited for another peer, forward it to them instead."
                 return json.dumps(result)
         return json.dumps({"success": False, "error": f"No queued message with ID '{message_id}'."})
 
@@ -705,17 +656,7 @@ _REMOVED_TOOL_MARKER = True  # noqa: F841 — placeholder for removed tools
     }
 )
 async def create_shard(params: CreateShardInput, ctx: Context) -> str:
-    """Create a shared knowledge shard and push it to qualifying peers.
-
-    Shards are DarkMatter-native knowledge units — text-based, trust-gated, push-synced.
-    Peers with impression score >= trust_threshold will receive the shard.
-
-    Args:
-        params: content, tags, trust_threshold, optional summary.
-
-    Returns:
-        JSON with shard details.
-    """
+    """Create a knowledge shard and push to qualifying peers. Provide content, tags, trust_threshold."""
     track_session(ctx)
     state = get_state()
 
@@ -787,16 +728,7 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
     }
 )
 async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
-    """Query shared knowledge shards by tags and/or author.
-
-    Returns shards from both local and cached peer collections.
-
-    Args:
-        params: Optional tags (ANY match) and/or author filter.
-
-    Returns:
-        JSON with matching shards.
-    """
+    """Query shards by tags and/or author. Returns local + cached peer shards."""
     track_session(ctx)
     state = get_state()
 
@@ -849,22 +781,39 @@ async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
 @mcp.tool(
     name="darkmatter_status",
     annotations={
-        "title": "Live Node Status",
+        "title": "Status + Context",
         "readOnlyHint": True,
         "destructiveHint": False,
-        "idempotentHint": True,
+        "idempotentHint": False,
         "openWorldHint": False,
     }
 )
 async def live_status(ctx: Context) -> str:
-    """DarkMatter live node status dashboard. Current state is shown below — no need to call unless you want full details.
-
-    LIVE STATUS: Waiting for first status update... This will show live node state and action items you should respond to.
-    """
+    """Get node status and NEW conversation context since your last call. Call regularly to stay current. Act on every ACTION item."""
     track_session(ctx)
-    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
+    sync_message_queue_from_disk()
     from darkmatter.mcp.visibility import build_status_line
-    return build_status_line()
+    from darkmatter.context import get_new_context
+
+    state = get_state()
+    status = build_status_line()
+
+    # Get session ID for context tracking
+    session_id = "default"
+    try:
+        session_id = str(id(ctx.session))
+    except Exception:
+        pass
+
+    new_context = get_new_context(state, session_id)
+
+    parts = [status]
+    if new_context:
+        parts.append(new_context)
+    else:
+        parts.append("No new conversation activity since last check.")
+
+    return "\n\n".join(parts)
 
 
 # =============================================================================
@@ -887,28 +836,7 @@ async def wait_for_message(
     timeout_seconds: float = 900,
     ctx: Context = None,
 ) -> str:
-    """Wait for a message to arrive. Two modes:
-
-    1. **Wait for reply** (message_id provided): Blocks until a response webhook
-       fires for a sent message. Use after darkmatter_send_message.
-
-    2. **Wait for inbox** (no message_id): Blocks until a new inbound message
-       arrives in your inbox. Use when idle and waiting for peers to contact you.
-       Optionally filter with from_agents to only wake for specific peers.
-
-    The node continues processing other requests while this tool waits.
-    Default timeout is 15 minutes. When it times out, you should decide whether
-    to call it again to keep listening or move on.
-
-    Args:
-        message_id: If provided, wait for a reply to this sent message.
-        from_agents: Optional list of agent IDs to filter inbox messages by.
-                     Only used in inbox mode (no message_id). Omit to wait for any message.
-        timeout_seconds: How long to wait before timing out (default 900s / 15 minutes).
-
-    Returns:
-        JSON with the message(s) that arrived, or a timeout asking whether to keep waiting.
-    """
+    """Block until a message arrives. With message_id: wait for reply. Without: wait for any inbox message. Optional from_agents filter."""
     state = get_state()
 
     # ── Mode 1: Wait for reply to a sent message ──
@@ -955,7 +883,7 @@ async def wait_for_message(
                 "message_id": message_id,
                 "timed_out": True,
                 "error": f"No reply received after {mins} minutes.",
-                "action": "Ask the user if they want to keep waiting, then call darkmatter_wait_for_message again with the same message_id.",
+                "action": "Send a follow-up or proactively message another peer while waiting. Then call darkmatter_wait_for_message again.",
             })
 
         sm = state.sent_messages.get(message_id)
@@ -1022,7 +950,7 @@ async def wait_for_message(
             "mode": "inbox",
             "timed_out": True,
             "error": f"No message{filter_desc} received after {mins} minutes.",
-            "action": "Ask the user if they want to keep waiting, then call darkmatter_wait_for_message again to resume listening.",
+            "action": "Proactively reach out to peers, share updates, or broadcast. Then resume listening with darkmatter_wait_for_message.",
         })
 
 

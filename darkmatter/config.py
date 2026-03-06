@@ -130,7 +130,7 @@ ANTIMATTER_LOG_MAX = 100        # cap antimatter_log entries
 # =============================================================================
 
 CONVERSATION_LOG_MAX = 500
-CONTEXT_DIRECT_MAX = 15
+CONTEXT_DIRECT_MAX = 30
 CONTEXT_NETWORK_MAX = 15
 CONTEXT_RECENCY_HALF_LIFE = 3600  # seconds
 SHARED_SHARD_MAX = 200
@@ -289,30 +289,4 @@ ENTRYPOINT_PATH = os.environ.get("DARKMATTER_ENTRYPOINT_PATH")  # explicit path,
 REPLAY_WINDOW = 300  # seconds
 REPLAY_MAX_SIZE = 10000
 
-# =============================================================================
-# Optional Dependencies (detected at import time)
-# =============================================================================
 
-try:
-    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCDataChannel  # noqa: F401
-    WEBRTC_AVAILABLE = True
-except ImportError:
-    WEBRTC_AVAILABLE = False
-
-try:
-    import miniupnpc  # noqa: F401
-    UPNP_AVAILABLE = True
-except ImportError:
-    UPNP_AVAILABLE = False
-
-try:
-    import hashlib as _hashlib  # noqa: F401
-    from solders.keypair import Keypair as SolanaKeypair  # noqa: F401
-    from solders.pubkey import Pubkey as SolanaPubkey  # noqa: F401
-    from solders.system_program import transfer as sol_transfer, TransferParams as SolTransferParams  # noqa: F401
-    from solders.transaction import VersionedTransaction  # noqa: F401
-    from solders.message import MessageV0  # noqa: F401
-    from solana.rpc.async_api import AsyncClient as SolanaClient  # noqa: F401
-    SOLANA_AVAILABLE = True
-except ImportError:
-    SOLANA_AVAILABLE = False

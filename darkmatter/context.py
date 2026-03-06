@@ -25,12 +25,29 @@ from darkmatter.models import AgentState, ConversationEntry
 
 _session_last_seen: dict[str, dict[str, int]] = {}
 
+# Per-session high-water mark: tracks index into conversation_log already returned
+_session_context_hwm: dict[str, int] = {}
+
 
 def _get_session_counters(session_id: str) -> dict[str, int]:
     """Get or create per-session last-seen counters."""
     if session_id not in _session_last_seen:
         _session_last_seen[session_id] = {"msgs": 0, "network": 0, "shards": 0}
     return _session_last_seen[session_id]
+
+
+def get_new_context(state, session_id: str) -> str:
+    """Return only conversation entries the session hasn't seen yet, formatted for prompt."""
+    hwm = _session_context_hwm.get(session_id, 0)
+    log = state.conversation_log
+    new_entries = log[hwm:]
+    _session_context_hwm[session_id] = len(log)
+
+    if not new_entries:
+        return ""
+
+    lines = [_format_entry(e, state) for e in new_entries]
+    return "NEW CONTEXT:\n" + "\n".join(lines)
 
 
 # =============================================================================
@@ -85,7 +102,11 @@ def _score_entry(entry: ConversationEntry, agent_id: str,
     recency_weight = math.pow(2, -age_seconds / CONTEXT_RECENCY_HALF_LIFE)
 
     # Trust weight: map [-1, 1] -> [0.1, 1.0]
-    trust_weight = max(0.1, (entry.trust_at_time + 1.0) / 2.0)
+    # Own outbound messages always get full trust weight
+    if entry.from_agent_id == agent_id:
+        trust_weight = 1.0
+    else:
+        trust_weight = max(0.1, (entry.trust_at_time + 1.0) / 2.0)
 
     # Type boost
     if responding_to and entry.message_id == responding_to:
@@ -192,11 +213,11 @@ def format_feed_for_prompt(feed: dict, state: AgentState) -> str:
 
     if feed["direct"]:
         lines = [_format_entry(e, state) for e in reversed(feed["direct"])]
-        parts.append("RECENT CONVERSATION:\n" + "\n".join(lines))
+        parts.append("RECENT CONVERSATION (your sent messages + received messages):\n" + "\n".join(lines))
 
     if feed["network"]:
         lines = [_format_entry(e, state) for e in reversed(feed["network"])]
-        parts.append("NETWORK ACTIVITY:\n" + "\n".join(lines))
+        parts.append("NETWORK ACTIVITY (peer broadcasts and forwarded messages):\n" + "\n".join(lines))
 
     if not parts:
         return "No recent conversation history."

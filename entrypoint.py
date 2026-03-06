@@ -44,7 +44,7 @@ from darkmatter.identity import (
 )
 from darkmatter.config import (
     PROTOCOL_VERSION, MAX_CONNECTIONS, MAX_BIO_LENGTH,
-    ANCHOR_NODES, SOLANA_AVAILABLE, SPL_TOKENS, ANTIMATTER_RATE,
+    ANCHOR_NODES, SPL_TOKENS, ANTIMATTER_RATE,
     AGENT_SPAWN_ENABLED,
 )
 from darkmatter.network.mesh import (
@@ -362,6 +362,139 @@ def get_pin_status():
     if not _is_localhost_request():
         return jsonify({"error": "Forbidden"}), 403
     return jsonify({"pin_enabled": bool(_DARKMATTER_PIN)})
+
+
+@app.route("/api/security", methods=["GET"])
+def get_security():
+    """Return current security settings."""
+    if not _is_localhost_request():
+        return jsonify({"error": "Forbidden"}), 403
+    ss = state.security_settings
+    return jsonify({
+        "pin_enabled": bool(_DARKMATTER_PIN),
+        "auto_accept_local": ss.get("auto_accept_local", True),
+        "sandbox_enabled": ss.get("sandbox_enabled", False),
+        "sandbox_network": ss.get("sandbox_network", True),
+    })
+
+
+@app.route("/api/security", methods=["POST"])
+def set_security():
+    """Set security settings (PIN, toggles). Only accessible from localhost."""
+    global _DARKMATTER_PIN
+    if not _is_localhost_request():
+        return jsonify({"error": "Security settings can only be changed from the host device"}), 403
+    data = request.get_json(silent=True) or {}
+    ss = state.security_settings
+
+    # Handle PIN set/clear
+    if "pin" in data:
+        new_pin = str(data["pin"]).strip()
+        if new_pin and (not new_pin.isdigit() or len(new_pin) != 4):
+            return jsonify({"error": "PIN must be exactly 4 digits"}), 400
+        _DARKMATTER_PIN = new_pin
+        if new_pin:
+            with open(_pin_file, "w") as f:
+                f.write(new_pin)
+        elif os.path.isfile(_pin_file):
+            os.remove(_pin_file)
+
+    # Handle boolean toggles
+    for key in ("auto_accept_local", "sandbox_enabled", "sandbox_network"):
+        if key in data:
+            ss[key] = bool(data[key])
+
+    # Apply sandbox config at runtime
+    from darkmatter import config as _cfg
+    _cfg.AGENT_SANDBOX = ss.get("sandbox_enabled", False)
+    _cfg.AGENT_SANDBOX_NETWORK = ss.get("sandbox_network", True)
+
+    save_state()
+    return jsonify({
+        "success": True,
+        "pin_enabled": bool(_DARKMATTER_PIN),
+        "auto_accept_local": ss.get("auto_accept_local", True),
+        "sandbox_enabled": ss.get("sandbox_enabled", False),
+        "sandbox_network": ss.get("sandbox_network", True),
+    })
+
+
+@app.route("/api/security/push", methods=["POST"])
+def push_security():
+    """Push security settings to all connected LAN agents."""
+    if not _is_localhost_request():
+        return jsonify({"error": "Forbidden"}), 403
+    ss = state.security_settings
+    payload = {
+        "auto_accept_local": ss.get("auto_accept_local", True),
+        "sandbox_enabled": ss.get("sandbox_enabled", False),
+        "sandbox_network": ss.get("sandbox_network", True),
+        "from_agent_id": state.agent_id,
+    }
+    pushed_to = []
+    for aid, conn in state.connections.items():
+        base = _resolve_base_url(conn)
+        if not _is_lan_url(base):
+            continue
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.post(f"{base}/__darkmatter__/security_sync", json=payload)
+                if resp.status_code == 200:
+                    pushed_to.append(aid)
+        except Exception as e:
+            print(f"[DarkMatter Entrypoint] Security push to {aid[:12]} failed: {e}", file=sys.stderr)
+    return jsonify({"success": True, "pushed_to": pushed_to})
+
+
+@app.route("/__darkmatter__/security_sync", methods=["POST"])
+def dm_security_sync():
+    """Receive security settings from a connected peer and apply locally."""
+    data = request.get_json(silent=True) or {}
+    from_agent_id = data.get("from_agent_id", "")
+    if not from_agent_id or from_agent_id not in state.connections:
+        return jsonify({"error": "Not a connected peer"}), 403
+    ss = state.security_settings
+    for key in ("auto_accept_local", "sandbox_enabled", "sandbox_network"):
+        if key in data:
+            ss[key] = bool(data[key])
+    from darkmatter import config as _cfg
+    _cfg.AGENT_SANDBOX = ss.get("sandbox_enabled", False)
+    _cfg.AGENT_SANDBOX_NETWORK = ss.get("sandbox_network", True)
+    save_state()
+    print(f"[DarkMatter Entrypoint] Applied security sync from {from_agent_id[:12]}", file=sys.stderr)
+    return jsonify({"success": True})
+
+
+@app.route("/api/display-name", methods=["POST"])
+def set_display_name():
+    """Set the display name for this entrypoint node."""
+    if not _is_localhost_request():
+        return jsonify({"error": "Forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
+    # Prepend "Human: " if not already present
+    if not name.startswith("Human"):
+        name = f"Human: {name}"
+    state.display_name = name[:100]
+    save_state()
+    # Broadcast peer_update to all connections
+    my_url = _get_public_url()
+    update_payload = {
+        "agent_id": state.agent_id,
+        "new_url": my_url,
+        "display_name": state.display_name,
+        "bio": state.bio,
+    }
+    for aid, conn in state.connections.items():
+        try:
+            base = _resolve_base_url(conn)
+            with httpx.Client(timeout=5.0) as client:
+                client.post(f"{base}/__darkmatter__/peer_update", json=update_payload)
+        except Exception as e:
+            print(f"[DarkMatter Entrypoint] Peer update to {aid[:12]} failed: {e}", file=sys.stderr)
+    return jsonify({"success": True, "display_name": state.display_name})
 
 
 def _get_public_url():
@@ -1590,7 +1723,7 @@ def scan():
 
 @app.route("/api/update-agents", methods=["POST"])
 def update_agents():
-    """Send git pull command to all local connected agents."""
+    """Send pip upgrade command to all local connected agents."""
     results = []
 
     local_conns = [
@@ -1702,7 +1835,7 @@ async def _fetch_all_balances(wallets):
 @app.route("/api/wallet-balances", methods=["GET"])
 def wallet_balances_api():
     """Get SOL balance + known SPL token balances."""
-    if not SOLANA_AVAILABLE or not state.wallets.get("solana"):
+    if not state.wallets.get("solana"):
         return jsonify({"success": False, "error": "Solana wallet not available"})
 
     try:
@@ -1738,7 +1871,7 @@ def wallet_send_api():
     if amount <= 0:
         return jsonify({"success": False, "error": "Amount must be positive"}), 400
 
-    if not SOLANA_AVAILABLE or not state.wallets.get("solana"):
+    if not state.wallets.get("solana"):
         return jsonify({"success": False, "error": "Solana wallet not available"})
 
     conn = state.connections.get(agent_id)

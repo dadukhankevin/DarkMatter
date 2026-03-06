@@ -32,7 +32,6 @@ from darkmatter.config import (
     REQUEST_EXPIRY_S,
     ANTIMATTER_MAX_AGE_S,
     TRUST_ANTIMATTER_SUCCESS,
-    WEBRTC_AVAILABLE,
     WEBRTC_STUN_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
 )
@@ -78,8 +77,7 @@ from darkmatter.wallet.solana import (
 from darkmatter.network.manager import get_network_manager
 from darkmatter.spawn import get_spawned_agents
 
-if WEBRTC_AVAILABLE:
-    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 
 
 # =============================================================================
@@ -1157,7 +1155,7 @@ async def handle_connection_accepted(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     result, status = process_connection_accepted(state, data)
-    if status == 200 and WEBRTC_AVAILABLE:
+    if status == 200:
         agent_id = data.get("agent_id", "")
         conn = state.connections.get(agent_id)
         if conn:
@@ -1241,10 +1239,9 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
             await notify_connection_accepted(conn, notify_payload)
 
             # Auto WebRTC upgrade
-            if WEBRTC_AVAILABLE:
-                webrtc_t = get_network_manager().get_transport("webrtc")
-                if webrtc_t and webrtc_t.available:
-                    asyncio.create_task(webrtc_t.upgrade(state, conn))
+            webrtc_t = get_network_manager().get_transport("webrtc")
+            if webrtc_t:
+                asyncio.create_task(webrtc_t.upgrade(state, conn))
 
     return JSONResponse(result, status_code=status)
 
@@ -1588,9 +1585,6 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    if not WEBRTC_AVAILABLE:
-        return JSONResponse({"error": "WebRTC not available (aiortc not installed)"}, status_code=501)
 
     try:
         data = await request.json()

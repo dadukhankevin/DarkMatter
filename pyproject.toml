@@ -35,12 +35,9 @@ dependencies = [
     "pydantic>=2.0.0",
     "solana>=0.34.0",
     "solders>=0.21.0",
+    "aiortc>=1.9.0",
+    "miniupnpc>=2.2.0",
 ]
-
-[project.optional-dependencies]
-webrtc = ["aiortc>=1.9.0"]
-upnp = ["miniupnpc>=2.2.0"]
-all = ["dmagent[webrtc,upnp]"]
 
 [project.scripts]
 darkmatter = "darkmatter.app:main"

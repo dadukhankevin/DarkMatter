@@ -25,9 +25,6 @@ from darkmatter.config import (
     AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
     ACTIVE_CLIENT,
-    SOLANA_AVAILABLE,
-    WEBRTC_AVAILABLE,
-    UPNP_AVAILABLE,
 )
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.names import generate_agent_name
@@ -150,7 +147,7 @@ def init_state(port: int = None) -> None:
 
     # Derive Solana wallet (ephemeral — not persisted, derived from passport each startup)
     state = get_state()
-    if SOLANA_AVAILABLE and state.private_key_hex:
+    if state.private_key_hex:
         from darkmatter.wallet.solana import _get_solana_wallet_address
         state.wallets["solana"] = _get_solana_wallet_address(state.private_key_hex)
         print(f"[DarkMatter] Solana wallet: {state.wallets['solana']}", file=sys.stderr)
@@ -338,8 +335,8 @@ def print_startup_banner(port: int, transport: str, discovery_enabled: bool) -> 
     print(f"[DarkMatter] Starting mesh protocol on http://localhost:{port}", file=sys.stderr)
     print(f"[DarkMatter] MCP transport: {transport}", file=sys.stderr)
     print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled'}", file=sys.stderr)
-    print(f"[DarkMatter] WebRTC: {'AVAILABLE' if WEBRTC_AVAILABLE else 'disabled (pip install aiortc)'}", file=sys.stderr)
-    print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}", file=sys.stderr)
+    print(f"[DarkMatter] WebRTC: AVAILABLE", file=sys.stderr)
+    print(f"[DarkMatter] UPnP: AVAILABLE", file=sys.stderr)
     spawn_info = f"ENABLED (max {AGENT_SPAWN_MAX_CONCURRENT} concurrent, {AGENT_SPAWN_MAX_PER_HOUR}/hr)" if AGENT_SPAWN_ENABLED else "disabled"
     if AGENT_SPAWN_ENABLED:
         spawn_info += f" [client: {ACTIVE_CLIENT['command']}]"

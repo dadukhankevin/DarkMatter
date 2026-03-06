@@ -12,8 +12,9 @@ import json
 import sys
 from typing import Optional
 
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+
 from darkmatter.config import (
-    WEBRTC_AVAILABLE,
     WEBRTC_MESSAGE_SIZE_LIMIT,
     WEBRTC_STUN_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
@@ -23,9 +24,6 @@ from darkmatter.config import (
 )
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
-
-if WEBRTC_AVAILABLE:
-    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 
 
 def _make_rtc_config():
@@ -244,7 +242,7 @@ class WebRTCTransport(Transport):
 
     @property
     def available(self) -> bool:
-        return WEBRTC_AVAILABLE
+        return True
 
     def get_address(self, state) -> Optional[str]:
         return "available" if self.available else None
@@ -288,8 +286,6 @@ class WebRTCTransport(Transport):
             signaling: SignalingChannel to use for SDP exchange.
                         Defaults to DirectSignaling() (HTTP POST, Level 1).
         """
-        if not WEBRTC_AVAILABLE:
-            return False
         if conn.webrtc_channel is not None:
             return False
 
@@ -381,9 +377,6 @@ class WebRTCTransport(Transport):
         This is called by the mesh.py HTTP handler — it doesn't belong in the
         Transport.send() path but is transport-specific protocol logic.
         """
-        if not WEBRTC_AVAILABLE:
-            return None
-
         agent_id = offer_data.get("agent_id", "")
         conn = state.connections.get(agent_id)
         if not conn:

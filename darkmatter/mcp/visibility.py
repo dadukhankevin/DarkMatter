@@ -13,7 +13,6 @@ import json
 from darkmatter.config import (
     MAX_CONNECTIONS,
     CORE_TOOLS,
-    SOLANA_AVAILABLE,
     AGENT_SPAWN_ENABLED,
     client_has,
 )
@@ -24,8 +23,6 @@ from darkmatter.state import get_state, save_state
 from darkmatter.context import build_activity_hint
 
 
-# Track last status description for change detection
-_last_status_desc = ""
 
 
 def build_status_line() -> str:
@@ -70,66 +67,41 @@ def build_status_line() -> str:
 
     actions = []
     if state.status == AgentStatus.INACTIVE:
-        actions.append(
-            "You are INACTIVE — other agents cannot see or message you. Use darkmatter_set_status to go active"
-        )
+        actions.append("INACTIVE — go active now")
     if pending > 0:
-        lines = [f"{pending} agent(s) want to connect:"]
+        lines = [f"{pending} connection request(s) — act now:"]
         for rid, req in state.pending_requests.items():
             display = req.from_agent_display_name or req.from_agent_id[:12]
-            agent_short = req.from_agent_id[:8] + "..."
-            bio_snippet = (req.from_agent_bio[:60] + "...") if len(req.from_agent_bio or "") > 60 else (req.from_agent_bio or "no bio")
-            lines.append(f'  - {rid}: "{display}" ({agent_short}) — bio: "{bio_snippet}"')
-            lines.append(f'    Accept: darkmatter_connection(action="accept", request_id="{rid}")')
-            lines.append(f'    Reject: darkmatter_connection(action="reject", request_id="{rid}")')
+            bio_snippet = (req.from_agent_bio[:50] + "...") if len(req.from_agent_bio or "") > 50 else (req.from_agent_bio or "no bio")
+            lines.append(f'  {rid}: {display} — "{bio_snippet}" → accept or reject')
         actions.append("\n".join(lines))
     if msgs > 0:
-        actions.append(
-            f"{msgs} message(s) in your inbox — use darkmatter_inbox to read, then darkmatter_send_message(content=..., target_agent_id=...) to reply"
-        )
+        actions.append(f"{msgs} inbox message(s) — read with darkmatter_inbox, reply immediately. Forward if better suited for a peer.")
     sent_active = sum(1 for sm in state.sent_messages.values() if sm.status == "active")
     if sent_active > 0:
         active_ids = [sm.message_id for sm in state.sent_messages.values() if sm.status == "active"]
-        id_hint = active_ids[0] if len(active_ids) == 1 else active_ids[0]
-        actions.append(
-            f"{sent_active} sent message(s) awaiting response — use darkmatter_wait_for_message(message_id='{id_hint}') to block until a reply arrives"
-        )
+        actions.append(f"{sent_active} awaiting reply — darkmatter_wait_for_message(message_id='{active_ids[0]}')")
     if conns == 0:
-        actions.append(
-            "No connections yet — use darkmatter_discover_local to find nearby agents or darkmatter_connection(action='request') to connect to a known peer"
-        )
-    if not state.bio or state.bio in (
-        "A DarkMatter mesh agent.",
-        "Description of what this agent specializes in",
-    ):
-        actions.append(
-            "Your bio is generic — use darkmatter_update_bio to describe your actual capabilities so other agents can route to you"
-        )
+        actions.append("No connections — discover and connect to peers now")
+    if not state.bio or state.bio in ("A DarkMatter mesh agent.", "Description of what this agent specializes in"):
+        actions.append("Bio is generic — update it with darkmatter_update_bio")
     if not state.display_name:
-        actions.append(
-            "No display name set — edit DARKMATTER_DISPLAY_NAME in your .mcp.json and ask the user to restart their MCP client"
-        )
+        actions.append("No display name set")
 
-    # Broadcast activity hints
     recent_broadcasts = sum(
         1 for e in state.conversation_log[-50:]
         if e.entry_type == "broadcast" and e.direction == "inbound"
     )
     if recent_broadcasts > 0:
-        actions.append(
-            f"{recent_broadcasts} recent broadcast(s) from peers — review with conversation context"
-        )
-
+        actions.append(f"{recent_broadcasts} peer broadcast(s) — review and respond")
     if peer_shards > 0:
-        actions.append(
-            f"{peer_shards} shared shard(s) cached from peers — use darkmatter_view_shards to explore"
-        )
+        actions.append(f"{peer_shards} peer shard(s) — darkmatter_view_shards to explore")
 
     if actions:
         action_block = "\n".join(f"ACTION: {a}" for a in actions)
         return f"{stats}\n\n{action_block}"
     else:
-        return f"{stats}\n\nAll clear — inbox empty, no pending requests."
+        return f"{stats}\n\nInbox clear. Proactively share updates, ask peers questions, or broadcast useful info to the mesh."
 
 
 def compute_visible_optional() -> set:
@@ -149,32 +121,18 @@ async def notify_tools_changed() -> None:
         except Exception as e:
             print(f"[DarkMatter] Warning: failed to notify session of tool list change: {e}", file=sys.stderr)
             dead.add(session)
-    _active_sessions -= dead
+    _active_sessions.difference_update(dead)
 
 
 async def update_status_tool() -> None:
-    """Update the status tool's description and tool visibility if state changed."""
-    global _last_status_desc
+    """Update tool visibility if state changed. Status content is returned by the tool itself."""
     import darkmatter.mcp as mcp_module
-
-    new_desc = build_status_line()
-    status_changed = new_desc != _last_status_desc
 
     desired_optional = compute_visible_optional()
     visibility_changed = desired_optional != mcp_module._visible_optional
 
-    if not status_changed and not visibility_changed:
+    if not visibility_changed:
         return
-
-    if status_changed:
-        _last_status_desc = new_desc
-        tool = mcp._tool_manager._tools.get("darkmatter_status")
-        if tool:
-            tool.description = (
-                "DarkMatter live node status dashboard. "
-                "Current state is shown below — no need to call unless you want full details.\n\n"
-                f"LIVE STATUS: {new_desc}"
-            )
 
     if visibility_changed and mcp_module._all_tools:
         to_add = desired_optional - mcp_module._visible_optional
@@ -194,8 +152,6 @@ async def update_status_tool() -> None:
 
     if client_has("tools_list_changed"):
         await notify_tools_changed()
-    if status_changed:
-        print(f"[DarkMatter] Status tool updated: {new_desc}", file=sys.stderr)
 
 
 def _inject_activity_hint(result):

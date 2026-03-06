@@ -2,41 +2,60 @@
 {% block title %}DarkMatter{% endblock %}
 {% block content %}
 
-<div class="flex h-[calc(100vh-48px)] relative">
+<div class="flex h-[calc(100vh-62px)] relative" style="padding: 10px 10px 10px 10px; gap: 10px;">
 
   <!-- ================================================================== -->
   <!-- SIDEBAR — 240px                                                     -->
   <!-- ================================================================== -->
-  <div id="sidebar" class="bg-base border-r border-border/50 flex flex-col shrink-0 overflow-hidden hidden md:flex z-20 transition-[width] duration-200 ease-out" style="width:240px">
+  <!-- Sidebar expand button (visible when sidebar collapsed) -->
+  <button id="sidebar-expand-btn" onclick="toggleSidebar()" class="hidden items-center justify-center z-30 shrink-0 w-7 h-7 rounded-xl glass-btn p-0" title="Show sidebar" style="align-self: flex-start; margin-top: 6px;">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+  </button>
+
+  <div id="sidebar" class="glass flex flex-col shrink-0 overflow-hidden hidden md:flex z-20 transition-all duration-300 ease-out" style="width:240px; border-radius: 16px; position: relative;">
+
+    <!-- Sidebar collapse toggle -->
+    <button id="sidebar-toggle" onclick="toggleSidebar()" class="hidden md:flex absolute top-2.5 right-2 z-30 w-7 h-7 items-center justify-center rounded-xl text-muted/40 hover:text-muted hover:bg-primary/5 transition-all" title="Toggle sidebar">
+      <svg id="sidebar-toggle-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+    </button>
 
     <!-- Identity card -->
-    <div class="px-4 py-3 border-b border-border/30">
+    <div class="px-4 py-3 border-b border-primary/[0.06]">
       <div class="flex items-center gap-2.5">
-        <div class="w-9 h-9 rounded-full bg-accent-blue/15 flex items-center justify-center shrink-0">
-          <span class="text-[15px] font-semibold" style="color: var(--accent-blue)" id="sidebar-avatar">H</span>
+        <div class="w-9 h-9 rounded-full flex items-center justify-center shrink-0" style="background: rgba(45,106,79,0.12); backdrop-filter: blur(10px); border: 1px solid rgba(45,106,79,0.2);">
+          <span class="text-[15px] font-semibold" style="color: #2d6a4f" id="sidebar-avatar">H</span>
         </div>
-        <div class="min-w-0">
-          <div class="text-[14px] font-semibold text-primary truncate" id="sidebar-name">{{ state.display_name or 'Human' }}</div>
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-1 group cursor-pointer" onclick="startEditDisplayName()">
+            <div class="text-[14px] font-semibold text-primary truncate" id="sidebar-name">{{ state.display_name or 'Human' }}</div>
+            <svg class="text-muted/30 group-hover:text-muted shrink-0 transition-colors" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+          </div>
+          <!-- Inline edit input (hidden by default) -->
+          <input type="text" id="sidebar-name-input" class="hidden text-[14px] font-semibold text-primary rounded-lg px-1.5 py-0.5 w-full outline-none"
+            style="background: rgba(var(--c-surface) / 0.3); border: 1px solid rgba(45,106,79,0.3);"
+            placeholder="Your name" maxlength="50"
+            onkeydown="if(event.key==='Enter'){saveDisplayName();event.preventDefault()}else if(event.key==='Escape')cancelEditDisplayName()"
+            onblur="saveDisplayName()">
           <div class="text-[11px] text-muted truncate" id="sidebar-agent-id">{{ short_id(state.agent_id) }}</div>
         </div>
       </div>
     </div>
 
     <!-- Connect form -->
-    <div class="px-3 py-2.5 border-b border-border/30">
+    <div class="px-3 py-2.5 border-b border-primary/[0.06]">
       <form id="connect-form" class="flex gap-1.5">
         <input type="text" name="url" placeholder="http://host:port"
-          class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted focus:border-accent-blue/50 transition-colors min-w-0">
+          class="flex-1 rounded-xl px-2.5 py-1.5 text-[13px] text-primary placeholder-muted focus:border-accent-blue/50 transition-colors min-w-0"
+          style="background: rgba(var(--c-surface) / 0.3); border: 1px solid var(--glass-border); backdrop-filter: blur(10px);">
         <button type="submit"
-          class="text-white text-[13px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
-          style="background: var(--accent-blue)">
+          class="glass-btn text-[13px] px-3 py-1.5 shrink-0">
           +
         </button>
       </form>
     </div>
 
     <!-- Discovered agents -->
-    <div id="discovered-section" class="border-b border-border/30">
+    <div id="discovered-section" class="border-b border-primary/[0.06]">
       <div class="px-3 py-2 flex items-center justify-between">
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Discovered</span>
         <button onclick="fetch('/api/scan',{method:'POST'}).then(()=>pollServer())"
@@ -48,29 +67,21 @@
     </div>
 
     <!-- Pending requests -->
-    <div id="pending-section" class="hidden border-b border-border/30">
+    <div id="pending-section" class="hidden border-b border-primary/[0.06]">
       <div class="px-3 py-2 flex items-center gap-2">
-        <div class="w-1.5 h-1.5 rounded-full bg-accent-purple"></div>
+        <div class="w-1.5 h-1.5 rounded-full bg-accent-orange"></div>
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Pending</span>
       </div>
       <div id="pending-list" class="px-3 pb-2 space-y-1"></div>
     </div>
 
     <!-- Connections list -->
-    <div class="border-b border-border/30">
+    <div class="border-b border-primary/[0.06]">
       <div class="px-3 py-2 flex items-center justify-between">
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Connections</span>
         <div class="flex items-center gap-2">
-          <button id="checkin-btn" onclick="checkinAll()" title="Ask all agents for a status update"
-            class="text-[10px] px-2 py-0.5 rounded-md font-semibold transition-colors"
-            style="background: var(--accent-green); color: white; opacity: 0.85;"
-            onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.85'">
-            Check In
-          </button>
-          <button id="update-all-btn" onclick="updateAllAgents()" title="Git pull &amp; restart all LAN agents"
-            class="text-[10px] px-2 py-0.5 rounded-md font-semibold transition-colors"
-            style="background: var(--accent-blue); color: white; opacity: 0.85;"
-            onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.85'">
+          <button id="update-all-btn" onclick="updateAllAgents()" title="pip upgrade &amp; restart all LAN agents"
+            class="glass-btn text-[10px] px-2 py-0.5"
             Update All
           </button>
           <span class="text-[11px] text-muted" id="sidebar-conn-count">0</span>
@@ -82,8 +93,8 @@
     </div>
 
     <!-- QR Code -->
-    <div id="qr-panel" class="border-b border-border/30">
-      <button onclick="toggleQR()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
+    <div id="qr-panel" class="border-b border-primary/[0.06]">
+      <button onclick="toggleQR()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-primary/5 transition-colors">
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">LAN Access</span>
         <svg id="qr-chevron" class="text-muted transition-transform" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
       </button>
@@ -95,8 +106,8 @@
     </div>
 
     <!-- Security settings -->
-    <div id="security-section" class="border-b border-border/30">
-      <button onclick="toggleSecurityPanel()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-surface/50 transition-colors">
+    <div id="security-section" class="border-b border-primary/[0.06]">
+      <button onclick="toggleSecurityPanel()" class="w-full px-3 py-2 flex items-center justify-between hover:bg-primary/5 transition-colors">
         <span class="flex items-center gap-1.5">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-muted"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Security</span>
@@ -112,10 +123,10 @@
           </div>
           <div class="flex gap-1.5">
             <input type="password" id="pin-set-input" placeholder="Enter PIN" maxlength="32"
-              class="flex-1 bg-surface border border-border/50 rounded-lg px-2.5 py-1.5 text-[13px] text-primary placeholder-muted text-center tracking-widest font-semibold focus:border-accent-blue/50 transition-colors min-w-0">
+              class="flex-1 rounded-xl px-2.5 py-1.5 text-[13px] text-primary placeholder-muted text-center tracking-widest font-semibold focus:border-accent-blue/50 transition-colors min-w-0"
+              style="background: rgba(var(--c-surface) / 0.3); border: 1px solid var(--glass-border);">
             <button id="pin-set-btn" onclick="setPin()"
-              class="text-white text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
-              style="background: var(--accent-blue)">Set</button>
+              class="glass-btn text-[11px] px-3 py-1.5 shrink-0">Set</button>
             <button id="pin-clear-btn" onclick="clearPin()"
               class="hidden text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0 border border-border/30 text-muted hover:text-primary">Clear</button>
           </div>
@@ -148,7 +159,7 @@
       </div>
     </div>
     <!-- Version footer -->
-    <div class="px-3 py-1.5 mt-auto border-t border-border">
+    <div class="px-3 py-1.5 mt-auto border-t border-primary/[0.06]">
       <span id="version-label" class="text-[10px] text-muted opacity-50">v{{ version }}</span>
     </div>
   </div>
@@ -156,26 +167,7 @@
   <!-- ================================================================== -->
   <!-- MAIN CHAT AREA                                                      -->
   <!-- ================================================================== -->
-  <div id="chat-area" class="flex-1 flex flex-col bg-surface overflow-hidden relative">
-
-    <!-- Sidebar toggle (desktop) -->
-    <button id="sidebar-toggle" onclick="toggleSidebar()" class="hidden md:flex absolute top-2 left-2 z-30 w-7 h-7 items-center justify-center rounded-lg text-muted/50 hover:text-muted hover:bg-card/40 transition-all" title="Toggle sidebar">
-      <svg id="sidebar-toggle-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
-    </button>
-
-    <!-- Network context banner (collapsible) -->
-    <div id="context-banner" class="border-b border-border/30 bg-base/60 backdrop-blur-sm hidden">
-      <button onclick="toggleContextPanel()" class="w-full px-5 py-2.5 flex items-center justify-between text-[12px] text-muted hover:text-label transition-colors">
-        <span class="flex items-center gap-2">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-          <span id="context-summary" class="font-medium">Network context</span>
-        </span>
-        <svg id="context-chevron" class="transition-transform duration-200" width="10" height="10" viewBox="0 0 10 10"><path d="M3 4l2 2 2-2" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
-      </button>
-      <div id="context-panel" class="hidden px-5 pb-4">
-        <div id="context-connections" class="space-y-2"></div>
-      </div>
-    </div>
+  <div id="chat-area" class="flex-1 flex flex-col overflow-hidden relative glass" style="border-radius: 16px;">
 
     <!-- Message feed -->
     <div id="feed-scroll" class="flex-1 overflow-y-auto">
@@ -183,7 +175,7 @@
         <!-- Empty state -->
         <div id="empty-state" class="flex flex-col items-center justify-center h-full text-center select-none pt-32 px-4">
           <div class="relative mb-6">
-            <div class="w-20 h-20 rounded-2xl bg-card flex items-center justify-center" style="box-shadow: 0 0 40px rgba(10,132,255,0.08)">
+            <div class="w-20 h-20 rounded-2xl glass-card flex items-center justify-center" style="box-shadow: 0 0 40px rgba(45,106,79,0.1)">
               <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" class="text-muted">
                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
               </svg>
@@ -199,83 +191,73 @@
     </div>
 
     <!-- Drawing canvas -->
-    <div id="draw-panel" class="hidden border-t border-border/30 px-4 py-3">
+    <div id="draw-panel" class="hidden border-t border-primary/[0.06] px-4 py-3">
       <div class="flex items-center justify-between mb-2">
         <div class="flex items-center gap-2">
           <span class="text-[12px] font-semibold text-muted">Draw</span>
-          <input type="color" id="draw-color" value="#ffffff" class="w-5 h-5 rounded cursor-pointer border-0 p-0 bg-transparent">
+          <input type="color" id="draw-color" value="#f0ebe3" class="w-5 h-5 rounded cursor-pointer border-0 p-0 bg-transparent">
           <input type="range" id="draw-size" min="1" max="20" value="3" class="w-16 h-1 accent-[var(--accent-blue)]">
           <button onclick="clearDrawCanvas()" class="text-[10px] text-muted hover:text-primary px-1.5 py-0.5 rounded border border-border/30">Clear</button>
           <button onclick="undoDrawCanvas()" class="text-[10px] text-muted hover:text-primary px-1.5 py-0.5 rounded border border-border/30">Undo</button>
         </div>
-        <button onclick="sendDrawing()" class="text-[11px] font-semibold px-3 py-1 rounded-lg text-white" style="background: var(--accent-blue)">Send Drawing</button>
+        <button onclick="closeDrawCanvas()" class="text-muted hover:text-primary transition-colors p-1 rounded hover:bg-primary/5" title="Close drawing">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
       </div>
-      <canvas id="draw-canvas" width="600" height="200" class="w-full rounded-lg cursor-crosshair" style="background: #1a1a2e; touch-action: none;"></canvas>
+      <canvas id="draw-canvas" width="600" height="200" class="w-full rounded-lg cursor-crosshair" style="background: #201c18; touch-action: none;"></canvas>
     </div>
 
     <!-- Compose bar -->
-    <div id="compose-bar" class="px-4 sm:px-6 py-3">
+    <div id="compose-bar" class="px-4 sm:px-6 py-3" style="background: transparent;">
       <input type="file" id="file-input" multiple class="hidden">
       <input type="file" id="camera-input" accept="image/*" capture="environment" class="hidden">
       <form id="compose-form">
-        <div class="compose-ring bg-card/30 relative" id="compose-drop-zone">
+        <div class="compose-ring relative" id="compose-drop-zone">
           <!-- Attachment chips -->
           <div id="attachment-chips" class="hidden flex flex-wrap gap-1.5 px-4 pt-3 pb-1"></div>
           <!-- Textarea -->
           <textarea name="content" id="compose-input" rows="1"
             placeholder="Send a message..."
-            class="w-full bg-transparent text-[15px] text-primary placeholder-muted/50 resize-none leading-relaxed px-4 pt-3 pb-12 border-0 focus:ring-0"
-            style="max-height:200px;outline:none;min-height:52px"
+            class="w-full bg-transparent text-[15px] text-primary placeholder-muted/50 resize-none leading-relaxed px-4 py-3 border-0 focus:ring-0"
+            style="max-height:200px;outline:none;min-height:44px"
             oninput="autoGrow(this)"></textarea>
           <!-- Drop overlay -->
-          <div id="drop-overlay" class="hidden absolute inset-0 bg-accent-blue/10 border-2 border-dashed border-accent-blue/40 rounded-xl flex items-center justify-center z-10 pointer-events-none">
+          <div id="drop-overlay" class="hidden absolute inset-0 bg-accent-blue/10 border-2 border-dashed border-accent-blue/40 rounded-card flex items-center justify-center z-10 pointer-events-none">
             <span class="text-[13px] font-semibold text-accent-blue">Drop files here</span>
           </div>
-          <!-- Bottom toolbar inside textarea -->
-          <div class="absolute bottom-0 left-0 right-0 flex items-center justify-between px-3 pb-2.5">
-            <div class="flex items-center gap-1.5">
-              <!-- Route selector -->
-              <div class="relative" id="target-dropdown-wrap">
-                <button type="button" id="target-dropdown-btn" onclick="toggleDropdown()"
-                  class="flex items-center gap-1.5 text-[11px] text-muted hover:text-primary rounded-lg px-2 py-1 transition-all hover:bg-surface/50">
-                  <div id="route-dot" class="w-1.5 h-1.5 rounded-full bg-accent-green shrink-0"></div>
-                  <span id="target-label" class="font-medium">auto</span>
-                  <svg width="7" height="7" viewBox="0 0 8 8" class="text-muted/60"><path d="M2 3l2 2 2-2" stroke="currentColor" stroke-width="1" fill="none"/></svg>
-                </button>
-                <div id="target-dropdown-menu" class="dropdown-menu absolute bottom-full left-0 mb-1.5 w-56 bg-card/95 backdrop-blur-xl border border-border/30 rounded-xl z-30 py-1 max-h-48 overflow-y-auto" style="box-shadow: 0 8px 32px rgba(0,0,0,0.2)"></div>
-              </div>
-              <!-- Attach button -->
+          <!-- Toolbar row -->
+          <div class="flex items-center justify-between px-2.5 pb-2.5 border-t border-primary/[0.06]">
+            <div class="compose-toolbar">
               <button type="button" onclick="document.getElementById('file-input').click()" title="Attach files"
-                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                class="text-muted/50 hover:text-primary transition-colors rounded-lg p-1.5 hover:bg-primary/5">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
               </button>
-              <!-- Camera button -->
               <button type="button" onclick="document.getElementById('camera-input').click()" title="Take photo"
-                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                class="text-muted/50 hover:text-primary transition-colors rounded-lg p-1.5 hover:bg-primary/5">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
               </button>
-              <!-- Draw button -->
               <button type="button" onclick="toggleDrawCanvas()" title="Draw a sketch" id="draw-toggle-btn"
-                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>
+                class="text-muted/50 hover:text-primary transition-colors rounded-lg p-1.5 hover:bg-primary/5">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>
               </button>
-              <!-- Clear button -->
+              <button type="button" id="checkin-btn" onclick="checkinAll()" title="Check in with all agents"
+                class="text-muted/50 hover:text-primary transition-colors rounded-lg p-1.5 hover:bg-primary/5">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+              </button>
               <button type="button" onclick="clearFeed()" title="Clear messages"
-                class="text-muted/40 hover:text-muted transition-colors rounded-lg px-2 py-1 hover:bg-surface/50">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                class="text-muted/50 hover:text-primary transition-colors rounded-lg p-1.5 hover:bg-primary/5">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
               </button>
             </div>
-            <!-- Send button -->
             <button type="submit" id="send-btn"
-              class="rounded-lg text-white flex items-center justify-center transition-all disabled:opacity-20 px-3 py-1.5 text-[12px] font-semibold gap-1.5"
-              style="background: var(--accent-blue)"
+              class="glass-btn flex items-center justify-center disabled:opacity-20 px-3 py-1.5 text-[12px] gap-1.5"
               title="Send">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
               Send
             </button>
           </div>
         </div>
-        <input type="hidden" name="target" id="target-value" value="auto">
+        <input type="hidden" name="target" id="target-value" value="fastest">
       </form>
     </div>
   </div>
@@ -283,8 +265,8 @@
   <!-- ================================================================== -->
   <!-- MESH VIEW                                                            -->
   <!-- ================================================================== -->
-  <div id="mesh-view" class="flex-1 flex flex-col bg-surface overflow-hidden relative hidden">
-    <div class="px-4 py-3 border-b border-border/30 flex items-center justify-between">
+  <div id="mesh-view" class="flex-1 flex flex-col overflow-hidden relative hidden glass" style="border-radius: 16px;">
+    <div class="px-4 py-3 border-b border-primary/[0.06] flex items-center justify-between">
       <div class="flex items-center gap-2">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="text-accent-blue">
           <circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><line x1="12" y1="7" x2="5" y2="17"/><line x1="12" y1="7" x2="19" y2="17"/><line x1="7" y1="19" x2="17" y2="19"/>
@@ -296,21 +278,21 @@
     </div>
     <div id="mesh-graph" class="flex-1 relative"></div>
     <!-- Mesh tooltip -->
-    <div id="mesh-tooltip" class="fixed hidden bg-card/95 backdrop-blur-xl border border-border/50 rounded-xl p-3 z-50 max-w-xs" style="box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
+    <div id="mesh-tooltip" class="fixed hidden glass rounded-2xl p-3 z-50 max-w-xs">
       <div class="text-[13px] font-semibold text-primary" id="tooltip-name"></div>
       <div class="text-[11px] text-muted mt-0.5" id="tooltip-id"></div>
       <div class="text-[12px] text-label mt-1.5" id="tooltip-bio"></div>
       <div class="text-[11px] text-muted mt-1" id="tooltip-level"></div>
-      <button id="tooltip-connect-btn" class="hidden mt-2 w-full text-[12px] font-semibold text-white rounded-lg py-1.5 transition-colors" style="background: var(--accent-blue)" onclick="connectFromTooltip()">Connect</button>
+      <button id="tooltip-connect-btn" class="hidden mt-2 w-full glass-btn text-[12px] py-1.5" onclick="connectFromTooltip()">Connect</button>
     </div>
   </div>
 
   <!-- ================================================================== -->
   <!-- MOBILE DRAWER                                                       -->
   <!-- ================================================================== -->
-  <div id="mobile-drawer-overlay" class="drawer-overlay fixed inset-0 bg-black/40 backdrop-blur-sm z-50 md:hidden" onclick="toggleMobileDrawer()">
-    <div class="drawer-panel absolute left-0 top-0 bottom-0 w-72 bg-base flex flex-col overflow-hidden" onclick="event.stopPropagation()">
-      <div class="px-4 py-3 border-b border-border/30 flex items-center justify-between">
+  <div id="mobile-drawer-overlay" class="drawer-overlay fixed inset-0 bg-primary/30 backdrop-blur-sm z-50 md:hidden" onclick="toggleMobileDrawer()">
+    <div class="drawer-panel absolute left-0 top-0 bottom-0 w-72 glass flex flex-col overflow-hidden" style="border-radius: 0 16px 16px 0;" onclick="event.stopPropagation()">
+      <div class="px-4 py-3 border-b border-primary/[0.06] flex items-center justify-between">
         <span class="text-[14px] font-semibold text-primary">DarkMatter</span>
         <button onclick="toggleMobileDrawer()" class="text-muted hover:text-primary text-lg">&times;</button>
       </div>
@@ -323,9 +305,9 @@
 <!-- ================================================================== -->
 <!-- WALLET MODAL                                                        -->
 <!-- ================================================================== -->
-<div id="wallet-modal" class="fixed inset-0 bg-black/40 backdrop-blur-sm z-[60] hidden flex items-center justify-center" onclick="if(event.target===this)closeWalletModal()">
-  <div class="bg-base border border-border/50 rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-    <div class="px-5 pt-5 pb-3 border-b border-border/30 flex items-center justify-between">
+<div id="wallet-modal" class="fixed inset-0 bg-primary/30 backdrop-blur-sm z-[60] hidden flex items-center justify-center" onclick="if(event.target===this)closeWalletModal()">
+  <div class="glass rounded-3xl w-full max-w-md mx-4 overflow-hidden">
+    <div class="px-5 pt-5 pb-3 border-b border-primary/[0.06] flex items-center justify-between">
       <div class="flex items-center gap-2.5">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--accent-blue)">
           <rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><circle cx="18" cy="15" r="1"/>
@@ -336,7 +318,7 @@
     </div>
 
     <!-- Tabs -->
-    <div class="flex border-b border-border/30">
+    <div class="flex border-b border-primary/[0.06]">
       <button id="wallet-main-tab-balances" onclick="walletMainTab('balances')"
         class="flex-1 text-[12px] font-semibold py-2.5 transition-colors text-primary border-b-2" style="border-color: var(--accent-blue)">
         Balances
@@ -397,8 +379,7 @@
         </div>
       </div>
       <button onclick="walletSend()" id="wallet-send-btn"
-        class="w-full text-white text-[13px] font-semibold px-4 py-2.5 rounded-xl transition-colors"
-        style="background: var(--accent-blue)">
+        class="w-full glass-btn text-[13px] px-4 py-2.5">
         Send
       </button>
       <div id="wallet-send-result" class="hidden text-[12px] font-mono bg-surface rounded-xl px-3 py-2 break-all"></div>
@@ -432,8 +413,7 @@
         </label>
         <div class="flex gap-2">
           <button id="wallet-connect-btn" onclick="walletAuth()"
-            class="flex-1 text-white text-[13px] font-semibold px-4 py-2.5 rounded-xl transition-colors"
-            style="background: var(--accent-blue)">
+            class="flex-1 glass-btn text-[13px] px-4 py-2.5">
             Connect Wallet
           </button>
           <button id="wallet-disconnect-btn" onclick="walletDisconnect()"
@@ -455,8 +435,7 @@
             <span class="text-[13px] text-label">Remember on this device</span>
           </label>
           <button onclick="startQRSession()"
-            class="w-full text-white text-[13px] font-semibold px-4 py-2.5 rounded-xl transition-colors"
-            style="background: var(--accent-blue)">
+            class="w-full glass-btn text-[13px] px-4 py-2.5">
             Generate QR Code
           </button>
         </div>
@@ -492,8 +471,7 @@ const composeInput = document.getElementById('compose-input');
 const sendBtn = document.getElementById('send-btn');
 const connectForm = document.getElementById('connect-form');
 const targetValue = document.getElementById('target-value');
-const targetLabel = document.getElementById('target-label');
-const targetMenu = document.getElementById('target-dropdown-menu');
+let _targetLabelText = 'fast';
 const feedScroll = document.getElementById('feed-scroll');
 const feedContainer = document.getElementById('feed-container');
 const emptyState = document.getElementById('empty-state');
@@ -505,6 +483,7 @@ const renderedPending = new Map();
 
 let prevPollData = null;
 let selfAgentId = null;
+let _lastConns = [];
 let qrInitialized = false;
 let qrExpanded = false;
 let _walletData = null;
@@ -669,15 +648,22 @@ function renderAttachmentsInMessage(attachments) {
 let sidebarCollapsed = false;
 function toggleSidebar() {
   const sb = document.getElementById('sidebar');
+  const expandBtn = document.getElementById('sidebar-expand-btn');
   sidebarCollapsed = !sidebarCollapsed;
   if (sidebarCollapsed) {
     sb.style.width = '0px';
-    sb.style.borderRightWidth = '0px';
+    sb.style.borderWidth = '0px';
+    sb.style.padding = '0px';
+    sb.style.opacity = '0';
     sb.style.overflow = 'hidden';
+    if (expandBtn) { expandBtn.classList.remove('hidden'); expandBtn.classList.add('flex'); }
   } else {
     sb.style.width = '240px';
-    sb.style.borderRightWidth = '';
-    setTimeout(() => { sb.style.overflow = ''; }, 200);
+    sb.style.borderWidth = '';
+    sb.style.padding = '';
+    sb.style.opacity = '1';
+    if (expandBtn) { expandBtn.classList.add('hidden'); expandBtn.classList.remove('flex'); }
+    setTimeout(() => { sb.style.overflow = ''; }, 300);
   }
   localStorage.setItem('dm-sidebar', sidebarCollapsed ? '0' : '1');
 }
@@ -686,7 +672,9 @@ function toggleSidebar() {
 (function() {
   if (localStorage.getItem('dm-sidebar') === '0') {
     const sb = document.getElementById('sidebar');
-    if (sb) { sb.style.width = '0px'; sb.style.borderRightWidth = '0px'; sb.style.overflow = 'hidden'; sidebarCollapsed = true; }
+    const expandBtn = document.getElementById('sidebar-expand-btn');
+    if (sb) { sb.style.width = '0px'; sb.style.borderWidth = '0px'; sb.style.padding = '0px'; sb.style.opacity = '0'; sb.style.overflow = 'hidden'; sidebarCollapsed = true; }
+    if (expandBtn) { expandBtn.classList.remove('hidden'); expandBtn.classList.add('flex'); }
   }
 })();
 
@@ -836,6 +824,8 @@ async function updateSecurityToggle(key, value) {
     if (key === 'sandbox_enabled') {
       document.getElementById('sec-sandbox-net-row').classList.toggle('hidden', !value);
     }
+    // Auto-push security settings to all LAN agents
+    pushSecurityToLAN();
   } else {
     showToast(data.error || 'Failed', 'error');
   }
@@ -857,76 +847,6 @@ loadSecurityStatus();
 // =========================================================================
 // Target dropdown
 // =========================================================================
-let dropdownOpen = false;
-
-function toggleDropdown() {
-  dropdownOpen = !dropdownOpen;
-  document.getElementById('target-dropdown-wrap').classList.toggle('dropdown-open', dropdownOpen);
-}
-
-function selectTarget(el) {
-  const val = el.dataset.value;
-  const label = el.textContent.trim();
-  targetValue.value = val;
-  targetLabel.textContent = label;
-  const dot = document.getElementById('route-dot');
-  if (val === 'broadcast') {
-    dot.className = 'w-2 h-2 rounded-full bg-accent-yellow shrink-0';
-  } else if (val === 'auto') {
-    dot.className = 'w-2 h-2 rounded-full bg-accent-green shrink-0';
-  } else if (val === 'fastest') {
-    dot.className = 'w-2 h-2 rounded-full bg-[#06b6d4] shrink-0';
-  } else {
-    dot.style.background = 'var(--accent-blue)';
-    dot.className = 'w-2 h-2 rounded-full shrink-0';
-  }
-  dropdownOpen = false;
-  document.getElementById('target-dropdown-wrap').classList.remove('dropdown-open');
-}
-
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('#target-dropdown-wrap') && dropdownOpen) {
-    dropdownOpen = false;
-    document.getElementById('target-dropdown-wrap').classList.remove('dropdown-open');
-  }
-});
-
-function updateDropdownOptions(conns) {
-  const cur = targetValue.value;
-  let html = `<div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
-    data-value="auto" onclick="selectTarget(this)">
-    <div class="w-2 h-2 rounded-full bg-accent-green shrink-0"></div>auto
-  </div>
-  <div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
-    data-value="fastest" onclick="selectTarget(this)">
-    <div class="w-2 h-2 rounded-full bg-[#06b6d4] shrink-0"></div>fastest
-  </div>
-  <div class="px-3 py-2 text-[13px] text-label hover:bg-surface cursor-pointer flex items-center gap-2 transition-colors rounded-lg mx-1"
-    data-value="broadcast" onclick="selectTarget(this)">
-    <div class="w-2 h-2 rounded-full bg-accent-yellow shrink-0"></div>broadcast all
-  </div>`;
-  if (conns.length > 0) {
-    html += `<div class="border-t border-border/30 my-1 mx-2"></div>`;
-    conns.forEach(c => {
-      const dead = c.health_status === 'unreachable';
-      const dotCls = dead ? 'bg-muted' : 'bg-accent-blue';
-      const textCls = dead ? 'text-muted' : 'text-label';
-      const hoverCls = dead ? '' : 'hover:bg-surface cursor-pointer';
-      const clickAttr = dead ? '' : 'onclick="selectTarget(this)"';
-      html += `<div class="px-3 py-2 text-[13px] ${textCls} ${hoverCls} flex items-center gap-2 transition-colors rounded-lg mx-1"
-        data-value="${c.agent_id}" ${clickAttr}>
-        <div class="w-2 h-2 rounded-full ${dotCls} shrink-0"></div>${esc(agentLabel(c))}
-      </div>`;
-    });
-  }
-  targetMenu.innerHTML = html;
-  const validValues = ['auto', 'fastest', 'broadcast', ...conns.map(c => c.agent_id)];
-  if (!validValues.includes(cur)) {
-    targetValue.value = 'auto';
-    targetLabel.textContent = 'auto';
-    document.getElementById('route-dot').className = 'w-2 h-2 rounded-full bg-accent-green shrink-0';
-  }
-}
 
 // =========================================================================
 // Chat Feed — Build unified timeline
@@ -1071,10 +991,9 @@ function renderFeedItem(item) {
         <div class="reply-area" data-reply-for="${item.message_id}">
           <div class="flex gap-2">
             <input type="text" placeholder="Reply to ${esc(item.from_name)}..." data-message-id="${item.message_id}"
-              class="reply-input flex-1 compose-ring bg-card/30 px-4 py-2.5 text-[14px] text-primary placeholder-muted/50 min-w-0">
+              class="reply-input flex-1 compose-ring px-4 py-2.5 text-[14px] text-primary placeholder-muted/50 min-w-0">
             <button type="button" data-message-id="${item.message_id}"
-              class="reply-btn text-white text-[13px] font-semibold px-5 py-2.5 rounded-lg transition-all hover:opacity-90"
-              style="background: var(--accent-blue)">
+              class="reply-btn glass-btn text-[13px] px-5 py-2.5">
               Send
             </button>
           </div>
@@ -1113,7 +1032,7 @@ function renderFeedItem(item) {
                 <span class="msg-sender" style="color:${aColor}">${esc(item.author)}</span>
                 <span class="msg-meta">${timeAgo(item.timestamp)}</span>
               </div>
-              <span class="text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-md" style="background: linear-gradient(135deg, rgba(175,82,222,0.1), rgba(10,132,255,0.1)); color: #AF52DE;">SHARD</span>
+              <span class="text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-md" style="background: rgba(45,106,79,0.1); color: var(--accent-blue);">SHARD</span>
             </div>
             <div id="${shardId}" class="msg-content" style="color:rgb(var(--c-label))">${esc(isLong ? item.content.slice(0, 300) : item.content)}${isLong ? '...' : ''}</div>
             ${isLong ? `<span class="shard-expand-btn text-[12px] mt-2 inline-block font-medium" style="color: var(--accent-blue)" data-expanded="0" data-full="${esc(item.content).replace(/"/g, '&quot;')}" data-short="${esc(item.content.slice(0, 300)).replace(/"/g, '&quot;')}..." data-target="${shardId}" onclick="toggleShardExpand(this)">Show more</span>` : ''}
@@ -1142,7 +1061,7 @@ function renderFeedItem(item) {
             ${item.bio ? `<div class="msg-meta mt-1 leading-snug">${esc(item.bio.slice(0, 120))}</div>` : ''}
           </div>
           <div class="flex gap-2 shrink-0">
-            <button class="feed-accept-btn text-white text-[12px] font-semibold px-4 py-1.5 rounded-lg transition-all hover:opacity-90" style="background: var(--accent-blue)">Accept</button>
+            <button class="feed-accept-btn glass-btn text-[12px] px-4 py-1.5">Accept</button>
             <button class="feed-reject-btn text-[12px] font-medium px-3 py-1.5 rounded-lg transition-all border" style="color:rgb(var(--c-muted));border-color:rgb(var(--c-border)/0.2)">Deny</button>
           </div>
         </div>
@@ -1177,7 +1096,7 @@ function buildStatusDot(status, updates) {
   const lastType = updates[updates.length - 1].type;
   const colors = {
     received: 'bg-accent-blue', responding: 'bg-accent-yellow animate-pulse',
-    forwarded: 'bg-accent-purple', expired: 'bg-accent-red',
+    forwarded: 'bg-accent-cyan', expired: 'bg-accent-red',
     delivery_failed: 'bg-accent-red', timed_out: 'bg-accent-yellow',
   };
   return `<div class="w-1.5 h-1.5 rounded-full ${colors[lastType] || 'bg-muted'}" title="${lastType}"></div>`;
@@ -1374,7 +1293,7 @@ composeForm.addEventListener('submit', async (e) => {
 });
 
 composeInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && e.metaKey) {
     e.preventDefault();
     composeForm.dispatchEvent(new Event('submit'));
   }
@@ -1475,7 +1394,7 @@ function renderPending(requests) {
           ${r.from_bio ? `<div class="text-[11px] text-muted truncate mt-0.5">${esc(r.from_bio.slice(0, 40))}</div>` : ''}
         </div>
         <div class="flex gap-1 shrink-0">
-          <button class="accept-btn text-white text-[11px] font-semibold px-2.5 py-1 rounded-lg transition-colors" style="background: var(--accent-blue)">Accept</button>
+          <button class="accept-btn glass-btn text-[11px] px-2.5 py-1">Accept</button>
           <button class="reject-btn text-accent-red bg-accent-red/10 text-[11px] px-2 py-1 rounded-lg transition-colors hover:bg-accent-red/20">Deny</button>
         </div>
       </div>`;
@@ -1536,8 +1455,7 @@ function renderDiscovered(agents) {
         ${a.bio ? `<div class="text-[11px] text-muted truncate mt-0.5">${esc(a.bio.slice(0, 35))}</div>` : ''}
       </div>
       <button type="button"
-        class="connect-btn shrink-0 text-[11px] font-semibold px-2.5 py-1 rounded-lg transition-colors"
-        style="background: var(--accent-blue); color: white">
+        class="connect-btn glass-btn shrink-0 text-[11px] px-2.5 py-1"
         Connect
       </button>`;
 
@@ -1564,7 +1482,7 @@ function renderDiscovered(agents) {
 // =========================================================================
 function createConnNode(c) {
   const el = document.createElement('div');
-  el.className = 'flex items-center justify-between text-[12px] py-1 group rounded-lg px-1.5 hover:bg-surface/50 transition-colors';
+  el.className = 'flex items-center justify-between text-[12px] py-1 group rounded-lg px-1.5 hover:bg-primary/5 transition-colors';
   const dead = c.health_status === 'unreachable';
   const dotColor = dead ? 'bg-accent-red' : 'bg-accent-green';
   const nameClass = dead ? 'text-muted truncate' : 'text-label truncate';
@@ -1586,12 +1504,7 @@ function createConnNode(c) {
   // Click to target this agent
   el.addEventListener('click', (e) => {
     if (e.target.closest('.dc-btn')) return;
-    targetValue.value = c.agent_id;
-    targetLabel.textContent = agentLabel(c);
-    const dot = document.getElementById('route-dot');
-    dot.style.background = 'var(--accent-blue)';
-    dot.className = 'w-2 h-2 rounded-full shrink-0';
-    composeInput.focus();
+    selectHeaderTarget(c.agent_id, agentLabel(c));
   });
 
   return el;
@@ -1636,7 +1549,6 @@ function renderConnections(conns) {
   });
 
   document.getElementById('sidebar-conn-count').textContent = conns.length;
-  updateDropdownOptions(conns);
 }
 
 // =========================================================================
@@ -1644,9 +1556,8 @@ function renderConnections(conns) {
 // =========================================================================
 async function checkinAll() {
   const btn = document.getElementById('checkin-btn');
-  const origText = btn.textContent;
-  btn.textContent = 'Checking...';
   btn.disabled = true;
+  btn.style.opacity = '0.4';
   try {
     const data = await ajaxPost('/api/checkin', {});
     if (data.success) {
@@ -1657,8 +1568,8 @@ async function checkinAll() {
   } catch (e) {
     showToast('Check-in failed: ' + e.message, 'error');
   } finally {
-    btn.textContent = origText;
     btn.disabled = false;
+    btn.style.opacity = '';
   }
 }
 
@@ -1690,13 +1601,17 @@ function initDrawCanvas() {
   drawCtx.lineCap = 'round';
   drawCtx.lineJoin = 'round';
 
+  // Prevent default touch behavior (scrolling) on the canvas for iPad/Pencil Pro
+  canvas.style.touchAction = 'none';
+
   function getPos(e) {
     const r = canvas.getBoundingClientRect();
-    const t = e.touches ? e.touches[0] : e;
-    return { x: t.clientX - r.left, y: t.clientY - r.top };
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
   }
 
   canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
     drawing = true;
     drawCtx.strokeStyle = document.getElementById('draw-color').value;
     drawCtx.lineWidth = document.getElementById('draw-size').value;
@@ -1710,13 +1625,19 @@ function initDrawCanvas() {
 
   canvas.addEventListener('pointermove', (e) => {
     if (!drawing) return;
+    e.preventDefault();
     const p = getPos(e);
     drawCtx.lineTo(p.x, p.y);
     drawCtx.stroke();
   });
 
-  canvas.addEventListener('pointerup', () => drawing = false);
-  canvas.addEventListener('pointerleave', () => drawing = false);
+  canvas.addEventListener('pointerup', (e) => { drawing = false; canvas.releasePointerCapture(e.pointerId); });
+  canvas.addEventListener('pointercancel', (e) => { drawing = false; canvas.releasePointerCapture(e.pointerId); });
+}
+
+function closeDrawCanvas() {
+  clearDrawCanvas();
+  if (drawCanvasOpen) toggleDrawCanvas();
 }
 
 function clearDrawCanvas() {
@@ -1801,7 +1722,7 @@ async function updateAllAgents() {
       showToast(`Updated ${succeeded}/${data.results.length} agents`, succeeded > 0 ? 'success' : 'error');
       data.results.forEach(r => {
         const status = r.success ? 'ok' : 'FAILED';
-        console.log(`[Update] ${r.display_name}: ${status} — ${r.git_output}`);
+        console.log(`[Update] ${r.display_name}: ${status} — ${r.git_output || ''}`);
       });
     } else {
       showToast(data.message || 'No local agents found', 'info');
@@ -1817,67 +1738,109 @@ async function updateAllAgents() {
 // =========================================================================
 // Network context panel
 // =========================================================================
-let contextExpanded = false;
 
-function toggleContextPanel() {
-  contextExpanded = !contextExpanded;
-  document.getElementById('context-panel').classList.toggle('hidden', !contextExpanded);
-  document.getElementById('context-chevron').style.transform = contextExpanded ? 'rotate(180deg)' : '';
+// =========================================================================
+// =========================================================================
+// Display name editing
+// =========================================================================
+function startEditDisplayName() {
+  const nameEl = document.getElementById('sidebar-name');
+  const inputEl = document.getElementById('sidebar-name-input');
+  const currentName = nameEl.textContent.replace(/^Human:\s*/i, '');
+  nameEl.parentElement.classList.add('hidden');
+  inputEl.classList.remove('hidden');
+  inputEl.value = currentName;
+  inputEl.focus();
+  inputEl.select();
 }
 
-function renderContextPanel(data) {
-  const banner = document.getElementById('context-banner');
-  const summary = document.getElementById('context-summary');
-  const container = document.getElementById('context-connections');
-  const conns = data.connections || [];
-  const shardCount = (data.shards || []).length;
-  const inboxCount = (data.inbox || []).length;
-  const outboxCount = (data.outbox || []).length;
+function cancelEditDisplayName() {
+  document.getElementById('sidebar-name-input').classList.add('hidden');
+  document.getElementById('sidebar-name').parentElement.classList.remove('hidden');
+}
 
-  if (conns.length === 0 && shardCount === 0) {
-    banner.classList.add('hidden');
-    return;
+async function saveDisplayName() {
+  const inputEl = document.getElementById('sidebar-name-input');
+  if (inputEl.classList.contains('hidden')) return;
+  const name = inputEl.value.trim();
+  cancelEditDisplayName();
+  if (!name) return;
+  try {
+    const data = await ajaxPost('/api/display-name', { name });
+    if (data.success) {
+      document.getElementById('sidebar-name').textContent = data.display_name;
+      document.getElementById('sidebar-avatar').textContent = data.display_name.replace(/^Human:\s*/i, '').charAt(0).toUpperCase();
+      showToast('Name updated', 'success');
+    } else {
+      showToast(data.error || 'Failed', 'error');
+    }
+  } catch (e) {
+    showToast('Failed to update name', 'error');
   }
-  banner.classList.remove('hidden');
+}
 
-  // Summary line
-  const parts = [];
-  if (conns.length) parts.push(`${conns.length} connection${conns.length > 1 ? 's' : ''}`);
-  if (inboxCount) parts.push(`${inboxCount} queued`);
-  if (outboxCount) parts.push(`${outboxCount} sent`);
-  if (shardCount) parts.push(`${shardCount} shard${shardCount > 1 ? 's' : ''}`);
-  summary.textContent = parts.join('  ·  ') || 'Network context';
+// =========================================================================
+// Active agents — header pill strip with route targeting
+// =========================================================================
+function renderActiveAgents(conns) {
+  const strip = document.getElementById('header-agents-strip');
+  if (!strip) return;
 
-  // Connection details
-  let html = '';
-  for (const c of conns) {
+  const curTarget = targetValue.value;
+
+  // Route mode pills
+  const modes = [
+    { value: 'fastest', label: 'fast', dot: '#40916c' },
+    { value: 'auto', label: 'auto', dot: '#34C759' },
+    { value: 'broadcast', label: 'all', dot: '#FFCC00' },
+  ];
+  let html = modes.map(m => {
+    const active = curTarget === m.value;
+    const activeCls = active ? 'agent-pill-active' : '';
+    return `<div class="agent-pill ${activeCls}" onclick="selectHeaderTarget('${m.value}', '${m.label}')" style="cursor:pointer;">
+      <div class="w-1.5 h-1.5 rounded-full shrink-0" style="background:${m.dot}"></div>
+      ${m.label}
+    </div>`;
+  }).join('');
+
+  // Divider if there are connections
+  const all = conns || [];
+  if (all.length > 0) {
+    html += `<div class="w-px h-4 shrink-0" style="background: var(--glass-border);"></div>`;
+  }
+
+  // Agent pills
+  const groups = {};
+  all.forEach(c => {
+    if (!groups[c.agent_id]) groups[c.agent_id] = { count: 0, conn: c };
+    groups[c.agent_id].count++;
+  });
+  html += Object.values(groups).map(({ conn: c, count }) => {
+    const name = agentLabel(c);
     const color = agentColor(c.agent_id);
     const dead = c.health_status === 'unreachable';
-    const healthDot = dead ? 'bg-accent-red' : 'bg-accent-green';
-    const level = c.connectivity_level ? `L${c.connectivity_level}` : '';
-    const method = c.connectivity_method || '';
-    const levelBadge = level ? `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded" style="background: rgb(var(--c-surface)); color: rgb(var(--c-muted))">${level}${method ? ':' + method : ''}</span>` : '';
-    const spawned = c.spawned_agents ? `<span class="text-[10px] text-muted">${c.spawned_agents} agent${c.spawned_agents > 1 ? 's' : ''} spawned</span>` : '';
-    const wallet = c.wallets && c.wallets.solana ? `<span class="text-[10px] text-muted font-mono">${c.wallets.solana.slice(0, 6)}...${c.wallets.solana.slice(-4)}</span>` : '';
+    const dotColor = dead ? '#FF3B30' : '#34C759';
+    const countBadge = count > 1 ? ` <span class="text-[9px] text-muted font-bold">&times;${count}</span>` : '';
+    const bio = (c.bio || '').trim();
+    const bioTip = bio ? `<div class="agent-bio-tip">${esc(bio.slice(0, 160))}</div>` : '';
+    const active = curTarget === c.agent_id;
+    const activeCls = active ? 'agent-pill-active' : '';
+    const cursor = dead ? '' : 'cursor:pointer;';
+    const click = dead ? '' : `onclick="selectHeaderTarget('${c.agent_id}', '${esc(name)}')"`;
+    return `<div class="agent-pill ${activeCls}" ${click} style="color: ${color}; ${cursor}">
+      <div class="w-1.5 h-1.5 rounded-full shrink-0" style="background:${dotColor}"></div>
+      ${esc(name)}${countBadge}${bioTip}
+    </div>`;
+  }).join('');
 
-    const tint = agentTint(c.agent_id);
-    html += `
-      <div class="rounded-xl px-3.5 py-2.5" style="background:${tint}">
-        <div class="flex items-center gap-2 flex-wrap">
-          <span class="text-[13px] font-semibold" style="color:${color}">${esc(agentLabel(c))}</span>
-          <div class="w-1.5 h-1.5 rounded-full ${healthDot}"></div>
-          ${levelBadge}
-          ${spawned}
-          ${wallet}
-        </div>
-        ${c.bio ? `<div class="text-[12px] text-muted mt-0.5 leading-snug">${esc(c.bio.slice(0, 120))}</div>` : ''}
-        <div class="flex items-center gap-2 mt-0.5 text-[10px] text-subtle">
-          <span>${c.direction || ''}</span>
-          ${c.last_activity ? `<span>active ${timeAgo(c.last_activity)}</span>` : ''}
-        </div>
-      </div>`;
-  }
-  container.innerHTML = html;
+  strip.innerHTML = html;
+}
+
+function selectHeaderTarget(value, label) {
+  targetValue.value = value;
+  _targetLabelText = label;
+  if (typeof _lastConns !== 'undefined') renderActiveAgents(_lastConns);
+  document.getElementById('compose-input').focus();
 }
 
 // =========================================================================
@@ -1890,22 +1853,16 @@ function onPollData(data) {
   renderPending(data.pending_requests);
   renderDiscovered(data.discovered || []);
   renderConnections(data.connections);
-  renderContextPanel(data);
+  _lastConns = data.connections;
+  renderActiveAgents(data.connections);
   renderFeed(data);
-
-  // Update route-dot to reflect target agent health
+  // Validate target still exists
   const curTarget = targetValue.value;
-  if (curTarget && curTarget !== 'auto' && curTarget !== 'broadcast') {
-    const targetConn = (data.connections || []).find(c => c.agent_id === curTarget);
-    const dot = document.getElementById('route-dot');
-    if (dot) {
-      if (!targetConn || targetConn.health_status === 'unreachable') {
-        dot.style.background = '#FF3B30';
-        dot.title = 'Target unreachable';
-      } else {
-        dot.style.background = 'var(--accent-blue)';
-        dot.title = '';
-      }
+  if (curTarget && curTarget !== 'auto' && curTarget !== 'broadcast' && curTarget !== 'fastest') {
+    const validIds = (data.connections || []).map(c => c.agent_id);
+    if (!validIds.includes(curTarget)) {
+      targetValue.value = 'fastest';
+      _targetLabelText = 'fast';
     }
   }
 
@@ -2364,12 +2321,11 @@ function renderMeshGraph(nodes, edges, selfId, peerUrls) {
   const height = container.clientHeight;
   if (width === 0 || height === 0) return;
 
-  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-  const accentBlue = isLight ? '#007AFF' : '#0A84FF';
-  const textColor = isLight ? '#000' : '#fff';
-  const mutedColor = isLight ? '#8e8e93' : '#636366';
-  const nodeColor = isLight ? '#c7c7cc' : '#48484a';
-  const bgColor = isLight ? '#f5f5f7' : '#000000';
+  const accentBlue = '#40916c';
+  const textColor = '#f0ebe3';
+  const mutedColor = '#8a7f74';
+  const nodeColor = '#3a342e';
+  const bgColor = '#161310';
 
   // Clear previous
   container.innerHTML = '';

@@ -43,7 +43,7 @@ from darkmatter.state import get_state, set_state, save_state
 from darkmatter.models import AgentState, AgentStatus, Connection, Impression, AntiMatterSignal, QueuedMessage
 from darkmatter.identity import generate_keypair
 from darkmatter.app import create_app
-from darkmatter.config import SOLANA_AVAILABLE, LAMPORTS_PER_SOL
+from darkmatter.config import LAMPORTS_PER_SOL
 from darkmatter.wallet.solana import (
     _resolve_spl_token,
     _get_solana_wallet_address,
@@ -249,10 +249,6 @@ async def test_adjust_trust_rounding() -> None:
 
 async def test_wallet_derivation_determinism() -> None:
     """Same key produces same wallet address twice."""
-    if not SOLANA_AVAILABLE:
-        report("wallet derivation determinism (skipped — solana not installed)", True)
-        return
-
     priv, _ = generate_keypair()
     addr1 = _get_solana_wallet_address(priv)
     addr2 = _get_solana_wallet_address(priv)
@@ -261,10 +257,6 @@ async def test_wallet_derivation_determinism() -> None:
 
 async def test_wallet_derivation_different_keys() -> None:
     """Different keys produce different wallets."""
-    if not SOLANA_AVAILABLE:
-        report("different keys -> different wallets (skipped)", True)
-        return
-
     priv1, _ = generate_keypair()
     priv2, _ = generate_keypair()
     addr1 = _get_solana_wallet_address(priv1)
@@ -275,10 +267,6 @@ async def test_wallet_derivation_different_keys() -> None:
 
 async def test_wallet_address_valid_base58() -> None:
     """Wallet address is valid base58 format."""
-    if not SOLANA_AVAILABLE:
-        report("valid base58 address (skipped)", True)
-        return
-
     priv, _ = generate_keypair()
     addr = _get_solana_wallet_address(priv)
     valid_chars = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
@@ -1698,7 +1686,7 @@ async def main() -> None:
 
     # --- Tier 3: Solana Devnet (opt-in) ---
     run_devnet = os.environ.get("RUN_DEVNET_TESTS", "").strip() == "1"
-    if run_devnet and SOLANA_AVAILABLE:
+    if run_devnet:
         tier3_tests = [
             ("38. Fresh wallet zero balance", test_devnet_fresh_wallet_zero_balance),
             ("39. Airdrop + balance check", test_devnet_airdrop_balance),
@@ -1713,8 +1701,6 @@ async def main() -> None:
                 await test_fn()
             except Exception as e:
                 report(label, False, f"EXCEPTION: {e}")
-    elif run_devnet and not SOLANA_AVAILABLE:
-        print(f"\n\n{YELLOW}Tier 3: Skipped (solana/solders not installed){RESET}")
     else:
         print(f"\n\n{YELLOW}Tier 3: Skipped (set RUN_DEVNET_TESTS=1 to enable){RESET}")
 

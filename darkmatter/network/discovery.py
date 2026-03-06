@@ -20,7 +20,6 @@ from darkmatter.config import (
     DEFAULT_PORT,
     MAX_CONNECTIONS,
     PROTOCOL_VERSION,
-    WEBRTC_AVAILABLE,
     DISCOVERY_PORT,
     DISCOVERY_MCAST_GROUP,
     DISCOVERY_INTERVAL,
@@ -122,7 +121,7 @@ async def handle_well_known(request) -> "JSONResponse":
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "mesh_url": f"{public_url}/__darkmatter__",
         "mcp_url": f"{public_url}/mcp",
-        "webrtc_enabled": WEBRTC_AVAILABLE,
+        "webrtc_enabled": True,
         "genome_version": darkmatter.__genome_version__ or f"stock:{darkmatter.__version__}",
         "genome_author": darkmatter.__genome_author__,
     })

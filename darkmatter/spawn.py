@@ -78,8 +78,42 @@ def can_spawn_agent() -> tuple[bool, str]:
 # =============================================================================
 
 def is_agent_running(agent: SpawnedAgent) -> bool:
-    """Check if a spawned agent is still running."""
-    return agent.process.returncode is None
+    """Check if a spawned agent is still running.
+
+    For asyncio.Process, returncode stays None until the process is reaped.
+    We check liveness via os.kill(pid, 0) and try os.waitpid(WNOHANG) to
+    reap zombies so the slot is freed for new spawns.
+    """
+    if agent.process.returncode is not None:
+        return False
+    # Check if process is still alive
+    try:
+        os.kill(agent.pid, 0)
+    except ProcessLookupError:
+        # Process is gone
+        agent.process.returncode = -1
+        return False
+    except PermissionError:
+        # Process exists but we can't signal it — treat as alive
+        return True
+    # Process exists — try to reap if it's a zombie
+    try:
+        pid, status = os.waitpid(agent.pid, os.WNOHANG)
+        if pid != 0:
+            # Zombie reaped
+            if os.WIFEXITED(status):
+                agent.process.returncode = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                agent.process.returncode = -os.WTERMSIG(status)
+            else:
+                agent.process.returncode = -1
+            return False
+    except ChildProcessError:
+        agent.process.returncode = -1
+        return False
+    except Exception:
+        pass
+    return True
 
 
 def kill_agent(agent: SpawnedAgent, force: bool = False) -> None:
@@ -130,27 +164,28 @@ def build_agent_prompt(state: AgentState, msg: QueuedMessage) -> str:
     if meta.get("type") == "connection_request":
         request_id = meta.get("request_id", msg.message_id)
         return f"""\
-DARKMATTER: You have received an incoming connection request. Here is your conversation context:
+CONNECTION REQUEST — Act now.
 
 {context}
 
-An agent wants to connect to you. Review the request details:
-- Request ID: {request_id}
-- Message: {msg.content}
+Request ID: {request_id}
+Message: {msg.content}
 
-Use darkmatter_list_inbox or darkmatter_status to see your current state, then decide:
-- To accept: darkmatter_connection(action="accept", request_id="{request_id}")
-- To reject: darkmatter_connection(action="reject", request_id="{request_id}")
+Accept: darkmatter_connection(action="accept", request_id="{request_id}")
+Reject: darkmatter_connection(action="reject", request_id="{request_id}")
 
-Consider the agent's bio, peer trust scores, and whether this connection would be valuable.
+After accepting, introduce yourself and share what you can help with.
 """
 
     return f"""\
-DARKMATTER: You have received a message. Here is your conversation context:
+INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
 
 {context}
 
-Check message {msg.message_id} and respond or forward accordingly.
+Read message {msg.message_id} with darkmatter_inbox(message_id="{msg.message_id}"), then:
+1. Reply with a substantive response — don't just acknowledge, provide value.
+2. If this message is better suited for another peer, forward it to them with darkmatter_send_message(message_id="{msg.message_id}", target_agent_id=...).
+3. After replying, proactively share relevant updates or ask follow-up questions.
 """
 
 
@@ -275,6 +310,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         )
 
         asyncio.create_task(agent_timeout_watchdog(agent))
+        asyncio.create_task(_reap_agent_when_done(agent))
 
     except FileNotFoundError:
         print(
@@ -284,6 +320,27 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         )
     except Exception as e:
         print(f"[DarkMatter] Agent spawn failed: {e}", file=sys.stderr)
+
+
+async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
+    """Await process completion so returncode gets set and the slot is freed.
+
+    Without this, asyncio.Process.returncode stays None forever because nothing
+    awaits the process — leading to zombie slots that block new spawns.
+
+    We use communicate() instead of wait() to drain stdout/stderr pipes.
+    If the pipes fill up (64KB buffer), the spawned process would deadlock.
+    """
+    try:
+        await agent.process.communicate()
+    except Exception:
+        pass
+    print(
+        f"[DarkMatter] Agent PID {agent.pid} finished (code={agent.process.returncode}), "
+        f"slot freed for new spawns",
+        file=sys.stderr,
+    )
+    cleanup_finished_agents()
 
 
 async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:

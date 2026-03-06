@@ -29,8 +29,6 @@ from darkmatter.config import (
     STALE_CONNECTION_AGE,
     IP_CHECK_INTERVAL,
     UPNP_PORT_RANGE,
-    UPNP_AVAILABLE,
-    WEBRTC_AVAILABLE,
     WEBHOOK_RECOVERY_MAX_ATTEMPTS,
     WEBHOOK_RECOVERY_TIMEOUT,
     TRUST_NEGATIVE_TIMEOUT,
@@ -331,14 +329,13 @@ class NetworkManager:
             print(f"[DarkMatter] Public URL (env): {env_url}", file=sys.stderr)
             return env_url
 
-        if UPNP_AVAILABLE:
-            result = await asyncio.to_thread(try_upnp_mapping, port)
-            if result is not None:
-                url, upnp_obj, ext_port = result
-                if state is not None:
-                    state._upnp_mapping = (url, upnp_obj, ext_port)
-                print(f"[DarkMatter] Public URL (UPnP): {url}", file=sys.stderr)
-                return url
+        result = await asyncio.to_thread(try_upnp_mapping, port)
+        if result is not None:
+            url, upnp_obj, ext_port = result
+            if state is not None:
+                state._upnp_mapping = (url, upnp_obj, ext_port)
+            print(f"[DarkMatter] Public URL (UPnP): {url}", file=sys.stderr)
+            return url
 
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -591,8 +588,7 @@ class NetworkManager:
               file=sys.stderr)
         print(f"[DarkMatter] Connectivity upgrade loop: ENABLED ({CONNECTIVITY_UPGRADE_INTERVAL}s interval)",
               file=sys.stderr)
-        print(f"[DarkMatter] UPnP: {'AVAILABLE' if UPNP_AVAILABLE else 'disabled (pip install miniupnpc)'}",
-              file=sys.stderr)
+        print(f"[DarkMatter] UPnP: AVAILABLE", file=sys.stderr)
 
         # Register with anchor nodes
         if ANCHOR_NODES and state.public_url:
@@ -706,7 +702,7 @@ class NetworkManager:
                     reachable = True
                     conn.health_failures = 0
                     # Try to upgrade to a better transport
-                    if conn.transport == "http" and WEBRTC_AVAILABLE:
+                    if conn.transport == "http":
                         webrtc = self.get_transport("webrtc")
                         if webrtc and webrtc.available:
                             asyncio.create_task(webrtc.upgrade(state, conn))
