@@ -622,10 +622,57 @@ async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
     return json.dumps({"total": len(messages), "messages": messages})
 
 
+# =============================================================================
+# LAN Discovery Tool
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_discover_local",
+    annotations={
+        "title": "Discover Local Peers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def discover_local(ctx: Context) -> str:
+    """Scan LAN and localhost for DarkMatter agents. Returns discovered peers not yet connected."""
+    track_session(ctx)
+    state = get_state()
+
+    from darkmatter.network.discovery import scan_local_ports
+    await scan_local_ports(state)
+
+    # Filter out already-connected peers and self
+    results = {}
+    for peer_id, info in state.discovered_peers.items():
+        if peer_id == state.agent_id:
+            continue
+        if peer_id in state.connections:
+            continue
+        results[peer_id] = info
+
+    return json.dumps({
+        "discovered": len(results),
+        "already_connected": len(state.discovered_peers) - len(results),
+        "peers": {
+            pid: {
+                "url": p["url"],
+                "bio": p.get("bio", ""),
+                "status": p.get("status", "active"),
+                "accepting": p.get("accepting", True),
+                "source": p.get("source", "unknown"),
+            }
+            for pid, p in results.items()
+        },
+    })
+
+
 # NOTE: Tools removed from MCP and moved to HTTP API + skill:
 # get_identity, list_connections, list_pending_requests, set_status,
 # list_inbox, get_message, list_messages, get_sent_message, expire_message,
-# wait_for_response, network_info, discover_domain, discover_local,
+# wait_for_response, network_info, discover_domain,
 # set_impression, get_impression, set_superagent, set_rate_limit,
 # get_balance, send_sol, send_token, wallet_balances, wallet_send,
 # genome_info, genome_install
@@ -637,7 +684,7 @@ _REMOVED_TOOL_MARKER = True  # noqa: F841 — placeholder for removed tools
 
 # REMOVED: set_status, get_identity, list_connections, list_pending_requests,
 # list_inbox, get_message, list_messages, get_sent_message, expire_message,
-# wait_for_response, network_info, discover_domain, discover_local,
+# wait_for_response, network_info, discover_domain,
 # set_impression, get_impression, set_superagent, set_rate_limit,
 # get_balance, send_sol, send_token, wallet_balances, wallet_send
 
