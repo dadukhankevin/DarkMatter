@@ -1265,7 +1265,7 @@ async def handle_message_stream(request: Request) -> JSONResponse:
     signal_type = data.get("type", "")
     message_id = data.get("message_id", "")
 
-    if not from_id or not message_id or signal_type not in ("begin", "end"):
+    if not from_id or not message_id or signal_type not in ("begin", "chunk", "end"):
         return JSONResponse({"error": "Invalid stream signal"}, status_code=400)
 
     # Only accept signals from connected peers
@@ -1273,18 +1273,23 @@ async def handle_message_stream(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Not connected"}, status_code=403)
 
     # Store/clear typing state
+    if not hasattr(state, "_typing_indicators"):
+        state._typing_indicators = {}
+
     if signal_type == "begin":
-        if not hasattr(state, "_typing_indicators"):
-            state._typing_indicators = {}
         state._typing_indicators[from_id] = {
             "message_id": message_id,
             "in_reply_to": data.get("in_reply_to"),
             "display_name": data.get("from_display_name", ""),
             "started_at": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            "content": "",
         }
+    elif signal_type == "chunk":
+        indicator = state._typing_indicators.get(from_id)
+        if indicator:
+            indicator["content"] = indicator.get("content", "") + data.get("content", "")
     elif signal_type == "end":
-        if hasattr(state, "_typing_indicators"):
-            state._typing_indicators.pop(from_id, None)
+        state._typing_indicators.pop(from_id, None)
 
     return JSONResponse({"ok": True})
 

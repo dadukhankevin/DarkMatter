@@ -1113,6 +1113,7 @@ def _get_typing_indicators() -> list[dict]:
             "display_name": info.get("display_name") or _display_name_for(agent_id),
             "in_reply_to": info.get("in_reply_to"),
             "started_at": info["started_at"],
+            "content": info.get("content", ""),
         })
     for aid in expired:
         _typing_indicators.pop(aid, None)
@@ -1150,7 +1151,7 @@ def dm_message_stream():
     signal_type = data.get("type", "")
     message_id = data.get("message_id", "")
 
-    if not from_id or not message_id or signal_type not in ("begin", "end"):
+    if not from_id or not message_id or signal_type not in ("begin", "chunk", "end"):
         return jsonify({"error": "Invalid stream signal"}), 400
 
     if from_id not in state.connections:
@@ -1163,7 +1164,12 @@ def dm_message_stream():
             "in_reply_to": data.get("in_reply_to"),
             "display_name": data.get("from_display_name") or getattr(conn, "agent_display_name", ""),
             "started_at": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            "content": "",
         }
+    elif signal_type == "chunk":
+        indicator = _typing_indicators.get(from_id)
+        if indicator:
+            indicator["content"] = indicator.get("content", "") + data.get("content", "")
     elif signal_type == "end":
         _typing_indicators.pop(from_id, None)
 

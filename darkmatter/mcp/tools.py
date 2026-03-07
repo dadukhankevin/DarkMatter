@@ -212,6 +212,22 @@ async def _connection_disconnect(state, agent_id: str) -> str:
 _pending_streams: dict[str, dict] = {}
 
 
+async def _send_chunk(state, message_id: str, content: str, targets: list) -> None:
+    """Send a chunk signal to all targets (best-effort)."""
+    payload = {
+        "message_id": message_id,
+        "type": "chunk",
+        "from_agent_id": state.agent_id,
+        "content": content,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    for conn in targets:
+        try:
+            await send_to_peer(conn, "/__darkmatter__/message_stream", payload)
+        except Exception:
+            pass
+
+
 async def _begin_message(state, params: BeginMessageInput) -> str:
     """Signal that a message is being composed. Sends typing indicator to target(s)."""
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
@@ -253,14 +269,14 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
         "metadata": metadata,
     }
 
-    # Send typing signal to all targets (best-effort, don't fail on errors)
+    # Send typing signal to all targets (best-effort)
     signaled = []
     for conn in targets:
         try:
             await send_to_peer(conn, "/__darkmatter__/message_stream", signal_payload)
             signaled.append(conn.agent_id)
         except Exception:
-            pass  # typing indicator is best-effort
+            pass
 
     # Store pending stream state
     _pending_streams[message_id] = {
@@ -272,6 +288,17 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
         "metadata": metadata,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # Hook into spawned agent's stdout to stream chunks (if this is a reply)
+    if params.in_reply_to:
+        from darkmatter.spawn import get_spawned_agents
+        for agent in get_spawned_agents():
+            if agent.message_id == params.in_reply_to:
+                async def _on_chunk(chunk: str, _mid=message_id, _st=state, _tgts=targets):
+                    await _send_chunk(_st, _mid, chunk, _tgts)
+                agent.stdout_callback = _on_chunk
+                _pending_streams[message_id]["_spawned_agent"] = agent
+                break
 
     return json.dumps({
         "success": True,
@@ -285,6 +312,11 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
 async def _end_message(state, params: EndMessageInput) -> str:
     """Complete a message started with begin_message. Sends the final content."""
     stream_info = _pending_streams.pop(params.message_id, None)
+
+    # Stop stdout streaming
+    spawned = stream_info.get("_spawned_agent") if stream_info else None
+    if spawned:
+        spawned.stdout_callback = None
 
     if not stream_info:
         return json.dumps({

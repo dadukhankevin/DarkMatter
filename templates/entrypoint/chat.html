@@ -1861,6 +1861,16 @@ function renderTypingIndicators(typing) {
     const aColor = agentColor(t.agent_id);
     const tint = agentTint(t.agent_id);
     const name = t.display_name || shortId(t.agent_id);
+    const hasContent = t.content && t.content.trim().length > 0;
+    if (hasContent) {
+      return `<div class="msg-block msg-block-in" style="background:${tint}; opacity: 0.85;">
+        <div class="flex items-baseline gap-3 mb-1.5">
+          <span class="msg-sender" style="color:${aColor}">${esc(name)}</span>
+          <span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>
+        </div>
+        <div class="msg-content">${renderMd(t.content)}</div>
+      </div>`;
+    }
     return `<div class="typing-indicator fade-in" style="background:${tint}; border-radius: 16px;">
       <div class="flex items-center gap-2.5">
         <span class="msg-sender" style="color:${aColor}">${esc(name)}</span>

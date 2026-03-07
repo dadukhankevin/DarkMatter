@@ -36,6 +36,8 @@ class SpawnedAgent:
     spawned_at: float
     pid: int
     spawn_mcp_config: str = ""  # .mcp.json path to clean up when agent exits
+    # Stdout streaming: callback receives chunks as they arrive
+    stdout_callback: object = None  # Optional async callable(chunk: str)
 
 
 _spawned_agents: list[SpawnedAgent] = []
@@ -310,6 +312,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         )
 
         asyncio.create_task(agent_timeout_watchdog(agent))
+        asyncio.create_task(_drain_stdout(agent))
         asyncio.create_task(_reap_agent_when_done(agent))
 
     except FileNotFoundError:
@@ -322,17 +325,33 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         print(f"[DarkMatter] Agent spawn failed: {e}", file=sys.stderr)
 
 
+async def _drain_stdout(agent: SpawnedAgent) -> None:
+    """Read stdout and forward chunks to the callback if set."""
+    if not agent.process.stdout:
+        return
+    try:
+        while True:
+            chunk = await agent.process.stdout.read(512)
+            if not chunk:
+                break
+            if agent.stdout_callback:
+                try:
+                    await agent.stdout_callback(chunk.decode("utf-8", errors="replace"))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
     """Await process completion so returncode gets set and the slot is freed.
 
-    Without this, asyncio.Process.returncode stays None forever because nothing
-    awaits the process — leading to zombie slots that block new spawns.
-
-    We use communicate() instead of wait() to drain stdout/stderr pipes.
-    If the pipes fill up (64KB buffer), the spawned process would deadlock.
+    Stdout is drained by _drain_stdout. We drain stderr here.
     """
     try:
-        await agent.process.communicate()
+        if agent.process.stderr:
+            asyncio.ensure_future(agent.process.stderr.read())
+        await agent.process.wait()
     except Exception:
         pass
     print(
