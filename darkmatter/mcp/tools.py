@@ -212,23 +212,50 @@ async def _connection_disconnect(state, agent_id: str) -> str:
 _pending_streams: dict[str, dict] = {}
 
 
-def _is_streamable(conn) -> bool:
-    """Check if a connection supports chunk streaming (WebRTC, localhost, or LAN)."""
+def _get_stream_url(conn, state) -> str | None:
+    """Get the best URL for chunk streaming to a peer.
+
+    Returns a local/LAN URL if available (cheap HTTP POSTs), None otherwise.
+    Checks agent_url first, then discovered_peers for a LAN URL that the
+    agent_url (which may be a public UPnP address) doesn't reveal.
+    """
     from darkmatter.network.manager import is_local_url
-    # WebRTC data channel open = true streaming
+    url = getattr(conn, "agent_url", "") or ""
+    if is_local_url(url):
+        return url
+    if conn.agent_id in getattr(state, "discovered_peers", {}):
+        peer_url = state.discovered_peers[conn.agent_id].get("url", "")
+        if is_local_url(peer_url):
+            return peer_url
+    return None
+
+
+def _is_streamable(conn, state=None) -> bool:
+    """Check if a connection supports chunk streaming (WebRTC or LAN HTTP)."""
+    # WebRTC data channel = true streaming
     ch = getattr(conn, "webrtc_channel", None)
     if ch is not None and getattr(ch, "readyState", None) == "open":
         return True
-    # Local/LAN HTTP = fine for chunks (same machine or same network, low cost)
-    url = getattr(conn, "agent_url", "") or ""
-    if is_local_url(url):
+    # LAN/local HTTP = fine for chunks (low latency, negligible cost)
+    if _get_stream_url(conn, state):
         return True
-    # Remote HTTP = skip chunks (wasteful, one POST per 512-byte chunk)
+    # Remote HTTP = skip chunks (one POST per 512-byte chunk is wasteful)
     return False
 
 
+# Shared httpx client for chunk delivery (avoids creating one per chunk)
+_chunk_client: httpx.AsyncClient | None = None
+
+
+def _get_chunk_client() -> httpx.AsyncClient:
+    global _chunk_client
+    if _chunk_client is None or _chunk_client.is_closed:
+        _chunk_client = httpx.AsyncClient(timeout=httpx.Timeout(2.0))
+    return _chunk_client
+
+
 async def _send_chunk(state, message_id: str, content: str, targets: list) -> None:
-    """Send a chunk signal to streamable targets only (WebRTC or localhost)."""
+    """Send a chunk signal to streamable targets only (WebRTC or LAN HTTP)."""
     payload = {
         "message_id": message_id,
         "type": "chunk",
@@ -237,10 +264,19 @@ async def _send_chunk(state, message_id: str, content: str, targets: list) -> No
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     for conn in targets:
-        if not _is_streamable(conn):
+        if not _is_streamable(conn, state):
             continue
         try:
-            await send_to_peer(conn, "/__darkmatter__/message_stream", payload)
+            # WebRTC: use transport manager
+            ch = getattr(conn, "webrtc_channel", None)
+            if ch is not None and getattr(ch, "readyState", None) == "open":
+                await send_to_peer(conn, "/__darkmatter__/message_stream", payload)
+                continue
+            # LAN HTTP: POST directly to LAN URL (not the public UPnP URL)
+            lan_url = _get_stream_url(conn, state)
+            if lan_url:
+                client = _get_chunk_client()
+                await client.post(f"{lan_url}/__darkmatter__/message_stream", json=payload)
         except Exception:
             pass
 
