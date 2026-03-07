@@ -268,6 +268,7 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
         "signaled": signaled,
         "in_reply_to": params.in_reply_to,
         "broadcast": params.broadcast,
+        "hops_remaining": params.hops_remaining,
         "metadata": metadata,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -285,28 +286,25 @@ async def _end_message(state, params: EndMessageInput) -> str:
     """Complete a message started with begin_message. Sends the final content."""
     stream_info = _pending_streams.pop(params.message_id, None)
 
-    if stream_info:
-        target_ids = stream_info["targets"]
-        metadata = {**(stream_info.get("metadata") or {}), **(params.metadata or {})}
-        in_reply_to = stream_info.get("in_reply_to")
-    else:
-        # Graceful fallback: end_message works even without a prior begin_message
-        target_ids = None
-        metadata = params.metadata or {}
-        in_reply_to = None
+    if not stream_info:
+        return json.dumps({
+            "success": False,
+            "error": f"No pending message with ID '{params.message_id}'. Call begin_message first.",
+        })
 
-    if metadata.get("type") is None and stream_info and stream_info.get("broadcast"):
+    target_ids = stream_info["targets"]
+    metadata = stream_info.get("metadata") or {}
+    in_reply_to = stream_info.get("in_reply_to")
+    hops_remaining = stream_info.get("hops_remaining", 10)
+
+    if stream_info.get("broadcast"):
         metadata["type"] = "broadcast"
 
-    # Resolve targets
-    if target_ids:
-        targets = []
-        for tid in target_ids:
-            conn = state.connections.get(tid)
-            if conn:
-                targets.append(conn)
-    else:
-        targets = [c for c in state.connections.values()]
+    targets = []
+    for tid in target_ids:
+        conn = state.connections.get(tid)
+        if conn:
+            targets.append(conn)
 
     if not targets:
         return json.dumps({
@@ -323,7 +321,7 @@ async def _end_message(state, params: EndMessageInput) -> str:
         "message_id": params.message_id,
         "content": params.content,
         "webhook": webhook,
-        "hops_remaining": params.hops_remaining,
+        "hops_remaining": hops_remaining,
         "metadata": metadata,
         "timestamp": msg_timestamp,
     }
@@ -372,7 +370,7 @@ async def _end_message(state, params: EndMessageInput) -> str:
         message_id=params.message_id,
         content=params.content,
         status="active" if sent_to else "failed",
-        initial_hops=params.hops_remaining,
+        initial_hops=hops_remaining,
         routed_to=sent_to,
     )
     state.sent_messages[params.message_id] = sent_msg
@@ -382,7 +380,7 @@ async def _end_message(state, params: EndMessageInput) -> str:
         "success": len(sent_to) > 0,
         "message_id": params.message_id,
         "routed_to": sent_to,
-        "hops_remaining": params.hops_remaining,
+        "hops_remaining": hops_remaining,
     }
     if failed:
         result["failed"] = failed
@@ -390,107 +388,6 @@ async def _end_message(state, params: EndMessageInput) -> str:
             result["error"] = f"Message could not be delivered to any of {len(failed)} target(s)."
     if sent_to:
         result["next_step"] = f"Call darkmatter_wait_for_message(message_id='{params.message_id}') now to get the reply."
-    return json.dumps(result)
-
-
-async def _send_new_message(state, params: SendMessageInput) -> str:
-    """Send a new message into the mesh."""
-    message_id = f"msg-{uuid.uuid4().hex[:12]}"
-    metadata = params.metadata or {}
-
-    # Set broadcast metadata
-    if params.broadcast or params.message_type == "broadcast":
-        metadata["type"] = "broadcast"
-
-    # Determine peer_url for local relay bypass (set after target resolution)
-    _peer_url = None
-
-    if params.broadcast:
-        # Broadcast: send to all peers meeting trust threshold
-        targets = []
-        for aid, conn in state.connections.items():
-            imp = state.impressions.get(aid)
-            peer_trust = imp.score if imp else 0.0
-            if peer_trust >= params.trust_min:
-                targets.append(conn)
-    elif params.target_agent_id:
-        conn = state.connections.get(params.target_agent_id)
-        if not conn:
-            return json.dumps({
-                "success": False,
-                "error": f"Not connected to agent '{params.target_agent_id}'."
-            })
-        targets = [conn]
-    else:
-        targets = [c for c in state.connections.values()]
-
-    if not targets:
-        return json.dumps({
-            "success": False,
-            "error": "No connections available to route this message."
-        })
-
-    # Build webhook URL — pass single target's URL for local relay bypass
-    if len(targets) == 1:
-        _peer_url = targets[0].agent_url
-    webhook = get_network_manager().build_webhook_url(message_id, peer_url=_peer_url)
-
-    msg_timestamp = datetime.now(timezone.utc).isoformat()
-    base_payload = {
-        "message_id": message_id,
-        "content": params.content,
-        "webhook": webhook,
-        "hops_remaining": params.hops_remaining,
-        "metadata": metadata,
-        "timestamp": msg_timestamp,
-    }
-    envelope = prepare_outbound(base_payload, state.private_key_hex, state.agent_id, state.public_key_hex)
-
-    sent_to = []
-    failed = []
-    for conn in targets:
-        try:
-            await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
-            conn.messages_sent += 1
-            conn.last_activity = datetime.now(timezone.utc).isoformat()
-            sent_to.append(conn.agent_id)
-            adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
-        except Exception as e:
-            conn.messages_declined += 1
-            failed.append({"agent_id": conn.agent_id, "display_name": conn.agent_display_name, "error": str(e)})
-
-    # Log conversation
-    if sent_to:
-        msg_type = metadata.get("type", "direct") if metadata.get("type") == "broadcast" else "direct"
-        log_conversation(
-            state, message_id, params.content,
-            from_id=state.agent_id, to_ids=sent_to,
-            entry_type=msg_type, direction="outbound",
-            metadata=metadata,
-        )
-
-    sent_msg = SentMessage(
-        message_id=message_id,
-        content=params.content,
-        status="active",
-        initial_hops=params.hops_remaining,
-        routed_to=sent_to,
-    )
-    state.sent_messages[message_id] = sent_msg
-    save_state()
-
-    result = {
-        "success": len(sent_to) > 0,
-        "message_id": message_id,
-        "routed_to": sent_to,
-        "hops_remaining": params.hops_remaining,
-    }
-    if failed:
-        result["failed"] = failed
-        if not sent_to:
-            result["error"] = f"Message could not be delivered to any of {len(failed)} target(s). Check 'failed' for details."
-    if sent_to:
-        result["next_step"] = f"Call darkmatter_wait_for_message(message_id='{message_id}') now to get the reply."
     return json.dumps(result)
 
 
@@ -725,7 +622,7 @@ async def end_message(params: EndMessageInput, ctx: Context) -> str:
 @mcp.tool(
     name="darkmatter_send_message",
     annotations={
-        "title": "Send or Forward Message",
+        "title": "Forward Queued Message",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -733,19 +630,13 @@ async def end_message(params: EndMessageInput, ctx: Context) -> str:
     }
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send or forward a message. Prefer begin_message + end_message for new messages (enables typing indicators). Use this for forwarding queued messages or quick sends."""
+    """Forward a queued message to another agent. Provide message_id + target_agent_id. For new messages, use begin_message + end_message."""
     state = get_state()
 
-    # Validate parameter combinations
-    if params.message_id and params.content:
-        return json.dumps({"success": False, "error": "Provide either content (new message) or message_id (forward), not both."})
-    if not params.message_id and not params.content:
-        return json.dumps({"success": False, "error": "Provide content (new message/reply) or message_id (forward)."})
+    if not params.message_id:
+        return json.dumps({"success": False, "error": "message_id is required. For new messages, use begin_message + end_message."})
 
-    if params.message_id:
-        return await _forward_message(state, params)
-    else:
-        return await _send_new_message(state, params)
+    return await _forward_message(state, params)
 
 
 # =============================================================================

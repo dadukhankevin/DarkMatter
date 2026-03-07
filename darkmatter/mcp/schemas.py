@@ -32,10 +32,11 @@ class ConnectionInput(BaseModel):
 class BeginMessageInput(BaseModel):
     """Signal that you're composing a message. Sends a typing indicator to the target."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    target_agent_id: Optional[str] = Field(default=None, description="Agent to notify (omit for auto-select)")
+    target_agent_id: Optional[str] = Field(default=None, description="Agent to send to (omit for auto-select)")
     in_reply_to: Optional[str] = Field(default=None, description="Message ID this is replying to")
-    broadcast: bool = Field(default=False, description="Signal all connected peers")
-    trust_min: float = Field(default=0.0, ge=-1.0, le=1.0, description="Only signal peers with trust >= this (for broadcast)")
+    broadcast: bool = Field(default=False, description="Send to all connected peers")
+    trust_min: float = Field(default=0.0, ge=-1.0, le=1.0, description="Only send to peers with trust >= this (for broadcast)")
+    hops_remaining: int = Field(default=10, ge=1, le=50, description="TTL for mesh routing")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
 
 
@@ -44,24 +45,16 @@ class EndMessageInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="Message ID returned by begin_message")
     content: str = Field(..., description="Final message content", max_length=MAX_CONTENT_LENGTH)
-    metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata (budget, preferences, etc.)")
-    hops_remaining: int = Field(default=10, ge=1, le=50, description="TTL for mesh routing")
 
 
 class SendMessageInput(BaseModel):
     """Forward a queued message to another agent."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    content: Optional[str] = Field(default=None, description="Message content (for new messages)", max_length=MAX_CONTENT_LENGTH)
-    message_id: Optional[str] = Field(default=None, description="Queue message ID (for forwarding)")
-    target_agent_id: Optional[str] = Field(default=None, description="Specific agent to send/forward to")
+    message_id: str = Field(..., description="Queue message ID to forward")
+    target_agent_id: Optional[str] = Field(default=None, description="Agent to forward to")
     target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to forward to (fork)")
-    metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata (budget, preferences, etc.)")
-    hops_remaining: int = Field(default=10, ge=1, le=50, description="How many more hops this message can take before expiring (TTL)")
     note: Optional[str] = Field(default=None, description="Forwarding annotation visible to the sender", max_length=1000)
     force: bool = Field(default=False, description="Override loop detection when forwarding")
-    broadcast: bool = Field(default=False, description="Send to all connected peers (overrides target_agent_id)")
-    trust_min: float = Field(default=0.0, ge=-1.0, le=1.0, description="Only send to peers with trust >= this (for broadcast)")
-    message_type: str = Field(default="direct", description="'direct' or 'broadcast' — broadcasts are non-interruptive context")
 
 
 class UpdateBioInput(BaseModel):
