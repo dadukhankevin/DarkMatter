@@ -213,15 +213,18 @@ _pending_streams: dict[str, dict] = {}
 
 
 def _is_streamable(conn) -> bool:
-    """Check if a connection supports chunk streaming."""
-    # Any connection with a URL or WebRTC channel can receive chunks.
-    # Previously restricted to local/LAN URLs, but this broke streaming for
-    # LAN peers using public UPnP URLs and for all remote peers.
+    """Check if a connection supports chunk streaming (WebRTC, localhost, or LAN)."""
+    from darkmatter.network.manager import is_local_url
+    # WebRTC data channel open = true streaming
     ch = getattr(conn, "webrtc_channel", None)
     if ch is not None and getattr(ch, "readyState", None) == "open":
         return True
+    # Local/LAN HTTP = fine for chunks (same machine or same network, low cost)
     url = getattr(conn, "agent_url", "") or ""
-    return bool(url)
+    if is_local_url(url):
+        return True
+    # Remote HTTP = skip chunks (wasteful, one POST per 512-byte chunk)
+    return False
 
 
 async def _send_chunk(state, message_id: str, content: str, targets: list) -> None:
