@@ -41,10 +41,10 @@ class BeginMessageInput(BaseModel):
 
 
 class EndMessageInput(BaseModel):
-    """Complete a message started with begin_message. Sends the final content."""
+    """Complete a message started with begin_message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="Message ID returned by begin_message")
-    content: str = Field(..., description="Final message content", max_length=MAX_CONTENT_LENGTH)
+    content: str = Field(..., description="Summary of the full message. The receiver already saw the streamed content; this is the concise version stored in history.", max_length=MAX_CONTENT_LENGTH)
 
 
 class SendMessageInput(BaseModel):

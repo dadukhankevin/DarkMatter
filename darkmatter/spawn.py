@@ -185,9 +185,10 @@ INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
 {context}
 
 Read message {msg.message_id} with darkmatter_inbox(message_id="{msg.message_id}"), then:
-1. Reply with a substantive response — don't just acknowledge, provide value.
-2. If this message is better suited for another peer, forward it to them with darkmatter_send_message(message_id="{msg.message_id}", target_agent_id=...).
-3. After replying, proactively share relevant updates or ask follow-up questions.
+1. Call begin_message(target_agent_id=..., in_reply_to="{msg.message_id}") FIRST — this starts streaming your output to the receiver live.
+2. Write your full response. Everything you write streams in real time. For humans, be thorough and natural. For agents, be concise.
+3. Call end_message(message_id=..., content="...") with a summary of what you wrote.
+4. If this message is better suited for another peer, forward it with darkmatter_send_message(message_id="{msg.message_id}", target_agent_id=...).
 """
 
 

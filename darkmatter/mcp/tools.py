@@ -628,7 +628,7 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     }
 )
 async def begin_message(params: BeginMessageInput, ctx: Context) -> str:
-    """Signal that you're composing a message. Sends a typing indicator to the target. Call end_message when done."""
+    """Start composing a message. Everything you write after this streams live to the receiver. Call EARLY — the receiver sees your output in real time. For humans, write naturally and at length. For agents, be concise. Call end_message when done."""
     track_session(ctx)
     state = get_state()
     return await _begin_message(state, params)
@@ -645,7 +645,7 @@ async def begin_message(params: BeginMessageInput, ctx: Context) -> str:
     }
 )
 async def end_message(params: EndMessageInput, ctx: Context) -> str:
-    """Complete and send a message started with begin_message. Provide the message_id from begin_message and the final content."""
+    """Finish a message. The receiver already saw the streamed content; provide a summary for history. The summary should capture the key points of everything you wrote."""
     track_session(ctx)
     state = get_state()
     return await _end_message(state, params)
