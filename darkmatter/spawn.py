@@ -286,13 +286,28 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             print("[DarkMatter] Sandbox unavailable, spawning without sandbox", file=sys.stderr)
 
     try:
+        # Use a PTY for stdout to force unbuffered/line-buffered output from the
+        # child process. Without this, `claude -p` buffers all stdout until exit,
+        # making real-time chunk streaming impossible.
+        import pty as _pty
+        pty_master_fd, pty_slave_fd = _pty.openpty()
+
         process = await asyncio.create_subprocess_exec(
             *exec_argv,
             env=env,
             stdin=stdin_pipe,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=pty_slave_fd,
             stderr=asyncio.subprocess.PIPE,
             cwd=spawn_dir,
+        )
+        os.close(pty_slave_fd)  # Parent doesn't need the slave end
+
+        # Wrap PTY master fd in an asyncio-friendly stream reader
+        loop = asyncio.get_event_loop()
+        pty_reader = asyncio.StreamReader()
+        read_transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(pty_reader),
+            os.fdopen(pty_master_fd, "rb", 0),
         )
 
         if prompt_style == "stdin" and process.stdin is not None:
@@ -307,6 +322,9 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             pid=process.pid,
             spawn_mcp_config=spawn_mcp_path,
         )
+        # Attach PTY reader so _drain_stdout can use it instead of process.stdout
+        agent._pty_reader = pty_reader
+        agent._pty_transport = read_transport
         _spawned_agents.append(agent)
         _spawn_timestamps.append(time.monotonic())
         sandbox_label = " [sandboxed]" if sandboxed else ""
@@ -336,11 +354,13 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
     """Read stdout and forward chunks to all active callbacks (nested messages)."""
-    if not agent.process.stdout:
+    # Prefer PTY reader (unbuffered) over process.stdout (buffered)
+    reader = getattr(agent, "_pty_reader", None) or agent.process.stdout
+    if not reader:
         return
     try:
         while True:
-            chunk = await agent.process.stdout.read(512)
+            chunk = await reader.read(512)
             if not chunk:
                 break
             if agent.stdout_callbacks:
@@ -352,6 +372,10 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
                         pass
     except Exception:
         pass
+    finally:
+        transport = getattr(agent, "_pty_transport", None)
+        if transport:
+            transport.close()
 
 
 async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
