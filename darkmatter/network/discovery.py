@@ -380,15 +380,17 @@ def sync_entrypoint_files() -> None:
     if os.path.isfile(src_ep):
         shutil.copy2(src_ep, os.path.join(dest_dir, "entrypoint.py"))
 
-    # Copy templates/
+    # Copy templates/ into templates/entrypoint/ (entrypoint's template_folder)
     src_templates = os.path.join(bundled_dir, "templates")
     if os.path.isdir(src_templates):
         dest_templates = os.path.join(dest_dir, "templates")
+        dest_entrypoint = os.path.join(dest_templates, "entrypoint")
         if os.path.islink(dest_templates):
             os.remove(dest_templates)
-        elif os.path.isdir(dest_templates):
-            shutil.rmtree(dest_templates)
-        shutil.copytree(src_templates, dest_templates)
+        if os.path.isdir(dest_entrypoint):
+            shutil.rmtree(dest_entrypoint)
+        os.makedirs(dest_templates, exist_ok=True)
+        shutil.copytree(src_templates, dest_entrypoint)
 
     # Write version marker
     with open(version_file, "w") as f:
