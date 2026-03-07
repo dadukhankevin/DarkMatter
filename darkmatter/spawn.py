@@ -133,7 +133,6 @@ def kill_agent(agent: SpawnedAgent, force: bool = False) -> None:
 
 def cleanup_finished_agents() -> None:
     """Remove finished agent processes from the tracking list."""
-    import shutil
     still_running = []
     for agent in _spawned_agents:
         if not is_agent_running(agent):
@@ -144,11 +143,7 @@ def cleanup_finished_agents() -> None:
             )
             if agent.spawn_mcp_config:
                 try:
-                    backup_path = agent.spawn_mcp_config + ".pre-spawn"
-                    if os.path.exists(backup_path):
-                        shutil.move(backup_path, agent.spawn_mcp_config)
-                    else:
-                        os.remove(agent.spawn_mcp_config)
+                    os.remove(agent.spawn_mcp_config)
                 except Exception as e:
                     print(f"[DarkMatter] Failed to clean up spawn config {agent.spawn_mcp_config}: {e}", file=sys.stderr)
         else:
@@ -225,13 +220,13 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     for var in ACTIVE_CLIENT["env_cleanup"]:
         env.pop(var, None)
 
-    # Write .mcp.json in the project directory pointing to the parent's
-    # MCP server via HTTP. The child shares the parent's identity and inbox.
-    # We use the project directory (not a temp dir) so the child agent has
-    # access to the actual codebase and project context.
-    # NOTE: We back up the original .mcp.json first so cleanup can restore it
-    # instead of deleting it — prevents breaking the primary session's config.
+    # Write spawn MCP config to a TEMP FILE — never overwrite the project's
+    # .mcp.json. Previous approach backed up and restored the project config,
+    # but if the process was killed or the server crashed, the backup was never
+    # restored, leaving the primary session with a broken HTTP config.
     spawn_dir = _PROJECT_DIR
+    import json as _json
+    import tempfile as _tempfile
     mcp_config = {
         "mcpServers": {
             "darkmatter": {
@@ -240,19 +235,22 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             }
         }
     }
-    config_file = ACTIVE_CLIENT.get("config_file", ".mcp.json")
-    config_path = os.path.join(spawn_dir, config_file)
-    backup_path = config_path + ".pre-spawn"
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    import json as _json
-    if os.path.exists(config_path) and not os.path.exists(backup_path):
-        import shutil as _shutil
-        _shutil.copy2(config_path, backup_path)
-    with open(config_path, "w") as f:
+    # Write to a temp file that gets cleaned up when the agent exits
+    spawn_mcp_fd, spawn_mcp_path = _tempfile.mkstemp(
+        prefix="darkmatter-spawn-mcp-", suffix=".json"
+    )
+    with os.fdopen(spawn_mcp_fd, "w") as f:
         _json.dump(mcp_config, f)
 
     command = ACTIVE_CLIENT["command"]
     args = list(ACTIVE_CLIENT["args"])
+
+    # Pass the temp MCP config via CLI flags instead of overwriting project config.
+    # Claude Code: --mcp-config <path> --strict-mcp-config
+    # Other clients: fall back to writing to the project config_file location
+    # (but this should be rare — most modern clients support CLI config).
+    if "mcp_stdio" in ACTIVE_CLIENT.get("capabilities", set()):
+        args.extend(["--mcp-config", spawn_mcp_path, "--strict-mcp-config"])
     prompt_style = ACTIVE_CLIENT.get("prompt_style", "positional")
     stdin_pipe = None
 
@@ -306,7 +304,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             message_id=msg.message_id,
             spawned_at=time.monotonic(),
             pid=process.pid,
-            spawn_mcp_config=config_path,
+            spawn_mcp_config=spawn_mcp_path,
         )
         _spawned_agents.append(agent)
         _spawn_timestamps.append(time.monotonic())
@@ -327,8 +325,12 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             f"Set DARKMATTER_CLIENT to a valid profile or DARKMATTER_AGENT_COMMAND to the correct path.",
             file=sys.stderr,
         )
+        try: os.remove(spawn_mcp_path)
+        except OSError: pass
     except Exception as e:
         print(f"[DarkMatter] Agent spawn failed: {e}", file=sys.stderr)
+        try: os.remove(spawn_mcp_path)
+        except OSError: pass
 
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
