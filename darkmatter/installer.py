@@ -1,0 +1,218 @@
+"""
+Install DarkMatter MCP entries into supported client configs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+
+@dataclass(frozen=True)
+class InstallTarget:
+    client: str
+    label: str
+    path: str
+    format: str
+    supported: bool = True
+
+
+SUPPORTED_TARGETS: tuple[InstallTarget, ...] = (
+    InstallTarget("claude-code", "Claude Code", "~/.claude.json", "mcpServers"),
+    InstallTarget("cursor", "Cursor", "~/.cursor/mcp.json", "mcpServers"),
+    InstallTarget("gemini", "Gemini CLI", "~/.gemini/settings.json", "mcpServers"),
+    InstallTarget("codex", "Codex CLI", "~/.codex/config.toml", "codex_toml"),
+    InstallTarget("kimi", "Kimi Code", "~/.kimi/mcp.json", "mcpServers"),
+    InstallTarget("opencode", "OpenCode", "~/.config/opencode/opencode.json", "opencode"),
+    InstallTarget(
+        "openclaw",
+        "OpenClaw",
+        "",
+        "none",
+        supported=False,
+    ),
+)
+
+
+def _expand(path: str, home: Path) -> Path:
+    if path.startswith("~/"):
+        return home / path[2:]
+    return Path(path)
+
+
+def _server_env(client: str, display_name: str, port: int) -> dict[str, str]:
+    return {
+        "DARKMATTER_CLIENT": client,
+        "DARKMATTER_DISPLAY_NAME": display_name,
+        "DARKMATTER_PORT": str(port),
+    }
+
+
+def _stdio_entry(command: str, client: str, display_name: str, port: int) -> dict:
+    return {
+        "command": command,
+        "args": ["-m", "darkmatter"],
+        "env": _server_env(client, display_name, port),
+    }
+
+
+def _merge_json_config(path: Path, update_fn: Callable[[dict], None]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        with path.open() as f:
+            config = json.load(f)
+    else:
+        config = {}
+    update_fn(config)
+    with path.open("w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+
+
+def _install_mcp_servers_json(path: Path, command: str, client: str, display_name: str, port: int) -> None:
+    entry = _stdio_entry(command, client, display_name, port)
+
+    def update(config: dict) -> None:
+        config.setdefault("mcpServers", {})
+        config["mcpServers"]["darkmatter"] = entry
+
+    _merge_json_config(path, update)
+
+
+def _install_opencode(path: Path, command: str, client: str, display_name: str, port: int) -> None:
+    env = _server_env(client, display_name, port)
+
+    def update(config: dict) -> None:
+        config.setdefault("mcp", {})
+        config["mcp"]["darkmatter"] = {
+            "type": "local",
+            "enabled": True,
+            "command": [command, "-m", "darkmatter"],
+            "environment": env,
+        }
+
+    _merge_json_config(path, update)
+
+
+def _strip_toml_sections(text: str, sections: set[str]) -> str:
+    lines = text.splitlines()
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        match = re.match(r"^\[(.+)\]$", stripped)
+        if match:
+            section = match.group(1)
+            skipping = section in sections
+            if skipping:
+                continue
+        if not skipping:
+            out.append(line)
+    return "\n".join(out).rstrip()
+
+
+def _toml_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _install_codex_toml(path: Path, command: str, client: str, display_name: str, port: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.exists() else ""
+    stripped = _strip_toml_sections(existing, {"mcp_servers.darkmatter", "mcp_servers.darkmatter.env"})
+    env = _server_env(client, display_name, port)
+    args = ', '.join(_toml_string(arg) for arg in ["-m", "darkmatter"])
+    env_lines = "\n".join(f"{key} = {_toml_string(value)}" for key, value in env.items())
+    block = (
+        "[mcp_servers.darkmatter]\n"
+        f"command = {_toml_string(command)}\n"
+        f"args = [{args}]\n\n"
+        "[mcp_servers.darkmatter.env]\n"
+        f"{env_lines}\n"
+    )
+    content = f"{stripped}\n\n{block}" if stripped else block
+    path.write_text(content)
+
+
+def install_target(target: InstallTarget, *, command: str, display_name: str, port: int, home: Path) -> tuple[bool, str]:
+    if not target.supported:
+        return False, f"{target.label}: skipped (no native MCP config to install)"
+
+    path = _expand(target.path, home)
+    try:
+        if target.format == "mcpServers":
+            _install_mcp_servers_json(path, command, target.client, display_name, port)
+        elif target.format == "codex_toml":
+            _install_codex_toml(path, command, target.client, display_name, port)
+        elif target.format == "opencode":
+            _install_opencode(path, command, target.client, display_name, port)
+        else:
+            return False, f"{target.label}: unsupported config format"
+    except json.JSONDecodeError as exc:
+        return False, f"{target.label}: invalid JSON in {path} ({exc})"
+    except OSError as exc:
+        return False, f"{target.label}: failed to write {path} ({exc})"
+
+    return True, f"{target.label}: installed to {path}"
+
+
+def _target_by_client(client: str) -> InstallTarget:
+    for target in SUPPORTED_TARGETS:
+        if target.client == client:
+            return target
+    raise KeyError(client)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    client_names = [target.client for target in SUPPORTED_TARGETS]
+    parser = argparse.ArgumentParser(
+        prog="darkmatter install-mcp",
+        description="Install DarkMatter into supported MCP client configs.",
+    )
+    parser.add_argument("--display-name", default=os.environ.get("DARKMATTER_DISPLAY_NAME", "darkmatter-agent"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("DARKMATTER_PORT", "8100")))
+    parser.add_argument("--python", dest="python_cmd", default=sys.executable)
+    parser.add_argument("--home", default=str(Path.home()))
+    parser.add_argument("--client", action="append", dest="clients", choices=client_names)
+    parser.add_argument("--all", action="store_true", help="Install into every supported native MCP client.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    home = Path(args.home).expanduser()
+
+    if args.clients:
+        targets = [_target_by_client(client) for client in args.clients]
+    else:
+        targets = [target for target in SUPPORTED_TARGETS if target.supported]
+
+    installed = 0
+    for target in targets:
+        ok, message = install_target(
+            target,
+            command=args.python_cmd,
+            display_name=args.display_name,
+            port=args.port,
+            home=home,
+        )
+        print(message)
+        if ok:
+            installed += 1
+
+    skipped = [target.label for target in SUPPORTED_TARGETS if not target.supported]
+    if skipped and not args.clients:
+        print(f"Skipped: {', '.join(skipped)}")
+
+    print(f"Installed DarkMatter MCP config for {installed} client(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

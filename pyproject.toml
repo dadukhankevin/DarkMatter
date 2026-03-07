@@ -40,7 +40,7 @@ dependencies = [
 ]
 
 [project.scripts]
-darkmatter = "darkmatter.app:main"
+darkmatter = "darkmatter.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/dadukhankevin/DarkMatter"

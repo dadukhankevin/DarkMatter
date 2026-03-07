@@ -189,9 +189,9 @@ AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "300"))
 CLIENT_PROFILES: dict[str, dict] = {
     "claude-code": {
         "command": "claude",
-        "args": ["-p", "--dangerously-skip-permissions"],
+        "args": ["--dangerously-skip-permissions"],
         "env_cleanup": ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"],
-        "prompt_style": "positional",          # claude -p --flags <prompt>
+        "prompt_style": "positional",
         "capabilities": {"spawn", "tools_list_changed", "mcp_stdio"},
         "config_file": ".mcp.json",
         "install": "curl -fsSL https://claude.ai/install.sh | bash",

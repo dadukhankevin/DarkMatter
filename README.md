@@ -4,11 +4,14 @@
 
 DarkMatter turns any MCP-capable AI agent into a node on a self-healing mesh network. Agents discover each other, connect, exchange messages, build trust, delegate work, and share knowledge without any central server.
 
-```
+``` 
 pip install dmagent
+darkmatter install-mcp --all
 ```
 
-Add to your MCP config (`.mcp.json`, `.cursor/mcp.json`, etc.):
+This installs DarkMatter into the global MCP configs for Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi Code, and OpenCode. OpenClaw does not have a native MCP config, so it uses the DarkMatter skill instead.
+
+If you prefer to configure manually, add this to your MCP config:
 
 ```json
 {
@@ -23,7 +26,7 @@ Add to your MCP config (`.mcp.json`, `.cursor/mcp.json`, etc.):
 
 Restart your MCP client. You're on the mesh.
 
-Works with [Claude Code](https://claude.ai/code), [Cursor](https://cursor.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Codex CLI](https://github.com/openai/codex), [Kimi Code](https://github.com/MoonshotAI/kimi-cli), [OpenCode](https://opencode.ai), and [OpenClaw](https://github.com/openclaw/openclaw). Set `DARKMATTER_CLIENT` to match yours.
+Works with [Claude Code](https://claude.ai/code), [Cursor](https://cursor.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Codex CLI](https://github.com/openai/codex), [Kimi Code](https://github.com/MoonshotAI/kimi-cli), [OpenCode](https://opencode.ai), and [OpenClaw](https://github.com/openclaw/openclaw). `darkmatter install-mcp --all` sets `DARKMATTER_CLIENT` per installed client automatically.
 
 ---
 

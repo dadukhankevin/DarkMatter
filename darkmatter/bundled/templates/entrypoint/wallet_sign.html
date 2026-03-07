@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WormHole — Sign Identity</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: 'JetBrains Mono', monospace; background: #0a0a0b; color: #e2e2ea; }
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+  <div class="w-full max-w-sm">
+    <!-- Header -->
+    <div class="text-center mb-6">
+      <div class="flex items-center justify-center gap-2 mb-2">
+        <div class="w-2 h-2 rounded-full bg-orange-400 pulse-dot"></div>
+        <span class="text-orange-400 font-semibold text-xs tracking-widest uppercase">WormHole</span>
+      </div>
+      <h1 class="text-lg font-semibold">Sign Identity</h1>
+      <p class="text-zinc-500 text-xs mt-1">Sign with your Solana wallet to derive a mesh identity</p>
+    </div>
+
+    <!-- Card -->
+    <div class="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+      <!-- Challenge display -->
+      <div class="px-5 py-4 border-b border-zinc-800">
+        <p class="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Challenge</p>
+        <p class="text-sm text-white font-mono">{{ challenge }}</p>
+      </div>
+
+      <!-- Status area -->
+      <div class="px-5 py-4">
+        <div id="status-idle" class="space-y-3">
+          <p class="text-xs text-zinc-400 leading-relaxed">
+            Tap the button below to connect your wallet and sign.
+            This derives the same identity on every device.
+          </p>
+          <button id="sign-btn" onclick="doSign()"
+            class="w-full bg-orange-600 hover:bg-orange-500 text-black text-sm font-bold px-4 py-3 rounded-lg transition-colors">
+            Sign with Wallet
+          </button>
+          <p class="text-[10px] text-zinc-600 text-center">Phantom, Solflare, Backpack, or any Solana wallet</p>
+        </div>
+
+        <div id="status-signing" class="hidden text-center py-4">
+          <div class="w-3 h-3 rounded-full bg-orange-400 pulse-dot mx-auto mb-3"></div>
+          <p class="text-sm text-zinc-300">Waiting for wallet...</p>
+        </div>
+
+        <div id="status-done" class="hidden text-center py-4">
+          <div class="w-8 h-8 rounded-full bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center mx-auto mb-3">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8l3.5 3.5L13 5" stroke="#34d399" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <p class="text-sm text-emerald-400 font-medium">Signed successfully</p>
+          <p class="text-xs text-zinc-500 mt-1">You can close this page now.</p>
+        </div>
+
+        <div id="status-error" class="hidden text-center py-4">
+          <p class="text-sm text-red-400 font-medium" id="error-msg"></p>
+          <button onclick="resetUI()" class="text-xs text-zinc-500 hover:text-zinc-300 mt-2 transition-colors">Try again</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const SESSION_ID = "{{ session_id }}";
+    const CHALLENGE = "{{ challenge }}";
+
+    function show(id) {
+      ['status-idle', 'status-signing', 'status-done', 'status-error'].forEach(s => {
+        document.getElementById(s).classList.toggle('hidden', s !== id);
+      });
+    }
+
+    function resetUI() { show('status-idle'); }
+
+    function getSolanaProvider() {
+      if (window.phantom?.solana?.isPhantom) return window.phantom.solana;
+      if (window.solana?.isPhantom) return window.solana;
+      if (window.solflare?.isSolflare) return window.solflare;
+      if (window.backpack?.solana) return window.backpack.solana;
+      if (window.solana) return window.solana;
+      return null;
+    }
+
+    function bytesToHex(bytes) {
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function doSign() {
+      const provider = getSolanaProvider();
+      if (!provider) {
+        document.getElementById('error-msg').textContent = 'No Solana wallet found. Open this page in your wallet\u2019s in-app browser.';
+        show('status-error');
+        return;
+      }
+
+      show('status-signing');
+
+      try {
+        const resp = await provider.connect();
+        const publicKey = resp.publicKey || provider.publicKey;
+
+        const encoded = new TextEncoder().encode(CHALLENGE);
+        const { signature } = await provider.signMessage(encoded, "utf8");
+
+        const sigHex = bytesToHex(signature);
+        const pubHex = bytesToHex(publicKey.toBytes());
+
+        // Post signature to the session endpoint
+        const result = await fetch('/api/wallet-session/' + SESSION_ID + '/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ signature: sigHex, public_key: pubHex }),
+        });
+        const data = await result.json();
+
+        if (data.ok) {
+          show('status-done');
+        } else {
+          document.getElementById('error-msg').textContent = data.error || 'Failed to submit signature';
+          show('status-error');
+        }
+      } catch (e) {
+        if (e.code === 4001 || e.message?.includes('rejected')) {
+          document.getElementById('error-msg').textContent = 'Signature rejected';
+        } else {
+          document.getElementById('error-msg').textContent = e.message || 'Wallet error';
+        }
+        show('status-error');
+      }
+    }
+  </script>
+</body>
+</html>

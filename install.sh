@@ -76,66 +76,15 @@ else
 fi
 DISPLAY_NAME="${DISPLAY_NAME:-darkmatter-agent}"
 
-# Build the darkmatter MCP entry as JSON
-DM_ENTRY=$(cat <<JSONEOF
-{
-  "command": "$VENV_PYTHON",
-  "args": ["-m", "darkmatter"],
-  "env": {
-    "DARKMATTER_PORT": "$PORT",
-    "DARKMATTER_DISPLAY_NAME": "$DISPLAY_NAME"
-  }
-}
-JSONEOF
-)
-
-# Install into ALL known MCP config locations
-INSTALLED=0
-
-install_mcp_entry() {
-    local target="$1"
-    local target_dir
-    target_dir=$(dirname "$target")
-    mkdir -p "$target_dir"
-
-    if [ -f "$target" ]; then
-        MERGED=$(echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
-import json, sys
-entry = json.load(sys.stdin)
-with open('$target') as f:
-    config = json.load(f)
-config.setdefault('mcpServers', {})
-config['mcpServers']['darkmatter'] = entry
-print(json.dumps(config, indent=2))
-")
-        if [ $? -eq 0 ]; then
-            printf '%s\n' "$MERGED" > "$target"
-            echo "  Updated $target"
-            INSTALLED=$((INSTALLED + 1))
-        else
-            echo "  WARNING: Failed to merge into $target"
-        fi
-    else
-        echo "$DM_ENTRY" | "$VENV_PYTHON" -c "
-import json, sys
-entry = json.load(sys.stdin)
-config = {'mcpServers': {'darkmatter': entry}}
-with open('$target', 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\n')
-"
-        echo "  Created $target"
-        INSTALLED=$((INSTALLED + 1))
-    fi
-}
-
 echo ""
-echo "Installing MCP config (global — applies to all projects)..."
-install_mcp_entry "$HOME/.claude.json"
+echo "Installing MCP config for supported clients..."
+"$VENV_PYTHON" -m darkmatter install-mcp \
+  --display-name "$DISPLAY_NAME" \
+  --port "$PORT" \
+  --python "$VENV_PYTHON"
 
 echo ""
 echo "=== Setup complete ==="
-echo "DarkMatter installed to $INSTALLED location(s)"
 echo "Display name: $DISPLAY_NAME"
 echo "Port: $PORT"
 echo "Version: $VERSION"

@@ -483,6 +483,10 @@ async def run_stdio_with_http() -> None:
 
 def main() -> None:
     """Entry point — detect transport mode and run."""
+    if len(sys.argv) > 1 and sys.argv[1] == "install-mcp":
+        from darkmatter.installer import main as installer_main
+        raise SystemExit(installer_main(sys.argv[2:]))
+
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     transport = os.environ.get("DARKMATTER_TRANSPORT", "auto")
 

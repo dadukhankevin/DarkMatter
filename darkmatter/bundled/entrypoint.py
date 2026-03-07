@@ -135,7 +135,7 @@ if os.path.exists(_wallet_passport_path):
 # We do this with direct HTTP (not via NetworkManager) because transports
 # aren't initialized yet at module-load time.
 if state.connections:
-    _lan_ip = _mgr._get_lan_ip()
+    _lan_ip = NetworkManager._get_lan_ip()
     _lan_url = f"http://{_lan_ip}:{PORT}" if _lan_ip != "localhost" else f"http://localhost:{PORT}"
     _broadcast_count = 0
     for _conn in list(state.connections.values()):
@@ -1009,7 +1009,22 @@ def dm_message_stream():
         if indicator:
             indicator["content"] = indicator.get("content", "") + data.get("content", "")
     elif signal_type == "end":
-        _typing_indicators.pop(from_id, None)
+        indicator = _typing_indicators.pop(from_id, None)
+        # Persist the streamed content as a webhook response so it shows in the feed
+        if indicator and indicator.get("in_reply_to"):
+            sm = state.sent_messages.get(indicator["in_reply_to"])
+            if sm:
+                # Strip ANSI escape codes for clean text storage
+                import re
+                raw = indicator.get("content", "")
+                clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b[=<>]|\r", "", raw)
+                sm.responses.append({
+                    "agent_id": from_id,
+                    "response": clean or "(streamed)",
+                    "timestamp": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                })
+                sm.status = "responded"
+                save_state()
 
     return jsonify({"ok": True})
 

@@ -362,13 +362,30 @@ def sync_entrypoint_files() -> None:
     if not os.path.isdir(bundled_dir):
         return  # No bundled files (dev install without bundled/)
 
-    # Check version marker to avoid redundant copies
+    def _latest_mtime(path: str) -> float:
+        latest = 0.0
+        if os.path.isfile(path):
+            return os.path.getmtime(path)
+        for root, _, files in os.walk(path):
+            for name in files:
+                try:
+                    latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+                except OSError:
+                    continue
+        return latest
+
+    # Check version marker to avoid redundant copies in packaged installs, but
+    # still resync in dev when bundled files changed without a version bump.
     version_file = os.path.join(dest_dir, ".entrypoint_version")
     current_version = darkmatter.__version__
+    src_ep = os.path.join(bundled_dir, "entrypoint.py")
+    src_templates = os.path.join(bundled_dir, "templates")
+    source_mtime = max(_latest_mtime(src_ep), _latest_mtime(src_templates))
     try:
         with open(version_file) as f:
             installed_version = f.read().strip()
-        if installed_version == current_version:
+        version_mtime = os.path.getmtime(version_file)
+        if installed_version == current_version and source_mtime <= version_mtime:
             return  # Already up to date
     except FileNotFoundError:
         pass
@@ -376,12 +393,10 @@ def sync_entrypoint_files() -> None:
     os.makedirs(dest_dir, exist_ok=True)
 
     # Copy entrypoint.py
-    src_ep = os.path.join(bundled_dir, "entrypoint.py")
     if os.path.isfile(src_ep):
         shutil.copy2(src_ep, os.path.join(dest_dir, "entrypoint.py"))
 
     # Copy templates/ into templates/entrypoint/ (entrypoint's template_folder)
-    src_templates = os.path.join(bundled_dir, "templates")
     if os.path.isdir(src_templates):
         dest_templates = os.path.join(dest_dir, "templates")
         dest_entrypoint = os.path.join(dest_templates, "entrypoint")

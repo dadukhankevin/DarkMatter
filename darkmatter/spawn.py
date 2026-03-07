@@ -185,9 +185,9 @@ INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
 {context}
 
 Read message {msg.message_id} with darkmatter_inbox(message_id="{msg.message_id}"), then:
-1. Call begin_message(target_agent_id=..., in_reply_to="{msg.message_id}") FIRST — this starts streaming your output to the receiver live.
-2. Write your full response. Everything you write streams in real time. For humans, be thorough and natural. For agents, be concise.
-3. Call end_message(message_id=..., content="...") with a summary of what you wrote.
+1. Call begin_message(target_agent_id=..., in_reply_to="{msg.message_id}") FIRST. This starts streaming your stdout to the receiver in real time.
+2. Write your response naturally — everything you output between begin and end streams live to the receiver.
+3. Call end_message(message_id=...) when done. This just signals "stop streaming" — nothing else needed.
 4. If this message is better suited for another peer, forward it with darkmatter_send_message(message_id="{msg.message_id}", target_agent_id=...).
 """
 
@@ -199,6 +199,7 @@ Read message {msg.message_id} with darkmatter_inbox(message_id="{msg.message_id}
 async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
                                    save_state_fn=None) -> None:
     """Spawn an agent subprocess to handle an incoming message."""
+    print(f"[DarkMatter] DEBUG: spawn_agent_for_message called for {msg.message_id[:12]}...", file=sys.stderr)
     ok, reason = can_spawn_agent()
     if not ok:
         print(f"[DarkMatter] Not spawning agent: {reason}", file=sys.stderr)
@@ -246,28 +247,23 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     args = list(ACTIVE_CLIENT["args"])
 
     # Pass the temp MCP config via CLI flags instead of overwriting project config.
-    # IMPORTANT: --mcp-config <path> must come BEFORE the positional prompt because
-    # --mcp-config takes variadic args and will swallow the prompt otherwise.
-    # We insert it right after the base args but before prompt injection.
     mcp_via_cli = "mcp_stdio" in ACTIVE_CLIENT.get("capabilities", set())
     if mcp_via_cli:
         args.extend(["--mcp-config", spawn_mcp_path, "--strict-mcp-config"])
     prompt_style = ACTIVE_CLIENT.get("prompt_style", "positional")
-    stdin_pipe = None
+
+    # Sanitize prompt for shell safety — remove chars that break quoting
+    safe_prompt = prompt.replace('"', "'").replace('`', "'").replace('$', '')
 
     if prompt_style == "positional":
-        args.append(prompt)
-        stdin_pipe = asyncio.subprocess.DEVNULL  # Don't inherit parent's stdin (may be MCP pipe)
-    elif prompt_style == "stdin":
-        stdin_pipe = asyncio.subprocess.PIPE
+        args.append(safe_prompt)
     elif prompt_style.startswith("flag:"):
         flag_name = prompt_style.split(":", 1)[1]
-        args.extend([f"--{flag_name}", prompt])
-        stdin_pipe = asyncio.subprocess.DEVNULL
+        args.extend([f"--{flag_name}", safe_prompt])
+    elif prompt_style == "stdin":
+        stdin_pipe = asyncio.subprocess.PIPE
     else:
-        print(f"[DarkMatter] Unknown prompt_style '{prompt_style}', falling back to positional", file=sys.stderr)
-        args.append(prompt)
-        stdin_pipe = asyncio.subprocess.DEVNULL
+        args.append(safe_prompt)
 
     # Optionally wrap in OS-native sandbox
     exec_argv = [command] + args
@@ -286,21 +282,23 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             print("[DarkMatter] Sandbox unavailable, spawning without sandbox", file=sys.stderr)
 
     try:
-        # Use a PTY for stdout to force unbuffered/line-buffered output from the
-        # child process. Without this, `claude -p` buffers all stdout until exit,
-        # making real-time chunk streaming impossible.
+        # PTY gives us a headless terminal — output streams in real time.
         import pty as _pty
+        import fcntl, struct, termios
         pty_master_fd, pty_slave_fd = _pty.openpty()
+        # Set PTY size to match the xterm.js widget on the frontend
+        winsize = struct.pack("HHHH", 24, 120, 0, 0)  # rows=24, cols=120
+        fcntl.ioctl(pty_slave_fd, termios.TIOCSWINSZ, winsize)
 
         process = await asyncio.create_subprocess_exec(
             *exec_argv,
             env=env,
-            stdin=stdin_pipe,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=pty_slave_fd,
             stderr=asyncio.subprocess.PIPE,
             cwd=spawn_dir,
         )
-        os.close(pty_slave_fd)  # Parent doesn't need the slave end
+        os.close(pty_slave_fd)
 
         # Wrap PTY master fd in an asyncio-friendly stream reader
         loop = asyncio.get_event_loop()
@@ -309,11 +307,6 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             lambda: asyncio.StreamReaderProtocol(pty_reader),
             os.fdopen(pty_master_fd, "rb", 0),
         )
-
-        if prompt_style == "stdin" and process.stdin is not None:
-            process.stdin.write(prompt.encode())
-            await process.stdin.drain()
-            process.stdin.close()
 
         agent = SpawnedAgent(
             process=process,
@@ -353,18 +346,99 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
-    """Read stdout and forward chunks to all active callbacks (nested messages)."""
-    # Prefer PTY reader (unbuffered) over process.stdout (buffered)
+    """Read PTY output, extract only default-colored text (the actual response).
+
+    Claude Code's TUI renders chrome (spinners, status bar, tool calls) with
+    explicit ANSI foreground colors. The actual response text uses the default
+    foreground (no explicit color). We parse the ANSI stream, track color state,
+    and only pass through text in the default color.
+    """
     reader = getattr(agent, "_pty_reader", None) or agent.process.stdout
     if not reader:
         return
+    colored = False  # True when an explicit foreground color is active
     try:
         while True:
-            chunk = await reader.read(512)
+            chunk = await reader.read(4096)
             if not chunk:
                 break
-            if agent.stdout_callbacks:
-                text = chunk.decode("utf-8", errors="replace")
+            if not agent.stdout_callbacks:
+                continue
+            raw = chunk.decode("utf-8", errors="replace")
+            result = []
+            i = 0
+            n = len(raw)
+            while i < n:
+                if raw[i] == '\x1b':
+                    if i + 1 < n and raw[i + 1] == '[':
+                        # CSI sequence: \x1b[ ... <letter>
+                        j = i + 2
+                        while j < n and (raw[j].isdigit() or raw[j] in ';?'):
+                            j += 1
+                        if j < n:
+                            params_str = raw[i + 2:j]
+                            cmd = raw[j]
+                            if cmd == 'm':  # SGR — color/style
+                                parts = params_str.split(';') if params_str else ['0']
+                                for p in parts:
+                                    try:
+                                        code = int(p)
+                                    except ValueError:
+                                        continue
+                                    if code == 0 or code == 39:
+                                        colored = False
+                                    elif (30 <= code <= 37) or (90 <= code <= 97) or code == 38:
+                                        colored = True
+                            elif cmd == 'C' and not colored:
+                                # Cursor forward → insert spaces
+                                count = int(params_str) if params_str else 1
+                                result.append(' ' * count)
+                            elif cmd in ('B', 'E') and not colored:
+                                # Cursor down / next line → newline
+                                count = int(params_str) if params_str else 1
+                                result.append('\n' * count)
+                            i = j + 1
+                        else:
+                            i = j
+                    elif i + 1 < n and raw[i + 1] == ']':
+                        # OSC sequence — skip until BEL
+                        j = i + 2
+                        while j < n and raw[j] != '\x07':
+                            j += 1
+                        i = j + 1 if j < n else j
+                    else:
+                        i += 2
+                elif raw[i] == '\r':
+                    if i + 1 < n and raw[i + 1] == '\n':
+                        if not colored:
+                            result.append('\n')
+                        i += 2
+                    else:
+                        i += 1
+                else:
+                    if not colored:
+                        result.append(raw[i])
+                    i += 1
+            text = ''.join(result)
+            # Filter out tool call chrome that leaks through in default color
+            if text:
+                import re as _re2
+                text = _re2.sub(
+                    r'^.*(?:darkmatter\s*-\s*(?:Begin|Complete)\s+.*\(MCP\).*|'
+                    r'\(params:\s*\{.*?\}\).*|'
+                    r'⏺|⎿|ctrl\+o to expand|'
+                    r'"result"\s*:|"success"\s*:|"message_id"\s*:|"signaled"\s*:|"targets"\s*:).*$',
+                    '', text, flags=_re2.MULTILINE
+                )
+                # Filter lines with long hex strings (agent IDs from tool results)
+                text = _re2.sub(r'^.*[0-9a-f]{20,}.*$', '', text, flags=_re2.MULTILINE)
+                # Remove lines that are just JSON fragments: { } ( ) [ ]
+                text = _re2.sub(r'^\s*[{}\[\]()]+\s*$', '', text, flags=_re2.MULTILINE)
+                # Collapse excessive blank lines
+                text = _re2.sub(r'\n{3,}', '\n\n', text).strip()
+                if text:
+                    text += '\n'
+            if text:
                 for cb in list(agent.stdout_callbacks.values()):
                     try:
                         await cb(text)

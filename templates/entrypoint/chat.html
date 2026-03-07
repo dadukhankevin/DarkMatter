@@ -855,6 +855,23 @@ function buildFeedItems(data) {
   const items = [];
   const conns = data.connections || [];
   const findConn = (id) => conns.find(cn => cn.agent_id === id);
+  const responseItems = new Map();
+
+  function upsertResponseItem(parentId, agentId, next) {
+    if (!parentId || !agentId) return;
+    const id = 'resp_' + parentId + '_' + agentId;
+    const prev = responseItems.get(id) || {};
+    responseItems.set(id, {
+      id,
+      type: 'response',
+      parent_id: parentId,
+      from_agent_id: agentId,
+      timestamp: next.timestamp || prev.timestamp,
+      from_name: next.from_name || prev.from_name || shortId(agentId),
+      content: next.content !== undefined ? next.content : (prev.content || ''),
+      is_streaming: next.is_streaming !== undefined ? next.is_streaming : !!prev.is_streaming,
+    });
+  }
 
   // Outbound messages
   for (const msg of (data.outbox || [])) {
@@ -875,17 +892,29 @@ function buildFeedItems(data) {
     // Responses to sent messages appear as inbound replies
     for (const r of (msg.responses || [])) {
       const c = findConn(r.agent_id);
-      items.push({
-        id: 'resp_' + msg.message_id + '_' + r.agent_id,
-        type: 'response',
+      upsertResponseItem(msg.message_id, r.agent_id, {
         content: r.response,
         timestamp: r.timestamp || msg.created_at,
         from_name: c ? agentLabel(c) : (r.display_name || shortId(r.agent_id)),
-        from_agent_id: r.agent_id,
-        parent_id: msg.message_id,
+        is_streaming: false,
       });
     }
   }
+
+  // Active streamed replies are rendered as the same response items, just
+  // marked streaming until the end signal persists the final response.
+  for (const t of (data.typing || [])) {
+    if (!t.in_reply_to) continue;
+    const c = findConn(t.agent_id);
+    upsertResponseItem(t.in_reply_to, t.agent_id, {
+      content: t.content || '',
+      timestamp: t.started_at,
+      from_name: c ? agentLabel(c) : (t.display_name || shortId(t.agent_id)),
+      is_streaming: true,
+    });
+  }
+
+  items.push(...responseItems.values());
 
   // Inbound messages
   for (const msg of (data.inbox || [])) {
@@ -925,10 +954,25 @@ function buildFeedItems(data) {
   return items;
 }
 
+function feedItemSignature(item) {
+  return JSON.stringify({
+    type: item.type,
+    content: item.content || '',
+    status: item.status || '',
+    timestamp: item.timestamp || '',
+    is_streaming: !!item.is_streaming,
+    updates: item.updates || [],
+    routed_to: item.routed_to || [],
+    routed_to_names: item.routed_to_names || [],
+    attachments: item.attachments || [],
+  });
+}
+
 function renderFeedItem(item) {
   const el = document.createElement('div');
   el.className = 'fade-in';
   el.dataset.feedId = item.id;
+  el.dataset.itemHash = feedItemSignature(item);
 
   if (item.type === 'outbound') {
     const tint = agentTint(selfAgentId);
@@ -1011,13 +1055,15 @@ function renderFeedItem(item) {
   } else if (item.type === 'response') {
     const aColor = agentColor(item.from_agent_id);
     const tint = agentTint(item.from_agent_id);
+    const content = item.content && item.content.trim().length ? renderMd(item.content) : '<span class="msg-meta">Thinking...</span>';
     el.innerHTML = `
-      <div class="msg-block msg-block-in" style="background:${tint}">
+      <div class="msg-block msg-block-in" style="background:${tint};${item.is_streaming ? 'opacity:0.9' : ''}">
         <div class="flex items-baseline gap-3 mb-1.5">
           <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
           <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
+          ${item.is_streaming ? `<span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>` : ''}
         </div>
-        <div class="msg-content">${renderMd(item.content)}</div>
+        <div class="msg-content">${content}</div>
       </div>`;
   } else if (item.type === 'shard') {
     const shardId = 'shard-content-' + item.id.replace(/[^a-zA-Z0-9]/g, '_');
@@ -1214,20 +1260,12 @@ function renderFeed(data) {
       if (itemTs < clearedAtTs) continue;
     }
     if (renderedFeedItems.has(item.id)) {
-      // Update existing outbound status
-      if (item.type === 'outbound') {
-        const existing = renderedFeedItems.get(item.id);
-        const prevStatus = existing.querySelector('.msg-block')?.dataset.status;
-        if (prevStatus !== item.status && (item.status === 'failed' || item.status === 'timed_out')) {
-          // Full re-render to show failure banner
-          const newEl = renderFeedItem(item);
-          newEl.dataset.feedId = item.id;
-          existing.replaceWith(newEl);
-          renderedFeedItems.set(item.id, newEl);
-        } else {
-          const dot = existing.querySelector('.msg-meta [class*="rounded-full"]');
-          if (dot) dot.outerHTML = buildStatusDot(item.status, item.updates);
-        }
+      const existing = renderedFeedItems.get(item.id);
+      const nextHash = feedItemSignature(item);
+      if (existing.dataset.itemHash !== nextHash) {
+        const newEl = renderFeedItem(item);
+        existing.replaceWith(newEl);
+        renderedFeedItems.set(item.id, newEl);
       }
       continue;
     }
@@ -1844,47 +1882,6 @@ function selectHeaderTarget(value, label) {
 }
 
 // =========================================================================
-// Typing indicators
-// =========================================================================
-function renderTypingIndicators(typing) {
-  let container = document.getElementById('typing-indicators');
-  if (!container) {
-    container = document.createElement('div');
-    container.id = 'typing-indicators';
-    feedContainer.parentNode.appendChild(container);
-  }
-  if (!typing || typing.length === 0) {
-    container.innerHTML = '';
-    return;
-  }
-  const html = typing.map(t => {
-    const aColor = agentColor(t.agent_id);
-    const tint = agentTint(t.agent_id);
-    const name = t.display_name || shortId(t.agent_id);
-    const hasContent = t.content && t.content.trim().length > 0;
-    if (hasContent) {
-      return `<div class="msg-block msg-block-in" style="background:${tint}; opacity: 0.85;">
-        <div class="flex items-baseline gap-3 mb-1.5">
-          <span class="msg-sender" style="color:${aColor}">${esc(name)}</span>
-          <span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>
-        </div>
-        <div class="msg-content">${renderMd(t.content)}</div>
-      </div>`;
-    }
-    return `<div class="typing-indicator fade-in" style="background:${tint}; border-radius: 16px;">
-      <div class="flex items-center gap-2.5">
-        <span class="msg-sender" style="color:${aColor}">${esc(name)}</span>
-        <span class="typing-dots"><span></span><span></span><span></span></span>
-      </div>
-    </div>`;
-  }).join('');
-  container.innerHTML = html;
-
-  // Auto-scroll if near bottom
-  const nearBottom = feedScroll.scrollHeight - feedScroll.scrollTop - feedScroll.clientHeight < 80;
-  if (nearBottom) feedScroll.scrollTop = feedScroll.scrollHeight;
-}
-
 // =========================================================================
 // Main poll handler
 // =========================================================================
@@ -1898,7 +1895,6 @@ function onPollData(data) {
   _lastConns = data.connections;
   renderActiveAgents(data.connections);
   renderFeed(data);
-  renderTypingIndicators(data.typing || []);
   // Validate target still exists
   const curTarget = targetValue.value;
   if (curTarget && curTarget !== 'auto' && curTarget !== 'broadcast' && curTarget !== 'fastest') {

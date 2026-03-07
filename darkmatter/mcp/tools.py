@@ -265,6 +265,7 @@ async def _send_chunk(state, message_id: str, content: str, targets: list) -> No
     }
     for conn in targets:
         if not _is_streamable(conn, state):
+            print(f"[DarkMatter] CHUNK: not streamable for {getattr(conn, 'display_name', '?')}", file=sys.stderr)
             continue
         try:
             # WebRTC: use transport manager
@@ -276,9 +277,10 @@ async def _send_chunk(state, message_id: str, content: str, targets: list) -> No
             lan_url = _get_stream_url(conn, state)
             if lan_url:
                 client = _get_chunk_client()
+                print(f"[DarkMatter] CHUNK: sending {len(content)} chars to {lan_url}", file=sys.stderr)
                 await client.post(f"{lan_url}/__darkmatter__/message_stream", json=payload)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DarkMatter] CHUNK: error sending: {e}", file=sys.stderr)
 
 
 async def _begin_message(state, params: BeginMessageInput) -> str:
@@ -363,12 +365,12 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
         "message_id": message_id,
         "signaled": signaled,
         "targets": [c.agent_id for c in targets],
-        "next_step": f"Compose your response, then call darkmatter_end_message(message_id='{message_id}', content='...').",
+        "next_step": f"Write your response naturally — it streams to the receiver in real time. When done, call darkmatter_end_message(message_id='{message_id}') to stop streaming.",
     })
 
 
 async def _end_message(state, params: EndMessageInput) -> str:
-    """Complete a message started with begin_message. Sends the final content."""
+    """Signal that streaming is complete. Sends end signal and logs to history."""
     stream_info = _pending_streams.pop(params.message_id, None)
 
     # Stop stdout streaming for this message (other nested streams continue)
@@ -385,7 +387,6 @@ async def _end_message(state, params: EndMessageInput) -> str:
     target_ids = stream_info["targets"]
     metadata = stream_info.get("metadata") or {}
     in_reply_to = stream_info.get("in_reply_to")
-    hops_remaining = stream_info.get("hops_remaining", 10)
 
     if stream_info.get("broadcast"):
         metadata["type"] = "broadcast"
@@ -396,61 +397,31 @@ async def _end_message(state, params: EndMessageInput) -> str:
         if conn:
             targets.append(conn)
 
-    if not targets:
-        return json.dumps({
-            "success": False,
-            "error": "No connections available to deliver message."
-        })
-
-    # Determine peer_url for local relay bypass
-    _peer_url = targets[0].agent_url if len(targets) == 1 else None
-    webhook = get_network_manager().build_webhook_url(params.message_id, peer_url=_peer_url)
-
     msg_timestamp = datetime.now(timezone.utc).isoformat()
-    base_payload = {
-        "message_id": params.message_id,
-        "content": params.content,
-        "webhook": webhook,
-        "hops_remaining": hops_remaining,
-        "metadata": metadata,
-        "timestamp": msg_timestamp,
-    }
-    if in_reply_to:
-        base_payload["in_reply_to"] = in_reply_to
 
-    envelope = prepare_outbound(base_payload, state.private_key_hex, state.agent_id, state.public_key_hex)
-
-    sent_to = []
-    failed = []
-    for conn in targets:
-        try:
-            await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
-            conn.messages_sent += 1
-            conn.last_activity = datetime.now(timezone.utc).isoformat()
-            sent_to.append(conn.agent_id)
-            adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
-        except Exception as e:
-            conn.messages_declined += 1
-            failed.append({"agent_id": conn.agent_id, "display_name": conn.agent_display_name, "error": str(e)})
-
-    # Send end signal to close typing indicator (best-effort)
+    # Send end signal to stop streaming (best-effort)
     end_signal = {
         "message_id": params.message_id,
         "type": "end",
         "from_agent_id": state.agent_id,
         "timestamp": msg_timestamp,
     }
+    sent_to = []
     for conn in targets:
         try:
             await send_to_peer(conn, "/__darkmatter__/message_stream", end_signal)
+            conn.messages_sent += 1
+            conn.last_activity = datetime.now(timezone.utc).isoformat()
+            sent_to.append(conn.agent_id)
+            adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
         except Exception:
             pass
 
-    # Log conversation
+    # Log conversation (content was streamed, just record the event)
     if sent_to:
         msg_type = metadata.get("type", "direct") if metadata.get("type") == "broadcast" else "direct"
         log_conversation(
-            state, params.message_id, params.content,
+            state, params.message_id, "(streamed)",
             from_id=state.agent_id, to_ids=sent_to,
             entry_type=msg_type, direction="outbound",
             metadata=metadata,
@@ -458,26 +429,27 @@ async def _end_message(state, params: EndMessageInput) -> str:
 
     sent_msg = SentMessage(
         message_id=params.message_id,
-        content=params.content,
+        content="(streamed)",
         status="active" if sent_to else "failed",
-        initial_hops=hops_remaining,
+        initial_hops=stream_info.get("hops_remaining", 10),
         routed_to=sent_to,
     )
     state.sent_messages[params.message_id] = sent_msg
     save_state()
 
+    # Kill the spawned agent process — it's done with this message.
+    # Without -p mode, Claude runs interactively and won't exit on its own.
+    if spawned:
+        try:
+            spawned.process.terminate()
+        except Exception:
+            pass
+
     result = {
         "success": len(sent_to) > 0,
         "message_id": params.message_id,
         "routed_to": sent_to,
-        "hops_remaining": hops_remaining,
     }
-    if failed:
-        result["failed"] = failed
-        if not sent_to:
-            result["error"] = f"Message could not be delivered to any of {len(failed)} target(s)."
-    if sent_to:
-        result["next_step"] = f"Call darkmatter_wait_for_message(message_id='{params.message_id}') now to get the reply."
     return json.dumps(result)
 
 

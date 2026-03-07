@@ -957,7 +957,12 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     # Route message through the extensible router chain
     from darkmatter.router import execute_routing
-    asyncio.create_task(execute_routing(state, msg, execute_decision_fn=_execute_router_decision))
+    try:
+        await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
+    except Exception as e:
+        import traceback
+        print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
     return {"success": True, "queued": True, "queue_position": len(state.message_queue)}, 200
 

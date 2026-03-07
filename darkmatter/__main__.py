@@ -1,4 +1,4 @@
 """Allow running as: python -m darkmatter"""
-from darkmatter.app import main
+from darkmatter.cli import main
 
 main()

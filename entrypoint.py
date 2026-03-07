@@ -14,6 +14,7 @@ import atexit
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -135,7 +136,7 @@ if os.path.exists(_wallet_passport_path):
 # We do this with direct HTTP (not via NetworkManager) because transports
 # aren't initialized yet at module-load time.
 if state.connections:
-    _lan_ip = _mgr._get_lan_ip()
+    _lan_ip = NetworkManager._get_lan_ip()
     _lan_url = f"http://{_lan_ip}:{PORT}" if _lan_ip != "localhost" else f"http://localhost:{PORT}"
     _broadcast_count = 0
     for _conn in list(state.connections.values()):
@@ -932,6 +933,39 @@ _typing_indicators: dict[str, dict] = {}
 _TYPING_TIMEOUT_S = 120  # Auto-expire after 2 minutes
 
 
+def _strip_stream_artifacts(text: str) -> str:
+    """Normalize streamed terminal output into readable markdown text."""
+    if not text:
+        return ""
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b[=<>]|\r", "", text)
+
+
+def _persist_streamed_reply(from_id: str, indicator: dict, ended_at: str | None = None) -> None:
+    """Finalize a streamed reply into the parent sent message."""
+    parent_id = indicator.get("in_reply_to")
+    if not parent_id:
+        return
+    sm = state.sent_messages.get(parent_id)
+    if not sm:
+        return
+
+    clean = _strip_stream_artifacts(indicator.get("content", "")).strip()
+    if not clean:
+        clean = "(streamed)"
+
+    for existing in getattr(sm, "responses", []):
+        if existing.get("agent_id") == from_id and existing.get("response", "").strip() == clean:
+            return
+
+    sm.responses.append({
+        "agent_id": from_id,
+        "response": clean,
+        "timestamp": ended_at or datetime.now(timezone.utc).isoformat(),
+    })
+    sm.status = "responded"
+    save_state()
+
+
 def _get_typing_indicators() -> list[dict]:
     """Return active typing indicators, auto-expiring stale ones."""
     now = datetime.now(timezone.utc)
@@ -1009,7 +1043,9 @@ def dm_message_stream():
         if indicator:
             indicator["content"] = indicator.get("content", "") + data.get("content", "")
     elif signal_type == "end":
-        _typing_indicators.pop(from_id, None)
+        indicator = _typing_indicators.pop(from_id, None)
+        if indicator:
+            _persist_streamed_reply(from_id, indicator, data.get("timestamp"))
 
     return jsonify({"ok": True})
 
