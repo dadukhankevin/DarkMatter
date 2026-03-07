@@ -1246,6 +1246,49 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=status)
 
 
+async def handle_message_stream(request: Request) -> JSONResponse:
+    """Handle message stream signals (typing indicators).
+
+    POST /__darkmatter__/message_stream
+    Body: {message_id, type: "begin"|"end", from_agent_id, ...}
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    from_id = data.get("from_agent_id", "")
+    signal_type = data.get("type", "")
+    message_id = data.get("message_id", "")
+
+    if not from_id or not message_id or signal_type not in ("begin", "end"):
+        return JSONResponse({"error": "Invalid stream signal"}, status_code=400)
+
+    # Only accept signals from connected peers
+    if from_id not in state.connections:
+        return JSONResponse({"error": "Not connected"}, status_code=403)
+
+    # Store/clear typing state
+    if signal_type == "begin":
+        if not hasattr(state, "_typing_indicators"):
+            state._typing_indicators = {}
+        state._typing_indicators[from_id] = {
+            "message_id": message_id,
+            "in_reply_to": data.get("in_reply_to"),
+            "display_name": data.get("from_display_name", ""),
+            "started_at": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        }
+    elif signal_type == "end":
+        if hasattr(state, "_typing_indicators"):
+            state._typing_indicators.pop(from_id, None)
+
+    return JSONResponse({"ok": True})
+
+
 async def handle_message(request: Request) -> JSONResponse:
     """Handle an incoming routed message from another agent (HTTP transport)."""
     state = get_state()

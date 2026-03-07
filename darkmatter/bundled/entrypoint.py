@@ -1089,9 +1089,44 @@ def dm_accept_pending():
     return jsonify(result), status
 
 
+# Typing indicators from connected agents
+_typing_indicators: dict[str, dict] = {}
+_TYPING_TIMEOUT_S = 120  # Auto-expire after 2 minutes
+
+
+def _get_typing_indicators() -> list[dict]:
+    """Return active typing indicators, auto-expiring stale ones."""
+    now = datetime.now(timezone.utc)
+    expired = []
+    result = []
+    for agent_id, info in _typing_indicators.items():
+        try:
+            started = datetime.fromisoformat(info["started_at"])
+            if (now - started).total_seconds() > _TYPING_TIMEOUT_S:
+                expired.append(agent_id)
+                continue
+        except Exception:
+            expired.append(agent_id)
+            continue
+        result.append({
+            "agent_id": agent_id,
+            "display_name": info.get("display_name") or _display_name_for(agent_id),
+            "in_reply_to": info.get("in_reply_to"),
+            "started_at": info["started_at"],
+        })
+    for aid in expired:
+        _typing_indicators.pop(aid, None)
+    return result
+
+
 @app.route("/__darkmatter__/message", methods=["POST"])
 def dm_message():
     data = request.get_json(silent=True) or {}
+
+    # Clear typing indicator when actual message arrives
+    from_id = data.get("from_agent_id", "")
+    if from_id:
+        _typing_indicators.pop(from_id, None)
 
     # Use shared validation/queuing logic from darkmatter.network.mesh.
     # router_mode is "queue_only" — messages queue for the human to read.
@@ -1108,9 +1143,40 @@ def dm_message():
     return jsonify(result), status
 
 
+@app.route("/__darkmatter__/message_stream", methods=["POST"])
+def dm_message_stream():
+    data = request.get_json(silent=True) or {}
+    from_id = data.get("from_agent_id", "")
+    signal_type = data.get("type", "")
+    message_id = data.get("message_id", "")
+
+    if not from_id or not message_id or signal_type not in ("begin", "end"):
+        return jsonify({"error": "Invalid stream signal"}), 400
+
+    if from_id not in state.connections:
+        return jsonify({"error": "Not connected"}), 403
+
+    if signal_type == "begin":
+        conn = state.connections[from_id]
+        _typing_indicators[from_id] = {
+            "message_id": message_id,
+            "in_reply_to": data.get("in_reply_to"),
+            "display_name": data.get("from_display_name") or getattr(conn, "agent_display_name", ""),
+            "started_at": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        }
+    elif signal_type == "end":
+        _typing_indicators.pop(from_id, None)
+
+    return jsonify({"ok": True})
+
+
 @app.route("/__darkmatter__/webhook/<message_id>", methods=["POST"])
 def dm_webhook_post(message_id):
     data = request.get_json(silent=True) or {}
+    # Clear typing indicator when response arrives
+    responder = data.get("agent_id", "")
+    if responder and data.get("type") == "response":
+        _typing_indicators.pop(responder, None)
     result, status = _process_webhook_locally(state, message_id, data)
     return jsonify(result), status
 
@@ -1730,6 +1796,7 @@ def poll():
             "total_active_agents": total_active_agents,
             "wallets": state.wallets,
         },
+        "typing": _get_typing_indicators(),
         "inbox": inbox, "outbox": outbox, "pending_requests": pending,
         "connections": connections, "discovered": discovered,
         "shards": [{

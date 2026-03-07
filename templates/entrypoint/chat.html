@@ -1844,6 +1844,38 @@ function selectHeaderTarget(value, label) {
 }
 
 // =========================================================================
+// Typing indicators
+// =========================================================================
+function renderTypingIndicators(typing) {
+  let container = document.getElementById('typing-indicators');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'typing-indicators';
+    feedContainer.parentNode.appendChild(container);
+  }
+  if (!typing || typing.length === 0) {
+    container.innerHTML = '';
+    return;
+  }
+  const html = typing.map(t => {
+    const aColor = agentColor(t.agent_id);
+    const tint = agentTint(t.agent_id);
+    const name = t.display_name || shortId(t.agent_id);
+    return `<div class="typing-indicator fade-in" style="background:${tint}; border-radius: 16px;">
+      <div class="flex items-center gap-2.5">
+        <span class="msg-sender" style="color:${aColor}">${esc(name)}</span>
+        <span class="typing-dots"><span></span><span></span><span></span></span>
+      </div>
+    </div>`;
+  }).join('');
+  container.innerHTML = html;
+
+  // Auto-scroll if near bottom
+  const nearBottom = feedScroll.scrollHeight - feedScroll.scrollTop - feedScroll.clientHeight < 80;
+  if (nearBottom) feedScroll.scrollTop = feedScroll.scrollHeight;
+}
+
+// =========================================================================
 // Main poll handler
 // =========================================================================
 function onPollData(data) {
@@ -1856,6 +1888,7 @@ function onPollData(data) {
   _lastConns = data.connections;
   renderActiveAgents(data.connections);
   renderFeed(data);
+  renderTypingIndicators(data.typing || []);
   // Validate target still exists
   const curTarget = targetValue.value;
   if (curTarget && curTarget !== 'auto' && curTarget !== 'broadcast' && curTarget !== 'fastest') {

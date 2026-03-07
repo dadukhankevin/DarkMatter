@@ -29,8 +29,27 @@ class ConnectionInput(BaseModel):
     agent_id: Optional[str] = Field(default=None, description="Agent ID (for disconnect)")
 
 
+class BeginMessageInput(BaseModel):
+    """Signal that you're composing a message. Sends a typing indicator to the target."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    target_agent_id: Optional[str] = Field(default=None, description="Agent to notify (omit for auto-select)")
+    in_reply_to: Optional[str] = Field(default=None, description="Message ID this is replying to")
+    broadcast: bool = Field(default=False, description="Signal all connected peers")
+    trust_min: float = Field(default=0.0, ge=-1.0, le=1.0, description="Only signal peers with trust >= this (for broadcast)")
+    metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
+
+
+class EndMessageInput(BaseModel):
+    """Complete a message started with begin_message. Sends the final content."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    message_id: str = Field(..., description="Message ID returned by begin_message")
+    content: str = Field(..., description="Final message content", max_length=MAX_CONTENT_LENGTH)
+    metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata (budget, preferences, etc.)")
+    hops_remaining: int = Field(default=10, ge=1, le=50, description="TTL for mesh routing")
+
+
 class SendMessageInput(BaseModel):
-    """Send a message or forward a message."""
+    """Forward a queued message to another agent."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     content: Optional[str] = Field(default=None, description="Message content (for new messages)", max_length=MAX_CONTENT_LENGTH)
     message_id: Optional[str] = Field(default=None, description="Queue message ID (for forwarding)")

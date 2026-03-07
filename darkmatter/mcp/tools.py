@@ -20,6 +20,8 @@ from darkmatter.mcp import mcp, track_session
 from darkmatter.mcp.schemas import (
     ConnectionAction,
     ConnectionInput,
+    BeginMessageInput,
+    EndMessageInput,
     SendMessageInput,
     UpdateBioInput,
     CreateShardInput,
@@ -204,6 +206,191 @@ async def _connection_disconnect(state, agent_id: str) -> str:
         "success": True,
         "disconnected_from": agent_id,
     })
+
+
+# In-flight messages started by begin_message, keyed by message_id
+_pending_streams: dict[str, dict] = {}
+
+
+async def _begin_message(state, params: BeginMessageInput) -> str:
+    """Signal that a message is being composed. Sends typing indicator to target(s)."""
+    message_id = f"msg-{uuid.uuid4().hex[:12]}"
+    metadata = params.metadata or {}
+
+    if params.broadcast:
+        targets = []
+        for aid, conn in state.connections.items():
+            imp = state.impressions.get(aid)
+            peer_trust = imp.score if imp else 0.0
+            if peer_trust >= params.trust_min:
+                targets.append(conn)
+    elif params.target_agent_id:
+        conn = state.connections.get(params.target_agent_id)
+        if not conn:
+            return json.dumps({
+                "success": False,
+                "error": f"Not connected to agent '{params.target_agent_id}'."
+            })
+        targets = [conn]
+    else:
+        targets = [c for c in state.connections.values()]
+
+    if not targets:
+        return json.dumps({
+            "success": False,
+            "error": "No connections available to send to."
+        })
+
+    # Build typing signal payload
+    signal_payload = {
+        "message_id": message_id,
+        "type": "begin",
+        "from_agent_id": state.agent_id,
+        "from_public_key_hex": state.public_key_hex,
+        "from_display_name": state.display_name,
+        "in_reply_to": params.in_reply_to,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metadata": metadata,
+    }
+
+    # Send typing signal to all targets (best-effort, don't fail on errors)
+    signaled = []
+    for conn in targets:
+        try:
+            await send_to_peer(conn, "/__darkmatter__/message_stream", signal_payload)
+            signaled.append(conn.agent_id)
+        except Exception:
+            pass  # typing indicator is best-effort
+
+    # Store pending stream state
+    _pending_streams[message_id] = {
+        "targets": [c.agent_id for c in targets],
+        "signaled": signaled,
+        "in_reply_to": params.in_reply_to,
+        "broadcast": params.broadcast,
+        "metadata": metadata,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return json.dumps({
+        "success": True,
+        "message_id": message_id,
+        "signaled": signaled,
+        "targets": [c.agent_id for c in targets],
+        "next_step": f"Compose your response, then call darkmatter_end_message(message_id='{message_id}', content='...').",
+    })
+
+
+async def _end_message(state, params: EndMessageInput) -> str:
+    """Complete a message started with begin_message. Sends the final content."""
+    stream_info = _pending_streams.pop(params.message_id, None)
+
+    if stream_info:
+        target_ids = stream_info["targets"]
+        metadata = {**(stream_info.get("metadata") or {}), **(params.metadata or {})}
+        in_reply_to = stream_info.get("in_reply_to")
+    else:
+        # Graceful fallback: end_message works even without a prior begin_message
+        target_ids = None
+        metadata = params.metadata or {}
+        in_reply_to = None
+
+    if metadata.get("type") is None and stream_info and stream_info.get("broadcast"):
+        metadata["type"] = "broadcast"
+
+    # Resolve targets
+    if target_ids:
+        targets = []
+        for tid in target_ids:
+            conn = state.connections.get(tid)
+            if conn:
+                targets.append(conn)
+    else:
+        targets = [c for c in state.connections.values()]
+
+    if not targets:
+        return json.dumps({
+            "success": False,
+            "error": "No connections available to deliver message."
+        })
+
+    # Determine peer_url for local relay bypass
+    _peer_url = targets[0].agent_url if len(targets) == 1 else None
+    webhook = get_network_manager().build_webhook_url(params.message_id, peer_url=_peer_url)
+
+    msg_timestamp = datetime.now(timezone.utc).isoformat()
+    base_payload = {
+        "message_id": params.message_id,
+        "content": params.content,
+        "webhook": webhook,
+        "hops_remaining": params.hops_remaining,
+        "metadata": metadata,
+        "timestamp": msg_timestamp,
+    }
+    if in_reply_to:
+        base_payload["in_reply_to"] = in_reply_to
+
+    envelope = prepare_outbound(base_payload, state.private_key_hex, state.agent_id, state.public_key_hex)
+
+    sent_to = []
+    failed = []
+    for conn in targets:
+        try:
+            await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
+            conn.messages_sent += 1
+            conn.last_activity = datetime.now(timezone.utc).isoformat()
+            sent_to.append(conn.agent_id)
+            adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
+        except Exception as e:
+            conn.messages_declined += 1
+            failed.append({"agent_id": conn.agent_id, "display_name": conn.agent_display_name, "error": str(e)})
+
+    # Send end signal to close typing indicator (best-effort)
+    end_signal = {
+        "message_id": params.message_id,
+        "type": "end",
+        "from_agent_id": state.agent_id,
+        "timestamp": msg_timestamp,
+    }
+    for conn in targets:
+        try:
+            await send_to_peer(conn, "/__darkmatter__/message_stream", end_signal)
+        except Exception:
+            pass
+
+    # Log conversation
+    if sent_to:
+        msg_type = metadata.get("type", "direct") if metadata.get("type") == "broadcast" else "direct"
+        log_conversation(
+            state, params.message_id, params.content,
+            from_id=state.agent_id, to_ids=sent_to,
+            entry_type=msg_type, direction="outbound",
+            metadata=metadata,
+        )
+
+    sent_msg = SentMessage(
+        message_id=params.message_id,
+        content=params.content,
+        status="active" if sent_to else "failed",
+        initial_hops=params.hops_remaining,
+        routed_to=sent_to,
+    )
+    state.sent_messages[params.message_id] = sent_msg
+    save_state()
+
+    result = {
+        "success": len(sent_to) > 0,
+        "message_id": params.message_id,
+        "routed_to": sent_to,
+        "hops_remaining": params.hops_remaining,
+    }
+    if failed:
+        result["failed"] = failed
+        if not sent_to:
+            result["error"] = f"Message could not be delivered to any of {len(failed)} target(s)."
+    if sent_to:
+        result["next_step"] = f"Call darkmatter_wait_for_message(message_id='{params.message_id}') now to get the reply."
+    return json.dumps(result)
 
 
 async def _send_new_message(state, params: SendMessageInput) -> str:
@@ -502,6 +689,40 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
 
 
 @mcp.tool(
+    name="darkmatter_begin_message",
+    annotations={
+        "title": "Begin Composing Message",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def begin_message(params: BeginMessageInput, ctx: Context) -> str:
+    """Signal that you're composing a message. Sends a typing indicator to the target. Call end_message when done."""
+    track_session(ctx)
+    state = get_state()
+    return await _begin_message(state, params)
+
+
+@mcp.tool(
+    name="darkmatter_end_message",
+    annotations={
+        "title": "Complete Message",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def end_message(params: EndMessageInput, ctx: Context) -> str:
+    """Complete and send a message started with begin_message. Provide the message_id from begin_message and the final content."""
+    track_session(ctx)
+    state = get_state()
+    return await _end_message(state, params)
+
+
+@mcp.tool(
     name="darkmatter_send_message",
     annotations={
         "title": "Send or Forward Message",
@@ -512,7 +733,7 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     }
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send or forward a message. New/reply: provide content + target_agent_id. Forward: provide message_id + target_agent_id."""
+    """Send or forward a message. Prefer begin_message + end_message for new messages (enables typing indicators). Use this for forwarding queued messages or quick sends."""
     state = get_state()
 
     # Validate parameter combinations
