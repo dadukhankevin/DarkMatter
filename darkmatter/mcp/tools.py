@@ -212,8 +212,23 @@ async def _connection_disconnect(state, agent_id: str) -> str:
 _pending_streams: dict[str, dict] = {}
 
 
+def _is_streamable(conn) -> bool:
+    """Check if a connection supports chunk streaming (WebRTC, localhost, or LAN)."""
+    from darkmatter.network.manager import is_local_url
+    # WebRTC data channel open = true streaming
+    ch = getattr(conn, "webrtc_channel", None)
+    if ch is not None and getattr(ch, "readyState", None) == "open":
+        return True
+    # Local/LAN HTTP = fine for chunks (same machine or same network, low cost)
+    url = getattr(conn, "agent_url", "") or ""
+    if is_local_url(url):
+        return True
+    # Remote HTTP = skip chunks (wasteful, one POST per 512-byte chunk)
+    return False
+
+
 async def _send_chunk(state, message_id: str, content: str, targets: list) -> None:
-    """Send a chunk signal to all targets (best-effort)."""
+    """Send a chunk signal to streamable targets only (WebRTC or localhost)."""
     payload = {
         "message_id": message_id,
         "type": "chunk",
@@ -222,6 +237,8 @@ async def _send_chunk(state, message_id: str, content: str, targets: list) -> No
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     for conn in targets:
+        if not _is_streamable(conn):
+            continue
         try:
             await send_to_peer(conn, "/__darkmatter__/message_stream", payload)
         except Exception:
@@ -229,7 +246,11 @@ async def _send_chunk(state, message_id: str, content: str, targets: list) -> No
 
 
 async def _begin_message(state, params: BeginMessageInput) -> str:
-    """Signal that a message is being composed. Sends typing indicator to target(s)."""
+    """Signal that a message is being composed. Sends typing indicator to target(s).
+
+    Supports nesting: if called while another message is in flight,
+    stdout chunks stream to ALL active targets (stack model).
+    """
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
@@ -280,6 +301,7 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
 
     # Store pending stream state
     _pending_streams[message_id] = {
+        "from_agent_id": state.agent_id,
         "targets": [c.agent_id for c in targets],
         "signaled": signaled,
         "in_reply_to": params.in_reply_to,
@@ -296,7 +318,7 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
             if agent.message_id == params.in_reply_to:
                 async def _on_chunk(chunk: str, _mid=message_id, _st=state, _tgts=targets):
                     await _send_chunk(_st, _mid, chunk, _tgts)
-                agent.stdout_callback = _on_chunk
+                agent.stdout_callbacks[message_id] = _on_chunk
                 _pending_streams[message_id]["_spawned_agent"] = agent
                 break
 
@@ -313,10 +335,10 @@ async def _end_message(state, params: EndMessageInput) -> str:
     """Complete a message started with begin_message. Sends the final content."""
     stream_info = _pending_streams.pop(params.message_id, None)
 
-    # Stop stdout streaming
+    # Stop stdout streaming for this message (other nested streams continue)
     spawned = stream_info.get("_spawned_agent") if stream_info else None
     if spawned:
-        spawned.stdout_callback = None
+        spawned.stdout_callbacks.pop(params.message_id, None)
 
     if not stream_info:
         return json.dumps({
@@ -846,38 +868,15 @@ _REMOVED_TOOL_MARKER = True  # noqa: F841 — placeholder for removed tools
         "openWorldHint": True,
     }
 )
-async def create_shard(params: CreateShardInput, ctx: Context) -> str:
-    """Create a knowledge shard and push to qualifying peers. Provide content, tags, trust_threshold."""
-    track_session(ctx)
-    state = get_state()
-
-    from darkmatter.config import SHARED_SHARD_MAX
-    if len(state.shared_shards) >= SHARED_SHARD_MAX:
-        return json.dumps({"success": False, "error": f"Shard limit reached ({SHARED_SHARD_MAX})"})
-
-    now = datetime.now(timezone.utc).isoformat()
-    from darkmatter.security import sign_shard
-
-    shard_id = f"shard-{uuid.uuid4().hex[:12]}"
-    tags_str = ",".join(sorted(params.tags))
-    sig = sign_shard(state.private_key_hex, shard_id, state.agent_id, params.content, tags_str)
-
-    shard = SharedShard(
-        shard_id=shard_id,
-        author_agent_id=state.agent_id,
-        content=params.content,
-        tags=params.tags,
-        trust_threshold=params.trust_threshold,
-        created_at=now,
-        updated_at=now,
-        summary=params.summary,
-        signature_hex=sig,
-    )
-    state.shared_shards.append(shard)
-    save_state()
-
-    # Push to qualifying peers
+async def _push_shard_to_peers(state, shard) -> list[str]:
+    """Push a shard to all qualifying connected peers. Returns list of agent IDs pushed to."""
     pushed_to = []
+    from darkmatter.security import sign_shard
+    # Re-sign with current content
+    tags_str = ",".join(sorted(shard.tags))
+    shard.signature_hex = sign_shard(
+        state.private_key_hex, shard.shard_id, state.agent_id, shard.content, tags_str,
+    )
     shard_payload = {
         "shard_id": shard.shard_id,
         "author_agent_id": shard.author_agent_id,
@@ -888,24 +887,133 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         "updated_at": shard.updated_at,
         "summary": shard.summary,
         "signature_hex": shard.signature_hex,
+        "file": shard.file,
+        "from_text": shard.from_text,
+        "to_text": shard.to_text,
+        "function_anchor": shard.function_anchor,
+        "original_content": shard.original_content,
+        "original_hash": shard.original_hash,
     }
     for aid, conn in state.connections.items():
         imp = state.impressions.get(aid)
         peer_trust = imp.score if imp else 0.0
-        if peer_trust >= params.trust_threshold:
+        if peer_trust >= shard.trust_threshold:
             try:
                 await send_to_peer(conn, "/__darkmatter__/shard_push", shard_payload)
                 pushed_to.append(aid)
             except Exception as e:
                 print(f"[DarkMatter] Warning: failed to push shard {shard.shard_id} to peer {aid}: {e}", file=sys.stderr)
+    return pushed_to
 
-    return json.dumps({
+
+async def create_shard(params: CreateShardInput, ctx: Context) -> str:
+    """Create a knowledge shard (text or code) and push to qualifying peers.
+
+    Text shard: provide content directly.
+    Code shard: provide file, from_text, to_text — content is resolved live from the file.
+    When the code changes, updates are automatically pushed to peers on next view.
+
+    Prefer raw code over summaries. Only add a summary for very long code regions
+    where the full content would waste context. For most shards, skip summary.
+    """
+    track_session(ctx)
+    state = get_state()
+
+    from darkmatter.config import SHARED_SHARD_MAX
+    if len(state.shared_shards) >= SHARED_SHARD_MAX:
+        return json.dumps({"success": False, "error": f"Shard limit reached ({SHARED_SHARD_MAX})"})
+
+    is_code_shard = params.file is not None
+    file_path = None
+    region = None
+    original_content = None
+    original_hash = None
+
+    if is_code_shard:
+        if not params.from_text or not params.to_text:
+            return json.dumps({"success": False, "error": "Code shards require file, from_text, and to_text."})
+
+        from darkmatter.shard_resolver import resolve_region, hash_content
+        from pathlib import Path
+        # Resolve file path
+        p = Path(params.file)
+        file_path = str(p) if p.is_absolute() else str(Path.cwd() / params.file)
+
+        if not Path(file_path).exists():
+            return json.dumps({"success": False, "error": f"File not found: {params.file}"})
+
+        region = resolve_region(file_path, params.from_text, params.to_text)
+        if region is None:
+            return json.dumps({
+                "success": False,
+                "error": f"Could not find region in {params.file}. "
+                         f"Make sure from_text ('{params.from_text[:50]}') appears in the file."
+            })
+
+        original_content = region.content
+        original_hash = hash_content(original_content)
+        content = original_content  # stored content = resolved snapshot
+    else:
+        if not params.content:
+            return json.dumps({"success": False, "error": "Text shards require content."})
+        content = params.content
+
+    now = datetime.now(timezone.utc).isoformat()
+    from darkmatter.security import sign_shard
+
+    # Upsert: if a code shard exists for same file+from_text, replace it
+    shard_id = f"shard-{uuid.uuid4().hex[:12]}"
+    was_update = False
+    if is_code_shard:
+        for i, existing in enumerate(state.shared_shards):
+            if (existing.author_agent_id == state.agent_id
+                    and existing.file == params.file
+                    and existing.from_text == params.from_text):
+                shard_id = existing.shard_id
+                was_update = True
+                state.shared_shards.pop(i)
+                break
+
+    tags_str = ",".join(sorted(params.tags))
+    sig = sign_shard(state.private_key_hex, shard_id, state.agent_id, content, tags_str)
+
+    shard = SharedShard(
+        shard_id=shard_id,
+        author_agent_id=state.agent_id,
+        content=content,
+        tags=params.tags,
+        trust_threshold=params.trust_threshold,
+        created_at=now,
+        updated_at=now,
+        summary=params.summary,
+        signature_hex=sig,
+        file=params.file,
+        from_text=params.from_text,
+        to_text=params.to_text,
+        function_anchor=region.function_anchor if region else None,
+        original_content=original_content,
+        original_hash=original_hash,
+    )
+    state.shared_shards.append(shard)
+    save_state()
+
+    pushed_to = await _push_shard_to_peers(state, shard)
+
+    result = {
         "success": True,
         "shard_id": shard.shard_id,
+        "action": "updated" if was_update else "created",
         "tags": shard.tags,
         "trust_threshold": shard.trust_threshold,
         "pushed_to": pushed_to,
-    })
+    }
+    if is_code_shard:
+        result["file"] = params.file
+        result["lines"] = f"{region.start_line}-{region.end_line}"
+        if region.function_anchor:
+            result["function_anchor"] = region.function_anchor
+
+    return json.dumps(result)
 
 
 @mcp.tool(
@@ -919,11 +1027,21 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
     }
 )
 async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
-    """Query shards by tags and/or author. Returns local + cached peer shards."""
+    """Query shards by tags, author, and/or file. Returns local + cached peer shards.
+
+    Code shards resolve live content from files and include health status.
+    Remote code shards show the last-known snapshot.
+    """
     track_session(ctx)
     state = get_state()
 
+    from darkmatter.shard_resolver import resolve_region, assess_health, hash_content
+    from pathlib import Path
+
     results = []
+    to_delete = []
+    to_push = []  # shards whose content changed — push updates to peers
+
     for shard in state.shared_shards:
         # Filter by tags
         if params.tags:
@@ -936,6 +1054,12 @@ async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
         # Filter by author
         if params.author and shard.author_agent_id != params.author:
             continue
+        # Filter by file
+        if params.file and shard.file != params.file:
+            continue
+
+        is_local = shard.author_agent_id == state.agent_id
+        is_code = shard.file is not None
 
         entry = {
             "shard_id": shard.shard_id,
@@ -945,24 +1069,106 @@ async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
             "created_at": shard.created_at,
             "updated_at": shard.updated_at,
         }
-        # Show summary if available, else content
-        if shard.summary:
-            entry["summary"] = shard.summary
+
+        if is_code:
+            entry["file"] = shard.file
+            entry["type"] = "code"
+
+            if is_local and shard.from_text and shard.to_text:
+                # Resolve live content from file
+                p = Path(shard.file)
+                file_path = str(p) if p.is_absolute() else str(Path.cwd() / shard.file)
+                region = resolve_region(
+                    file_path, shard.from_text, shard.to_text,
+                    function_anchor=shard.function_anchor,
+                )
+                current_content = region.content if region else None
+
+                if shard.original_content and shard.original_hash:
+                    health = assess_health(
+                        shard.original_content, shard.original_hash,
+                        current_content, shard.stale_views,
+                    )
+                    entry["health"] = {"score": health.score, "status": health.status, "message": health.message}
+
+                    if region:
+                        entry["lines"] = f"{region.start_line}-{region.end_line}"
+
+                    # If content changed, update the shard and queue for push
+                    if current_content and hash_content(current_content) != shard.original_hash:
+                        shard.content = current_content
+                        shard.original_content = current_content
+                        shard.original_hash = hash_content(current_content)
+                        shard.updated_at = datetime.now(timezone.utc).isoformat()
+                        shard.stale_views = 0
+                        if region:
+                            shard.function_anchor = region.function_anchor
+                        to_push.append(shard)
+
+                    # Show content (raw code preferred for code shards)
+                    if shard.summary and not params.raw:
+                        entry["summary"] = shard.summary
+                    else:
+                        entry["content"] = current_content or "[Could not resolve]"
+
+                    if health.should_delete():
+                        to_delete.append(shard.shard_id)
+                        entry["expired"] = True
+                    elif health.status in ("stale", "degraded"):
+                        shard.stale_views += 1
+                else:
+                    # Code shard without original tracking — show content
+                    entry["content"] = current_content or shard.content
+            else:
+                # Remote code shard — show last-known snapshot
+                entry["cached"] = True
+                if shard.summary and not params.raw:
+                    entry["summary"] = shard.summary
+                else:
+                    entry["content"] = shard.content[:500]
+                    if len(shard.content) > 500:
+                        entry["truncated"] = True
         else:
-            entry["content"] = shard.content[:500]
-            if len(shard.content) > 500:
-                entry["truncated"] = True
+            entry["type"] = "text"
+            if shard.summary and not params.raw:
+                entry["summary"] = shard.summary
+            else:
+                entry["content"] = shard.content[:500]
+                if len(shard.content) > 500:
+                    entry["truncated"] = True
 
         # Label if from peer
-        if shard.author_agent_id != state.agent_id:
+        if not is_local:
             conn = state.connections.get(shard.author_agent_id)
             if conn:
                 entry["author_name"] = conn.agent_display_name or shard.author_agent_id[:12]
-            entry["cached"] = True
+            if "cached" not in entry:
+                entry["cached"] = True
 
         results.append(entry)
 
-    return json.dumps({"success": True, "count": len(results), "shards": results})
+    # Delete expired shards
+    if to_delete:
+        state.shared_shards = [s for s in state.shared_shards if s.shard_id not in set(to_delete)]
+
+    # Push updated code shards to peers
+    pushed_updates = []
+    for shard in to_push:
+        if shard.shard_id not in set(to_delete):
+            peers = await _push_shard_to_peers(state, shard)
+            if peers:
+                pushed_updates.append({"shard_id": shard.shard_id, "pushed_to": peers})
+
+    if to_delete or to_push:
+        save_state()
+
+    response = {"success": True, "count": len(results), "shards": results}
+    if to_delete:
+        response["expired_deleted"] = to_delete
+    if pushed_updates:
+        response["pushed_updates"] = pushed_updates
+
+    return json.dumps(response)
 
 
 # =============================================================================
