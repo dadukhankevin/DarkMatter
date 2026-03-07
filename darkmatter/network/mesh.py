@@ -22,7 +22,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from darkmatter.config import (
-    ANCHOR_NODES,
     MAX_AGENT_ID_LENGTH,
     MAX_BIO_LENGTH,
     MAX_CONNECTIONS,
@@ -32,7 +31,7 @@ from darkmatter.config import (
     REQUEST_EXPIRY_S,
     ANTIMATTER_MAX_AGE_S,
     TRUST_ANTIMATTER_SUCCESS,
-    WEBRTC_STUN_SERVERS,
+    WEBRTC_ICE_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
 )
 from darkmatter.models import (
@@ -446,66 +445,11 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
     return {"success": True}, 200
 
 
-def process_connection_relay_callback(state: AgentState, data: dict) -> None:
-    """Process a connection_accepted callback received via anchor relay.
-
-    Called from entrypoint.py's relay poll loop. The data dict has the same
-    shape as the connection_accepted POST body:
-      {agent_id, agent_url, agent_bio, agent_public_key_hex, agent_display_name}
-    """
-    agent_id = data.get("agent_id", "")
-    agent_url = data.get("agent_url", "")
-    agent_bio = data.get("agent_bio", "")
-    agent_public_key_hex = data.get("agent_public_key_hex")
-    agent_display_name = data.get("agent_display_name")
-
-    if not agent_id or not agent_url:
-        print("[DarkMatter] Relay callback: missing agent_id or agent_url", file=sys.stderr)
-        return
-    url_err = validate_url(agent_url)
-    if url_err:
-        print(f"[DarkMatter] Relay callback: invalid URL: {url_err}", file=sys.stderr)
-        return
-
-    # Match against pending outbound requests (same logic as process_connection_accepted)
-    agent_base = agent_url.rstrip("/").rsplit("/mcp", 1)[0].rstrip("/")
-    matched = None
-    for pending_url in state.pending_outbound:
-        pending_base = pending_url.rsplit("/mcp", 1)[0].rstrip("/")
-        if pending_base == agent_base:
-            matched = pending_url
-            break
-
-    if matched is None and agent_id:
-        for pending_url, pending_agent_id in state.pending_outbound.items():
-            if pending_agent_id == agent_id:
-                matched = pending_url
-                break
-
-    if matched is None:
-        print(f"[DarkMatter] Relay callback: no pending outbound for {agent_id[:12]}...", file=sys.stderr)
-        return
-
-    del state.pending_outbound[matched]
-
-    conn = Connection(
-        agent_id=agent_id,
-        agent_url=agent_url,
-        agent_bio=agent_bio,
-        agent_public_key_hex=agent_public_key_hex,
-        agent_display_name=agent_display_name,
-    )
-    state.connections[agent_id] = conn
-    save_state()
-    print(f"[DarkMatter] Relay callback: connection established with {agent_id[:12]}...", file=sys.stderr)
-
-
 async def notify_connection_accepted(conn: Connection, payload: dict) -> None:
-    """Notify a peer that we accepted their connection request, with anchor relay fallback.
+    """Notify a peer that we accepted their connection request.
 
-    Uses NetworkManager.send() for the direct attempt (tries all transports in
-    priority order: WebRTC, HTTP, etc.). Falls back to anchor relay only when
-    all transports fail (e.g. both sides behind NAT).
+    Uses NetworkManager.send() which tries all transports in priority order
+    (WebRTC, HTTP).
     """
     result = await get_network_manager().send(
         conn.agent_id, "/__darkmatter__/connection_accepted", payload
@@ -513,23 +457,7 @@ async def notify_connection_accepted(conn: Connection, payload: dict) -> None:
     if result.success:
         return
 
-    # All transports failed — fall back to anchor relay (signaling escape hatch)
-    if ANCHOR_NODES:
-        for anchor in ANCHOR_NODES:
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(
-                        f"{anchor}/__darkmatter__/connection_relay/{conn.agent_id}",
-                        json=payload,
-                    )
-                    if resp.status_code < 400:
-                        print(f"[DarkMatter] Connection accept relayed via {anchor} for {conn.agent_id[:12]}...", file=sys.stderr)
-                        return
-            except Exception as e:
-                print(f"[DarkMatter] Anchor relay {anchor} failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
-                continue
-
-    print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... (transports + all anchors failed)", file=sys.stderr)
+    print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... of acceptance: {result.error}", file=sys.stderr)
 
 
 def process_accept_pending(state: AgentState, request_id: str, public_url: str) -> tuple[dict, int, dict | None]:
@@ -1105,6 +1033,54 @@ def _process_webhook_locally(state: AgentState, message_id: str, data: dict) -> 
 
 
 # =============================================================================
+# Peer Ping — distributed IP change detection
+# =============================================================================
+
+async def handle_ping(request: Request) -> JSONResponse:
+    """Handle an inbound ping from a peer. Returns the requester's IP.
+
+    POST /__darkmatter__/ping
+    Body: {"agent_id": str, "timestamp": str}
+    Response: {"your_ip": str, "agent_id": str, "timestamp": str}
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    from_agent_id = data.get("agent_id", "")
+
+    # Extract requester's IP (check X-Forwarded-For for proxied requests)
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        requester_ip = forwarded.split(",")[0].strip()
+    else:
+        requester_ip = request.client.host if request.client else "unknown"
+
+    # Update last_activity on the connection (doubles as heartbeat)
+    if from_agent_id and from_agent_id in state.connections:
+        state.connections[from_agent_id].last_activity = datetime.now(timezone.utc).isoformat()
+
+    # Track inbound ping time on the manager
+    from darkmatter.network.manager import get_network_manager
+    try:
+        mgr = get_network_manager()
+        mgr._last_inbound_ping = time.time()
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "your_ip": requester_ip,
+        "agent_id": state.agent_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+# =============================================================================
 # HTTP Endpoints — Agent-to-Agent Communication Layer
 #
 # These are the raw HTTP endpoints that agents call on each other.
@@ -1602,9 +1578,9 @@ async def handle_antimatter_result(request: Request) -> JSONResponse:
 
 
 def _make_rtc_config():
-    """Create an RTCConfiguration with STUN servers."""
+    """Create an RTCConfiguration with ICE servers (STUN + TURN)."""
     return RTCConfiguration(
-        iceServers=[RTCIceServer(urls=s["urls"]) for s in WEBRTC_STUN_SERVERS]
+        iceServers=[RTCIceServer(**s) for s in WEBRTC_ICE_SERVERS]
     )
 
 
@@ -1799,6 +1775,12 @@ async def handle_shard_push(request: Request) -> JSONResponse:
         updated_at=data.get("updated_at", ""),
         summary=data.get("summary"),
         signature_hex=signature_hex,
+        file=data.get("file"),
+        from_text=data.get("from_text"),
+        to_text=data.get("to_text"),
+        function_anchor=data.get("function_anchor"),
+        original_content=data.get("original_content"),
+        original_hash=data.get("original_hash"),
     )
 
     if existing_idx is not None:

@@ -151,13 +151,6 @@
       </div>
     </div>
 
-    <!-- NAT status footer -->
-    <div id="nat-status" class="px-3 py-2 mt-auto hidden">
-      <div class="flex items-center gap-1.5">
-        <div class="w-1.5 h-1.5 rounded-full bg-accent-orange"></div>
-        <span class="text-[11px] text-muted">NAT detected — using relay</span>
-      </div>
-    </div>
     <!-- Version footer -->
     <div class="px-3 py-1.5 mt-auto border-t border-primary/[0.06]">
       <span id="version-label" class="text-[10px] text-muted opacity-50">v{{ version }}</span>
@@ -1912,11 +1905,6 @@ function onPollData(data) {
   // QR code init
   if (data.self && data.self.lan_url && !qrInitialized) {
     initQR(data.self.lan_url);
-  }
-
-  // NAT status
-  if (data.self && data.self.nat_detected) {
-    document.getElementById('nat-status').classList.remove('hidden');
   }
 
   // Update sidebar identity

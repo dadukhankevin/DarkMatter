@@ -70,7 +70,7 @@ class Connection:
     identity_verified: bool = False   # True if challenge-response proof passed
     tls_secure: bool = False          # True if peer URL uses HTTPS
     # NAT traversal connectivity tracking (ephemeral)
-    connectivity_level: int = 0    # 0=unknown, 1=direct, 2=lan_webrtc, 3=peer_relay, 4=anchor_relay, 5=anchor_msg_relay
+    connectivity_level: int = 0    # 0=unknown, 1=direct, 2=lan_webrtc, 3=peer_relay
     connectivity_method: str = ""  # human label set alongside level
 
     @property
@@ -137,7 +137,12 @@ class ConversationEntry:
 
 @dataclass
 class SharedShard:
-    """A DarkMatter-native knowledge shard, trust-gated and push-synced."""
+    """A DarkMatter-native knowledge shard, trust-gated and push-synced.
+
+    Two types:
+    - Text shard: content is freeform text (file is None)
+    - Code shard: anchored to a file region via from_text/to_text, resolved live
+    """
     shard_id: str
     author_agent_id: str
     content: str
@@ -147,6 +152,14 @@ class SharedShard:
     updated_at: str
     summary: Optional[str] = None
     signature_hex: Optional[str] = None
+    # Code shard fields (all None for text shards)
+    file: Optional[str] = None
+    from_text: Optional[str] = None
+    to_text: Optional[str] = None
+    function_anchor: Optional[str] = None
+    original_content: Optional[str] = None
+    original_hash: Optional[str] = None
+    stale_views: int = 0
 
 
 # =============================================================================
@@ -327,8 +340,6 @@ class AgentState:
     # Extensible message routing
     routing_rules: list = field(default_factory=list)
     router_mode: str = "spawn"
-    # NAT detection (ephemeral)
-    nat_detected: bool = False
     # AntiMatter economy
     superagent_url: Optional[str] = None
     antimatter_log: list[dict] = field(default_factory=list)

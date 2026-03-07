@@ -315,6 +315,13 @@ def save_state() -> None:
                 "updated_at": s.updated_at,
                 "summary": s.summary,
                 "signature_hex": s.signature_hex,
+                "file": s.file,
+                "from_text": s.from_text,
+                "to_text": s.to_text,
+                "function_anchor": s.function_anchor,
+                "original_content": s.original_content,
+                "original_hash": s.original_hash,
+                "stale_views": s.stale_views,
             }
             for s in state.shared_shards[-SHARED_SHARD_MAX:]
         ],
@@ -504,6 +511,13 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             updated_at=sd.get("updated_at", ""),
             summary=sd.get("summary"),
             signature_hex=sd.get("signature_hex"),
+            file=sd.get("file"),
+            from_text=sd.get("from_text"),
+            to_text=sd.get("to_text"),
+            function_anchor=sd.get("function_anchor"),
+            original_content=sd.get("original_content"),
+            original_hash=sd.get("original_hash"),
+            stale_views=sd.get("stale_views", 0),
         ))
 
     # Deserialize pools

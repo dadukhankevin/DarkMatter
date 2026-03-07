@@ -36,8 +36,13 @@ class SpawnedAgent:
     spawned_at: float
     pid: int
     spawn_mcp_config: str = ""  # .mcp.json path to clean up when agent exits
-    # Stdout streaming: callback receives chunks as they arrive
-    stdout_callback: object = None  # Optional async callable(chunk: str)
+    # Stdout streaming: dict of message_id → async callable(chunk: str)
+    # Multiple callbacks = nested messages, chunks go to all active targets
+    stdout_callbacks: dict = None  # Initialized to {} in __post_init__
+
+    def __post_init__(self):
+        if self.stdout_callbacks is None:
+            self.stdout_callbacks = {}
 
 
 _spawned_agents: list[SpawnedAgent] = []
@@ -327,7 +332,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
-    """Read stdout and forward chunks to the callback if set."""
+    """Read stdout and forward chunks to all active callbacks (nested messages)."""
     if not agent.process.stdout:
         return
     try:
@@ -335,11 +340,13 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
             chunk = await agent.process.stdout.read(512)
             if not chunk:
                 break
-            if agent.stdout_callback:
-                try:
-                    await agent.stdout_callback(chunk.decode("utf-8", errors="replace"))
-                except Exception:
-                    pass
+            if agent.stdout_callbacks:
+                text = chunk.decode("utf-8", errors="replace")
+                for cb in list(agent.stdout_callbacks.values()):
+                    try:
+                        await cb(text)
+                    except Exception:
+                        pass
     except Exception:
         pass
 

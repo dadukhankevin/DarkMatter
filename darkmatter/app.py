@@ -36,7 +36,6 @@ from darkmatter.mcp.visibility import initialize_tool_visibility, status_updater
 from darkmatter.network.manager import NetworkManager, set_network_manager, get_network_manager
 from darkmatter.network.transports.http import HttpTransport
 from darkmatter.network.transports.webrtc import WebRTCTransport
-from darkmatter.network.transports.anchor_relay import AnchorRelayTransport
 from darkmatter.network.discovery import (
     DiscoveryProtocol,
     discovery_loop,
@@ -77,6 +76,7 @@ from darkmatter.network.mesh import (
     handle_local_sent_messages,
     handle_local_expire_message,
     handle_local_config,
+    handle_ping,
 )
 from darkmatter.spawn import spawn_agent_for_message
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
@@ -173,7 +173,6 @@ def create_app() -> Router:
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
     manager.register_transport(HttpTransport())
     manager.register_transport(WebRTCTransport())
-    manager.register_transport(AnchorRelayTransport(state_getter=get_state))
     set_network_manager(manager)
 
     # Wire antimatter economy into NetworkManager for transport-agnostic sends
@@ -224,27 +223,7 @@ def create_app() -> Router:
         # Initialize dynamic tool visibility (hide optional tools until needed)
         initialize_tool_visibility()
 
-        # Wire up relay processing callbacks (avoids circular import)
-        from darkmatter.network.mesh import _process_webhook_locally, process_connection_relay_callback
-        manager.set_process_webhook_fn(_process_webhook_locally)
-        manager.set_process_connection_relay_fn(process_connection_relay_callback)
-
-        # Wire up relayed message processing (Level 5 anchor relay)
-        from darkmatter.network.mesh import _process_incoming_message
-        def _handle_relayed_message(state, path, payload, from_id):
-            """Process a message received via anchor relay (Level 5)."""
-            if path == "/__darkmatter__/message":
-                import asyncio as _aio
-                try:
-                    loop = _aio.get_running_loop()
-                    loop.create_task(_process_incoming_message(state, payload))
-                except RuntimeError:
-                    _aio.run(_process_incoming_message(state, payload))
-            else:
-                print(f"[DarkMatter] Relay: unhandled path {path} from {from_id[:12]}...", file=sys.stderr)
-        manager.set_process_relayed_message_fn(_handle_relayed_message)
-
-        # Start NetworkManager (discovers public URL, detects NAT, starts health loop, registers with anchors)
+        # Start NetworkManager (discovers public URL, starts health loop + ping loop)
         await manager.start()
 
         # Auto-start entrypoint (human node) if not already running
@@ -304,6 +283,7 @@ def create_app() -> Router:
         Route("/pool_info/{pool_id}", handle_pool_info, methods=["GET"]),
         Route("/admin_update", handle_admin_update, methods=["POST"]),
         Route("/genome", handle_genome, methods=["GET"]),
+        Route("/ping", handle_ping, methods=["POST"]),
         # Local API — for skill/curl access
         Route("/inbox", handle_local_inbox, methods=["GET"]),
         Route("/pending_requests", handle_local_pending, methods=["GET"]),
@@ -457,7 +437,6 @@ async def run_stdio_with_http() -> None:
         manager = NetworkManager(state_getter=get_state, state_saver=save_state)
         manager.register_transport(HttpTransport())
         manager.register_transport(WebRTCTransport())
-        manager.register_transport(AnchorRelayTransport(state_getter=get_state))
         set_network_manager(manager)
         set_antimatter_network_fns(
             send_fn=manager.send,

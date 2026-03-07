@@ -708,18 +708,21 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     }
 )
 async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
-    """Update your bio. Shared with peers for routing decisions."""
+    """Update your bio and/or display name. Shared with peers for routing decisions."""
     state = get_state()
-    state.bio = params.bio
+    if params.bio is not None:
+        state.bio = params.bio
+    if params.display_name is not None:
+        state.display_name = params.display_name
     save_state()
 
-    # Broadcast bio change to all connected peers
+    # Broadcast change to all connected peers
     try:
         await get_network_manager().broadcast_peer_update()
     except Exception as e:
-        print(f"[DarkMatter] Failed to broadcast bio update: {e}", file=sys.stderr)
+        print(f"[DarkMatter] Failed to broadcast update: {e}", file=sys.stderr)
 
-    return json.dumps({"success": True, "bio": state.bio})
+    return json.dumps({"success": True, "bio": state.bio, "display_name": state.display_name})
 
 
 # =============================================================================

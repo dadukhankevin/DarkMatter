@@ -58,9 +58,10 @@ class SendMessageInput(BaseModel):
 
 
 class UpdateBioInput(BaseModel):
-    """Update this agent's bio / specialty description."""
+    """Update this agent's bio and/or display name."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    bio: str = Field(..., description="New bio text describing this agent's specialty", min_length=1, max_length=1000)
+    bio: Optional[str] = Field(default=None, description="New bio text describing this agent's specialty", min_length=1, max_length=1000)
+    display_name: Optional[str] = Field(default=None, description="New display name for this agent", min_length=1, max_length=100)
 
 
 class SetStatusInput(BaseModel):
@@ -178,12 +179,20 @@ class SetRateLimitInput(BaseModel):
 
 
 class CreateShardInput(BaseModel):
-    """Create a shared knowledge shard."""
+    """Create a shared knowledge shard (text or code).
+
+    Text shard: provide content directly.
+    Code shard: provide file, from_text, to_text — content is resolved live from the file.
+    """
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    content: str = Field(..., description="Text content of the shard", max_length=MAX_CONTENT_LENGTH)
+    content: Optional[str] = Field(default=None, description="Text content (for text shards). Omit for code shards.", max_length=MAX_CONTENT_LENGTH)
     tags: list[str] = Field(..., description="Tags for organizing and querying shards", min_length=1)
     trust_threshold: float = Field(default=0.0, ge=0.0, le=1.0, description="Min trust to receive this shard (0.0=public, 1.0=private)")
-    summary: Optional[str] = Field(default=None, description="Optional summary shown instead of content", max_length=1000)
+    summary: Optional[str] = Field(default=None, description="Optional summary. Only use for very long code regions where raw content would waste context. For most shards, skip this — raw code is better.", max_length=1000)
+    # Code shard fields
+    file: Optional[str] = Field(default=None, description="File path for code shard (relative or absolute)")
+    from_text: Optional[str] = Field(default=None, description="Text marking start of code region")
+    to_text: Optional[str] = Field(default=None, description="Text marking end of code region")
 
 
 class ViewShardsInput(BaseModel):
@@ -191,6 +200,8 @@ class ViewShardsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     tags: Optional[list[str]] = Field(default=None, description="Filter by tags (ANY match, prefix matching — 'pool' matches 'pool:llm')")
     author: Optional[str] = Field(default=None, description="Filter by author agent ID")
+    file: Optional[str] = Field(default=None, description="Filter by file path (code shards only)")
+    raw: bool = Field(default=False, description="Show raw content instead of summaries")
 
 
 class GenomeInstallInput(BaseModel):

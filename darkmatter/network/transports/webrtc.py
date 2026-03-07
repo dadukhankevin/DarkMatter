@@ -16,10 +16,9 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, R
 
 from darkmatter.config import (
     WEBRTC_MESSAGE_SIZE_LIMIT,
-    WEBRTC_STUN_SERVERS,
+    WEBRTC_ICE_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
     WEBRTC_CHANNEL_OPEN_TIMEOUT,
-    SDP_RELAY_TIMEOUT,
     PEER_RELAY_SDP_TIMEOUT,
 )
 from darkmatter.network.transport import Transport, SendResult
@@ -27,9 +26,9 @@ from darkmatter.network.transports.http import strip_base_url
 
 
 def _make_rtc_config():
-    """Build RTCConfiguration from WEBRTC_STUN_SERVERS."""
+    """Build RTCConfiguration from WEBRTC_ICE_SERVERS."""
     return RTCConfiguration(
-        iceServers=[RTCIceServer(**s) for s in WEBRTC_STUN_SERVERS]
+        iceServers=[RTCIceServer(**s) for s in WEBRTC_ICE_SERVERS]
     )
 
 
@@ -160,68 +159,6 @@ class PeerRelaySignaling(SignalingChannel):
             print(f"[DarkMatter] PeerRelaySignaling failed: {e}", file=sys.stderr)
             for t in tasks:
                 t.cancel()
-        return None
-
-
-class AnchorRelaySignaling(SignalingChannel):
-    """Level 4: Buffer SDP on anchor node, poll for answer."""
-
-    name = "anchor_relay"
-
-    async def send_offer(self, state, conn, offer_data: dict) -> Optional[dict]:
-        import httpx
-        from darkmatter.config import ANCHOR_NODES
-        from darkmatter.identity import sign_relay_poll
-        from datetime import datetime, timezone
-
-        if not ANCHOR_NODES:
-            return None
-
-        anchor = ANCHOR_NODES[0]
-
-        # Post the SDP offer to anchor for the target agent to pick up
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{anchor}/__darkmatter__/sdp_relay/{conn.agent_id}",
-                    json={
-                        "from_agent_id": state.agent_id,
-                        "offer_data": offer_data,
-                        "type": "offer",
-                    },
-                )
-                if resp.status_code != 200:
-                    return None
-        except Exception as e:
-            print(f"[DarkMatter] AnchorRelaySignaling: failed to post offer: {e}", file=sys.stderr)
-            return None
-
-        # Poll anchor for the answer (target agent will post it back)
-        deadline = asyncio.get_event_loop().time() + SDP_RELAY_TIMEOUT
-        while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(2.0)
-            try:
-                ts = datetime.now(timezone.utc).isoformat()
-                sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(
-                        f"{anchor}/__darkmatter__/sdp_relay_poll/{state.agent_id}",
-                        params={"signature": sig, "timestamp": ts},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        signals = data.get("signals", [])
-                        for signal in signals:
-                            if (signal.get("type") == "answer" and
-                                    signal.get("from_agent_id") == conn.agent_id):
-                                answer_data = signal.get("answer_data")
-                                if answer_data and answer_data.get("sdp"):
-                                    return answer_data
-            except Exception as e:
-                print(f"[DarkMatter] AnchorRelaySignaling: poll failed: {e}", file=sys.stderr)
-
-        print(f"[DarkMatter] AnchorRelaySignaling: timed out waiting for SDP answer from {conn.agent_id[:12]}...",
-              file=sys.stderr)
         return None
 
 

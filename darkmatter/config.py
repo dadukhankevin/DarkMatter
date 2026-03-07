@@ -29,7 +29,18 @@ MAX_URL_LENGTH = 2048
 # WebRTC
 # =============================================================================
 
-WEBRTC_STUN_SERVERS = [{"urls": "stun:stun.l.google.com:19302"}]
+WEBRTC_ICE_SERVERS = [{"urls": "stun:stun.l.google.com:19302"}]
+
+# TURN server for NAT traversal (optional — if set, added to ICE servers)
+_turn_url = os.environ.get("DARKMATTER_TURN_URL", "")
+_turn_user = os.environ.get("DARKMATTER_TURN_USERNAME", "")
+_turn_cred = os.environ.get("DARKMATTER_TURN_CREDENTIAL", "")
+if _turn_url:
+    WEBRTC_ICE_SERVERS.append({
+        "urls": _turn_url,
+        "username": _turn_user,
+        "credential": _turn_cred,
+    })
 WEBRTC_ICE_GATHER_TIMEOUT = 10.0
 WEBRTC_CHANNEL_OPEN_TIMEOUT = 15.0
 WEBRTC_MESSAGE_SIZE_LIMIT = 16384  # 16 KB — fall back to HTTP for larger
@@ -56,21 +67,25 @@ STALE_CONNECTION_AGE = 300          # seconds of inactivity before health-checki
 UPNP_PORT_RANGE = (30000, 60000)    # external port range for UPnP mappings
 PEER_LOOKUP_TIMEOUT = 5.0           # seconds to wait for peer_lookup responses
 PEER_LOOKUP_MAX_CONCURRENT = 50     # fan out peer_lookup to all connections
-IP_CHECK_INTERVAL = 300             # check public IP every 5 min
 WEBHOOK_RECOVERY_MAX_ATTEMPTS = 3   # max peer-lookup recovery attempts per webhook call
 WEBHOOK_RECOVERY_TIMEOUT = 30.0     # total wall-clock budget for all recovery attempts
-ANCHOR_LOOKUP_TIMEOUT = 2.0         # seconds to wait for anchor node responses
 PEER_UPDATE_MAX_AGE = 300           # max age for peer_update timestamps (replay prevention)
+
+# =============================================================================
+# Peer Pings (distributed IP change detection)
+# =============================================================================
+
+PING_INTERVAL = 1.0                 # seconds between outbound pings
+PING_IP_WINDOW = 60                 # seconds of observations to track
+PING_SILENCE_THRESHOLD = 30         # seconds of no inbound pings before alert
 REQUEST_EXPIRY_S = int(os.environ.get("DARKMATTER_REQUEST_EXPIRY", "3600"))  # pending request TTL
 
 # =============================================================================
 # NAT Traversal
 # =============================================================================
 
-SDP_RELAY_TIMEOUT = 30              # seconds to wait for SDP answer via anchor relay
 PEER_RELAY_SDP_TIMEOUT = 15         # seconds for peer-relayed SDP
 CONNECTIVITY_UPGRADE_INTERVAL = 120 # seconds between upgrade attempts
-MESSAGE_RELAY_POLL_INTERVAL = 5     # seconds between anchor message relay polls
 
 # =============================================================================
 # Rate Limiting
@@ -94,14 +109,6 @@ CORE_TOOLS = frozenset({
     "darkmatter_status",
     "darkmatter_wait_for_message",
 })
-
-# =============================================================================
-# Anchor Nodes
-# =============================================================================
-
-_ANCHOR_DEFAULT = "https://loseylabs.ai"
-_anchor_env = os.environ.get("DARKMATTER_ANCHOR_NODES", _ANCHOR_DEFAULT).strip()
-ANCHOR_NODES: list[str] = [u.strip().rstrip("/") for u in _anchor_env.split(",") if u.strip()] if _anchor_env else []
 
 # =============================================================================
 # Solana / Wallet
@@ -155,10 +162,7 @@ TRUST_RATE_DISAGREEMENT = -0.02         # penalty when peer uses different antim
 TRUST_COMMITMENT_FRAUD = -0.1           # penalty when peer fails commitment verification
 TRUST_NEGATIVE_TIMEOUT = 3600           # seconds of sustained negative trust before auto-disconnect
 TRUST_RATE_TOLERANCE = 0.001            # float comparison tolerance for rate disagreement
-SUPERAGENT_DEFAULT_URL = os.environ.get(
-    "DARKMATTER_SUPERAGENT",
-    ANCHOR_NODES[0] if ANCHOR_NODES else "",
-)
+SUPERAGENT_DEFAULT_URL = os.environ.get("DARKMATTER_SUPERAGENT", "")
 
 # =============================================================================
 # Agent Auto-Spawn

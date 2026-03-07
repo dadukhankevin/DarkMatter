@@ -1,9 +1,8 @@
 """
 NetworkManager — central orchestrator for transport-agnostic networking.
 
-Absorbs from resilience.py: discover_public_url, check_nat_status, broadcast_peer_update,
-network_health_loop, check_connection_health, poll_webhook_relay, lookup_peer_url,
-webhook_request_with_recovery, build_webhook_url, get_public_url, UPnP functions.
+Manages transport plugins, peer resolution, health monitoring, UPnP,
+webhook recovery, peer ping-based IP detection, and connectivity upgrades.
 
 Depends on: config, models, identity, state, network/transport
 """
@@ -11,8 +10,10 @@ Depends on: config, models, identity, state, network/transport
 import asyncio
 import ipaddress
 import os
+import random
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Optional
 from urllib.parse import urlparse
@@ -20,26 +21,24 @@ from urllib.parse import urlparse
 import httpx
 
 from darkmatter.config import (
-    ANCHOR_NODES,
-    ANCHOR_LOOKUP_TIMEOUT,
     PEER_LOOKUP_TIMEOUT,
     PEER_LOOKUP_MAX_CONCURRENT,
     HEALTH_CHECK_INTERVAL,
     HEALTH_FAILURE_THRESHOLD,
     STALE_CONNECTION_AGE,
-    IP_CHECK_INTERVAL,
     UPNP_PORT_RANGE,
     WEBHOOK_RECOVERY_MAX_ATTEMPTS,
     WEBHOOK_RECOVERY_TIMEOUT,
     TRUST_NEGATIVE_TIMEOUT,
     CONNECTIVITY_UPGRADE_INTERVAL,
-    MESSAGE_RELAY_POLL_INTERVAL,
-    SDP_RELAY_TIMEOUT,
+    PING_INTERVAL,
+    PING_IP_WINDOW,
+    PING_SILENCE_THRESHOLD,
 )
 from darkmatter.identity import (
     validate_webhook_url,
 )
-from darkmatter.security import sign_peer_update, sign_relay_poll
+from darkmatter.security import sign_peer_update
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
 
@@ -135,10 +134,10 @@ class NetworkManager:
         self._save_state = state_saver
         self._transports: list[Transport] = []
         self._tasks: list[asyncio.Task] = []
-        self._last_working_anchor: Optional[str] = None
-        self._process_webhook_fn: Optional[Callable] = None
-        self._process_connection_relay_fn: Optional[Callable] = None
-        self._process_relayed_message_fn: Optional[Callable] = None
+        # Peer ping state
+        self._observed_ips: deque = deque()  # (timestamp, ip) tuples
+        self._last_known_ip: Optional[str] = None
+        self._last_inbound_ping: float = 0.0
 
     # -- Transport registry --
 
@@ -258,29 +257,22 @@ class NetworkManager:
         raise last_err
 
     def build_webhook_url(self, message_id: str, peer_url: str = None) -> str:
-        """Build the webhook URL, using anchor relay if behind NAT.
+        """Build the webhook URL for this agent.
 
-        If peer_url is local (private IP / localhost / LAN), bypass the anchor
-        relay and use a direct URL the peer can reach us on.
+        If peer_url is local, use a local URL the peer can reach.
+        Otherwise use our public URL.
         """
         state = self._get_state()
-        if state.nat_detected and ANCHOR_NODES:
-            # Local peers don't need anchor relay
-            if peer_url and is_local_url(peer_url):
-                # Determine the right host for the webhook:
-                # - Same machine (localhost/127.x) → use localhost
-                # - LAN peer (10.x, 192.168.x, etc.) → use our LAN IP
-                try:
-                    peer_host = urlparse(peer_url).hostname or ""
-                    if peer_host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-                        webhook_host = "localhost"
-                    else:
-                        webhook_host = self._get_lan_ip()
-                except Exception:
+        if peer_url and is_local_url(peer_url):
+            try:
+                peer_host = urlparse(peer_url).hostname or ""
+                if peer_host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
                     webhook_host = "localhost"
-                return f"http://{webhook_host}:{state.port}/__darkmatter__/webhook/{message_id}"
-            anchor = self.get_active_anchor()
-            return f"{anchor}/__darkmatter__/webhook_relay/{state.agent_id}/{message_id}"
+                else:
+                    webhook_host = self._get_lan_ip()
+            except Exception:
+                webhook_host = "localhost"
+            return f"http://{webhook_host}:{state.port}/__darkmatter__/webhook/{message_id}"
         return f"{self.get_public_url()}/__darkmatter__/webhook/{message_id}"
 
     @staticmethod
@@ -298,12 +290,6 @@ class NetworkManager:
 
     # -- Peer resolution --
 
-    def get_active_anchor(self) -> str:
-        """Return the last known working anchor, or the first configured anchor."""
-        if self._last_working_anchor and self._last_working_anchor in ANCHOR_NODES:
-            return self._last_working_anchor
-        return ANCHOR_NODES[0] if ANCHOR_NODES else ""
-
     def get_public_url(self) -> str:
         """Get the public URL for this agent."""
         state = self._get_state()
@@ -318,6 +304,7 @@ class NetworkManager:
     async def discover_public_url(self) -> str:
         """Discover the best public URL for this agent.
 
+        Priority: env var > UPnP > ping-observed IP > localhost fallback.
         If UPnP succeeds, stores the mapping on state._upnp_mapping
         so cleanup can remove it on shutdown.
         """
@@ -337,82 +324,21 @@ class NetworkManager:
             print(f"[DarkMatter] Public URL (UPnP): {url}", file=sys.stderr)
             return url
 
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get("https://api.ipify.org?format=json")
-                if resp.status_code == 200:
-                    ip = resp.json().get("ip")
-                    if ip:
-                        url = f"http://{ip}:{port}"
-                        print(f"[DarkMatter] Public URL (ipify): {url}", file=sys.stderr)
-                        return url
-        except Exception as e:
-            print(f"[DarkMatter] ipify lookup failed: {e}", file=sys.stderr)
+        # Use ping-observed IP if available
+        if self._last_known_ip:
+            url = f"http://{self._last_known_ip}:{port}"
+            print(f"[DarkMatter] Public URL (ping): {url}", file=sys.stderr)
+            return url
 
         url = f"http://localhost:{port}"
         print(f"[DarkMatter] Public URL (fallback): {url}", file=sys.stderr)
         return url
 
-    async def check_nat_status(self, public_url: str) -> bool:
-        """Check if we're behind NAT by asking an anchor to probe our public URL.
-
-        The old self-test (hitting our own public IP) gave false negatives
-        because NAT hairpinning lets the request succeed locally even when
-        external clients can't reach us.  Now we ask the anchor to try.
-        Falls back to self-test if no anchor is available.
-        """
-        if "localhost" in public_url or "127.0.0.1" in public_url:
-            return True
-
-        # Ask anchor to probe our public URL
-        for anchor in ANCHOR_NODES:
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.post(
-                        f"{anchor}/__darkmatter__/probe_reachability",
-                        json={"url": f"{public_url}/__darkmatter__/status"},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        reachable = data.get("reachable", False)
-                        print(f"[DarkMatter] Anchor reachability probe: {'reachable' if reachable else 'UNREACHABLE'}", file=sys.stderr)
-                        return not reachable
-            except Exception:
-                pass  # Anchor doesn't support probe yet, fall back
-
-        # Fallback: compare local LAN IP vs public URL IP
-        # If they differ, we're likely behind NAT
-        try:
-            from urllib.parse import urlparse
-            import socket
-            parsed = urlparse(public_url)
-            public_host = parsed.hostname
-            # Get actual LAN IP by connecting to an external address (no data sent)
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-            finally:
-                s.close()
-            if public_host and local_ip and public_host != local_ip:
-                print(f"[DarkMatter] NAT inferred: local={local_ip} != public={public_host}", file=sys.stderr)
-                return True
-        except Exception:
-            pass
-
-        # Last resort: self-test (unreliable due to hairpinning)
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{public_url}/__darkmatter__/status")
-                return resp.status_code != 200
-        except Exception:
-            return True
-
     async def broadcast_peer_update(self) -> None:
-        """Notify all connected peers and anchor nodes of our current URL, bio, and display name.
+        """Notify all connected peers of our current URL, bio, and display name.
 
         Local peers receive our LAN URL (so they can reach us directly) while
-        remote peers and anchors receive our public URL.
+        remote peers receive our public URL.
         """
         state = self._get_state()
         public_url = state.public_url or f"http://127.0.0.1:{state.port}"
@@ -459,28 +385,13 @@ class NetworkManager:
                 print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... of URL change: {e}",
                       file=sys.stderr)
 
-        for anchor_url in ANCHOR_NODES:
-            try:
-                payload = _build_payload(public_url)
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(f"{anchor_url}/__darkmatter__/peer_update", json=payload)
-            except Exception as e:
-                print(f"[DarkMatter] Failed to notify anchor {anchor_url} of URL: {e}",
-                      file=sys.stderr)
-
     async def lookup_peer_url(self, target_agent_id: str,
                               exclude_urls: Optional[set[str]] = None) -> Optional[str]:
-        """Find an agent's current URL — peers first (trust-weighted consensus), anchors as fallback."""
+        """Find an agent's current URL via peer consensus lookup."""
         if exclude_urls is None:
             exclude_urls = set()
 
-        # 1. Try peer consensus first — peers ARE the mesh
-        result = await self._peer_consensus_lookup(target_agent_id, exclude_urls)
-        if result:
-            return result
-
-        # 2. Fall back to anchor nodes only if peers failed
-        return await self._anchor_lookup(target_agent_id, exclude_urls)
+        return await self._peer_consensus_lookup(target_agent_id, exclude_urls)
 
     async def _peer_consensus_lookup(self, target_agent_id: str,
                                       exclude_urls: set[str]) -> Optional[str]:
@@ -524,55 +435,10 @@ class NetworkManager:
 
         return max(url_scores, key=url_scores.get)
 
-    async def _anchor_lookup(self, target_agent_id: str,
-                              exclude_urls: set[str]) -> Optional[str]:
-        """Query anchor nodes for an agent's URL (infrastructure fallback)."""
-        if not ANCHOR_NODES:
-            return None
-
-        tasks = [asyncio.create_task(self._query_anchor(a, target_agent_id))
-                 for a in ANCHOR_NODES]
-        try:
-            done, pending = await asyncio.wait(
-                tasks, timeout=ANCHOR_LOOKUP_TIMEOUT,
-                return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                result = task.result()
-                if result is not None and result not in exclude_urls:
-                    for t in pending:
-                        t.cancel()
-                    return result
-            if pending:
-                done2, pending2 = await asyncio.wait(pending, timeout=0.5)
-                for task in done2:
-                    result = task.result()
-                    if result is not None and result not in exclude_urls:
-                        for t in pending2:
-                            t.cancel()
-                        return result
-                for t in pending2:
-                    t.cancel()
-        except Exception:
-            for t in tasks:
-                t.cancel()
-        return None
-
     # -- Lifecycle --
 
-    def set_process_webhook_fn(self, fn: Callable) -> None:
-        """Set the webhook processing callback (injected to avoid circular imports)."""
-        self._process_webhook_fn = fn
-
-    def set_process_connection_relay_fn(self, fn: Callable) -> None:
-        """Set the connection relay processing callback (injected to avoid circular imports)."""
-        self._process_connection_relay_fn = fn
-
-    def set_process_relayed_message_fn(self, fn: Callable) -> None:
-        """Set the relayed message processing callback (Level 5 anchor relay)."""
-        self._process_relayed_message_fn = fn
-
     async def start(self) -> None:
-        """Start all transports, discover public URL, detect NAT, start background tasks."""
+        """Start all transports, discover public URL, start background tasks."""
         state = self._get_state()
 
         # Start transports
@@ -587,28 +453,20 @@ class NetworkManager:
             http_transport._save_state = self._save_state
             http_transport._get_public_url = self.get_public_url
 
-        # Discover public URL and detect NAT
+        # Discover public URL
         state.public_url = await self.discover_public_url()
-        state.nat_detected = await self.check_nat_status(state.public_url)
-        if state.nat_detected:
-            print(f"[DarkMatter] NAT detected: True — using anchor webhook relay", file=sys.stderr)
 
         # Start background tasks
         self._tasks.append(asyncio.create_task(self._health_loop()))
         self._tasks.append(asyncio.create_task(self._connectivity_upgrade_loop()))
+        self._tasks.append(asyncio.create_task(self._ping_loop()))
         print(f"[DarkMatter] Network health loop: ENABLED ({HEALTH_CHECK_INTERVAL}s interval)",
               file=sys.stderr)
         print(f"[DarkMatter] Connectivity upgrade loop: ENABLED ({CONNECTIVITY_UPGRADE_INTERVAL}s interval)",
               file=sys.stderr)
+        print(f"[DarkMatter] Peer ping loop: ENABLED ({PING_INTERVAL}s interval)",
+              file=sys.stderr)
         print(f"[DarkMatter] UPnP: AVAILABLE", file=sys.stderr)
-
-        # Register with anchor nodes
-        if ANCHOR_NODES and state.public_url:
-            await self.broadcast_peer_update()
-            print(f"[DarkMatter] Anchor nodes: registered with {len(ANCHOR_NODES)} anchor(s)",
-                  file=sys.stderr)
-        elif ANCHOR_NODES:
-            print(f"[DarkMatter] Anchor nodes: configured but no public URL yet", file=sys.stderr)
 
     async def stop(self) -> None:
         """Cancel background tasks, stop transports, cleanup UPnP."""
@@ -637,34 +495,10 @@ class NetworkManager:
     # -- Background loops (internal) --
 
     async def _health_loop(self) -> None:
-        """Periodically check connection health and detect IP changes."""
-        last_ip_check = 0.0
-        last_known_ip = None
-
+        """Periodically check connection health."""
         while True:
             try:
                 await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-                now = time.time()
-
-                # IP change detection
-                if now - last_ip_check >= IP_CHECK_INTERVAL:
-                    last_ip_check = now
-                    try:
-                        async with httpx.AsyncClient(timeout=5.0) as client:
-                            resp = await client.get("https://api.ipify.org?format=json")
-                            if resp.status_code == 200:
-                                current_ip = resp.json().get("ip")
-                                if last_known_ip is None:
-                                    last_known_ip = current_ip
-                                elif current_ip != last_known_ip:
-                                    print(f"[DarkMatter] Public IP changed: "
-                                          f"{last_known_ip} -> {current_ip}", file=sys.stderr)
-                                    last_known_ip = current_ip
-                                    state = self._get_state()
-                                    state.public_url = await self.discover_public_url()
-                                    await self.broadcast_peer_update()
-                    except Exception:
-                        pass
 
                 # Connection health checks
                 await self._check_connection_health()
@@ -674,13 +508,6 @@ class NetworkManager:
 
                 # Shard cache cleanup
                 self._prune_stale_shards()
-
-                # NAT relay polling
-                state = self._get_state()
-                if state.nat_detected and ANCHOR_NODES and state.private_key_hex:
-                    await self._poll_webhook_relay()
-                    await self._poll_sdp_relay()
-                    await self._poll_message_relay()
 
                 # Update connectivity levels on all connections
                 self.update_connectivity_levels()
@@ -797,56 +624,6 @@ class NetworkManager:
             save_state()
             print(f"[DarkMatter] Pruned {pruned} stale peer shard(s)", file=sys.stderr)
 
-    async def _poll_webhook_relay(self) -> None:
-        """Poll anchor nodes for buffered webhook callbacks (NAT relay)."""
-        state = self._get_state()
-        ts = datetime.now(timezone.utc).isoformat()
-        sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
-
-        ordered = list(ANCHOR_NODES)
-        if self._last_working_anchor and self._last_working_anchor in ordered:
-            ordered.remove(self._last_working_anchor)
-            ordered.insert(0, self._last_working_anchor)
-
-        for anchor in ordered:
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        f"{anchor}/__darkmatter__/webhook_relay_poll/{state.agent_id}",
-                        params={"signature": sig, "timestamp": ts},
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    self._last_working_anchor = anchor
-                    data = resp.json()
-                    callbacks = data.get("callbacks", [])
-                    for cb in callbacks:
-                        msg_id = cb.get("message_id", "")
-                        cb_data = cb.get("data", {})
-                        if msg_id and cb_data and self._process_webhook_fn:
-                            result, _ = self._process_webhook_fn(state, msg_id, cb_data)
-                            if result.get("success"):
-                                print(f"[DarkMatter] Relay: processed webhook for {msg_id}",
-                                      file=sys.stderr)
-
-                    # Poll for connection relay callbacks
-                    if self._process_connection_relay_fn:
-                        resp2 = await client.get(
-                            f"{anchor}/__darkmatter__/connection_relay_poll/{state.agent_id}",
-                            params={"signature": sig, "timestamp": ts},
-                        )
-                        if resp2.status_code == 200:
-                            data2 = resp2.json()
-                            for cb_data in data2.get("callbacks", []):
-                                if isinstance(cb_data, dict) and cb_data.get("agent_id"):
-                                    self._process_connection_relay_fn(state, cb_data)
-                                    print(f"[DarkMatter] Relay: connection accepted by {cb_data['agent_id'][:12]}...",
-                                          file=sys.stderr)
-                    return
-            except Exception as e:
-                print(f"[DarkMatter] Relay poll error ({anchor}): {e}", file=sys.stderr)
-                continue
-
     # -- Connectivity level --
 
     def determine_connectivity_level(self, conn) -> tuple[int, str]:
@@ -856,8 +633,6 @@ class NetworkManager:
             1 = direct (HTTP or WebRTC with direct signaling)
             2 = LAN WebRTC (WebRTC via LAN multicast signaling)
             3 = Peer-relayed WebRTC (WebRTC via mutual peer SDP relay)
-            4 = Anchor-relayed WebRTC (WebRTC via anchor SDP relay)
-            5 = Anchor message relay (all messages through anchor)
             0 = unknown
         """
         signaling = getattr(conn, "_signaling_method", "")
@@ -869,20 +644,11 @@ class NetworkManager:
                     return 2, "lan-webrtc"
                 elif signaling == "peer_relay":
                     return 3, "peer-relay"
-                elif signaling == "anchor_relay":
-                    return 4, "anchor-relay"
                 else:
                     return 1, "direct"
 
         if conn.transport == "http":
-            # Check if we're actually reaching this peer via anchor relay
-            anchor_transport = self.get_transport("anchor_relay")
-            if anchor_transport:
-                # If HTTP is working directly, it's level 1
-                return 1, "direct"
-
-        if conn.transport == "anchor_relay":
-            return 5, "anchor-msg-relay"
+            return 1, "direct"
 
         return 0, "unknown"
 
@@ -942,19 +708,6 @@ class NetworkManager:
                             conn.connectivity_method = meth
                             peer = conn.agent_display_name or conn.agent_id[:12]
                             print(f"[DarkMatter] Upgraded {peer} to L{lvl}:{meth}", file=sys.stderr)
-                            continue
-
-                    # Try anchor relay signaling (Level 4) if available
-                    if level > 4 and ANCHOR_NODES:
-                        from darkmatter.network.transports.webrtc import AnchorRelaySignaling
-                        success = await webrtc.upgrade(state, conn, AnchorRelaySignaling())
-                        if success:
-                            conn._signaling_method = "anchor_relay"
-                            lvl, meth = self.determine_connectivity_level(conn)
-                            conn.connectivity_level = lvl
-                            conn.connectivity_method = meth
-                            peer = conn.agent_display_name or conn.agent_id[:12]
-                            print(f"[DarkMatter] Upgraded {peer} to L{lvl}:{meth}", file=sys.stderr)
 
             except asyncio.CancelledError:
                 return
@@ -963,118 +716,88 @@ class NetworkManager:
 
     # -- Relay polling (SDP + messages) --
 
-    async def _poll_sdp_relay(self) -> None:
-        """Poll anchor for buffered SDP signals when behind NAT."""
-        state = self._get_state()
-        if not state.private_key_hex or not ANCHOR_NODES:
-            return
+    # -- Peer Ping Loop --
 
-        ts = datetime.now(timezone.utc).isoformat()
-        sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
+    async def _ping_loop(self) -> None:
+        """Periodically ping a random connected peer to detect IP changes.
 
-        for anchor in ANCHOR_NODES:
+        Each peer's ping response includes `your_ip` — the IP they see us on.
+        We track these observations in a sliding window and broadcast a peer
+        update if the majority IP changes.
+        """
+        while True:
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        f"{anchor}/__darkmatter__/sdp_relay_poll/{state.agent_id}",
-                        params={"signature": sig, "timestamp": ts},
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
-                    signals = data.get("signals", [])
-                    for signal in signals:
-                        sig_type = signal.get("type")
-                        from_id = signal.get("from_agent_id", "")
-                        if sig_type == "offer" and from_id:
-                            offer_data = signal.get("offer_data")
-                            if offer_data:
-                                # Process the SDP offer
-                                webrtc = self.get_transport("webrtc")
-                                if webrtc:
-                                    answer = await webrtc.handle_offer(state, offer_data)
-                                    if answer:
-                                        # Post the answer back to anchor for the offerer
-                                        await client.post(
-                                            f"{anchor}/__darkmatter__/sdp_relay/{from_id}",
-                                            json={
-                                                "from_agent_id": state.agent_id,
-                                                "answer_data": answer,
-                                                "type": "answer",
-                                            },
-                                        )
-                                        conn = state.connections.get(from_id)
-                                        if conn:
-                                            conn._signaling_method = "anchor_relay"
-                    return
+                await asyncio.sleep(PING_INTERVAL)
+                state = self._get_state()
+                if state is None or not state.connections:
+                    continue
+
+                # Pick a random connected peer
+                peers = list(state.connections.values())
+                conn = random.choice(peers)
+                base_url = strip_base_url(conn.agent_url)
+
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.post(
+                            f"{base_url}/__darkmatter__/ping",
+                            json={
+                                "agent_id": state.agent_id,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            observed_ip = data.get("your_ip")
+                            if observed_ip and observed_ip != "unknown":
+                                now = time.time()
+                                self._observed_ips.append((now, observed_ip))
+
+                                # Prune old observations
+                                cutoff = now - PING_IP_WINDOW
+                                while self._observed_ips and self._observed_ips[0][0] < cutoff:
+                                    self._observed_ips.popleft()
+
+                                # Check for majority IP
+                                majority_ip = self._get_majority_ip()
+                                if majority_ip and majority_ip != self._last_known_ip:
+                                    old_ip = self._last_known_ip
+                                    self._last_known_ip = majority_ip
+                                    if old_ip is not None:
+                                        print(f"[DarkMatter] Public IP changed (ping): "
+                                              f"{old_ip} -> {majority_ip}", file=sys.stderr)
+                                        state.public_url = await self.discover_public_url()
+                                        await self.broadcast_peer_update()
+                                    else:
+                                        print(f"[DarkMatter] Public IP detected (ping): {majority_ip}",
+                                              file=sys.stderr)
+
+                            # Update last_activity on the connection
+                            conn.last_activity = datetime.now(timezone.utc).isoformat()
+                except Exception:
+                    pass  # Best-effort — don't spam errors for pings
+
+                # Check for inbound ping silence
+                if (self._last_inbound_ping > 0 and
+                        time.time() - self._last_inbound_ping > PING_SILENCE_THRESHOLD and
+                        len(state.connections) > 0):
+                    # No peers have pinged us in a while — possible network issue
+                    pass  # Future: could trigger re-discovery
+
+            except asyncio.CancelledError:
+                return
             except Exception as e:
-                print(f"[DarkMatter] SDP relay poll error ({anchor}): {e}", file=sys.stderr)
+                print(f"[DarkMatter] Ping loop error: {e}", file=sys.stderr)
 
-    async def _poll_message_relay(self) -> None:
-        """Poll anchor for buffered messages when behind NAT (Level 5)."""
-        state = self._get_state()
-        if not state.private_key_hex or not ANCHOR_NODES:
-            return
-
-        ts = datetime.now(timezone.utc).isoformat()
-        sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
-
-        for anchor in ANCHOR_NODES:
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        f"{anchor}/__darkmatter__/message_relay_poll/{state.agent_id}",
-                        params={"signature": sig, "timestamp": ts},
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
-                    messages = data.get("messages", [])
-                    for msg in messages:
-                        # Decrypt E2E encrypted relay messages
-                        if msg.get("e2e_encrypted") and msg.get("encrypted_payload"):
-                            sender_pub = msg.get("encrypted_payload", {}).get("sender_public_key_hex")
-                            if not sender_pub:
-                                sender_pub = msg.get("from_agent_id", "")
-                                print(f"[DarkMatter] Relay decrypt: no sender_public_key_hex in encrypted_payload, falling back to from_agent_id {sender_pub[:12]}…", file=sys.stderr)
-                            try:
-                                from darkmatter.security import decrypt_from_peer
-                                import json as _json
-                                plaintext = decrypt_from_peer(
-                                    msg["encrypted_payload"],
-                                    state.private_key_hex,
-                                    sender_pub,
-                                )
-                                msg = _json.loads(plaintext.decode("utf-8"))
-                            except Exception as e:
-                                print(f"[DarkMatter] Relay decryption failed: {e}", file=sys.stderr)
-                                continue
-
-                        path = msg.get("path", "")
-                        payload = msg.get("payload", {})
-                        from_id = msg.get("from_agent_id", "")
-                        if path and payload and self._process_relayed_message_fn:
-                            self._process_relayed_message_fn(state, path, payload, from_id)
-                        elif path and payload:
-                            print(f"[DarkMatter] Relay: received message on {path} from {from_id[:12]}...",
-                                  file=sys.stderr)
-                    return
-            except Exception as e:
-                print(f"[DarkMatter] Message relay poll error ({anchor}): {e}", file=sys.stderr)
-
-    # -- Private helpers --
-
-    async def _query_anchor(self, anchor_url: str, target_agent_id: str) -> Optional[str]:
-        """Query a single anchor node for an agent's URL."""
-        try:
-            async with httpx.AsyncClient(timeout=ANCHOR_LOOKUP_TIMEOUT) as client:
-                resp = await client.get(
-                    f"{anchor_url}/__darkmatter__/peer_lookup/{target_agent_id}"
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("url"):
-                        return data["url"]
-        except Exception:
-            pass
+    def _get_majority_ip(self) -> Optional[str]:
+        """Return the most frequently observed IP in the sliding window, if it's a majority."""
+        if not self._observed_ips:
+            return None
+        counts: dict[str, int] = {}
+        for _, ip in self._observed_ips:
+            counts[ip] = counts.get(ip, 0) + 1
+        best_ip = max(counts, key=counts.get)
+        # Require majority (>50% of observations)
+        if counts[best_ip] > len(self._observed_ips) / 2:
+            return best_ip
         return None

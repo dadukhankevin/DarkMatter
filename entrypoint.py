@@ -40,17 +40,17 @@ from darkmatter.state import get_state, set_state, save_state
 from darkmatter.models import AgentState, AgentStatus, Connection, SentMessage
 from darkmatter.identity import (
     load_or_create_passport, sign_message, sign_peer_update,
-    sign_relay_poll, validate_url,
+    validate_url,
 )
 from darkmatter.config import (
     PROTOCOL_VERSION, MAX_CONNECTIONS, MAX_BIO_LENGTH,
-    ANCHOR_NODES, SPL_TOKENS, ANTIMATTER_RATE,
+    SPL_TOKENS, ANTIMATTER_RATE,
     AGENT_SPAWN_ENABLED,
 )
 from darkmatter.network.mesh import (
     process_connection_request, process_connection_accepted,
     process_accept_pending, _process_incoming_message,
-    _process_webhook_locally, process_connection_relay_callback,
+    _process_webhook_locally,
     build_outbound_request_payload, build_connection_from_accepted,
     process_antimatter_match, process_antimatter_signal,
     process_antimatter_result,
@@ -99,36 +99,9 @@ _mgr = NetworkManager(state_getter=get_state, state_saver=save_state)
 set_network_manager(_mgr)
 
 # Discover public URL using the same logic as the real server
-# (env var > UPnP port mapping > ipify public IP > localhost fallback)
+# (env var > UPnP port mapping > ping-observed IP > localhost fallback)
 _public_url = asyncio.run(_mgr.discover_public_url())
 get_state().public_url = _public_url
-
-# Detect NAT — if behind CGNAT, use anchor relay for webhooks
-get_state().nat_detected = asyncio.run(_mgr.check_nat_status(_public_url))
-if get_state().nat_detected:
-    print(f"[DarkMatter Entrypoint] NAT detected: True — using anchor webhook relay", file=sys.stderr)
-
-# Register with anchor nodes (required for relay poll signature verification)
-if ANCHOR_NODES and _public_url:
-    _reg_state = get_state()
-    _reg_ts = datetime.now(timezone.utc).isoformat()
-    _reg_payload = {
-        "agent_id": _reg_state.agent_id,
-        "new_url": _public_url,
-        "public_key_hex": _reg_state.public_key_hex,
-        "timestamp": _reg_ts,
-    }
-    if _reg_state.private_key_hex and _reg_state.public_key_hex:
-        _reg_payload["signature"] = sign_peer_update(
-            _reg_state.private_key_hex, _reg_state.agent_id, _public_url, _reg_ts
-        )
-    for _anchor in ANCHOR_NODES:
-        try:
-            with httpx.Client(timeout=5.0) as _c:
-                _c.post(f"{_anchor}/__darkmatter__/peer_update", json=_reg_payload)
-            print(f"[DarkMatter Entrypoint] Registered with anchor: {_anchor}", file=sys.stderr)
-        except Exception as _e:
-            print(f"[DarkMatter Entrypoint] Anchor registration failed ({_anchor}): {_e}", file=sys.stderr)
 
 # Remove self-connection if present (shared passport state file)
 if state := get_state():
@@ -763,127 +736,6 @@ _multicast_thread.start()
 
 
 # ---------------------------------------------------------------------------
-# Webhook relay polling (for NAT-ed nodes)
-# ---------------------------------------------------------------------------
-
-def _relay_poll_loop():
-    """Background thread: poll anchors for buffered webhook and connection callbacks.
-
-    Tries each anchor in order, tracks last working anchor for failover.
-    """
-    _last_working = None
-    while True:
-        try:
-            time.sleep(5)
-            if not state.nat_detected or not ANCHOR_NODES or not state.private_key_hex:
-                continue
-
-            ts = datetime.now(timezone.utc).isoformat()
-            sig = sign_relay_poll(state.private_key_hex, state.agent_id, ts)
-
-            # Try anchors in order: last working first, then the rest
-            ordered = list(ANCHOR_NODES)
-            if _last_working and _last_working in ordered:
-                ordered.remove(_last_working)
-                ordered.insert(0, _last_working)
-
-            for anchor in ordered:
-                try:
-                    with httpx.Client(timeout=10.0) as client:
-                        # Poll for webhook callbacks
-                        resp = client.get(
-                            f"{anchor}/__darkmatter__/webhook_relay_poll/{state.agent_id}",
-                            params={"signature": sig, "timestamp": ts},
-                        )
-                        if resp.status_code != 200:
-                            continue
-                        _last_working = anchor
-                        data = resp.json()
-                        callbacks = data.get("callbacks", [])
-                        if callbacks:
-                            print(f"[DarkMatter Entrypoint] Relay poll: got {len(callbacks)} callback(s)", file=sys.stderr)
-                        for cb in callbacks:
-                            msg_id = cb.get("message_id", "")
-                            cb_data = cb.get("data", {})
-                            if msg_id and cb_data:
-                                result, status = _process_webhook_locally(state, msg_id, cb_data)
-                                if result.get("success"):
-                                    print(f"[DarkMatter Entrypoint] Relay: webhook for {msg_id} OK", file=sys.stderr)
-
-                        # Poll for connection relay callbacks
-                        resp2 = client.get(
-                            f"{anchor}/__darkmatter__/connection_relay_poll/{state.agent_id}",
-                            params={"signature": sig, "timestamp": ts},
-                        )
-                        if resp2.status_code == 200:
-                            data2 = resp2.json()
-                            for cb_data in data2.get("callbacks", []):
-                                if isinstance(cb_data, dict) and cb_data.get("agent_id"):
-                                    process_connection_relay_callback(state, cb_data)
-                                    print(f"[DarkMatter Entrypoint] Relay: connection accepted by {cb_data['agent_id'][:12]}...", file=sys.stderr)
-
-                        # Poll for relayed messages (Level 5 anchor relay)
-                        resp3 = client.get(
-                            f"{anchor}/__darkmatter__/message_relay_poll/{state.agent_id}",
-                            params={"signature": sig, "timestamp": ts},
-                        )
-                        if resp3.status_code == 200:
-                            data3 = resp3.json()
-                            messages = data3.get("messages", [])
-                            for relay_msg in messages:
-                                # Decrypt E2E encrypted relay messages
-                                if relay_msg.get("e2e_encrypted") and relay_msg.get("encrypted_payload"):
-                                    sender_pub = relay_msg.get("encrypted_payload", {}).get("sender_public_key_hex")
-                                    if not sender_pub:
-                                        sender_pub = relay_msg.get("from_agent_id", "")
-                                    try:
-                                        from darkmatter.security import decrypt_from_peer
-                                        plaintext = decrypt_from_peer(
-                                            relay_msg["encrypted_payload"],
-                                            state.private_key_hex,
-                                            sender_pub,
-                                        )
-                                        relay_msg = json.loads(plaintext.decode("utf-8"))
-                                    except Exception as e:
-                                        print(f"[DarkMatter Entrypoint] Relay decryption failed: {e}", file=sys.stderr)
-                                        continue
-
-                                path = relay_msg.get("path", "")
-                                payload = relay_msg.get("payload", {})
-                                from_id = relay_msg.get("from_agent_id", "")
-                                if path == "/__darkmatter__/message" and payload:
-                                    loop = asyncio.new_event_loop()
-                                    try:
-                                        result, status = loop.run_until_complete(
-                                            _process_incoming_message(state, payload)
-                                        )
-                                        pending = asyncio.all_tasks(loop)
-                                        if pending:
-                                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                                        if result.get("success"):
-                                            print(f"[DarkMatter Entrypoint] Relay: message from {from_id[:12]}... queued", file=sys.stderr)
-                                    except Exception as e:
-                                        print(f"[DarkMatter Entrypoint] Relay message processing failed: {e}", file=sys.stderr)
-                                    finally:
-                                        loop.close()
-                                elif path and payload:
-                                    print(f"[DarkMatter Entrypoint] Relay: unhandled path {path} from {from_id[:12]}...", file=sys.stderr)
-                            if messages:
-                                print(f"[DarkMatter Entrypoint] Relay poll: got {len(messages)} message(s)", file=sys.stderr)
-
-                        break  # success — don't try other anchors
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-
-if state.nat_detected:
-    _relay_thread = threading.Thread(target=_relay_poll_loop, daemon=True)
-    _relay_thread.start()
-
-
-# ---------------------------------------------------------------------------
 # Peer spawned agent count
 # ---------------------------------------------------------------------------
 
@@ -966,34 +818,20 @@ def _pick_best_agent():
 # ---------------------------------------------------------------------------
 
 def _notify_connection_accepted(conn, payload):
-    """Notify a peer that we accepted their connection request, with anchor relay fallback."""
+    """Notify a peer that we accepted their connection request."""
     base = conn.agent_url.rstrip("/")
     for suffix in ("/mcp", "/__darkmatter__"):
         if base.endswith(suffix):
             base = base[:-len(suffix)]
             break
 
-    direct_ok = False
     try:
         with httpx.Client(timeout=15.0) as client:
             resp = client.post(base + "/__darkmatter__/connection_accepted", json=payload)
-            direct_ok = resp.status_code < 400
-    except Exception:
-        pass
-
-    if not direct_ok and ANCHOR_NODES:
-        for anchor in ANCHOR_NODES:
-            try:
-                with httpx.Client(timeout=10.0) as client:
-                    resp = client.post(
-                        f"{anchor}/__darkmatter__/connection_relay/{conn.agent_id}",
-                        json=payload,
-                    )
-                    if resp.status_code < 400:
-                        print(f"[DarkMatter Entrypoint] Connection accept relayed via {anchor} for {conn.agent_id[:12]}...", file=sys.stderr)
-                        break
-            except Exception:
-                continue
+            if resp.status_code >= 400:
+                print(f"[DarkMatter Entrypoint] Failed to notify {conn.agent_id[:12]}... of acceptance: HTTP {resp.status_code}", file=sys.stderr)
+    except Exception as e:
+        print(f"[DarkMatter Entrypoint] Failed to notify {conn.agent_id[:12]}... of acceptance: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1356,28 +1194,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
         except Exception as e:
             conn.messages_declined += 1
             conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
-            # Try anchor message relay as fallback
-            relayed = False
-            if ANCHOR_NODES:
-                for anchor in ANCHOR_NODES:
-                    try:
-                        with httpx.Client(timeout=10.0) as relay_client:
-                            resp = relay_client.post(
-                                f"{anchor}/__darkmatter__/message_relay/{conn.agent_id}",
-                                json=payload,
-                            )
-                            if resp.status_code < 400:
-                                conn.messages_sent += 1
-                                conn._consecutive_failures = 0
-                                conn.last_activity = datetime.now(timezone.utc).isoformat()
-                                sent_to.append(conn.agent_id)
-                                relayed = True
-                                print(f"[DarkMatter Entrypoint] Message relayed via {anchor} to {conn.agent_id[:12]}...", file=sys.stderr)
-                                break
-                    except Exception:
-                        continue
-            if not relayed:
-                failed.append({"agent_id": conn.agent_id, "error": str(e)})
+            failed.append({"agent_id": conn.agent_id, "error": str(e)})
 
     # Update the pre-registered sent message with delivery results
     if sent_to:
@@ -1797,7 +1614,6 @@ def poll():
             "display_name": state.display_name or "Human",
             "lan_url": lan_url,
             "public_url": _get_public_url(),
-            "nat_detected": getattr(state, "nat_detected", False),
             "connections_count": len(state.connections),
             "total_active_agents": total_active_agents,
             "wallets": state.wallets,
@@ -1867,7 +1683,6 @@ def info():
         "display_name": state.display_name or "Human",
         "lan_url": lan_url,
         "public_url": _get_public_url(),
-        "nat_detected": getattr(state, "nat_detected", False),
         "port": PORT,
         "wallet_identity": os.path.exists(wallet_path),
         "wallets": state.wallets,
