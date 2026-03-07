@@ -246,10 +246,11 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     args = list(ACTIVE_CLIENT["args"])
 
     # Pass the temp MCP config via CLI flags instead of overwriting project config.
-    # Claude Code: --mcp-config <path> --strict-mcp-config
-    # Other clients: fall back to writing to the project config_file location
-    # (but this should be rare — most modern clients support CLI config).
-    if "mcp_stdio" in ACTIVE_CLIENT.get("capabilities", set()):
+    # IMPORTANT: --mcp-config <path> must come BEFORE the positional prompt because
+    # --mcp-config takes variadic args and will swallow the prompt otherwise.
+    # We insert it right after the base args but before prompt injection.
+    mcp_via_cli = "mcp_stdio" in ACTIVE_CLIENT.get("capabilities", set())
+    if mcp_via_cli:
         args.extend(["--mcp-config", spawn_mcp_path, "--strict-mcp-config"])
     prompt_style = ACTIVE_CLIENT.get("prompt_style", "positional")
     stdin_pipe = None

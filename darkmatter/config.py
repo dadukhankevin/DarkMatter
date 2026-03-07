@@ -101,6 +101,8 @@ RATE_LIMIT_WINDOW = 60                    # sliding window in seconds
 
 CORE_TOOLS = frozenset({
     "darkmatter_send_message",
+    "darkmatter_begin_message",
+    "darkmatter_end_message",
     "darkmatter_connection",
     "darkmatter_update_bio",
     "darkmatter_inbox",
