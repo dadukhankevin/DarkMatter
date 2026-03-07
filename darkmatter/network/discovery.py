@@ -384,7 +384,9 @@ def sync_entrypoint_files() -> None:
     src_templates = os.path.join(bundled_dir, "templates")
     if os.path.isdir(src_templates):
         dest_templates = os.path.join(dest_dir, "templates")
-        if os.path.isdir(dest_templates):
+        if os.path.islink(dest_templates):
+            os.remove(dest_templates)
+        elif os.path.isdir(dest_templates):
             shutil.rmtree(dest_templates)
         shutil.copytree(src_templates, dest_templates)
 
