@@ -940,7 +940,9 @@ def _get_typing_indicators() -> list[dict]:
             "chunks": info.get("chunks", []),
         })
     for aid in expired:
-        _typing_indicators.pop(aid, None)
+        indicator = _typing_indicators.pop(aid, None)
+        if indicator and indicator.get("chunks"):
+            _persist_streamed_reply(aid, indicator)
     return result
 
 

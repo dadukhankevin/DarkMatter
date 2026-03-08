@@ -368,17 +368,23 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
-    """Read PTY output, extract only default-colored text (the actual response).
+    """Read PTY output, strip terminal control codes, stream text sections.
 
-    Claude Code's TUI renders chrome (spinners, status bar, tool calls) with
-    explicit ANSI foreground colors. The actual response text uses the default
-    foreground (no explicit color). We parse the ANSI stream, track color state,
-    and only pass through text in the default color.
+    General-purpose: strips ANSI escapes, handles bare \\r (line overwrites),
+    and sends all non-empty sections via callbacks.  The frontend's word-count
+    threshold (CHUNK_WORD_THRESHOLD) decides what's prose vs tool chrome.
     """
     reader = getattr(agent, "_pty_reader", None) or agent.process.stdout
     if not reader:
         return
-    colored = False  # True when an explicit foreground color is active
+    import re
+    _ansi_re = re.compile(
+        r'\x1b\[[0-9;?]*[A-Za-z]'    # CSI sequences (colors, cursor, etc.)
+        r'|\x1b\][^\x07]*\x07'        # OSC sequences
+        r'|\x1b[()][A-Z0-9]'          # Charset designation
+        r'|\x1b[78=>cDEHMNOZ]'        # 2-byte escapes
+    )
+    esc_buf = ""
     try:
         while True:
             chunk = await reader.read(4096)
@@ -386,90 +392,21 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
                 break
             if not agent.stdout_callbacks:
                 continue
-            raw = chunk.decode("utf-8", errors="replace")
-            result = []
-            i = 0
-            n = len(raw)
-            while i < n:
-                if raw[i] == '\x1b':
-                    if i + 1 < n and raw[i + 1] == '[':
-                        # CSI sequence: \x1b[ ... <letter>
-                        j = i + 2
-                        while j < n and (raw[j].isdigit() or raw[j] in ';?'):
-                            j += 1
-                        if j < n:
-                            params_str = raw[i + 2:j]
-                            cmd = raw[j]
-                            if cmd == 'm':  # SGR — color/style
-                                parts = params_str.split(';') if params_str else ['0']
-                                for p in parts:
-                                    try:
-                                        code = int(p)
-                                    except ValueError:
-                                        continue
-                                    if code == 0 or code == 39:
-                                        colored = False
-                                    elif (30 <= code <= 37) or (90 <= code <= 97) or code == 38:
-                                        colored = True
-                            elif cmd == 'C' and not colored:
-                                # Cursor forward → insert spaces
-                                count = int(params_str) if params_str else 1
-                                result.append(' ' * count)
-                            elif cmd in ('B', 'E') and not colored:
-                                # Cursor down / next line → newline
-                                count = int(params_str) if params_str else 1
-                                result.append('\n' * count)
-                            i = j + 1
-                        else:
-                            i = j
-                    elif i + 1 < n and raw[i + 1] == ']':
-                        # OSC sequence — skip until BEL
-                        j = i + 2
-                        while j < n and raw[j] != '\x07':
-                            j += 1
-                        i = j + 1 if j < n else j
-                    elif i + 1 < n and raw[i + 1] in '()':
-                        # Character set designation: ESC ( B, ESC ) 0, etc. — 3 bytes
-                        i += 3 if i + 2 < n else i + 2
-                    elif i + 1 < n and raw[i + 1] in '78=>cDEHMNOZ':
-                        # Known 2-byte escape sequences (save/restore cursor, reset, etc.)
-                        i += 2
-                    else:
-                        # Unknown sequence — skip just the ESC, preserve the next char
-                        i += 1
-                elif raw[i] == '\r':
-                    if i + 1 < n and raw[i + 1] == '\n':
-                        if not colored:
-                            result.append('\n')
-                        i += 2
-                    else:
-                        i += 1
-                else:
-                    if not colored:
-                        result.append(raw[i])
-                    i += 1
-            text = ''.join(result)
-            if not text:
-                continue
-            import re as _re2
-            # Filter out tool call chrome that leaks through in default color.
-            text = _re2.sub(
-                r'^.*(?:darkmatter\s*-\s*(?:Begin|Complete)\s+.*\(MCP\).*|'
-                r'\(params:\s*\{.*?\}\).*|'
-                r'⏺|⎿|ctrl\+o to expand|'
-                r'"result"\s*:|"success"\s*:|"message_id"\s*:|"signaled"\s*:|"targets"\s*:|'
-                r'"in_reply_to"\s*:|"target_agent_id"\s*:|"from_agent_id"\s*:|'
-                r'\d+ (?:tool use|tokens|lines)|^\s*$).*$',
-                '', text, flags=_re2.MULTILINE
-            )
-            # Filter lines with long hex strings (agent IDs from tool results)
-            text = _re2.sub(r'^.*[0-9a-f]{20,}.*$', '', text, flags=_re2.MULTILINE)
-            # Remove lines that are just JSON fragments: { } ( ) [ ]
-            text = _re2.sub(r'^\s*[{}\[\]()]+\s*$', '', text, flags=_re2.MULTILINE)
-            # Remove leaked ANSI color params from chunk-boundary splits
-            text = _re2.sub(r'\d+(?:;\d+){3,}m', '', text)
-            # Collapse excessive blank lines, split into paragraph chunks
-            text = _re2.sub(r'\n{3,}', '\n\n', text).strip()
+            raw = esc_buf + chunk.decode("utf-8", errors="replace")
+            esc_buf = ""
+            # Buffer incomplete escape sequence at end of chunk
+            last_esc = raw.rfind('\x1b')
+            if last_esc >= 0 and not _ansi_re.search(raw[last_esc:]):
+                esc_buf = raw[last_esc:]
+                raw = raw[:last_esc]
+            # Strip all ANSI escape sequences
+            text = _ansi_re.sub('', raw)
+            # Handle bare \r (terminal line overwrite): keep only text after last \r
+            lines = text.split('\n')
+            lines = [l.rsplit('\r', 1)[-1] for l in lines]
+            text = '\n'.join(lines)
+            # Collapse excessive blank lines, split into paragraph sections
+            text = re.sub(r'\n{3,}', '\n\n', text).strip()
             if not text:
                 continue
             sections = [s.strip() for s in text.split('\n\n') if s.strip()]
