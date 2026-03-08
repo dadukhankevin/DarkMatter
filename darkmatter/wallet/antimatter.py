@@ -3,7 +3,7 @@ AntiMatter economy — match game, elder selection, antimatter signals, timeout 
 
 Depends on: config, models, wallet/solana (at runtime)
 Uses callbacks for network operations to avoid circular imports.
-Network sends go through injected _network_send_fn / _webhook_request_fn
+Network sends go through injected _network_send_fn / _http_request_fn
 (wired to NetworkManager by app.py at startup).
 """
 
@@ -46,14 +46,14 @@ from darkmatter.models import (
 # async (agent_id, path, payload) -> SendResult-like object (.success, .response)
 _network_send_fn = None
 # async (url, from_agent_id, method="POST", **kwargs) -> httpx.Response
-_webhook_request_fn = None
+_http_request_fn = None
 
 
-def set_network_fns(send_fn, webhook_request_fn) -> None:
+def set_network_fns(send_fn, http_request_fn) -> None:
     """Wire up network functions. Called by app.py after NetworkManager is created."""
-    global _network_send_fn, _webhook_request_fn
+    global _network_send_fn, _http_request_fn
     _network_send_fn = send_fn
-    _webhook_request_fn = webhook_request_fn
+    _http_request_fn = http_request_fn
 
 
 # Cache for superagent wallet resolution
@@ -156,11 +156,11 @@ async def get_superagent_wallet(state: AgentState) -> Optional[str]:
         return cached[0]
 
     try:
-        # Superagent may not be a connected peer — use webhook_request for
-        # recovery-capable HTTP, or fall back to raw httpx if not wired yet.
+        # Superagent may not be a connected peer — use http_request if wired,
+        # or fall back to raw httpx.
         fetch_url = url.rstrip("/") + "/__darkmatter__/network_info"
-        if _webhook_request_fn:
-            resp = await _webhook_request_fn(fetch_url, from_agent_id=None, method="GET")
+        if _http_request_fn:
+            resp = await _http_request_fn(fetch_url, from_agent_id=None, method="GET")
         else:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(fetch_url)
@@ -467,7 +467,7 @@ async def resolve_antimatter(state: AgentState, sig: AntiMatterSignal, resolutio
                 "resolved_by": resolved_by or state.agent_id,
                 "resolution": resolution,
             }
-            await _webhook_request_fn(
+            await _http_request_fn(
                 sig.callback_url,
                 from_agent_id=sig.sender_agent_id,
                 method="POST",

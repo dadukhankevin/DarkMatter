@@ -49,8 +49,6 @@ from darkmatter.network.mesh import (
     handle_accept_pending,
     handle_message,
     handle_message_stream,
-    handle_webhook_post,
-    handle_webhook_get,
     handle_status,
     handle_network_info,
     handle_impression_get,
@@ -73,8 +71,6 @@ from darkmatter.network.mesh import (
     handle_local_pending,
     handle_local_connections,
     handle_local_set_impression,
-    handle_local_sent_messages,
-    handle_local_expire_message,
     handle_local_config,
     handle_ping,
 )
@@ -178,7 +174,7 @@ def create_app() -> Router:
     # Wire antimatter economy into NetworkManager for transport-agnostic sends
     set_antimatter_network_fns(
         send_fn=manager.send,
-        webhook_request_fn=manager.webhook_request,
+        http_request_fn=manager.http_request,
     )
 
     # LAN discovery setup
@@ -229,6 +225,14 @@ def create_app() -> Router:
         # Auto-start entrypoint (human node) if not already running
         asyncio.create_task(ensure_entrypoint_running())
 
+        # Start warm agent pool maintainer
+        if AGENT_SPAWN_ENABLED:
+            from darkmatter.spawn import warm_pool_loop
+            from darkmatter.config import AGENT_WARM_POOL_ENABLED, AGENT_WARM_POOL_SIZE
+            if AGENT_WARM_POOL_ENABLED:
+                asyncio.create_task(warm_pool_loop())
+                print(f"[DarkMatter] Warm agent pool: ENABLED (size: {AGENT_WARM_POOL_SIZE})", file=sys.stderr)
+
         # Re-spawn agents for any queued messages left from a previous session
         # Skip messages older than 30 minutes — they're stale and the sender
         # has likely moved on.  Stale messages are removed from the queue.
@@ -264,8 +268,6 @@ def create_app() -> Router:
         Route("/accept_pending", handle_accept_pending, methods=["POST"]),
         Route("/message", handle_message, methods=["POST"]),
         Route("/message_stream", handle_message_stream, methods=["POST"]),
-        Route("/webhook/{message_id}", handle_webhook_post, methods=["POST"]),
-        Route("/webhook/{message_id}", handle_webhook_get, methods=["GET"]),
         Route("/status", handle_status, methods=["GET"]),
         Route("/network_info", handle_network_info, methods=["GET"]),
         Route("/impression/{agent_id}", handle_impression_get, methods=["GET"]),
@@ -289,8 +291,6 @@ def create_app() -> Router:
         Route("/pending_requests", handle_local_pending, methods=["GET"]),
         Route("/connections", handle_local_connections, methods=["GET"]),
         Route("/set_impression", handle_local_set_impression, methods=["POST"]),
-        Route("/sent_messages", handle_local_sent_messages, methods=["GET"]),
-        Route("/expire_message", handle_local_expire_message, methods=["POST"]),
         Route("/config", handle_local_config, methods=["POST"]),
     ]
 
@@ -386,7 +386,7 @@ async def run_stdio_with_http() -> None:
 
     This is the preferred mode when launched by an MCP client (e.g. Claude Code).
     The client talks MCP over stdin/stdout. The HTTP server runs alongside for
-    agent-to-agent mesh communication, discovery, and webhooks.
+    agent-to-agent mesh communication and discovery.
 
     Port conflict resolution:
     - Port free -> start normally
@@ -440,7 +440,7 @@ async def run_stdio_with_http() -> None:
         set_network_manager(manager)
         set_antimatter_network_fns(
             send_fn=manager.send,
-            webhook_request_fn=manager.webhook_request,
+            http_request_fn=manager.http_request,
         )
 
         async with stdio_server() as (read_stream, write_stream):

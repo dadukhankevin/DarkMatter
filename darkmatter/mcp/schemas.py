@@ -30,30 +30,21 @@ class ConnectionInput(BaseModel):
 
 
 class BeginMessageInput(BaseModel):
-    """Signal that you're composing a message. Sends a typing indicator to the target."""
+    """Start composing a message. Sends a typing indicator to the target(s)."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    target_agent_id: Optional[str] = Field(default=None, description="Agent to send to (omit for auto-select)")
+    target_agent_id: Optional[str] = Field(default=None, description="Single agent to send to (omit for auto-select)")
+    target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to send to (explicit list)")
     in_reply_to: Optional[str] = Field(default=None, description="Message ID this is replying to")
-    broadcast: bool = Field(default=False, description="Send to all connected peers")
-    trust_min: float = Field(default=0.0, ge=-1.0, le=1.0, description="Only send to peers with trust >= this (for broadcast)")
+    forward_message_ids: Optional[list[str]] = Field(default=None, description="Queue message IDs to forward with this message. Content is included in delivery and messages are consumed from inbox.")
     hops_remaining: int = Field(default=10, ge=1, le=50, description="TTL for mesh routing")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
 
 
 class EndMessageInput(BaseModel):
-    """Signal that streaming is complete. The real content was already streamed via stdout."""
+    """Finish and deliver the message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="Message ID returned by begin_message")
 
-
-class SendMessageInput(BaseModel):
-    """Forward a queued message to another agent."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="Queue message ID to forward")
-    target_agent_id: Optional[str] = Field(default=None, description="Agent to forward to")
-    target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to forward to (fork)")
-    note: Optional[str] = Field(default=None, description="Forwarding annotation visible to the sender", max_length=1000)
-    force: bool = Field(default=False, description="Override loop detection when forwarding")
 
 
 class UpdateBioInput(BaseModel):
@@ -74,25 +65,6 @@ class GetMessageInput(BaseModel):
     """Get full details of a specific queued message."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     message_id: str = Field(..., description="The ID of the queued message to inspect")
-
-
-class GetSentMessageInput(BaseModel):
-    """Get full details of a sent message including webhook updates."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="The ID of the sent message to inspect")
-
-
-class ExpireMessageInput(BaseModel):
-    """Expire a sent message so agents stop forwarding it."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="The ID of the sent message to expire")
-
-
-class WaitForResponseInput(BaseModel):
-    """Wait for a response to a sent message."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="The ID of the sent message to wait on")
-    timeout_seconds: float = Field(default=60, description="How long to wait in seconds before giving up", gt=0)
 
 
 class ConnectionAcceptedInput(BaseModel):
@@ -178,20 +150,18 @@ class SetRateLimitInput(BaseModel):
 
 
 class CreateShardInput(BaseModel):
-    """Create a shared knowledge shard (text or code).
+    """Create a live code shard anchored to a file region.
 
-    Text shard: provide content directly.
-    Code shard: provide file, from_text, to_text — content is resolved live from the file.
+    Content is resolved live from the file. When the code changes,
+    updates are automatically pushed to peers on next view.
     """
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    content: Optional[str] = Field(default=None, description="Text content (for text shards). Omit for code shards.", max_length=MAX_CONTENT_LENGTH)
+    file: str = Field(..., description="File path (relative or absolute)")
+    from_text: str = Field(..., description="Text marking start of code region")
+    to_text: str = Field(..., description="Text marking end of code region")
     tags: list[str] = Field(..., description="Tags for organizing and querying shards", min_length=1)
-    trust_threshold: float = Field(default=0.0, ge=0.0, le=1.0, description="Min trust to receive this shard (0.0=public, 1.0=private)")
+    share_with_top_n: int = Field(default=-1, ge=-1, description="Share with top N peers by trust score. -1 = all peers (public).")
     summary: Optional[str] = Field(default=None, description="Optional summary. Only use for very long code regions where raw content would waste context. For most shards, skip this — raw code is better.", max_length=1000)
-    # Code shard fields
-    file: Optional[str] = Field(default=None, description="File path for code shard (relative or absolute)")
-    from_text: Optional[str] = Field(default=None, description="Text marking start of code region")
-    to_text: Optional[str] = Field(default=None, description="Text marking end of code region")
 
 
 class ViewShardsInput(BaseModel):
@@ -201,6 +171,14 @@ class ViewShardsInput(BaseModel):
     author: Optional[str] = Field(default=None, description="Filter by author agent ID")
     file: Optional[str] = Field(default=None, description="Filter by file path (code shards only)")
     raw: bool = Field(default=False, description="Show raw content instead of summaries")
+
+
+class CompleteAndSummarizeInput(BaseModel):
+    """Summarize your work and sign off. MANDATORY before finishing — do not skip this."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    summary: str = Field(..., description="Dense summary of what you did. Use @agent_id to reference peers. Include shards created, decisions made, things the hivemind should know.", min_length=10, max_length=25000)
+    shard_tags: list[str] = Field(default_factory=list, description="Tags of shards you created this session")
+    share_with_top_n: int = Field(default=-1, ge=-1, description="Who sees this summary: -1 = all peers, N = top N by trust")
 
 
 class GenomeInstallInput(BaseModel):

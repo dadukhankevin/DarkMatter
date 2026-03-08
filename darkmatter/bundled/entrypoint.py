@@ -14,6 +14,7 @@ import atexit
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -37,7 +38,7 @@ def _is_ajax():
 
 from darkmatter.app import init_state
 from darkmatter.state import get_state, set_state, save_state
-from darkmatter.models import AgentState, AgentStatus, Connection, SentMessage
+from darkmatter.models import AgentState, AgentStatus, Connection
 from darkmatter.identity import (
     load_or_create_passport, sign_message, sign_peer_update,
     validate_url,
@@ -50,7 +51,6 @@ from darkmatter.config import (
 from darkmatter.network.mesh import (
     process_connection_request, process_connection_accepted,
     process_accept_pending, _process_incoming_message,
-    _process_webhook_locally,
     build_outbound_request_payload, build_connection_from_accepted,
     process_antimatter_match, process_antimatter_signal,
     process_antimatter_result,
@@ -183,71 +183,6 @@ atexit.register(_cleanup_network)
 # Background: message timeout + dead peer detection
 # ---------------------------------------------------------------------------
 
-def _message_timeout_checker():
-    """Check for unacknowledged messages and flag unreachable peers."""
-    while True:
-        time.sleep(10)
-        now = datetime.now(timezone.utc)
-        dirty = False
-
-        # Timeout stale sent messages
-        for sm in list(state.sent_messages.values()):
-            if sm.status != "active":
-                continue
-            try:
-                created = datetime.fromisoformat(sm.created_at)
-            except Exception:
-                print(f"[DarkMatter Entrypoint] Malformed timestamp in sent message {sm.message_id}: {sm.created_at!r}", file=sys.stderr)
-                continue
-            age = (now - created).total_seconds()
-            has_ack = any(u.get("type") == "received" for u in sm.updates)
-            timeout = MESSAGE_RESPONSE_TIMEOUT_SECONDS if has_ack else MESSAGE_TIMEOUT_SECONDS
-            if age <= timeout:
-                continue
-
-            # Check if we got webhook responses
-            if sm.responses:
-                continue
-
-            # Check if any routed-to peer had activity after we sent the message
-            # (replies may come as regular messages, not webhook responses)
-            got_activity = False
-            for agent_id in sm.routed_to:
-                conn = state.connections.get(agent_id)
-                if conn and conn.last_activity:
-                    try:
-                        last = datetime.fromisoformat(conn.last_activity)
-                        if last > created:
-                            got_activity = True
-                            break
-                    except Exception:
-                        pass
-            if got_activity:
-                # Peer was active after we sent — mark as delivered, not timed out
-                if sm.status == "active":
-                    sm.status = "delivered"
-                    dirty = True
-                continue
-
-            reason = "No response received" if has_ack else "No acknowledgement received"
-            sm.status = "timed_out"
-            sm.updates.append({
-                "type": "timed_out",
-                "timestamp": now.isoformat(),
-                "reason": reason,
-            })
-            # Count timeout as a failure for each routed-to peer
-            for agent_id in sm.routed_to:
-                conn = state.connections.get(agent_id)
-                if conn:
-                    conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
-            dirty = True
-
-        if dirty:
-            save_state()
-
-
-threading.Thread(target=_message_timeout_checker, daemon=True).start()
 
 
 HEALTH_CHECK_INTERVAL = 15  # seconds between heartbeat pings
@@ -932,6 +867,41 @@ _typing_indicators: dict[str, dict] = {}
 _TYPING_TIMEOUT_S = 120  # Auto-expire after 2 minutes
 
 
+def _strip_stream_artifacts(text: str) -> str:
+    """Normalize streamed terminal output into readable markdown text."""
+    if not text:
+        return ""
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b[=<>]|\r", "", text)
+
+
+_streamed_responses: dict[str, list[dict]] = {}  # message_id -> list of responses
+
+def _persist_streamed_reply(from_id: str, indicator: dict, ended_at: str | None = None) -> None:
+    """Finalize a streamed reply into the local responses store."""
+    parent_id = indicator.get("in_reply_to")
+    if not parent_id:
+        return
+
+    # Save chunks as-is (already filtered by _drain_stdout)
+    chunks = [c for c in indicator.get("chunks", []) if c.strip()]
+    content = indicator.get("content", "").strip() or "(streamed)"
+
+    if parent_id not in _streamed_responses:
+        _streamed_responses[parent_id] = []
+
+    # Deduplicate
+    for existing in _streamed_responses[parent_id]:
+        if existing.get("agent_id") == from_id and existing.get("chunks"):
+            return
+
+    _streamed_responses[parent_id].append({
+        "agent_id": from_id,
+        "response": content,
+        "chunks": chunks,
+        "timestamp": ended_at or datetime.now(timezone.utc).isoformat(),
+    })
+
+
 def _get_typing_indicators() -> list[dict]:
     """Return active typing indicators, auto-expiring stale ones."""
     now = datetime.now(timezone.utc)
@@ -952,6 +922,7 @@ def _get_typing_indicators() -> list[dict]:
             "in_reply_to": info.get("in_reply_to"),
             "started_at": info["started_at"],
             "content": info.get("content", ""),
+            "chunks": info.get("chunks", []),
         })
     for aid in expired:
         _typing_indicators.pop(aid, None)
@@ -973,7 +944,7 @@ def dm_message():
     try:
         result, status = loop.run_until_complete(_process_incoming_message(state, data))
     finally:
-        # Let any background tasks (webhook notify, antimatter interception) finish
+        # Let any background tasks (antimatter interception, etc.) finish
         pending = asyncio.all_tasks(loop)
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
@@ -1003,53 +974,22 @@ def dm_message_stream():
             "display_name": data.get("from_display_name") or getattr(conn, "agent_display_name", ""),
             "started_at": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
             "content": "",
+            "chunks": [],  # Each chunk kept separate for frontend rendering
         }
     elif signal_type == "chunk":
         indicator = _typing_indicators.get(from_id)
         if indicator:
-            indicator["content"] = indicator.get("content", "") + data.get("content", "")
+            chunk_text = data.get("content", "")
+            if chunk_text:
+                indicator["chunks"].append(chunk_text)
+                # Also accumulate full content for end_message persistence
+                indicator["content"] = indicator.get("content", "") + chunk_text
     elif signal_type == "end":
         indicator = _typing_indicators.pop(from_id, None)
-        # Persist the streamed content as a webhook response so it shows in the feed
-        if indicator and indicator.get("in_reply_to"):
-            sm = state.sent_messages.get(indicator["in_reply_to"])
-            if sm:
-                # Strip ANSI escape codes for clean text storage
-                import re
-                raw = indicator.get("content", "")
-                clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b[=<>]|\r", "", raw)
-                sm.responses.append({
-                    "agent_id": from_id,
-                    "response": clean or "(streamed)",
-                    "timestamp": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
-                })
-                sm.status = "responded"
-                save_state()
+        if indicator:
+            _persist_streamed_reply(from_id, indicator, data.get("timestamp"))
 
     return jsonify({"ok": True})
-
-
-@app.route("/__darkmatter__/webhook/<message_id>", methods=["POST"])
-def dm_webhook_post(message_id):
-    data = request.get_json(silent=True) or {}
-    # Clear typing indicator when response arrives
-    responder = data.get("agent_id", "")
-    if responder and data.get("type") == "response":
-        _typing_indicators.pop(responder, None)
-    result, status = _process_webhook_locally(state, message_id, data)
-    return jsonify(result), status
-
-
-@app.route("/__darkmatter__/webhook/<message_id>", methods=["GET"])
-def dm_webhook_get(message_id):
-    sm = state.sent_messages.get(message_id)
-    if not sm:
-        return jsonify({"error": f"No sent message with ID '{message_id}'"}), 404
-    return jsonify({
-        "message_id": sm.message_id, "status": sm.status,
-        "initial_hops": sm.initial_hops, "created_at": sm.created_at,
-        "updates": sm.updates,
-    })
 
 
 @app.route("/__darkmatter__/peer_update", methods=["POST"])
@@ -1154,7 +1094,7 @@ def _sync_connection_request(target_url, mutual=False):
 
 
 def _sync_send_message(content, target_agent_id=None, metadata=None):
-    """Send a message to an agent (sync version)."""
+    """Send a message to an agent (sync version). Returns ACK with routing info."""
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
 
     if target_agent_id:
@@ -1168,21 +1108,12 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             return {"success": False, "error": "No agents connected."}
         targets = [best]
 
-    webhook = _mgr.build_webhook_url(message_id, peer_url=targets[0].agent_url)
-
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     signature_hex = None
     if state.private_key_hex:
         signature_hex = sign_message(
             state.private_key_hex, state.agent_id, message_id, msg_timestamp, content
         )
-
-    # Pre-register sent message BEFORE delivery so webhook callbacks don't 404
-    sent_msg = SentMessage(
-        message_id=message_id, content=content, status="sending",
-        initial_hops=10, routed_to=[c.agent_id for c in targets], metadata=metadata or {},
-    )
-    state.sent_messages[message_id] = sent_msg
 
     sent_to = []
     failed = []
@@ -1191,7 +1122,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             base = _resolve_base_url(conn)
             payload = {
                 "message_id": message_id, "content": content,
-                "webhook": webhook, "hops_remaining": 10,
+                "hops_remaining": 10,
                 "from_agent_id": state.agent_id, "metadata": metadata or {},
                 "timestamp": msg_timestamp, "from_public_key_hex": state.public_key_hex,
                 "signature_hex": signature_hex,
@@ -1205,27 +1136,14 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
                     conn.messages_sent += 1
                     conn._consecutive_failures = 0
                     conn.last_activity = datetime.now(timezone.utc).isoformat()
-                    sent_to.append(conn.agent_id)
+                    # Parse the ACK for routing info
+                    ack = resp.json() if resp.status_code == 200 else {}
+                    sent_to.append({"agent_id": conn.agent_id, "routed_to": ack.get("routed_to", "unknown")})
         except Exception as e:
             conn.messages_declined += 1
             conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
             failed.append({"agent_id": conn.agent_id, "error": str(e)})
-
-    # Update the pre-registered sent message with delivery results
     if sent_to:
-        sent_msg.status = "active"
-        sent_msg.routed_to = sent_to
-        save_state()
-    elif failed:
-        sent_msg.status = "failed"
-        sent_msg.routed_to = [f["agent_id"] for f in failed]
-        for f in failed:
-            sent_msg.updates.append({
-                "type": "delivery_failed",
-                "agent_id": f["agent_id"],
-                "error": f["error"],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
         save_state()
 
     result = {"success": len(sent_to) > 0, "message_id": message_id, "routed_to": sent_to}
@@ -1289,7 +1207,7 @@ def _sync_broadcast_message(content, metadata=None):
 
 
 def _sync_respond_to_message(message_id, response_text):
-    """Respond to a queued inbox message (sync version)."""
+    """Respond to a queued inbox message by sending a direct reply to the sender."""
     msg = None
     for i, m in enumerate(state.message_queue):
         if m.message_id == message_id:
@@ -1299,34 +1217,18 @@ def _sync_respond_to_message(message_id, response_text):
     if msg is None:
         return {"success": False, "error": f"No queued message with ID '{message_id}'."}
 
-    resp_timestamp = datetime.now(timezone.utc).isoformat()
-    resp_signature_hex = None
-    if state.private_key_hex:
-        resp_signature_hex = sign_message(
-            state.private_key_hex, state.agent_id, msg.message_id, resp_timestamp, response_text
-        )
+    if not msg.from_agent_id or msg.from_agent_id not in state.connections:
+        save_state()
+        return {"success": False, "error": "Sender is not a connected peer — cannot reply."}
 
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(msg.webhook, json={
-                "type": "response", "agent_id": state.agent_id,
-                "response": response_text, "metadata": msg.metadata,
-                "timestamp": resp_timestamp, "from_public_key_hex": state.public_key_hex,
-                "signature_hex": resp_signature_hex,
-            })
-            webhook_success = resp.status_code < 400
-            if not webhook_success:
-                print(f"[DarkMatter Entrypoint] Webhook response failed (HTTP {resp.status_code}) for message {msg.message_id}", file=sys.stderr)
-    except Exception as e:
-        webhook_success = False
-        print(f"[DarkMatter Entrypoint] Webhook response error for message {msg.message_id}: {e}", file=sys.stderr)
-
-    if msg.from_agent_id and msg.from_agent_id in state.connections:
-        conn = state.connections[msg.from_agent_id]
-        conn.last_activity = datetime.now(timezone.utc).isoformat()
-
+    # Send reply as a new message to the sender
+    result = _sync_send_message(
+        response_text,
+        target_agent_id=msg.from_agent_id,
+        metadata={"type": "reply", "in_reply_to": msg.message_id},
+    )
     save_state()
-    return {"success": webhook_success, "message_id": msg.message_id}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1435,22 +1337,18 @@ def send():
 
 @app.route("/retry/<message_id>", methods=["POST"])
 def retry(message_id):
-    """Re-send a failed or timed-out message."""
-    old = state.sent_messages.get(message_id)
-    if not old:
+    """Re-send a message from conversation log."""
+    # Find the message in conversation log
+    entry = None
+    for e in reversed(state.conversation_log):
+        if e.message_id == message_id and e.direction == "outbound":
+            entry = e
+            break
+    if not entry:
         return jsonify({"success": False, "error": "Message not found"}), 404
-    if old.status not in ("failed", "timed_out"):
-        return jsonify({"success": False, "error": f"Message status is '{old.status}', not retryable"}), 400
 
-    content = old.content
-    target_id = old.routed_to[0] if old.routed_to else None
-    metadata = old.metadata
-
-    # Remove the old failed message
-    del state.sent_messages[message_id]
-    save_state()
-
-    result = _sync_send_message(content, target_id, metadata=metadata if metadata else None)
+    target_id = entry.to_agent_ids[0] if entry.to_agent_ids else None
+    result = _sync_send_message(entry.content, target_id, metadata=entry.metadata if entry.metadata else None)
     return jsonify(result)
 
 
@@ -1557,24 +1455,32 @@ def poll():
         "metadata": getattr(msg, "metadata", {}),
     } for msg in state.message_queue]
 
+    # Outbox: outbound messages from conversation log
     outbox = []
-    for sm in sorted(state.sent_messages.values(), key=lambda s: s.created_at, reverse=True)[:50]:
-        responses = [{
-            "agent_id": r["agent_id"],
-            "display_name": _display_name_for(r["agent_id"]),
-            "response": r.get("response", ""),
-            "timestamp": r.get("timestamp"),
-        } for r in getattr(sm, "responses", [])]
-        routed_to_names = [_display_name_for(rid) for rid in sm.routed_to]
-        outbox.append({
-            "message_id": sm.message_id, "status": sm.status, "content": sm.content,
-            "routed_to": sm.routed_to, "routed_to_names": routed_to_names,
-            "created_at": sm.created_at,
-            "updates": getattr(sm, "updates", []),
-            "responses": responses,
-            "from_self": True,
-            "metadata": getattr(sm, "metadata", {}),
-        })
+    for e in reversed(state.conversation_log):
+        if e.direction == "outbound" and e.from_agent_id == state.agent_id:
+            responses = []
+            for r in _streamed_responses.get(e.message_id, []):
+                responses.append({
+                    "agent_id": r["agent_id"],
+                    "display_name": _display_name_for(r["agent_id"]),
+                    "response": r.get("response", ""),
+                    "chunks": r.get("chunks", []),
+                    "timestamp": r.get("timestamp"),
+                })
+            outbox.append({
+                "message_id": e.message_id,
+                "status": "sent",
+                "content": e.content,
+                "routed_to": e.to_agent_ids,
+                "routed_to_names": [_display_name_for(rid) for rid in e.to_agent_ids],
+                "created_at": e.timestamp,
+                "responses": responses,
+                "from_self": True,
+                "metadata": e.metadata,
+            })
+            if len(outbox) >= 50:
+                break
 
     pending = [{
         "request_id": req.request_id, "from_agent_id": req.from_agent_id,
@@ -1623,6 +1529,20 @@ def poll():
 
     total_active_agents = sum(c.get("spawned_agents", 0) for c in connections)
 
+    # Conversation log — same data agents see via get_context().
+    # Last 50 entries, chronological.  Includes broadcasts, forwards, and
+    # handled messages that are no longer in inbox/outbox.
+    conversation = [{
+        "message_id": e.message_id,
+        "from_agent_id": e.from_agent_id,
+        "from_name": _display_name_for(e.from_agent_id),
+        "to_agent_ids": e.to_agent_ids,
+        "content": e.content[:500],
+        "timestamp": e.timestamp,
+        "entry_type": e.entry_type,
+        "direction": e.direction,
+    } for e in state.conversation_log[-50:]]
+
     return jsonify({
         "self": {
             "agent_id": state.agent_id,
@@ -1636,6 +1556,7 @@ def poll():
         "typing": _get_typing_indicators(),
         "inbox": inbox, "outbox": outbox, "pending_requests": pending,
         "connections": connections, "discovered": discovered,
+        "conversation": conversation,
         "shards": [{
             "shard_id": s.shard_id,
             "author_id": s.author_agent_id,

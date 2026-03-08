@@ -106,11 +106,13 @@ def get_router_chain(mode: str) -> list:
 
 
 async def execute_routing(state: AgentState, msg: QueuedMessage,
-                          execute_decision_fn=None) -> None:
+                          execute_decision_fn=None) -> RouterDecision:
     """Run the router chain and execute the winning decision.
 
     execute_decision_fn is a callback that handles the actual execution
     (forwarding, spawning, etc.) — injected to avoid circular imports.
+
+    Returns the winning RouterDecision.
     """
     chain = get_router_chain(state.router_mode)
 
@@ -132,6 +134,7 @@ async def execute_routing(state: AgentState, msg: QueuedMessage,
             )
             if execute_decision_fn is not None:
                 await execute_decision_fn(state, msg, decision)
-            return
+            return decision
 
     print(f"[DarkMatter] All routers passed for {msg.message_id[:12]}... — message stays in queue", file=sys.stderr)
+    return RouterDecision(action=RouterAction.PASS, reason="All routers passed")

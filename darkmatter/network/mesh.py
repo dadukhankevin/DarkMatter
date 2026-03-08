@@ -46,7 +46,6 @@ from darkmatter.models import (
 )
 from darkmatter.identity import (
     validate_url,
-    validate_webhook_url,
     verify_message,
     verify_peer_update_signature,
     is_timestamp_fresh,
@@ -183,7 +182,6 @@ def _spawn_for_connection_request(
     synthetic_msg = QueuedMessage(
         message_id=msg_id,
         content=content,
-        webhook="",
         hops_remaining=0,
         metadata={"type": "connection_request", "request_id": request_id or msg_id, "status": status},
         from_agent_id=from_agent_id,
@@ -770,8 +768,9 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
     if decision.action == RouterAction.HANDLE:
         import darkmatter.config as _cfg
         if _cfg.AGENT_SPAWN_ENABLED:
-            from darkmatter.spawn import spawn_agent_for_message
-            await spawn_agent_for_message(state, msg)
+            from darkmatter.spawn import claim_warm_agent, spawn_agent_for_message
+            if not claim_warm_agent(msg):
+                await spawn_agent_for_message(state, msg)
         # If spawn disabled, message stays in queue for manual handling
 
     elif decision.action == RouterAction.FORWARD:
@@ -794,19 +793,6 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
         # Remove from queue after forwarding
         state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
 
-    elif decision.action == RouterAction.RESPOND:
-        if msg.webhook and decision.response:
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(msg.webhook, json={
-                        "type": "response",
-                        "from_agent_id": state.agent_id,
-                        "content": decision.response,
-                    })
-            except Exception as e:
-                print(f"[DarkMatter] Auto-respond webhook failed: {e}", file=sys.stderr)
-        state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
-
     elif decision.action == RouterAction.DROP:
         state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
 
@@ -824,11 +810,10 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     message_id = data.get("message_id", "")
     content = data.get("content", "")
-    webhook = data.get("webhook", "")
     from_agent_id = data.get("from_agent_id")
 
-    if not message_id or not content or not webhook:
-        missing = [f for f, v in [("message_id", message_id), ("content", content), ("webhook", webhook)] if not v]
+    if not message_id or not content:
+        missing = [f for f, v in [("message_id", message_id), ("content", content)] if not v]
         return {"error": f"Missing required fields: {', '.join(missing)}"}, 400
     if check_message_replay(message_id):
         return {"error": "Duplicate message — already received"}, 409
@@ -836,9 +821,6 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         return {"error": f"Content exceeds {MAX_CONTENT_LENGTH} bytes"}, 413
     if from_agent_id and len(from_agent_id) > MAX_AGENT_ID_LENGTH:
         return {"error": "from_agent_id too long"}, 400
-    url_err = validate_url(webhook)
-    if url_err:
-        return {"error": f"Invalid webhook: {url_err}"}, 400
 
     if not from_agent_id:
         return {"error": "Missing from_agent_id."}, 400
@@ -901,7 +883,6 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     msg = QueuedMessage(
         message_id=truncate_field(message_id, 128),
         content=content,
-        webhook=webhook,
         hops_remaining=hops_remaining,
         metadata=msg_metadata,
         from_agent_id=from_agent_id,
@@ -931,18 +912,6 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     save_state()
 
-    # Notify originator that message was received
-    webhook_err = validate_webhook_url(msg.webhook, get_state_fn=get_state, get_public_url_fn=lambda port: get_network_manager().get_public_url())
-    if not webhook_err:
-        try:
-            await get_network_manager().webhook_request(
-                msg.webhook, msg.from_agent_id,
-                method="POST", timeout=10.0,
-                json={"type": "received", "agent_id": state.agent_id}
-            )
-        except Exception:
-            pass  # Best-effort notification
-
     # AntiMatter economy: if this is a payment notification with antimatter_eligible flag, initiate match game
     msg_meta = msg.metadata or {}
     if (msg_meta.get("type") == "solana_payment"
@@ -957,84 +926,27 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     # Route message through the extensible router chain
     from darkmatter.router import execute_routing
+    routed_to = "queued"  # default
     try:
-        await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
+        decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
+        if decision.action == RouterAction.HANDLE:
+            import darkmatter.config as _cfg
+            routed_to = "agent" if _cfg.AGENT_SPAWN_ENABLED else "queued"
+        elif decision.action == RouterAction.FORWARD:
+            routed_to = "forwarded"
+        elif decision.action == RouterAction.DROP:
+            routed_to = "dropped"
     except Exception as e:
         import traceback
         print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
-    return {"success": True, "queued": True, "queue_position": len(state.message_queue)}, 200
-
-
-def _process_webhook_locally(state: AgentState, message_id: str, data: dict) -> tuple[dict, int]:
-    """Process a webhook callback payload locally. Returns (response_dict, status_code).
-
-    Shared by handle_webhook_post (direct) and relay poll (NAT).
-    """
-    sm = state.sent_messages.get(message_id)
-    if not sm:
-        return {"error": f"No sent message with ID '{message_id}'"}, 404
-
-    update_type = data.get("type", "")
-    agent_id = data.get("agent_id", "unknown")
-    timestamp = datetime.now(timezone.utc).isoformat()
-
-    if update_type == "received":
-        sm.updates.append({
-            "type": "received",
-            "agent_id": agent_id,
-            "timestamp": timestamp,
-        })
-        save_state()
-        return {"success": True, "recorded": "received"}, 200
-
-    elif update_type == "responding":
-        sm.updates.append({
-            "type": "responding",
-            "agent_id": agent_id,
-            "timestamp": timestamp,
-        })
-        save_state()
-        return {"success": True, "recorded": "responding"}, 200
-
-    elif update_type == "forwarded":
-        sm.updates.append({
-            "type": "forwarded",
-            "agent_id": agent_id,
-            "target_agent_id": data.get("target_agent_id", ""),
-            "note": data.get("note"),
-            "timestamp": timestamp,
-        })
-        save_state()
-        return {"success": True, "recorded": "forwarded"}, 200
-
-    elif update_type == "response":
-        sm.responses.append({
-            "agent_id": agent_id,
-            "response": data.get("response", ""),
-            "metadata": data.get("metadata", {}),
-            "timestamp": timestamp,
-        })
-        sm.status = "responded"
-        save_state()
-        # Wake any wait_for_response waiters on this message
-        for evt in state._response_events.pop(message_id, []):
-            evt.set()
-        return {"success": True, "recorded": "response"}, 200
-
-    elif update_type == "expired":
-        sm.updates.append({
-            "type": "expired",
-            "agent_id": agent_id,
-            "note": data.get("note"),
-            "timestamp": timestamp,
-        })
-        save_state()
-        return {"success": True, "recorded": "expired"}, 200
-
-    else:
-        return {"error": f"Unknown update type: '{update_type}'"}, 400
+    return {
+        "status": "received",
+        "message_id": msg.message_id,
+        "routed_to": routed_to,
+        "queue_position": len(state.message_queue),
+    }, 200
 
 
 # =============================================================================
@@ -1291,67 +1203,6 @@ async def handle_message(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=status_code)
 
 
-async def handle_webhook_post(request: Request) -> JSONResponse:
-    """Handle incoming webhook updates (forwarding notifications, responses).
-
-    POST /__darkmatter__/webhook/{message_id}
-
-    Body should contain:
-    - type: "received" | "responding" | "forwarded" | "response" | "expired"
-    - agent_id: the agent posting this update
-    - For "received": (no extra fields -- signals message was queued)
-    - For "responding": (no extra fields -- signals agent is actively working on a response)
-    - For "forwarded": target_agent_id, optional note
-    - For "response": response text, optional metadata (multiple agents may respond)
-    - For "expired": optional note
-    """
-    state = get_state()
-
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    # Global rate limit for webhook POSTs
-    rate_err = check_rate_limit(state)
-    if rate_err:
-        return JSONResponse({"error": rate_err}, status_code=429)
-
-    message_id = request.path_params.get("message_id", "")
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    result, status_code = _process_webhook_locally(state, message_id, data)
-    return JSONResponse(result, status_code=status_code)
-
-
-async def handle_webhook_get(request: Request) -> JSONResponse:
-    """Status check for agents holding a message -- is it still active?
-
-    GET /__darkmatter__/webhook/{message_id}
-
-    Returns message status and forwarding updates (for loop detection).
-    """
-    state = get_state()
-
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    message_id = request.path_params.get("message_id", "")
-    sm = state.sent_messages.get(message_id)
-    if not sm:
-        return JSONResponse({"error": f"No sent message with ID '{message_id}'"}, status_code=404)
-
-    return JSONResponse({
-        "message_id": sm.message_id,
-        "status": sm.status,
-        "initial_hops": sm.initial_hops,
-        "created_at": sm.created_at,
-        "updates": sm.updates,
-    })
-
-
 async def handle_status(request: Request) -> JSONResponse:
     """Return this agent's public status (for health checks and discovery)."""
     state = get_state()
@@ -1360,6 +1211,8 @@ async def handle_status(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
     spawned_agents = get_spawned_agents()
+    from darkmatter.spawn import get_warm_agents
+    warm = get_warm_agents()
     return JSONResponse({
         "agent_id": state.agent_id,
         "display_name": state.display_name,
@@ -1369,6 +1222,8 @@ async def handle_status(request: Request) -> JSONResponse:
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "spawned_agents": len(spawned_agents),
+        "warm_agents": len(warm),
+        "active_agents": len(spawned_agents) - len(warm),
     })
 
 
@@ -1731,7 +1586,6 @@ async def handle_shard_push(request: Request) -> JSONResponse:
 
     author_id = data.get("author_agent_id", "")
     shard_id = data.get("shard_id", "")
-    trust_threshold = data.get("trust_threshold", 0.0)
 
     if not author_id or not shard_id:
         missing = [f for f, v in [("author_agent_id", author_id), ("shard_id", shard_id)] if not v]
@@ -1754,11 +1608,7 @@ async def handle_shard_push(request: Request) -> JSONResponse:
                                    data.get("content", ""), tags_str):
         return JSONResponse({"error": "Invalid shard signature"}, status_code=403)
 
-    # Trust gate: verify we trust this peer enough for this shard
-    imp = state.impressions.get(author_id)
-    our_trust = imp.score if imp else 0.0
-    if our_trust < trust_threshold:
-        return JSONResponse({"error": "Trust threshold not met"}, status_code=403)
+    # If the sender pushed this shard to us, we're already in their top-N — accept it.
 
     # Upsert: replace existing shard from same author with same ID
     from darkmatter.models import SharedShard
@@ -1775,7 +1625,7 @@ async def handle_shard_push(request: Request) -> JSONResponse:
         author_agent_id=author_id,
         content=data.get("content", "")[:MAX_CONTENT_LENGTH],
         tags=data.get("tags", []),
-        trust_threshold=trust_threshold,
+        share_with_top_n=data.get("share_with_top_n", -1),
         created_at=data.get("created_at", ""),
         updated_at=data.get("updated_at", ""),
         summary=data.get("summary"),
@@ -2207,7 +2057,6 @@ async def handle_local_inbox(request: Request) -> JSONResponse:
             "message_id": msg.message_id,
             "content": msg.content[:500] if msg.content else "",
             "from_agent_id": msg.from_agent_id,
-            "webhook_url": msg.webhook,
             "hops_remaining": msg.hops_remaining,
             "verified": msg.verified,
             "received_at": msg.received_at,
@@ -2297,59 +2146,6 @@ async def handle_local_set_impression(request: Request) -> JSONResponse:
     save_state()
 
     return JSONResponse({"success": True, "agent_id": agent_id, "score": score})
-
-
-async def handle_local_sent_messages(request: Request) -> JSONResponse:
-    """GET /__darkmatter__/sent_messages — list sent messages with status."""
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    message_id = request.query_params.get("id")
-    if message_id:
-        sm = state.sent_messages.get(message_id)
-        if not sm:
-            return JSONResponse({"error": "Message not found"}, status_code=404)
-        return JSONResponse({
-            "message_id": sm.message_id,
-            "content": sm.content,
-            "status": sm.status,
-            "created_at": sm.created_at,
-            "updates": [{"type": u.get("type"), "from": u.get("from_agent_id"),
-                         "content": u.get("content", "")[:500]} for u in sm.updates],
-        })
-
-    messages = []
-    for sm in state.sent_messages.values():
-        messages.append({
-            "message_id": sm.message_id,
-            "content": (sm.content or "")[:200],
-            "status": sm.status,
-            "created_at": sm.created_at,
-            "updates_count": len(sm.updates),
-        })
-    return JSONResponse({"count": len(messages), "messages": messages})
-
-
-async def handle_local_expire_message(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/expire_message — expire a sent message."""
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    message_id = data.get("message_id", "")
-    sm = state.sent_messages.get(message_id)
-    if not sm:
-        return JSONResponse({"error": "Message not found"}, status_code=404)
-
-    sm.status = "expired"
-    save_state()
-    return JSONResponse({"success": True, "message_id": message_id, "status": "expired"})
 
 
 async def handle_local_config(request: Request) -> JSONResponse:

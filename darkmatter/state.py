@@ -14,7 +14,6 @@ from typing import Optional
 from darkmatter.filelock import lock_exclusive, unlock
 from darkmatter.config import (
     DEFAULT_PORT,
-    SENT_MESSAGES_MAX,
     ANTIMATTER_LOG_MAX,
     CONVERSATION_LOG_MAX,
     SHARED_SHARD_MAX,
@@ -32,7 +31,6 @@ from darkmatter.models import (
     PoolProvider,
     QueuedMessage,
     RoutingRule,
-    SentMessage,
     SharedShard,
 )
 
@@ -104,7 +102,6 @@ def sync_message_queue_from_disk() -> None:
             state.message_queue.append(QueuedMessage(
                 message_id=mid,
                 content=qd.get("content", ""),
-                webhook=qd.get("webhook", ""),
                 hops_remaining=qd.get("hops_remaining", 0),
                 metadata=qd.get("metadata", {}),
                 received_at=qd.get("received_at", ""),
@@ -222,11 +219,6 @@ def save_state() -> None:
     if state is None:
         return
 
-    # Cap sent_messages
-    if len(state.sent_messages) > SENT_MESSAGES_MAX:
-        sorted_msgs = sorted(state.sent_messages.items(), key=lambda x: x[1].created_at)
-        state.sent_messages = dict(sorted_msgs[-SENT_MESSAGES_MAX:])
-
     # Cap conversation_log
     if len(state.conversation_log) > CONVERSATION_LOG_MAX:
         state.conversation_log = state.conversation_log[-CONVERSATION_LOG_MAX:]
@@ -266,19 +258,6 @@ def save_state() -> None:
             }
             for aid, c in state.connections.items()
         },
-        "sent_messages": {
-            mid: {
-                "message_id": sm.message_id,
-                "content": sm.content,
-                "status": sm.status,
-                "initial_hops": sm.initial_hops,
-                "routed_to": sm.routed_to,
-                "created_at": sm.created_at,
-                "updates": sm.updates,
-                "responses": sm.responses,
-            }
-            for mid, sm in state.sent_messages.items()
-        },
         "impressions": {
             aid: {"score": imp.score, "note": imp.note, "negative_since": imp.negative_since}
             for aid, imp in state.impressions.items()
@@ -310,7 +289,7 @@ def save_state() -> None:
                 "author_agent_id": s.author_agent_id,
                 "content": s.content,
                 "tags": s.tags,
-                "trust_threshold": s.trust_threshold,
+                "share_with_top_n": s.share_with_top_n,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
                 "summary": s.summary,
@@ -379,7 +358,6 @@ def save_state() -> None:
             {
                 "message_id": m.message_id,
                 "content": m.content,
-                "webhook": m.webhook,
                 "hops_remaining": m.hops_remaining,
                 "metadata": m.metadata,
                 "received_at": m.received_at,
@@ -449,28 +427,11 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             tls_secure=cd.get("tls_secure", False),
         )
 
-    sent_messages = {}
-    for mid, sd in data.get("sent_messages", {}).items():
-        responses = sd.get("responses", [])
-        if not responses and sd.get("response"):
-            responses = [sd["response"]]
-        sent_messages[mid] = SentMessage(
-            message_id=sd["message_id"],
-            content=sd["content"],
-            status=sd["status"],
-            initial_hops=sd["initial_hops"],
-            routed_to=sd["routed_to"],
-            created_at=sd.get("created_at", ""),
-            updates=sd.get("updates", []),
-            responses=responses,
-        )
-
     message_queue = []
     for qd in data.get("message_queue", []):
         message_queue.append(QueuedMessage(
             message_id=qd["message_id"],
             content=qd["content"],
-            webhook=qd["webhook"],
             hops_remaining=qd.get("hops_remaining", 0),
             metadata=qd.get("metadata", {}),
             received_at=qd.get("received_at", ""),
@@ -506,7 +467,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             author_agent_id=sd.get("author_agent_id", ""),
             content=sd.get("content", ""),
             tags=sd.get("tags", []),
-            trust_threshold=sd.get("trust_threshold", 0.0),
+            share_with_top_n=sd.get("share_with_top_n", -1),
             created_at=sd.get("created_at", ""),
             updated_at=sd.get("updated_at", ""),
             summary=sd.get("summary"),
@@ -577,7 +538,6 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         display_name=data.get("display_name"),
         connections=connections,
         message_queue=message_queue,
-        sent_messages=sent_messages,
         impressions={
             aid: (
                 Impression(score=v["score"], note=v.get("note", ""), negative_since=v.get("negative_since"))

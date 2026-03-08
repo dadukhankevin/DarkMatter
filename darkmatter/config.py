@@ -19,7 +19,6 @@ DEFAULT_PORT = 8100
 
 MAX_CONNECTIONS = int(os.environ.get("DARKMATTER_MAX_CONNECTIONS", "50"))
 MESSAGE_QUEUE_MAX = 50
-SENT_MESSAGES_MAX = 100
 MAX_CONTENT_LENGTH = 65536   # 64 KB
 MAX_BIO_LENGTH = 1000
 MAX_AGENT_ID_LENGTH = 128
@@ -67,8 +66,6 @@ STALE_CONNECTION_AGE = 300          # seconds of inactivity before health-checki
 UPNP_PORT_RANGE = (30000, 60000)    # external port range for UPnP mappings
 PEER_LOOKUP_TIMEOUT = 5.0           # seconds to wait for peer_lookup responses
 PEER_LOOKUP_MAX_CONCURRENT = 50     # fan out peer_lookup to all connections
-WEBHOOK_RECOVERY_MAX_ATTEMPTS = 3   # max peer-lookup recovery attempts per webhook call
-WEBHOOK_RECOVERY_TIMEOUT = 30.0     # total wall-clock budget for all recovery attempts
 PEER_UPDATE_MAX_AGE = 300           # max age for peer_update timestamps (replay prevention)
 
 # =============================================================================
@@ -100,16 +97,14 @@ RATE_LIMIT_WINDOW = 60                    # sliding window in seconds
 # =============================================================================
 
 CORE_TOOLS = frozenset({
-    "darkmatter_send_message",
     "darkmatter_begin_message",
     "darkmatter_end_message",
     "darkmatter_connection",
     "darkmatter_update_bio",
-    "darkmatter_inbox",
     "darkmatter_create_shard",
     "darkmatter_view_shards",
-    "darkmatter_status",
     "darkmatter_wait_for_message",
+    "darkmatter_complete_and_summarize",
 })
 
 # =============================================================================
@@ -139,9 +134,9 @@ ANTIMATTER_LOG_MAX = 100        # cap antimatter_log entries
 # =============================================================================
 
 CONVERSATION_LOG_MAX = 500
-CONTEXT_DIRECT_MAX = 30
-CONTEXT_NETWORK_MAX = 15
-CONTEXT_RECENCY_HALF_LIFE = 3600  # seconds
+CONTEXT_MAX_MESSAGES = 20          # max entries shown in full context feed
+CONTEXT_MAX_WORDS = 1000           # max words per entry in context feed
+CONTEXT_PIGGYBACK_MAX = 5          # max entries injected into tool responses
 SHARED_SHARD_MAX = 200
 SHARD_CACHE_TTL = 86400           # 24h
 
@@ -180,6 +175,8 @@ AGENT_SANDBOX_NETWORK = os.environ.get("DARKMATTER_SANDBOX_NETWORK", "true").low
 AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
 AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "15"))
 AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "300"))
+AGENT_WARM_POOL_ENABLED = os.environ.get("DARKMATTER_WARM_POOL", "true").lower() == "true"
+AGENT_WARM_POOL_SIZE = int(os.environ.get("DARKMATTER_WARM_POOL_SIZE", "1"))
 
 # Client profiles — each entry describes how to invoke an MCP client as a spawned agent.
 # DARKMATTER_CLIENT env var selects the active profile (default: "claude-code").

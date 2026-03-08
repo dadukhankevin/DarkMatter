@@ -22,10 +22,10 @@ from darkmatter.mcp.schemas import (
     ConnectionInput,
     BeginMessageInput,
     EndMessageInput,
-    SendMessageInput,
     UpdateBioInput,
     CreateShardInput,
     ViewShardsInput,
+    CompleteAndSummarizeInput,
 )
 from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, consume_message
 from darkmatter.context import log_conversation
@@ -35,13 +35,11 @@ from darkmatter.config import (
 )
 from darkmatter.identity import (
     validate_url,
-    validate_webhook_url,
 )
 from darkmatter.security import sign_message, prepare_outbound
 from darkmatter.models import (
     AgentStatus,
     Connection,
-    SentMessage,
     SharedShard,
 )
 from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
@@ -284,21 +282,21 @@ async def _send_chunk(state, message_id: str, content: str, targets: list) -> No
 
 
 async def _begin_message(state, params: BeginMessageInput) -> str:
-    """Signal that a message is being composed. Sends typing indicator to target(s).
-
-    Supports nesting: if called while another message is in flight,
-    stdout chunks stream to ALL active targets (stack model).
-    """
+    """Start composing a message. Sends typing indicator to the target(s)."""
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
-    if params.broadcast:
+    # Resolve targets — explicit list, single ID, or auto-select
+    if params.target_agent_ids:
         targets = []
-        for aid, conn in state.connections.items():
-            imp = state.impressions.get(aid)
-            peer_trust = imp.score if imp else 0.0
-            if peer_trust >= params.trust_min:
-                targets.append(conn)
+        for tid in params.target_agent_ids:
+            conn = state.connections.get(tid)
+            if not conn:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Not connected to agent '{tid}'."
+                })
+            targets.append(conn)
     elif params.target_agent_id:
         conn = state.connections.get(params.target_agent_id)
         if not conn:
@@ -308,7 +306,7 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
             })
         targets = [conn]
     else:
-        targets = [c for c in state.connections.values()]
+        targets = list(state.connections.values())
 
     if not targets:
         return json.dumps({
@@ -316,7 +314,7 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
             "error": "No connections available to send to."
         })
 
-    # Build typing signal payload
+    # Send typing indicator to targets (best-effort)
     signal_payload = {
         "message_id": message_id,
         "type": "begin",
@@ -327,8 +325,6 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "metadata": metadata,
     }
-
-    # Send typing signal to all targets (best-effort)
     signaled = []
     for conn in targets:
         try:
@@ -337,36 +333,62 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
         except Exception:
             pass
 
+    # Consume forwarded messages from the queue
+    forwarded_msgs = []
+    if params.forward_message_ids:
+        sync_message_queue_from_disk()
+        forwarded_msgs = _consume_queue_messages(state, params.forward_message_ids)
+        not_found = set(params.forward_message_ids) - {m["message_id"] for m in forwarded_msgs}
+        if not_found:
+            return json.dumps({
+                "success": False,
+                "error": f"Messages not found in queue: {list(not_found)}"
+            })
+
     # Store pending stream state
     _pending_streams[message_id] = {
         "from_agent_id": state.agent_id,
         "targets": [c.agent_id for c in targets],
-        "signaled": signaled,
         "in_reply_to": params.in_reply_to,
-        "broadcast": params.broadcast,
         "hops_remaining": params.hops_remaining,
         "metadata": metadata,
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "_content": [],  # accumulate chunks for delivery on end
+        "_forwarded_msgs": forwarded_msgs,  # messages to include in delivery
     }
 
-    # Hook into spawned agent's stdout to stream chunks (if this is a reply)
+    # Hook into spawned agent's stdout to stream chunks to streamable targets
     if params.in_reply_to:
         from darkmatter.spawn import get_spawned_agents
         for agent in get_spawned_agents():
             if agent.message_id == params.in_reply_to:
                 async def _on_chunk(chunk: str, _mid=message_id, _st=state, _tgts=targets):
+                    _pending_streams[_mid]["_content"].append(chunk)
                     await _send_chunk(_st, _mid, chunk, _tgts)
                 agent.stdout_callbacks[message_id] = _on_chunk
                 _pending_streams[message_id]["_spawned_agent"] = agent
                 break
 
-    return json.dumps({
+    # Hint based on whether any target is streamable (human/entrypoint)
+    has_streamable = any(_is_streamable(c, state) for c in targets)
+    if has_streamable:
+        style = "Your output streams live to a human. Write naturally, use detail, include tool calls and reasoning — they see it all in real time. Longer is better."
+    else:
+        style = "Sending to another agent. Be concise and direct."
+
+    result = {
         "success": True,
         "message_id": message_id,
-        "signaled": signaled,
         "targets": [c.agent_id for c in targets],
-        "next_step": f"Write your response naturally — it streams to the receiver in real time. When done, call darkmatter_end_message(message_id='{message_id}') to stop streaming.",
-    })
+        "style": style,
+        "next_step": f"Write your response, then call darkmatter_end_message(message_id='{message_id}').",
+    }
+    if forwarded_msgs:
+        result["forwarding"] = [
+            {"message_id": m["message_id"], "from": m["from_agent_id"], "content": m["content"][:200]}
+            for m in forwarded_msgs
+        ]
+    return json.dumps(result)
 
 
 async def _end_message(state, params: EndMessageInput) -> str:
@@ -384,32 +406,70 @@ async def _end_message(state, params: EndMessageInput) -> str:
             "error": f"No pending message with ID '{params.message_id}'. Call begin_message first.",
         })
 
-    target_ids = stream_info["targets"]
     metadata = stream_info.get("metadata") or {}
     in_reply_to = stream_info.get("in_reply_to")
+    forwarded_msgs = stream_info.get("_forwarded_msgs", [])
 
-    if stream_info.get("broadcast"):
-        metadata["type"] = "broadcast"
-
+    # Deliver to the targets set at begin_message time
     targets = []
-    for tid in target_ids:
+    for tid in stream_info["targets"]:
         conn = state.connections.get(tid)
         if conn:
             targets.append(conn)
+    msg_type = "broadcast" if len(targets) > 1 else "direct"
 
     msg_timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Send end signal to stop streaming (best-effort)
-    end_signal = {
-        "message_id": params.message_id,
-        "type": "end",
-        "from_agent_id": state.agent_id,
-        "timestamp": msg_timestamp,
-    }
+    # Collect accumulated content from streaming
+    content_parts = stream_info.get("_content", [])
+    full_content = "\n\n".join(content_parts).strip() if content_parts else "(no content)"
+
+    # Build forwarded content section if any
+    if forwarded_msgs:
+        fwd_sections = []
+        for fwd in forwarded_msgs:
+            fwd_sections.append(f"[Forwarded from {fwd['from_agent_id'][:12]}]: {fwd['content']}")
+        fwd_block = "\n\n".join(fwd_sections)
+        if full_content != "(no content)":
+            full_content = f"{full_content}\n\n---\n{fwd_block}"
+        else:
+            full_content = fwd_block
+        metadata["forwarded"] = True
+        metadata["forwarded_by"] = state.agent_id
+        metadata["forwarded_message_ids"] = [m["message_id"] for m in forwarded_msgs]
+
     sent_to = []
     for conn in targets:
         try:
-            await send_to_peer(conn, "/__darkmatter__/message_stream", end_signal)
+            if _is_streamable(conn, state):
+                # Streamable target (entrypoint): send end signal — they have the chunks
+                end_signal = {
+                    "message_id": params.message_id,
+                    "type": "end",
+                    "from_agent_id": state.agent_id,
+                    "timestamp": msg_timestamp,
+                }
+                await send_to_peer(conn, "/__darkmatter__/message_stream", end_signal)
+            else:
+                # Non-streamable target (agent): deliver the full message directly
+                hops = stream_info.get("hops_remaining", 10)
+                if forwarded_msgs:
+                    # Use lowest hops from forwarded messages
+                    hops = min(m.get("hops_remaining", 10) for m in forwarded_msgs)
+                    hops = max(0, hops - 1)
+                msg_payload = {
+                    "message_id": params.message_id,
+                    "content": full_content,
+                    "hops_remaining": hops,
+                    "metadata": metadata,
+                    "timestamp": msg_timestamp,
+                    "in_reply_to": in_reply_to,
+                }
+                envelope = prepare_outbound(
+                    msg_payload, state.private_key_hex,
+                    state.agent_id, state.public_key_hex,
+                )
+                await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
             conn.messages_sent += 1
             conn.last_activity = datetime.now(timezone.utc).isoformat()
             sent_to.append(conn.agent_id)
@@ -417,24 +477,16 @@ async def _end_message(state, params: EndMessageInput) -> str:
         except Exception:
             pass
 
-    # Log conversation (content was streamed, just record the event)
+    # Log conversation with actual content
+    entry_type = "forward" if forwarded_msgs else msg_type
     if sent_to:
-        msg_type = metadata.get("type", "direct") if metadata.get("type") == "broadcast" else "direct"
         log_conversation(
-            state, params.message_id, "(streamed)",
+            state, params.message_id, full_content,
             from_id=state.agent_id, to_ids=sent_to,
-            entry_type=msg_type, direction="outbound",
+            entry_type=entry_type, direction="outbound",
             metadata=metadata,
         )
 
-    sent_msg = SentMessage(
-        message_id=params.message_id,
-        content="(streamed)",
-        status="active" if sent_to else "failed",
-        initial_hops=stream_info.get("hops_remaining", 10),
-        routed_to=sent_to,
-    )
-    state.sent_messages[params.message_id] = sent_msg
     save_state()
 
     # Kill the spawned agent process — it's done with this message.
@@ -453,155 +505,30 @@ async def _end_message(state, params: EndMessageInput) -> str:
     return json.dumps(result)
 
 
-async def _forward_message(state, params: SendMessageInput) -> str:
-    """Forward a queued message to one or more connected agents. Removes from queue after delivery."""
-    sync_message_queue_from_disk()  # Pick up messages queued by HTTP server
-    # Find the message in the queue
-    msg = None
-    msg_index = None
-    for i, m in enumerate(state.message_queue):
-        if m.message_id == params.message_id:
-            msg_index = i
-            msg = m
-            break
-
-    if msg is None:
-        return json.dumps({
-            "success": False,
-            "error": f"No queued message with ID '{params.message_id}'."
-        })
-
-    # Determine target(s)
-    target_ids = []
-    if params.target_agent_ids:
-        target_ids = params.target_agent_ids
-    elif params.target_agent_id:
-        target_ids = [params.target_agent_id]
-    else:
-        return json.dumps({"success": False, "error": "target_agent_id or target_agent_ids required for forwarding."})
-
-    # Validate all targets exist
-    target_conns = []
-    for tid in target_ids:
-        conn = state.connections.get(tid)
-        if not conn:
-            return json.dumps({"success": False, "error": f"Not connected to agent '{tid}'."})
-        target_conns.append((tid, conn))
-
-    # GET webhook status -- verify message is still active + loop detection
-    webhook_err = validate_webhook_url(msg.webhook)
-    if not webhook_err:
-        try:
-            status_resp = await get_network_manager().webhook_request(
-                msg.webhook, msg.from_agent_id,
-                method="GET", timeout=10.0,
-            )
-            if status_resp.status_code == 200:
-                webhook_data = status_resp.json()
-                msg_status = webhook_data.get("status", "active")
-                if msg_status in ("expired", "responded"):
-                    state.message_queue.pop(msg_index)
-                    consume_message(msg.message_id)
-                    save_state()
-                    return json.dumps({
-                        "success": False,
-                        "error": f"Message is already {msg_status} (checked via webhook). Removed from queue.",
-                    })
-
-                # Loop detection per target
-                if not params.force:
-                    for tid, _ in target_conns:
-                        for update in webhook_data.get("updates", []):
-                            if update.get("target_agent_id") == tid:
-                                return json.dumps({
-                                    "success": False,
-                                    "error": f"Agent '{tid}' has already received this message. To forward anyway, retry with force=true.",
-                                })
-        except Exception as e:
-            print(f"[DarkMatter] Warning: webhook status check failed for {msg.message_id}: {e}", file=sys.stderr)
-
-    # TTL check
-    if msg.hops_remaining <= 0:
-        state.message_queue.pop(msg_index)
-        consume_message(msg.message_id)
-        if not webhook_err:
-            try:
-                await get_network_manager().webhook_request(
-                    msg.webhook, msg.from_agent_id,
-                    method="POST", timeout=30.0,
-                    json={"type": "expired", "agent_id": state.agent_id, "note": "Message expired — no hops remaining."}
-                )
-            except Exception as e:
-                print(f"[DarkMatter] Warning: failed to notify webhook of TTL expiry for {msg.message_id}: {e}", file=sys.stderr)
+def _consume_queue_messages(state, message_ids: list[str]) -> list[dict]:
+    """Consume messages from the queue by ID. Returns the consumed messages as dicts."""
+    consumed = []
+    remaining = []
+    consumed_ids = set()
+    for msg in state.message_queue:
+        if msg.message_id in message_ids and msg.message_id not in consumed_ids:
+            consumed.append({
+                "message_id": msg.message_id,
+                "content": msg.content,
+                "from_agent_id": msg.from_agent_id,
+                "hops_remaining": msg.hops_remaining,
+                "verified": msg.verified,
+                "metadata": msg.metadata,
+                "received_at": msg.received_at,
+            })
+            consumed_ids.add(msg.message_id)
+            consume_message(msg.message_id)
+        else:
+            remaining.append(msg)
+    state.message_queue = remaining
+    if consumed:
         save_state()
-        return json.dumps({"success": False, "error": "Message expired — hops_remaining is 0."})
-
-    new_hops_remaining = msg.hops_remaining - 1
-
-    # Sign the forwarded message — mark metadata as forwarded so the recipient
-    # knows to use the webhook for replies (the original sender isn't their peer)
-    fwd_metadata = dict(msg.metadata or {})
-    fwd_metadata["forwarded"] = True
-    fwd_metadata["forwarded_by"] = state.agent_id
-    fwd_timestamp = datetime.now(timezone.utc).isoformat()
-    fwd_base_payload = {
-        "message_id": msg.message_id,
-        "content": msg.content,
-        "webhook": msg.webhook,
-        "hops_remaining": new_hops_remaining,
-        "metadata": fwd_metadata,
-        "timestamp": fwd_timestamp,
-    }
-    fwd_envelope = prepare_outbound(fwd_base_payload, state.private_key_hex, state.agent_id, state.public_key_hex)
-
-    # Deliver to all targets
-    per_target_results = []
-    for tid, conn in target_conns:
-        # POST forwarding update to webhook
-        if not webhook_err:
-            try:
-                await get_network_manager().webhook_request(
-                    msg.webhook, msg.from_agent_id,
-                    method="POST", timeout=10.0,
-                    json={"type": "forwarded", "agent_id": state.agent_id, "target_agent_id": tid, "note": params.note}
-                )
-            except Exception as e:
-                print(f"[DarkMatter] Warning: failed to post forwarding update to webhook: {e}", file=sys.stderr)
-
-        try:
-            result = await send_to_peer(conn, "/__darkmatter__/message", fwd_envelope.payload)
-            conn.messages_sent += 1
-            conn.last_activity = datetime.now(timezone.utc).isoformat()
-            per_target_results.append({"agent_id": tid, "success": True})
-            adjust_trust(state, tid, TRUST_MESSAGE_SENT)
-        except Exception as e:
-            per_target_results.append({"agent_id": tid, "success": False, "error": str(e)})
-
-    # Log conversation
-    forwarded_to = [r["agent_id"] for r in per_target_results if r["success"]]
-    if forwarded_to:
-        log_conversation(
-            state, msg.message_id, msg.content,
-            from_id=state.agent_id, to_ids=forwarded_to,
-            entry_type="forward", direction="outbound",
-            metadata=msg.metadata,
-        )
-
-    # Remove from queue after delivery attempts
-    state.message_queue.pop(msg_index)
-    consume_message(msg.message_id)
-    save_state()
-
-    any_success = any(r["success"] for r in per_target_results)
-    result = {
-        "success": any_success,
-        "message_id": msg.message_id,
-        "hops_remaining_for_targets": new_hops_remaining,
-        "results": per_target_results,
-    }
-    if params.note:
-        result["note"] = params.note
-    return json.dumps(result)
+    return consumed
 
 
 
@@ -658,7 +585,7 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     }
 )
 async def begin_message(params: BeginMessageInput, ctx: Context) -> str:
-    """Start composing a message. Everything you write after this streams live to the receiver. Call EARLY — the receiver sees your output in real time. For humans, write naturally and at length. For agents, be concise. Call end_message when done."""
+    """Start composing a message. Call this EARLY — respond fast. Follow the style hint in the response. Call end_message when done."""
     track_session(ctx)
     state = get_state()
     return await _begin_message(state, params)
@@ -675,30 +602,11 @@ async def begin_message(params: BeginMessageInput, ctx: Context) -> str:
     }
 )
 async def end_message(params: EndMessageInput, ctx: Context) -> str:
-    """Finish a message. The receiver already saw the streamed content; provide a summary for history. The summary should capture the key points of everything you wrote."""
+    """Finish and deliver the message. Set broadcast=true to send to all peers instead of just the original target."""
     track_session(ctx)
     state = get_state()
     return await _end_message(state, params)
 
-
-@mcp.tool(
-    name="darkmatter_send_message",
-    annotations={
-        "title": "Forward Queued Message",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Forward a queued message to another agent. Provide message_id + target_agent_id. For new messages, use begin_message + end_message."""
-    state = get_state()
-
-    if not params.message_id:
-        return json.dumps({"success": False, "error": "message_id is required. For new messages, use begin_message + end_message."})
-
-    return await _forward_message(state, params)
 
 
 # =============================================================================
@@ -716,7 +624,7 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     }
 )
 async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
-    """Update your bio and/or display name. Shared with peers for routing decisions."""
+    """Update your bio and/or display name. Both fields are optional — omit either to keep its current value. Shared with peers for routing decisions."""
     state = get_state()
     if params.bio is not None:
         state.bio = params.bio
@@ -733,70 +641,6 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     return json.dumps({"success": True, "bio": state.bio, "display_name": state.display_name})
 
 
-# =============================================================================
-# Inbox Tool (merged list + get)
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_inbox",
-    annotations={
-        "title": "View Inbox",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    }
-)
-async def inbox(message_id: Optional[str] = None, ctx: Context = None) -> str:
-    """View inbox. No args: list all. With message_id: read full message (removes from queue). Reply by sending to from_agent_id. If not the right recipient, forward it."""
-    sync_message_queue_from_disk()
-    state = get_state()
-
-    if message_id:
-        for i, msg in enumerate(state.message_queue):
-            if msg.message_id == message_id:
-                # Remove from queue (mark as read)
-                state.message_queue.pop(i)
-                consume_message(message_id)
-                save_state()
-
-                is_forwarded = bool((msg.metadata or {}).get("forwarded"))
-                result = {
-                    "message_id": msg.message_id,
-                    "content": msg.content,
-                    "hops_remaining": msg.hops_remaining,
-                    "can_forward": msg.hops_remaining > 0,
-                    "from_agent_id": msg.from_agent_id,
-                    "verified": msg.verified,
-                    "metadata": msg.metadata,
-                    "received_at": msg.received_at,
-                }
-                # Only surface webhook for forwarded messages — direct messages
-                # should be replied to by sending a message to from_agent_id
-                if is_forwarded and msg.webhook:
-                    result["webhook"] = msg.webhook
-                    result["reply_hint"] = "Forwarded message. Reply to original sender via webhook. If better suited for another peer, forward it."
-                else:
-                    result["reply_hint"] = f"Reply to {msg.from_agent_id}. If this is better suited for another peer, forward it to them instead."
-                return json.dumps(result)
-        return json.dumps({"success": False, "error": f"No queued message with ID '{message_id}'."})
-
-    messages = []
-    for msg in state.message_queue:
-        is_forwarded = bool((msg.metadata or {}).get("forwarded"))
-        entry = {
-            "message_id": msg.message_id,
-            "content": msg.content[:200] + ("..." if len(msg.content) > 200 else ""),
-            "hops_remaining": msg.hops_remaining,
-            "can_forward": msg.hops_remaining > 0,
-            "from_agent_id": msg.from_agent_id,
-            "verified": msg.verified,
-            "metadata": msg.metadata,
-            "received_at": msg.received_at,
-            "forwarded": is_forwarded,
-        }
-        messages.append(entry)
-    return json.dumps({"total": len(messages), "messages": messages})
 
 
 # =============================================================================
@@ -869,16 +713,6 @@ _REMOVED_TOOL_MARKER = True  # noqa: F841 — placeholder for removed tools
 # Shared Shards Tools
 # =============================================================================
 
-@mcp.tool(
-    name="darkmatter_create_shard",
-    annotations={
-        "title": "Create Shared Shard",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
 async def _push_shard_to_peers(state, shard) -> list[str]:
     """Push a shard to all qualifying connected peers. Returns list of agent IDs pushed to."""
     pushed_to = []
@@ -893,7 +727,7 @@ async def _push_shard_to_peers(state, shard) -> list[str]:
         "author_agent_id": shard.author_agent_id,
         "content": shard.content,
         "tags": shard.tags,
-        "trust_threshold": shard.trust_threshold,
+        "share_with_top_n": shard.share_with_top_n,
         "created_at": shard.created_at,
         "updated_at": shard.updated_at,
         "summary": shard.summary,
@@ -905,24 +739,44 @@ async def _push_shard_to_peers(state, shard) -> list[str]:
         "original_content": shard.original_content,
         "original_hash": shard.original_hash,
     }
-    for aid, conn in state.connections.items():
-        imp = state.impressions.get(aid)
-        peer_trust = imp.score if imp else 0.0
-        if peer_trust >= shard.trust_threshold:
-            try:
-                await send_to_peer(conn, "/__darkmatter__/shard_push", shard_payload)
-                pushed_to.append(aid)
-            except Exception as e:
-                print(f"[DarkMatter] Warning: failed to push shard {shard.shard_id} to peer {aid}: {e}", file=sys.stderr)
+
+    # Determine which peers to push to based on share_with_top_n
+    if shard.share_with_top_n == -1:
+        # All peers
+        eligible = list(state.connections.items())
+    else:
+        # Rank peers by trust score descending, pick top N
+        ranked = sorted(
+            state.connections.items(),
+            key=lambda item: (state.impressions.get(item[0]).score if state.impressions.get(item[0]) else 0.0),
+            reverse=True,
+        )
+        eligible = ranked[:shard.share_with_top_n]
+
+    for aid, conn in eligible:
+        try:
+            await send_to_peer(conn, "/__darkmatter__/shard_push", shard_payload)
+            pushed_to.append(aid)
+        except Exception as e:
+            print(f"[DarkMatter] Warning: failed to push shard {shard.shard_id} to peer {aid}: {e}", file=sys.stderr)
     return pushed_to
 
 
+@mcp.tool(
+    name="darkmatter_create_shard",
+    annotations={
+        "title": "Create Shared Shard",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 async def create_shard(params: CreateShardInput, ctx: Context) -> str:
-    """Create a knowledge shard (text or code) and push to qualifying peers.
+    """Create a live code shard anchored to a file region, and push to qualifying peers.
 
-    Text shard: provide content directly.
-    Code shard: provide file, from_text, to_text — content is resolved live from the file.
-    When the code changes, updates are automatically pushed to peers on next view.
+    Content is resolved live from the file. When the code changes,
+    updates are automatically pushed to peers on next view.
 
     Prefer raw code over summaries. Only add a summary for very long code regions
     where the full content would waste context. For most shards, skip summary.
@@ -934,56 +788,41 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
     if len(state.shared_shards) >= SHARED_SHARD_MAX:
         return json.dumps({"success": False, "error": f"Shard limit reached ({SHARED_SHARD_MAX})"})
 
-    is_code_shard = params.file is not None
-    file_path = None
-    region = None
-    original_content = None
-    original_hash = None
+    from darkmatter.shard_resolver import resolve_region, hash_content
+    from pathlib import Path
+    # Resolve file path
+    p = Path(params.file)
+    file_path = str(p) if p.is_absolute() else str(Path.cwd() / params.file)
 
-    if is_code_shard:
-        if not params.from_text or not params.to_text:
-            return json.dumps({"success": False, "error": "Code shards require file, from_text, and to_text."})
+    if not Path(file_path).exists():
+        return json.dumps({"success": False, "error": f"File not found: {params.file}"})
 
-        from darkmatter.shard_resolver import resolve_region, hash_content
-        from pathlib import Path
-        # Resolve file path
-        p = Path(params.file)
-        file_path = str(p) if p.is_absolute() else str(Path.cwd() / params.file)
+    region = resolve_region(file_path, params.from_text, params.to_text)
+    if region is None:
+        return json.dumps({
+            "success": False,
+            "error": f"Could not find region in {params.file}. "
+                     f"Make sure from_text ('{params.from_text[:50]}') appears in the file."
+        })
 
-        if not Path(file_path).exists():
-            return json.dumps({"success": False, "error": f"File not found: {params.file}"})
-
-        region = resolve_region(file_path, params.from_text, params.to_text)
-        if region is None:
-            return json.dumps({
-                "success": False,
-                "error": f"Could not find region in {params.file}. "
-                         f"Make sure from_text ('{params.from_text[:50]}') appears in the file."
-            })
-
-        original_content = region.content
-        original_hash = hash_content(original_content)
-        content = original_content  # stored content = resolved snapshot
-    else:
-        if not params.content:
-            return json.dumps({"success": False, "error": "Text shards require content."})
-        content = params.content
+    original_content = region.content
+    original_hash = hash_content(original_content)
+    content = original_content  # stored content = resolved snapshot
 
     now = datetime.now(timezone.utc).isoformat()
     from darkmatter.security import sign_shard
 
-    # Upsert: if a code shard exists for same file+from_text, replace it
+    # Upsert: if a shard exists for same file+from_text, replace it
     shard_id = f"shard-{uuid.uuid4().hex[:12]}"
     was_update = False
-    if is_code_shard:
-        for i, existing in enumerate(state.shared_shards):
-            if (existing.author_agent_id == state.agent_id
-                    and existing.file == params.file
-                    and existing.from_text == params.from_text):
-                shard_id = existing.shard_id
-                was_update = True
-                state.shared_shards.pop(i)
-                break
+    for i, existing in enumerate(state.shared_shards):
+        if (existing.author_agent_id == state.agent_id
+                and existing.file == params.file
+                and existing.from_text == params.from_text):
+            shard_id = existing.shard_id
+            was_update = True
+            state.shared_shards.pop(i)
+            break
 
     tags_str = ",".join(sorted(params.tags))
     sig = sign_shard(state.private_key_hex, shard_id, state.agent_id, content, tags_str)
@@ -993,7 +832,7 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         author_agent_id=state.agent_id,
         content=content,
         tags=params.tags,
-        trust_threshold=params.trust_threshold,
+        share_with_top_n=params.share_with_top_n,
         created_at=now,
         updated_at=now,
         summary=params.summary,
@@ -1001,7 +840,7 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         file=params.file,
         from_text=params.from_text,
         to_text=params.to_text,
-        function_anchor=region.function_anchor if region else None,
+        function_anchor=region.function_anchor or "",
         original_content=original_content,
         original_hash=original_hash,
     )
@@ -1015,14 +854,13 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         "shard_id": shard.shard_id,
         "action": "updated" if was_update else "created",
         "tags": shard.tags,
-        "trust_threshold": shard.trust_threshold,
+        "share_with_top_n": shard.share_with_top_n,
         "pushed_to": pushed_to,
     }
-    if is_code_shard:
-        result["file"] = params.file
-        result["lines"] = f"{region.start_line}-{region.end_line}"
-        if region.function_anchor:
-            result["function_anchor"] = region.function_anchor
+    result["file"] = params.file
+    result["lines"] = f"{region.start_line}-{region.end_line}"
+    if region.function_anchor:
+        result["function_anchor"] = region.function_anchor
 
     return json.dumps(result)
 
@@ -1070,77 +908,66 @@ async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
             continue
 
         is_local = shard.author_agent_id == state.agent_id
-        is_code = shard.file is not None
 
         entry = {
             "shard_id": shard.shard_id,
             "author": shard.author_agent_id,
             "tags": shard.tags,
-            "trust_threshold": shard.trust_threshold,
+            "share_with_top_n": shard.share_with_top_n,
             "created_at": shard.created_at,
             "updated_at": shard.updated_at,
+            "file": shard.file,
+            "type": "code",
         }
 
-        if is_code:
-            entry["file"] = shard.file
-            entry["type"] = "code"
+        if is_local and shard.from_text and shard.to_text:
+            # Resolve live content from file
+            p = Path(shard.file)
+            file_path = str(p) if p.is_absolute() else str(Path.cwd() / shard.file)
+            region = resolve_region(
+                file_path, shard.from_text, shard.to_text,
+                function_anchor=shard.function_anchor,
+            )
+            current_content = region.content if region else None
 
-            if is_local and shard.from_text and shard.to_text:
-                # Resolve live content from file
-                p = Path(shard.file)
-                file_path = str(p) if p.is_absolute() else str(Path.cwd() / shard.file)
-                region = resolve_region(
-                    file_path, shard.from_text, shard.to_text,
-                    function_anchor=shard.function_anchor,
+            if shard.original_content and shard.original_hash:
+                health = assess_health(
+                    shard.original_content, shard.original_hash,
+                    current_content, shard.stale_views,
                 )
-                current_content = region.content if region else None
+                entry["health"] = {"score": health.score, "status": health.status, "message": health.message}
 
-                if shard.original_content and shard.original_hash:
-                    health = assess_health(
-                        shard.original_content, shard.original_hash,
-                        current_content, shard.stale_views,
-                    )
-                    entry["health"] = {"score": health.score, "status": health.status, "message": health.message}
+                if region:
+                    entry["lines"] = f"{region.start_line}-{region.end_line}"
 
+                # If content changed, update the shard and queue for push
+                if current_content and hash_content(current_content) != shard.original_hash:
+                    shard.content = current_content
+                    shard.original_content = current_content
+                    shard.original_hash = hash_content(current_content)
+                    shard.updated_at = datetime.now(timezone.utc).isoformat()
+                    shard.stale_views = 0
                     if region:
-                        entry["lines"] = f"{region.start_line}-{region.end_line}"
+                        shard.function_anchor = region.function_anchor
+                    to_push.append(shard)
 
-                    # If content changed, update the shard and queue for push
-                    if current_content and hash_content(current_content) != shard.original_hash:
-                        shard.content = current_content
-                        shard.original_content = current_content
-                        shard.original_hash = hash_content(current_content)
-                        shard.updated_at = datetime.now(timezone.utc).isoformat()
-                        shard.stale_views = 0
-                        if region:
-                            shard.function_anchor = region.function_anchor
-                        to_push.append(shard)
-
-                    # Show content (raw code preferred for code shards)
-                    if shard.summary and not params.raw:
-                        entry["summary"] = shard.summary
-                    else:
-                        entry["content"] = current_content or "[Could not resolve]"
-
-                    if health.should_delete():
-                        to_delete.append(shard.shard_id)
-                        entry["expired"] = True
-                    elif health.status in ("stale", "degraded"):
-                        shard.stale_views += 1
-                else:
-                    # Code shard without original tracking — show content
-                    entry["content"] = current_content or shard.content
-            else:
-                # Remote code shard — show last-known snapshot
-                entry["cached"] = True
+                # Show content (raw code preferred)
                 if shard.summary and not params.raw:
                     entry["summary"] = shard.summary
                 else:
-                    entry["content"] = shard.content[:500]
-                    if len(shard.content) > 500:
-                        entry["truncated"] = True
+                    entry["content"] = current_content or "[Could not resolve]"
+
+                if health.should_delete():
+                    to_delete.append(shard.shard_id)
+                    entry["expired"] = True
+                elif health.status in ("stale", "degraded"):
+                    shard.stale_views += 1
+            else:
+                # Shard without original tracking — show content
+                entry["content"] = current_content or shard.content
         else:
-            entry["type"] = "text"
+            # Remote shard — show last-known snapshot
+            entry["cached"] = True
             if shard.summary and not params.raw:
                 entry["summary"] = shard.summary
             else:
@@ -1182,47 +1009,6 @@ async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
     return json.dumps(response)
 
 
-# =============================================================================
-# Live Status Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_status",
-    annotations={
-        "title": "Status + Context",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    }
-)
-async def live_status(ctx: Context) -> str:
-    """Get node status and NEW conversation context since your last call. Call regularly to stay current. Act on every ACTION item."""
-    track_session(ctx)
-    sync_message_queue_from_disk()
-    from darkmatter.mcp.visibility import build_status_line
-    from darkmatter.context import get_new_context
-
-    state = get_state()
-    status = build_status_line()
-
-    # Get session ID for context tracking
-    session_id = "default"
-    try:
-        session_id = str(id(ctx.session))
-    except Exception:
-        pass
-
-    new_context = get_new_context(state, session_id)
-
-    parts = [status]
-    if new_context:
-        parts.append(new_context)
-    else:
-        parts.append("No new conversation activity since last check.")
-
-    return "\n\n".join(parts)
-
 
 # =============================================================================
 # Wait for Message Tool
@@ -1232,86 +1018,26 @@ async def live_status(ctx: Context) -> str:
     name="darkmatter_wait_for_message",
     annotations={
         "title": "Wait for Message",
-        "readOnlyHint": True,
+        "readOnlyHint": False,
         "destructiveHint": False,
-        "idempotentHint": True,
+        "idempotentHint": False,
         "openWorldHint": True,
     }
 )
 async def wait_for_message(
-    message_id: Optional[str] = None,
     from_agents: Optional[list[str]] = None,
     timeout_seconds: float = 900,
     ctx: Context = None,
 ) -> str:
-    """Block until a message arrives. With message_id: wait for reply. Without: wait for any inbox message. Optional from_agents filter."""
+    """Block until a new inbox message arrives. Consumes and returns all matching messages. Optional from_agents filter."""
     state = get_state()
-
-    # ── Mode 1: Wait for reply to a sent message ──
-    if message_id:
-        sm = state.sent_messages.get(message_id)
-        if not sm:
-            return json.dumps({"success": False, "error": f"No sent message with ID '{message_id}'."})
-
-        # Check if responses already exist
-        if sm.responses:
-            return json.dumps({
-                "success": True,
-                "mode": "reply",
-                "message_id": message_id,
-                "responses": sm.responses,
-                "waited": False,
-            })
-
-        if sm.status == "expired":
-            return json.dumps({
-                "success": False,
-                "message_id": message_id,
-                "error": "Message is expired — no response will arrive.",
-            })
-
-        # Register event and wait
-        event = asyncio.Event()
-        if message_id not in state._response_events:
-            state._response_events[message_id] = []
-        state._response_events[message_id].append(event)
-
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            evts = state._response_events.get(message_id, [])
-            if event in evts:
-                evts.remove(event)
-            if not evts:
-                state._response_events.pop(message_id, None)
-            mins = int(timeout_seconds / 60)
-            return json.dumps({
-                "success": False,
-                "mode": "reply",
-                "message_id": message_id,
-                "timed_out": True,
-                "error": f"No reply received after {mins} minutes.",
-                "action": "Send a follow-up or proactively message another peer while waiting. Then call darkmatter_wait_for_message again.",
-            })
-
-        sm = state.sent_messages.get(message_id)
-        return json.dumps({
-            "success": True,
-            "mode": "reply",
-            "message_id": message_id,
-            "responses": sm.responses if sm else [],
-            "waited": True,
-        })
-
-    # ── Mode 2: Wait for new inbox message ──
 
     # Check if matching messages already exist in inbox
     sync_message_queue_from_disk()
-    existing = _filter_inbox(state, from_agents)
+    existing = _drain_inbox(state, from_agents)
     if existing:
         return json.dumps({
             "success": True,
-            "mode": "inbox",
             "messages": existing,
             "waited": False,
         })
@@ -1337,13 +1063,12 @@ async def wait_for_message(
 
             # Woke up — check if a matching message arrived
             sync_message_queue_from_disk()
-            matched = _filter_inbox(state, from_agents)
+            matched = _drain_inbox(state, from_agents)
             if matched:
                 if event in state._inbox_events:
                     state._inbox_events.remove(event)
                 return json.dumps({
                     "success": True,
-                    "mode": "inbox",
                     "messages": matched,
                     "waited": True,
                 })
@@ -1355,33 +1080,124 @@ async def wait_for_message(
         filter_desc = f" from {from_agents}" if from_agents else ""
         return json.dumps({
             "success": False,
-            "mode": "inbox",
             "timed_out": True,
             "error": f"No message{filter_desc} received after {mins} minutes.",
             "action": "Proactively reach out to peers, share updates, or broadcast. Then resume listening with darkmatter_wait_for_message.",
         })
 
 
-def _filter_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
-    """Return inbox messages matching the agent filter, as JSON-safe dicts."""
-    messages = []
+def _drain_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
+    """Return and consume inbox messages matching the agent filter."""
+    matched_ids = []
     for msg in state.message_queue:
         if from_agents and msg.from_agent_id not in from_agents:
             continue
-        is_forwarded = bool((msg.metadata or {}).get("forwarded"))
-        entry = {
-            "message_id": msg.message_id,
-            "content": msg.content[:500] + ("..." if len(msg.content) > 500 else ""),
-            "from_agent_id": msg.from_agent_id,
-            "hops_remaining": msg.hops_remaining,
-            "verified": msg.verified,
-            "received_at": msg.received_at,
-            "forwarded": is_forwarded,
+        matched_ids.append(msg.message_id)
+    if not matched_ids:
+        return []
+    return _consume_queue_messages(state, matched_ids)
+
+# =============================================================================
+# Complete and Summarize Tool
+# =============================================================================
+
+@mcp.tool(
+    name="darkmatter_complete_and_summarize",
+    annotations={
+        "title": "Complete & Summarize",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def complete_and_summarize(params: CompleteAndSummarizeInput, ctx: Context = None) -> str:
+    """MANDATORY when your task is done. Summarize what you did, what you learned, and what the hivemind should know. Uses @agent_id to reference peers. This terminates your session and spawns a fresh warm agent."""
+    state = get_state()
+
+    summary_id = f"summary-{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Build metadata
+    meta = {
+        "type": "summary",
+        "shard_tags": params.shard_tags,
+        "share_with_top_n": params.share_with_top_n,
+    }
+
+    # Identify where this session started in the conversation log.
+    # The session HWM was set when get_context(mode="full") ran at spawn time.
+    session_id = "default"
+    try:
+        session_id = str(id(ctx.session))
+    except Exception:
+        pass
+    from darkmatter.context import _session_context_hwm
+    session_start_idx = _session_context_hwm.get(session_id, 0)
+
+    # Log the summary as a conversation entry
+    log_conversation(
+        state, summary_id, params.summary,
+        from_id=state.agent_id, to_ids=[],
+        entry_type="summary", direction="outbound",
+        metadata=meta,
+    )
+
+    # Prune non-summary entries created during this session only.
+    # Entries before session_start_idx are from prior sessions — keep them.
+    # The summary replaces this session's raw message history.
+    before_session = state.conversation_log[:session_start_idx]
+    during_session = state.conversation_log[session_start_idx:]
+    during_session = [e for e in during_session if e.entry_type == "summary"]
+    state.conversation_log = before_session + during_session
+    save_state()
+
+    # Push summary to qualifying peers
+    pushed_to = []
+    if state.connections:
+        summary_payload = {
+            "message_id": summary_id,
+            "content": params.summary,
+            "metadata": meta,
+            "timestamp": now,
         }
-        if is_forwarded and msg.webhook:
-            entry["webhook"] = msg.webhook
-        messages.append(entry)
-    return messages
+        envelope = prepare_outbound(
+            summary_payload, state.private_key_hex,
+            state.agent_id, state.public_key_hex,
+        )
+
+        if params.share_with_top_n == -1:
+            eligible = list(state.connections.items())
+        else:
+            ranked = sorted(
+                state.connections.items(),
+                key=lambda item: (state.impressions.get(item[0]).score if state.impressions.get(item[0]) else 0.0),
+                reverse=True,
+            )
+            eligible = ranked[:params.share_with_top_n]
+
+        for aid, conn in eligible:
+            try:
+                await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
+                pushed_to.append(aid)
+            except Exception:
+                pass
+
+    # Spawn a fresh warm agent to replace this one
+    from darkmatter.spawn import spawn_warm_agent
+    try:
+        await spawn_warm_agent(state)
+    except Exception as e:
+        print(f"[DarkMatter] Warning: failed to spawn warm replacement: {e}", file=sys.stderr)
+
+    result = {
+        "success": True,
+        "summary_id": summary_id,
+        "pushed_to": pushed_to,
+        "message": "Summary stored. Session complete. A fresh warm agent has been spawned.",
+    }
+    return json.dumps(result)
+
 
 # Genome tools moved to HTTP API + skill (see /__darkmatter__/genome)
 

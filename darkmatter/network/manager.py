@@ -2,7 +2,7 @@
 NetworkManager — central orchestrator for transport-agnostic networking.
 
 Manages transport plugins, peer resolution, health monitoring, UPnP,
-webhook recovery, peer ping-based IP detection, and connectivity upgrades.
+peer ping-based IP detection, and connectivity upgrades.
 
 Depends on: config, models, identity, state, network/transport
 """
@@ -27,16 +27,11 @@ from darkmatter.config import (
     HEALTH_FAILURE_THRESHOLD,
     STALE_CONNECTION_AGE,
     UPNP_PORT_RANGE,
-    WEBHOOK_RECOVERY_MAX_ATTEMPTS,
-    WEBHOOK_RECOVERY_TIMEOUT,
     TRUST_NEGATIVE_TIMEOUT,
     CONNECTIVITY_UPGRADE_INTERVAL,
     PING_INTERVAL,
     PING_IP_WINDOW,
     PING_SILENCE_THRESHOLD,
-)
-from darkmatter.identity import (
-    validate_webhook_url,
 )
 from darkmatter.security import sign_peer_update
 from darkmatter.network.transport import Transport, SendResult
@@ -126,7 +121,7 @@ class NetworkManager:
     """Central orchestrator for transport-agnostic networking.
 
     Manages transport plugins, peer resolution, health monitoring,
-    NAT detection, UPnP, webhook recovery, and anchor node communication.
+    NAT detection, UPnP, and peer URL recovery.
     """
 
     def __init__(self, state_getter: Callable, state_saver: Callable):
@@ -188,105 +183,14 @@ class NetworkManager:
         state = self._get_state()
         return state.connections if state else {}
 
-    # -- Webhook helpers --
+    # -- HTTP request helper --
 
-    async def webhook_request(
-        self, webhook_url: str, from_agent_id: Optional[str],
-        method: str = "POST", timeout: float = 30.0, **kwargs
+    async def http_request(
+        self, url: str, method: str = "GET", timeout: float = 10.0, **kwargs
     ) -> "httpx.Response":
-        """Make an HTTP request to a webhook URL, with peer lookup recovery on failure."""
-        deadline = time.monotonic() + WEBHOOK_RECOVERY_TIMEOUT
-        current_url = webhook_url
-        last_err: Optional[Exception] = None
-
-        try:
-            remaining = max(1.0, deadline - time.monotonic())
-            async with httpx.AsyncClient(timeout=min(timeout, remaining)) as client:
-                return await getattr(client, method.lower())(current_url, **kwargs)
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-            last_err = e
-
-        if not from_agent_id:
-            raise last_err
-
-        urls_tried = {current_url}
-
-        for attempt in range(1, WEBHOOK_RECOVERY_MAX_ATTEMPTS + 1):
-            if time.monotonic() >= deadline:
-                break
-
-            new_base = await self.lookup_peer_url(from_agent_id, exclude_urls=urls_tried)
-            if not new_base:
-                print(f"[DarkMatter] Webhook recovery: no alternative URL found for {from_agent_id[:12]}… (attempt {attempt})", file=sys.stderr)
-                break
-
-            parsed = urlparse(current_url if attempt == 1 else webhook_url)
-            path = parsed.path
-            if not (path.startswith("/__darkmatter__/webhook/") or
-                    path.startswith("/__darkmatter__/webhook_relay/")):
-                print(f"[DarkMatter] Webhook recovery: unexpected path {path}, aborting", file=sys.stderr)
-                break
-
-            new_base = strip_base_url(new_base)
-            new_webhook = f"{new_base}{path}"
-
-            if new_webhook in urls_tried:
-                print(f"[DarkMatter] Webhook recovery: already tried {new_webhook}, aborting", file=sys.stderr)
-                break
-            urls_tried.add(new_webhook)
-
-            err = validate_webhook_url(
-                new_webhook, get_state_fn=self._get_state,
-                get_public_url_fn=lambda port: self.get_public_url(),
-            )
-            if err:
-                print(f"[DarkMatter] Webhook recovery: validation failed for {new_webhook}: {err}", file=sys.stderr)
-                break
-
-            print(f"[DarkMatter] Webhook recovery: {webhook_url} -> {new_webhook} "
-                  f"(attempt {attempt}/{WEBHOOK_RECOVERY_MAX_ATTEMPTS})", file=sys.stderr)
-
-            try:
-                remaining = max(1.0, deadline - time.monotonic())
-                async with httpx.AsyncClient(timeout=min(timeout, remaining)) as client:
-                    return await getattr(client, method.lower())(new_webhook, **kwargs)
-            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-                last_err = e
-                continue
-
-        raise last_err
-
-    def build_webhook_url(self, message_id: str, peer_url: str = None) -> str:
-        """Build the webhook URL for this agent.
-
-        If peer_url is local, use a local URL the peer can reach.
-        Otherwise use our public URL.
-        """
-        state = self._get_state()
-        if peer_url and is_local_url(peer_url):
-            try:
-                peer_host = urlparse(peer_url).hostname or ""
-                if peer_host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-                    webhook_host = "localhost"
-                else:
-                    webhook_host = self._get_lan_ip()
-            except Exception:
-                webhook_host = "localhost"
-            return f"http://{webhook_host}:{state.port}/__darkmatter__/webhook/{message_id}"
-        return f"{self.get_public_url()}/__darkmatter__/webhook/{message_id}"
-
-    @staticmethod
-    def _get_lan_ip() -> str:
-        """Get the LAN IP address of this machine."""
-        import socket
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("10.255.255.255", 1))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "localhost"
+        """Make an HTTP request (used by antimatter and other subsystems)."""
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await getattr(client, method.lower())(url, **kwargs)
 
     # -- Peer resolution --
 

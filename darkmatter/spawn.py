@@ -16,9 +16,12 @@ from darkmatter.config import (
     AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
     AGENT_SPAWN_TIMEOUT,
+    AGENT_WARM_POOL_ENABLED,
+    AGENT_WARM_POOL_SIZE,
     ACTIVE_CLIENT,
 )
 from darkmatter.models import AgentState, QueuedMessage
+from darkmatter.state import get_state
 
 # Capture the project directory at import time so spawned agents run here,
 # not in a temporary directory.
@@ -36,6 +39,7 @@ class SpawnedAgent:
     spawned_at: float
     pid: int
     spawn_mcp_config: str = ""  # .mcp.json path to clean up when agent exits
+    is_warm: bool = False  # True for pre-spawned agents waiting for work
     # Stdout streaming: dict of message_id → async callable(chunk: str)
     # Multiple callbacks = nested messages, chunks go to all active targets
     stdout_callbacks: dict = None  # Initialized to {} in __post_init__
@@ -43,6 +47,7 @@ class SpawnedAgent:
     def __post_init__(self):
         if self.stdout_callbacks is None:
             self.stdout_callbacks = {}
+
 
 
 _spawned_agents: list[SpawnedAgent] = []
@@ -158,9 +163,8 @@ def cleanup_finished_agents() -> None:
 
 def build_agent_prompt(state: AgentState, msg: QueuedMessage) -> str:
     """Build the prompt for a spawned agent with conversation context."""
-    from darkmatter.context import build_context_feed, format_feed_for_prompt
-    feed = build_context_feed(state, responding_to=msg.message_id)
-    context = format_feed_for_prompt(feed, state)
+    from darkmatter.context import get_context
+    context = get_context(state, mode="full")
 
     meta = msg.metadata or {}
     if meta.get("type") == "connection_request":
@@ -177,6 +181,7 @@ Accept: darkmatter_connection(action="accept", request_id="{request_id}")
 Reject: darkmatter_connection(action="reject", request_id="{request_id}")
 
 After accepting, introduce yourself and share what you can help with.
+MANDATORY: When done, call darkmatter_complete_and_summarize summarizing what happened (accepted/rejected, who, why).
 """
 
     return f"""\
@@ -184,11 +189,15 @@ INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
 
 {context}
 
-Read message {msg.message_id} with darkmatter_inbox(message_id="{msg.message_id}"), then:
-1. Call begin_message(target_agent_id=..., in_reply_to="{msg.message_id}") FIRST. This starts streaming your stdout to the receiver in real time.
+Message {msg.message_id} from {msg.from_agent_id[:12]}:
+{msg.content}
+
+INSTRUCTIONS:
+1. Call begin_message(target_agent_id="{msg.from_agent_id}", in_reply_to="{msg.message_id}") FIRST. This starts streaming your stdout to the receiver in real time.
 2. Write your response naturally — everything you output between begin and end streams live to the receiver.
 3. Call end_message(message_id=...) when done. This just signals "stop streaming" — nothing else needed.
-4. If this message is better suited for another peer, forward it with darkmatter_send_message(message_id="{msg.message_id}", target_agent_id=...).
+4. If this message is better suited for another peer, forward it: begin_message(target_agent_id=<peer>, forward_message_ids=["{msg.message_id}"]).
+5. MANDATORY: When done, call darkmatter_complete_and_summarize with a dense summary of what you did, referencing peers with @agent_id, listing shard tags you created, and anything the hivemind should know.
 """
 
 
@@ -212,6 +221,14 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
     if save_state_fn:
         save_state_fn()
+
+    # Consume the message from the queue — it's being delivered to the spawned agent
+    from darkmatter.state import consume_message
+    for i, m in enumerate(state.message_queue):
+        if m.message_id == msg.message_id:
+            state.message_queue.pop(i)
+            consume_message(msg.message_id)
+            break
 
     prompt = build_agent_prompt(state, msg)
 
@@ -406,8 +423,15 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
                         while j < n and raw[j] != '\x07':
                             j += 1
                         i = j + 1 if j < n else j
-                    else:
+                    elif i + 1 < n and raw[i + 1] in '()':
+                        # Character set designation: ESC ( B, ESC ) 0, etc. — 3 bytes
+                        i += 3 if i + 2 < n else i + 2
+                    elif i + 1 < n and raw[i + 1] in '78=>cDEHMNOZ':
+                        # Known 2-byte escape sequences (save/restore cursor, reset, etc.)
                         i += 2
+                    else:
+                        # Unknown sequence — skip just the ESC, preserve the next char
+                        i += 1
                 elif raw[i] == '\r':
                     if i + 1 < n and raw[i + 1] == '\n':
                         if not colored:
@@ -420,28 +444,34 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
                         result.append(raw[i])
                     i += 1
             text = ''.join(result)
-            # Filter out tool call chrome that leaks through in default color
-            if text:
-                import re as _re2
-                text = _re2.sub(
-                    r'^.*(?:darkmatter\s*-\s*(?:Begin|Complete)\s+.*\(MCP\).*|'
-                    r'\(params:\s*\{.*?\}\).*|'
-                    r'⏺|⎿|ctrl\+o to expand|'
-                    r'"result"\s*:|"success"\s*:|"message_id"\s*:|"signaled"\s*:|"targets"\s*:).*$',
-                    '', text, flags=_re2.MULTILINE
-                )
-                # Filter lines with long hex strings (agent IDs from tool results)
-                text = _re2.sub(r'^.*[0-9a-f]{20,}.*$', '', text, flags=_re2.MULTILINE)
-                # Remove lines that are just JSON fragments: { } ( ) [ ]
-                text = _re2.sub(r'^\s*[{}\[\]()]+\s*$', '', text, flags=_re2.MULTILINE)
-                # Collapse excessive blank lines
-                text = _re2.sub(r'\n{3,}', '\n\n', text).strip()
-                if text:
-                    text += '\n'
-            if text:
+            if not text:
+                continue
+            import re as _re2
+            # Filter out tool call chrome that leaks through in default color.
+            text = _re2.sub(
+                r'^.*(?:darkmatter\s*-\s*(?:Begin|Complete)\s+.*\(MCP\).*|'
+                r'\(params:\s*\{.*?\}\).*|'
+                r'⏺|⎿|ctrl\+o to expand|'
+                r'"result"\s*:|"success"\s*:|"message_id"\s*:|"signaled"\s*:|"targets"\s*:|'
+                r'"in_reply_to"\s*:|"target_agent_id"\s*:|"from_agent_id"\s*:|'
+                r'\d+ (?:tool use|tokens|lines)|^\s*$).*$',
+                '', text, flags=_re2.MULTILINE
+            )
+            # Filter lines with long hex strings (agent IDs from tool results)
+            text = _re2.sub(r'^.*[0-9a-f]{20,}.*$', '', text, flags=_re2.MULTILINE)
+            # Remove lines that are just JSON fragments: { } ( ) [ ]
+            text = _re2.sub(r'^\s*[{}\[\]()]+\s*$', '', text, flags=_re2.MULTILINE)
+            # Remove leaked ANSI color params from chunk-boundary splits
+            text = _re2.sub(r'\d+(?:;\d+){3,}m', '', text)
+            # Collapse excessive blank lines, split into paragraph chunks
+            text = _re2.sub(r'\n{3,}', '\n\n', text).strip()
+            if not text:
+                continue
+            sections = [s.strip() for s in text.split('\n\n') if s.strip()]
+            for section in sections:
                 for cb in list(agent.stdout_callbacks.values()):
                     try:
-                        await cb(text)
+                        await cb(section)
                     except Exception:
                         pass
     except Exception:
@@ -472,7 +502,19 @@ async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
 
 
 async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:
-    """Kill a spawned agent if it exceeds the timeout."""
+    """Kill a spawned agent if it exceeds the timeout.
+
+    Warm agents don't timeout — their whole purpose is to stay alive and wait.
+    Once claimed (is_warm flipped to False), the normal timeout applies from
+    that point.
+    """
+    # While the agent is warm, just sleep and re-check. Don't kill it.
+    while agent.is_warm:
+        await asyncio.sleep(30)
+        if not is_agent_running(agent):
+            return
+
+    # Agent is active (either never warm, or just claimed). Apply normal timeout.
     await asyncio.sleep(AGENT_SPAWN_TIMEOUT)
     if not is_agent_running(agent):
         return
@@ -488,3 +530,212 @@ async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:
             kill_agent(agent, force=True)
     except ProcessLookupError:
         pass
+
+
+# =============================================================================
+# Warm Agent Pool
+# =============================================================================
+
+def build_warm_agent_prompt(state: AgentState) -> str:
+    """Build the prompt for a pre-spawned warm agent that waits for work."""
+    from darkmatter.context import get_context
+    context = get_context(state, mode="full")
+
+    return f"""\
+PRE-SPAWNED AGENT — You are already running and waiting for work. Act IMMEDIATELY when a message arrives.
+
+{context}
+
+INSTRUCTIONS:
+1. Call darkmatter_update_bio to set your display name and bio.
+2. Call darkmatter_wait_for_message(timeout_seconds=86400) to block until a message arrives.
+3. When a message arrives (returned by wait_for_message), respond: call begin_message(target_agent_id=<sender>, in_reply_to=<id>) FIRST, write your response, then end_message.
+4. If the message is better suited for a peer, forward it: begin_message(target_agent_id=<peer>, forward_message_ids=[<id>]).
+5. MANDATORY: When done, call darkmatter_complete_and_summarize with a dense summary of what you did, referencing peers with @agent_id, listing shard tags you created, and anything the hivemind should know. This ends your session.
+"""
+
+
+def get_warm_agents() -> list[SpawnedAgent]:
+    """Return currently running warm agents."""
+    return [a for a in _spawned_agents if a.is_warm and is_agent_running(a)]
+
+
+def claim_warm_agent(msg: QueuedMessage) -> bool:
+    """Claim a warm agent for a specific message. Returns True if one was available.
+
+    The warm agent is already blocked on wait_for_message — when the inbox event
+    fires (from message arrival), it wakes up and handles the message automatically.
+    We just mark it as non-warm so it's not reclaimed.
+    """
+    warm = get_warm_agents()
+    if not warm:
+        return False
+    agent = warm[0]
+    agent.is_warm = False
+    agent.message_id = msg.message_id
+    print(
+        f"[DarkMatter] Warm agent PID {agent.pid} claimed for message {msg.message_id[:12]}...",
+        file=sys.stderr,
+    )
+    return True
+
+
+async def spawn_warm_agent(state: AgentState) -> None:
+    """Spawn a warm agent that blocks on wait_for_message until work arrives."""
+    import uuid
+    ok, reason = can_spawn_agent()
+    if not ok:
+        return
+
+    synthetic_id = f"warm-{uuid.uuid4().hex[:16]}"
+    prompt = build_warm_agent_prompt(state)
+
+    # Build a synthetic QueuedMessage so we can reuse spawn_agent_for_message's
+    # subprocess machinery without duplicating it.
+    msg = QueuedMessage(
+        message_id=synthetic_id,
+        content="",
+        from_agent_id=state.agent_id,
+    )
+
+    env = os.environ.copy()
+    env["DARKMATTER_AGENT_ENABLED"] = "false"
+    env["DARKMATTER_ENTRYPOINT_AUTOSTART"] = "false"
+    for var in ACTIVE_CLIENT["env_cleanup"]:
+        env.pop(var, None)
+
+    import json as _json
+    import tempfile as _tempfile
+    spawn_dir = _PROJECT_DIR
+    mcp_config = {
+        "mcpServers": {
+            "darkmatter": {
+                "type": "http",
+                "url": f"http://127.0.0.1:{state.port}/mcp",
+            }
+        }
+    }
+    spawn_mcp_fd, spawn_mcp_path = _tempfile.mkstemp(
+        prefix="darkmatter-warm-mcp-", suffix=".json"
+    )
+    with os.fdopen(spawn_mcp_fd, "w") as f:
+        _json.dump(mcp_config, f)
+
+    command = ACTIVE_CLIENT["command"]
+    args = list(ACTIVE_CLIENT["args"])
+
+    mcp_via_cli = "mcp_stdio" in ACTIVE_CLIENT.get("capabilities", set())
+    if mcp_via_cli:
+        args.extend(["--mcp-config", spawn_mcp_path, "--strict-mcp-config"])
+    prompt_style = ACTIVE_CLIENT.get("prompt_style", "positional")
+
+    safe_prompt = prompt.replace('"', "'").replace('`', "'").replace('$', '')
+
+    if prompt_style == "positional":
+        args.append(safe_prompt)
+    elif prompt_style.startswith("flag:"):
+        flag_name = prompt_style.split(":", 1)[1]
+        args.extend([f"--{flag_name}", safe_prompt])
+
+    exec_argv = [command] + args
+    sandboxed = False
+    if _cfg.AGENT_SANDBOX:
+        from darkmatter.sandbox import build_sandbox_command
+        sandbox_argv = build_sandbox_command(
+            command=exec_argv,
+            writable_roots=[spawn_dir],
+            network=_cfg.AGENT_SANDBOX_NETWORK,
+        )
+        if sandbox_argv is not None:
+            exec_argv = sandbox_argv
+            sandboxed = True
+
+    try:
+        import pty as _pty
+        import fcntl, struct, termios
+        pty_master_fd, pty_slave_fd = _pty.openpty()
+        winsize = struct.pack("HHHH", 24, 120, 0, 0)
+        fcntl.ioctl(pty_slave_fd, termios.TIOCSWINSZ, winsize)
+
+        process = await asyncio.create_subprocess_exec(
+            *exec_argv,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=pty_slave_fd,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=spawn_dir,
+        )
+        os.close(pty_slave_fd)
+
+        loop = asyncio.get_event_loop()
+        pty_reader = asyncio.StreamReader()
+        read_transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(pty_reader),
+            os.fdopen(pty_master_fd, "rb", 0),
+        )
+
+        agent = SpawnedAgent(
+            process=process,
+            message_id=synthetic_id,
+            spawned_at=time.monotonic(),
+            pid=process.pid,
+            spawn_mcp_config=spawn_mcp_path,
+            is_warm=True,
+        )
+        agent._pty_reader = pty_reader
+        agent._pty_transport = read_transport
+        _spawned_agents.append(agent)
+        _spawn_timestamps.append(time.monotonic())
+        sandbox_label = " [sandboxed]" if sandboxed else ""
+        print(
+            f"[DarkMatter] Warm agent spawned PID {process.pid}{sandbox_label} "
+            f"(pool slot, waiting for work)",
+            file=sys.stderr,
+        )
+
+        asyncio.create_task(agent_timeout_watchdog(agent))
+        asyncio.create_task(_drain_stdout(agent))
+        asyncio.create_task(_reap_agent_when_done(agent))
+
+    except FileNotFoundError:
+        print(
+            f"[DarkMatter] Warm agent spawn failed: command '{command}' not found.",
+            file=sys.stderr,
+        )
+        try: os.remove(spawn_mcp_path)
+        except OSError: pass
+    except Exception as e:
+        print(f"[DarkMatter] Warm agent spawn failed: {e}", file=sys.stderr)
+        try: os.remove(spawn_mcp_path)
+        except OSError: pass
+
+
+async def warm_pool_loop() -> None:
+    """Background loop that maintains the warm agent pool."""
+    # Wait for startup spawns to settle
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            state = get_state()
+            if state is None:
+                await asyncio.sleep(10)
+                continue
+
+            if not (_cfg.AGENT_SPAWN_ENABLED and AGENT_WARM_POOL_ENABLED
+                    and state.router_mode == "spawn"):
+                await asyncio.sleep(30)
+                continue
+
+            cleanup_finished_agents()
+            warm_count = len(get_warm_agents())
+            if warm_count < AGENT_WARM_POOL_SIZE:
+                ok, reason = can_spawn_agent()
+                if ok:
+                    await spawn_warm_agent(state)
+                else:
+                    print(f"[DarkMatter] Warm pool: can't spawn ({reason}), will retry", file=sys.stderr)
+        except Exception as e:
+            print(f"[DarkMatter] Warm pool loop error: {e}", file=sys.stderr)
+
+        await asyncio.sleep(10)

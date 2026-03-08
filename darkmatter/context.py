@@ -1,20 +1,18 @@
 """
-Conversation memory: logging, context feed algorithm, activity hints, prompt formatting.
+Conversation memory: logging, context feed, activity hints, prompt formatting.
 
 Depends on: config, models, state
 """
 
-import math
 import sys
-import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from darkmatter.config import (
     CONVERSATION_LOG_MAX,
-    CONTEXT_DIRECT_MAX,
-    CONTEXT_NETWORK_MAX,
-    CONTEXT_RECENCY_HALF_LIFE,
+    CONTEXT_MAX_MESSAGES,
+    CONTEXT_MAX_WORDS,
+    CONTEXT_PIGGYBACK_MAX,
 )
 from darkmatter.models import AgentState, ConversationEntry
 
@@ -36,8 +34,53 @@ def _get_session_counters(session_id: str) -> dict[str, int]:
     return _session_last_seen[session_id]
 
 
-def get_new_context(state, session_id: str) -> str:
-    """Return only conversation entries the session hasn't seen yet, formatted for prompt."""
+# =============================================================================
+# Unified context retrieval
+# =============================================================================
+
+def get_context(state: AgentState, mode: str = "piggyback",
+                session_id: Optional[str] = None) -> str:
+    """Single entry point for all context retrieval.
+
+    Modes:
+        "full"      - Agent startup (cold spawn, warm wake). Last
+                      CONTEXT_MAX_MESSAGES entries chronologically,
+                      each capped at CONTEXT_MAX_WORDS words.
+                      Summaries are shown in full. Advances HWM.
+        "piggyback" - Injected into every tool response. Up to
+                      CONTEXT_PIGGYBACK_MAX most recent new entries.
+    """
+    if mode == "full":
+        return _context_full(state, session_id)
+    elif mode == "piggyback":
+        return _context_incremental(state, session_id, max_entries=CONTEXT_PIGGYBACK_MAX)
+    else:
+        return ""
+
+
+def _context_full(state: AgentState, session_id: Optional[str]) -> str:
+    """Last N conversation entries chronologically for agent startup."""
+    entries = state.conversation_log[-CONTEXT_MAX_MESSAGES:]
+
+    if not entries:
+        return "No recent conversation history."
+
+    lines = [_format_entry(e, state, full=True) for e in entries]
+    text = "RECENT CONTEXT:\n" + "\n".join(lines)
+
+    # Advance HWM so piggyback won't re-show these
+    if session_id:
+        _session_context_hwm[session_id] = len(state.conversation_log)
+
+    return text
+
+
+def _context_incremental(state: AgentState, session_id: Optional[str],
+                         max_entries: int) -> str:
+    """Chronological new entries since last check."""
+    if not session_id:
+        return ""
+
     hwm = _session_context_hwm.get(session_id, 0)
     log = state.conversation_log
     new_entries = log[hwm:]
@@ -46,8 +89,16 @@ def get_new_context(state, session_id: str) -> str:
     if not new_entries:
         return ""
 
+    skipped = 0
+    if max_entries > 0 and len(new_entries) > max_entries:
+        skipped = len(new_entries) - max_entries
+        new_entries = new_entries[-max_entries:]
+
     lines = [_format_entry(e, state) for e in new_entries]
-    return "NEW CONTEXT:\n" + "\n".join(lines)
+    header = "NEW CONTEXT"
+    if skipped:
+        header += f" ({skipped} older entries omitted)"
+    return f"{header}:\n" + "\n".join(lines)
 
 
 # =============================================================================
@@ -68,7 +119,7 @@ def log_conversation(state: AgentState, message_id: str, content: str,
 
     entry = ConversationEntry(
         message_id=message_id,
-        content=content[:2000],  # truncate for storage
+        content=content[:25000] if entry_type == "summary" else content[:10000],
         from_agent_id=from_id,
         to_agent_ids=to_ids,
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -85,81 +136,6 @@ def log_conversation(state: AgentState, message_id: str, content: str,
 
 
 # =============================================================================
-# Context Feed Algorithm
-# =============================================================================
-
-def _score_entry(entry: ConversationEntry, agent_id: str,
-                 responding_to: Optional[str] = None) -> float:
-    """Score a conversation entry for ranking."""
-    now = time.time()
-    try:
-        entry_time = datetime.fromisoformat(entry.timestamp.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        print(f"[DarkMatter] Warning: malformed timestamp in conversation entry: {entry.timestamp!r}, falling back to 1h ago", file=sys.stderr)
-        entry_time = now - 3600  # fallback to 1h ago
-
-    age_seconds = max(0, now - entry_time)
-    recency_weight = math.pow(2, -age_seconds / CONTEXT_RECENCY_HALF_LIFE)
-
-    # Trust weight: map [-1, 1] -> [0.1, 1.0]
-    # Own outbound messages always get full trust weight
-    if entry.from_agent_id == agent_id:
-        trust_weight = 1.0
-    else:
-        trust_weight = max(0.1, (entry.trust_at_time + 1.0) / 2.0)
-
-    # Type boost
-    if responding_to and entry.message_id == responding_to:
-        type_boost = 10.0
-    elif entry.entry_type == "direct":
-        type_boost = 2.0
-    elif entry.entry_type == "reply":
-        type_boost = 1.5
-    elif entry.entry_type == "broadcast":
-        type_boost = 1.0
-    elif entry.entry_type == "forward":
-        type_boost = 0.5
-    else:
-        type_boost = 1.0
-
-    return recency_weight * trust_weight * type_boost
-
-
-def build_context_feed(state: AgentState,
-                       responding_to: Optional[str] = None) -> dict:
-    """Build ranked context feed split into direct and network buckets."""
-    direct = []
-    network = []
-    seen_ids = set()
-
-    for entry in state.conversation_log:
-        if entry.message_id in seen_ids:
-            continue
-        seen_ids.add(entry.message_id)
-
-        score = _score_entry(entry, state.agent_id, responding_to)
-        is_direct = (
-            entry.from_agent_id == state.agent_id
-            or state.agent_id in entry.to_agent_ids
-            or entry.direction in ("inbound", "outbound")
-        )
-
-        if is_direct:
-            direct.append((score, entry))
-        else:
-            network.append((score, entry))
-
-    # Sort by score descending
-    direct.sort(key=lambda x: x[0], reverse=True)
-    network.sort(key=lambda x: x[0], reverse=True)
-
-    return {
-        "direct": [e for _, e in direct[:CONTEXT_DIRECT_MAX]],
-        "network": [e for _, e in network[:CONTEXT_NETWORK_MAX]],
-    }
-
-
-# =============================================================================
 # Prompt Formatting
 # =============================================================================
 
@@ -169,7 +145,6 @@ def _format_time(iso_ts: str) -> str:
         dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         return dt.strftime("%H:%M:%SZ")
     except Exception:
-        print(f"[DarkMatter] Warning: truncating malformed timestamp for display: {iso_ts!r}", file=sys.stderr)
         return iso_ts[:19]
 
 
@@ -183,16 +158,39 @@ def _agent_label(agent_id: str, state: AgentState) -> str:
     return agent_id[:12]
 
 
-def _format_entry(entry: ConversationEntry, state: AgentState) -> str:
-    """Format a single conversation entry for prompt injection."""
+def _cap_words(text: str, max_words: int) -> str:
+    """Cap text to max_words, appending '...' if truncated."""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + "..."
+
+
+def _format_entry(entry: ConversationEntry, state: AgentState,
+                  full: bool = False) -> str:
+    """Format a single conversation entry for prompt injection.
+
+    full=True uses CONTEXT_MAX_WORDS cap (for full context feed).
+    full=False uses 200 char preview (for piggyback/incremental).
+    """
     ts = _format_time(entry.timestamp)
     sender = _agent_label(entry.from_agent_id, state)
-    content_preview = entry.content[:200]
-    if len(entry.content) > 200:
-        content_preview += "..."
+
+    if full:
+        # Summaries get 5x the word cap — they're dense digests worth showing in full
+        cap = CONTEXT_MAX_WORDS * 5 if entry.entry_type == "summary" else CONTEXT_MAX_WORDS
+        content = _cap_words(entry.content, cap)
+    else:
+        content = entry.content[:200]
+        if len(entry.content) > 200:
+            content += "..."
+
+    # Summaries get special formatting — show them prominently
+    if entry.entry_type == "summary":
+        return f'[{ts}] SUMMARY by {sender}: {content}'
 
     if entry.entry_type == "broadcast":
-        return f'[{ts}] {sender} (broadcast): "{content_preview}"'
+        return f'[{ts}] {sender} (broadcast): "{content}"'
 
     if entry.direction == "outbound":
         targets = ", ".join(_agent_label(t, state) for t in entry.to_agent_ids[:3])
@@ -201,28 +199,10 @@ def _format_entry(entry: ConversationEntry, state: AgentState) -> str:
         prefix = "forward" if entry.entry_type == "forward" else ""
         arrow = f" → {targets}"
         if prefix:
-            return f'[{ts}] {sender}{arrow} ({prefix}): "{content_preview}"'
-        return f'[{ts}] {sender}{arrow}: "{content_preview}"'
+            return f'[{ts}] {sender}{arrow} ({prefix}): "{content}"'
+        return f'[{ts}] {sender}{arrow}: "{content}"'
 
-    return f'[{ts}] {sender} → you: "{content_preview}"'
-
-
-def format_feed_for_prompt(feed: dict, state: AgentState) -> str:
-    """Format a context feed dict into a human-readable prompt section."""
-    parts = []
-
-    if feed["direct"]:
-        lines = [_format_entry(e, state) for e in reversed(feed["direct"])]
-        parts.append("RECENT CONVERSATION (your sent messages + received messages):\n" + "\n".join(lines))
-
-    if feed["network"]:
-        lines = [_format_entry(e, state) for e in reversed(feed["network"])]
-        parts.append("NETWORK ACTIVITY (peer broadcasts and forwarded messages):\n" + "\n".join(lines))
-
-    if not parts:
-        return "No recent conversation history."
-
-    return "\n\n".join(parts)
+    return f'[{ts}] {sender} → you: "{content}"'
 
 
 # =============================================================================

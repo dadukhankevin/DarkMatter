@@ -159,35 +159,6 @@ def is_private_ip(hostname: str) -> bool:
     return False
 
 
-def is_darkmatter_webhook(url: str, **_kwargs) -> bool:
-    """Check if a URL is a DarkMatter webhook endpoint.
-
-    Security is handled by message signing and connection verification,
-    not by IP filtering. Any URL with a /__darkmatter__/webhook/ path
-    is legitimate mesh traffic.
-    """
-    try:
-        parsed = urlparse(url)
-        return "/__darkmatter__/webhook/" in (parsed.path or "")
-    except Exception:
-        return False
-
-
-def validate_webhook_url(url: str, **_kwargs) -> Optional[str]:
-    """Validate a webhook URL: must be http(s), and DarkMatter webhooks
-    are always allowed regardless of IP. Security comes from signed
-    messages and verified connections, not IP-based filtering.
-    """
-    err = validate_url(url)
-    if err:
-        return err
-    if is_darkmatter_webhook(url):
-        return None
-    parsed = urlparse(url)
-    if is_private_ip(parsed.hostname):
-        return "Webhook URL must not target private or link-local IP addresses."
-    return None
-
 
 def truncate_field(value: str, max_len: int) -> str:
     """Truncate a string to max_len."""

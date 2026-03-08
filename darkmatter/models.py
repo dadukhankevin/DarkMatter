@@ -27,7 +27,6 @@ class RouterAction(str, Enum):
     """Actions a router can take on an incoming message."""
     HANDLE = "handle"      # Keep in queue; spawn agent if in spawn mode
     FORWARD = "forward"    # Auto-forward to specified peer(s)
-    RESPOND = "respond"    # Send immediate response via webhook
     DROP = "drop"          # Remove from queue silently
     PASS = "pass"          # No opinion — try next router in chain
 
@@ -137,25 +136,23 @@ class ConversationEntry:
 
 @dataclass
 class SharedShard:
-    """A DarkMatter-native knowledge shard, trust-gated and push-synced.
+    """A live code shard, trust-gated and push-synced.
 
-    Two types:
-    - Text shard: content is freeform text (file is None)
-    - Code shard: anchored to a file region via from_text/to_text, resolved live
+    Anchored to a file region via from_text/to_text, resolved live on view.
+    When the code changes, updates are automatically pushed to peers.
     """
     shard_id: str
     author_agent_id: str
-    content: str
+    content: str                # snapshot of resolved content
     tags: list[str]
-    trust_threshold: float      # 0.0 = public, 1.0 = private
+    share_with_top_n: int       # -1 = all peers, N = top N by trust score
     created_at: str
     updated_at: str
     summary: Optional[str] = None
     signature_hex: Optional[str] = None
-    # Code shard fields (all None for text shards)
-    file: Optional[str] = None
-    from_text: Optional[str] = None
-    to_text: Optional[str] = None
+    file: str = ""
+    from_text: str = ""
+    to_text: str = ""
     function_anchor: Optional[str] = None
     original_content: Optional[str] = None
     original_hash: Optional[str] = None
@@ -245,26 +242,11 @@ class QueuedMessage:
     """A message waiting to be processed."""
     message_id: str
     content: str
-    webhook: str
     hops_remaining: int
     metadata: dict
     received_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     from_agent_id: Optional[str] = None
     verified: bool = False
-
-
-@dataclass
-class SentMessage:
-    """Tracks a message this agent originated. Accumulates webhook updates."""
-    message_id: str
-    content: str
-    status: str  # "active" | "expired" | "responded"
-    initial_hops: int
-    routed_to: list[str]
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    updates: list[dict] = field(default_factory=list)
-    responses: list[dict] = field(default_factory=list)
-    metadata: dict = field(default_factory=dict)
 
 
 # =============================================================================
@@ -311,7 +293,6 @@ class AgentState:
     connections: dict[str, Connection] = field(default_factory=dict)
     pending_requests: dict[str, PendingConnectionRequest] = field(default_factory=dict)
     message_queue: list[QueuedMessage] = field(default_factory=list)
-    sent_messages: dict[str, SentMessage] = field(default_factory=dict)
     messages_handled: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     impressions: dict[str, Impression] = field(default_factory=dict)
@@ -333,9 +314,7 @@ class AgentState:
     _upnp_mapping: Optional[tuple] = None
     # Auto-reactivation timer
     inactive_until: Optional[str] = None
-    # Response waiters (ephemeral)
-    _response_events: dict[str, list[asyncio.Event]] = field(default_factory=dict)
-    # Inbox waiters — agents blocking on wait_for_response for new inbound messages
+    # Inbox waiters — agents blocking on wait_for_message for new inbound messages
     _inbox_events: list[asyncio.Event] = field(default_factory=list)
     # Extensible message routing
     routing_rules: list = field(default_factory=list)

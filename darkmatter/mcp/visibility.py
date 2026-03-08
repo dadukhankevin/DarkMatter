@@ -5,8 +5,10 @@ Depends on: config, models, mcp/__init__, spawn
 """
 
 import asyncio
+import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import json
 
@@ -47,8 +49,18 @@ def build_status_line() -> str:
 
     agent_label = state.display_name or state.agent_id[:12]
     spawned = get_spawned_agents()
-    active_agents = len(spawned)
-    agent_suffix = f" | Spawned agents: {active_agents}" if AGENT_SPAWN_ENABLED else ""
+    from darkmatter.spawn import get_warm_agents
+    warm_count = len(get_warm_agents())
+    active_count = len(spawned) - warm_count
+    if AGENT_SPAWN_ENABLED:
+        parts_a = []
+        if active_count > 0:
+            parts_a.append(f"{active_count} active")
+        if warm_count > 0:
+            parts_a.append(f"{warm_count} warm")
+        agent_suffix = f" | Agents: {', '.join(parts_a)}" if parts_a else " | Agents: 0"
+    else:
+        agent_suffix = ""
     wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in state.wallets.items()]
     wallet_suffix = f" | Wallets: {', '.join(wallet_parts)}" if wallet_parts else ""
     # Conversation memory stats
@@ -76,17 +88,13 @@ def build_status_line() -> str:
             lines.append(f'  {rid}: {display} — "{bio_snippet}" → accept or reject')
         actions.append("\n".join(lines))
     if msgs > 0:
-        actions.append(f"{msgs} inbox message(s) — read with darkmatter_inbox, reply immediately. Forward if better suited for a peer.")
-    sent_active = sum(1 for sm in state.sent_messages.values() if sm.status == "active")
-    if sent_active > 0:
-        active_ids = [sm.message_id for sm in state.sent_messages.values() if sm.status == "active"]
-        actions.append(f"{sent_active} awaiting reply — darkmatter_wait_for_message(message_id='{active_ids[0]}')")
+        actions.append(f"{msgs} inbox message(s) — will be delivered via wait_for_message or context injection.")
     if conns == 0:
         actions.append("No connections — discover and connect to peers now")
     if not state.bio or state.bio in ("A DarkMatter mesh agent.", "Description of what this agent specializes in"):
-        actions.append("Bio is generic — update it with darkmatter_update_bio")
+        actions.append("Bio is generic — update it with darkmatter_update_bio(bio=...)")
     if not state.display_name:
-        actions.append("No display name set")
+        actions.append("No display name — set one with darkmatter_update_bio(display_name=...)")
 
     recent_broadcasts = sum(
         1 for e in state.conversation_log[-50:]
@@ -154,12 +162,19 @@ async def update_status_tool() -> None:
         await notify_tools_changed()
 
 
-def _inject_activity_hint(result):
-    """Inject an activity hint into tool call results."""
+def _inject_activity_hint(result, session_id=None):
+    """Inject activity hint and new context into tool call results."""
     state = get_state()
     if state is None:
         return result
-    hint = build_activity_hint(state)
+    hint = build_activity_hint(state, session_id=session_id)
+
+    # Deliver new conversation context piggyback on every tool response.
+    new_context = None
+    if session_id:
+        from darkmatter.context import get_context
+        new_context = get_context(state, mode="piggyback", session_id=session_id)
+
     # result is a list of content objects from MCP
     if isinstance(result, list):
         for item in result:
@@ -169,9 +184,13 @@ def _inject_activity_hint(result):
                     data = json.loads(text)
                     if isinstance(data, dict):
                         data["_hint"] = hint
+                        if new_context:
+                            data["_context"] = new_context
                         item.text = json.dumps(data)
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    # Non-JSON text response — append as a suffix
+                    if new_context:
+                        item.text = text + f"\n\n{new_context}"
     return result
 
 
@@ -203,8 +222,16 @@ def initialize_tool_visibility() -> None:
             print(f"[DarkMatter] Graceful fallback: restored hidden tool '{name}' on demand", file=sys.stderr)
             mcp_module._visible_optional.add(name)
         result = await original_call_tool(name, arguments, **kwargs)
-        # Inject activity hints into tool responses
-        result = _inject_activity_hint(result)
+        # Derive session_id from MCP context for per-session tracking
+        session_id = None
+        ctx = kwargs.get("context")
+        if ctx:
+            try:
+                session_id = str(id(ctx.session))
+            except Exception:
+                pass
+        # Inject activity hints + new context into tool responses.
+        result = _inject_activity_hint(result, session_id=session_id)
         return result
 
     mcp._tool_manager.call_tool = _patched_call_tool
@@ -263,6 +290,17 @@ def check_auto_reactivate(state: AgentState) -> None:
         print(f"[DarkMatter] Warning: failed to parse inactive_until timestamp: {e}", file=sys.stderr)
 
 
+def _write_status_file(state) -> None:
+    """Write current node status to ~/.darkmatter/status.txt for external visibility."""
+    try:
+        status_dir = Path.home() / ".darkmatter"
+        status_dir.mkdir(parents=True, exist_ok=True)
+        status_path = status_dir / "status.txt"
+        status_path.write_text(build_status_line() + "\n")
+    except Exception:
+        pass  # Best-effort, never crash the updater
+
+
 async def status_updater() -> None:
     """Background task: periodically update the status tool description."""
     _purge_cycle = 0
@@ -280,5 +318,6 @@ async def status_updater() -> None:
                 _purge_cycle = 0
                 purge_stale_inbox(state)
             await update_status_tool()
+            _write_status_file(state)
         except Exception as e:
             print(f"[DarkMatter] Status updater error: {e}", file=sys.stderr)
