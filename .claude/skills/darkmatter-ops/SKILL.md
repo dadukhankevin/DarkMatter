@@ -62,13 +62,26 @@ curl -s "https://example.com/.well-known/darkmatter.json" | jq .
 # Network info (your URL, peers, accepting status)
 curl -s "$DM/__darkmatter__/network_info" | jq .
 
-# Local peer scan
+# Discover all DarkMatter peers — localhost (ports 8100-8200) + LAN subnet (ports 8100-8101, 8200)
+LAN_IP=$(python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('8.8.8.8',80)); print(s.getsockname()[0]); s.close()" 2>/dev/null || echo "127.0.0.1")
+SUBNET=$(echo "$LAN_IP" | rev | cut -d. -f2- | rev)
+echo "LAN IP: $LAN_IP  Subnet: $SUBNET.0/24"
+echo "--- Scanning localhost ports 8100-8200 ---"
 for p in $(seq 8100 8200); do
-  r=$(curl -s --connect-timeout 0.5 "http://localhost:$p/.well-known/darkmatter.json" 2>/dev/null)
-  if echo "$r" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-    echo "Port $p: $(echo "$r" | jq -r '.display_name // "unnamed"') ($(echo "$r" | jq -r '.agent_id[:12]')...)"
-  fi
+  curl -s --connect-timeout 0.3 "http://localhost:$p/.well-known/darkmatter.json" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'  localhost:{\"$p\"} → {d[\"display_name\"]} ({d[\"agent_id\"][:12]}...)')" 2>/dev/null
 done
+if [ "$LAN_IP" != "127.0.0.1" ]; then
+  echo "--- Scanning LAN $SUBNET.1-254 on ports 8100-8101, 8200 ---"
+  for i in $(seq 1 254); do
+    ip="$SUBNET.$i"
+    [ "$ip" = "$LAN_IP" ] && continue
+    for p in 8100 8101 8200; do
+      curl -s --connect-timeout 0.3 "http://$ip:$p/.well-known/darkmatter.json" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'  {\"$ip\"}:{\"$p\"} → {d[\"display_name\"]} ({d[\"agent_id\"][:12]}...)')" 2>/dev/null &
+    done
+  done
+  wait
+fi
+echo "Scan complete."
 ```
 
 ## Sent Messages

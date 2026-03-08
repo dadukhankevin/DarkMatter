@@ -43,6 +43,7 @@ class SpawnedAgent:
     # Stdout streaming: dict of message_id → async callable(chunk: str)
     # Multiple callbacks = nested messages, chunks go to all active targets
     stdout_callbacks: dict = None  # Initialized to {} in __post_init__
+    _returncode: int = None  # Tracks exit code (Process.returncode is read-only in Python 3.14+)
 
     def __post_init__(self):
         if self.stdout_callbacks is None:
@@ -96,14 +97,18 @@ def is_agent_running(agent: SpawnedAgent) -> bool:
     We check liveness via os.kill(pid, 0) and try os.waitpid(WNOHANG) to
     reap zombies so the slot is freed for new spawns.
     """
+    if agent._returncode is not None:
+        return False
+    # Also check the process object's own returncode (set by asyncio reaping)
     if agent.process.returncode is not None:
+        agent._returncode = agent.process.returncode
         return False
     # Check if process is still alive
     try:
         os.kill(agent.pid, 0)
     except ProcessLookupError:
         # Process is gone
-        agent.process.returncode = -1
+        agent._returncode = -1
         return False
     except PermissionError:
         # Process exists but we can't signal it — treat as alive
@@ -114,14 +119,14 @@ def is_agent_running(agent: SpawnedAgent) -> bool:
         if pid != 0:
             # Zombie reaped
             if os.WIFEXITED(status):
-                agent.process.returncode = os.WEXITSTATUS(status)
+                agent._returncode = os.WEXITSTATUS(status)
             elif os.WIFSIGNALED(status):
-                agent.process.returncode = -os.WTERMSIG(status)
+                agent._returncode = -os.WTERMSIG(status)
             else:
-                agent.process.returncode = -1
+                agent._returncode = -1
             return False
     except ChildProcessError:
-        agent.process.returncode = -1
+        agent._returncode = -1
         return False
     except Exception:
         pass
@@ -724,6 +729,12 @@ async def warm_pool_loop() -> None:
 
             if not (_cfg.AGENT_SPAWN_ENABLED and AGENT_WARM_POOL_ENABLED
                     and state.router_mode == "spawn"):
+                await asyncio.sleep(30)
+                continue
+
+            # Don't pre-spawn warm agents until at least one cold spawn has happened.
+            # Avoids wasting resources on nodes that aren't actively receiving messages.
+            if state.messages_handled == 0:
                 await asyncio.sleep(30)
                 continue
 
