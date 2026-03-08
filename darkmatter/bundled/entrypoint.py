@@ -884,7 +884,12 @@ def _persist_streamed_reply(from_id: str, indicator: dict, ended_at: str | None 
 
     # Save chunks as-is (already filtered by _drain_stdout)
     chunks = [c for c in indicator.get("chunks", []) if c.strip()]
-    content = indicator.get("content", "").strip() or "(streamed)"
+    # Prefer accumulated content; fall back to joining chunks; last resort placeholder
+    content = indicator.get("content", "").strip()
+    if not content and chunks:
+        content = _strip_stream_artifacts("".join(chunks)).strip()
+    if not content:
+        content = "(streamed)"
 
     if parent_id not in _streamed_responses:
         _streamed_responses[parent_id] = []
