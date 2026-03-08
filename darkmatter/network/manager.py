@@ -246,7 +246,8 @@ class NetworkManager:
         """
         state = self._get_state()
         public_url = state.public_url or f"http://127.0.0.1:{state.port}"
-        lan_ip = self._get_lan_ip()
+        from darkmatter.network.discovery import _get_lan_ip
+        lan_ip = _get_lan_ip()
         lan_url = f"http://{lan_ip}:{state.port}" if lan_ip != "localhost" else f"http://localhost:{state.port}"
 
         # Build transport address map

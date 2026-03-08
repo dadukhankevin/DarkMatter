@@ -924,22 +924,25 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
             save_state_fn=save_state,
         ))
 
-    # Route message through the extensible router chain
-    from darkmatter.router import execute_routing
-    routed_to = "queued"  # default
-    try:
-        decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
-        if decision.action == RouterAction.HANDLE:
-            import darkmatter.config as _cfg
-            routed_to = "agent" if _cfg.AGENT_SPAWN_ENABLED else "queued"
-        elif decision.action == RouterAction.FORWARD:
-            routed_to = "forwarded"
-        elif decision.action == RouterAction.DROP:
-            routed_to = "dropped"
-    except Exception as e:
-        import traceback
-        print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+    # Route message through the extensible router chain.
+    # queue_only mode (entrypoints) skips routing entirely — messages just
+    # sit in the queue for the human to handle.
+    routed_to = "queued"
+    if state.router_mode != "queue_only":
+        from darkmatter.router import execute_routing
+        try:
+            decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
+            if decision.action == RouterAction.HANDLE:
+                import darkmatter.config as _cfg
+                routed_to = "agent" if _cfg.AGENT_SPAWN_ENABLED else "queued"
+            elif decision.action == RouterAction.FORWARD:
+                routed_to = "forwarded"
+            elif decision.action == RouterAction.DROP:
+                routed_to = "dropped"
+        except Exception as e:
+            import traceback
+            print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
     return {
         "status": "received",

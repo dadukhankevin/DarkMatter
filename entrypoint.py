@@ -36,9 +36,14 @@ def _is_ajax():
 # Import DarkMatter internals from darkmatter/ package
 # ---------------------------------------------------------------------------
 
+# Entrypoint never spawns sub-agents — human handles messages via the UI.
+# Must be set BEFORE importing darkmatter.config (which reads this env var).
+os.environ["DARKMATTER_AGENT_ENABLED"] = "false"
+
 from darkmatter.app import init_state
 from darkmatter.state import get_state, set_state, save_state
 from darkmatter.models import AgentState, AgentStatus, Connection
+from darkmatter.context import log_conversation
 from darkmatter.identity import (
     load_or_create_passport, sign_message, sign_peer_update,
     validate_url,
@@ -46,7 +51,6 @@ from darkmatter.identity import (
 from darkmatter.config import (
     PROTOCOL_VERSION, MAX_CONNECTIONS, MAX_BIO_LENGTH,
     SPL_TOKENS, ANTIMATTER_RATE,
-    AGENT_SPAWN_ENABLED,
 )
 from darkmatter.network.mesh import (
     process_connection_request, process_connection_accepted,
@@ -135,7 +139,13 @@ if os.path.exists(_wallet_passport_path):
 # We do this with direct HTTP (not via NetworkManager) because transports
 # aren't initialized yet at module-load time.
 if state.connections:
-    _lan_ip = NetworkManager._get_lan_ip()
+    try:
+        _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _s.connect(("8.8.8.8", 80))
+        _lan_ip = _s.getsockname()[0]
+        _s.close()
+    except Exception:
+        _lan_ip = "127.0.0.1"
     _lan_url = f"http://{_lan_ip}:{PORT}" if _lan_ip != "localhost" else f"http://localhost:{PORT}"
     _broadcast_count = 0
     for _conn in list(state.connections.values()):
@@ -943,13 +953,10 @@ def dm_message():
     if from_id:
         _typing_indicators.pop(from_id, None)
 
-    # Use shared validation/queuing logic from darkmatter.network.mesh.
-    # router_mode is "queue_only" — messages queue for the human to read.
     loop = asyncio.new_event_loop()
     try:
         result, status = loop.run_until_complete(_process_incoming_message(state, data))
     finally:
-        # Let any background tasks (antimatter interception, etc.) finish
         pending = asyncio.all_tasks(loop)
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
@@ -1149,6 +1156,14 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
             failed.append({"agent_id": conn.agent_id, "error": str(e)})
     if sent_to:
+        # Record outbound message in conversation log so it appears in the UI outbox
+        log_conversation(
+            state, message_id, content,
+            from_id=state.agent_id,
+            to_ids=[s["agent_id"] for s in sent_to],
+            entry_type="direct", direction="outbound",
+            metadata=metadata or {},
+        )
         save_state()
 
     result = {"success": len(sent_to) > 0, "message_id": message_id, "routed_to": sent_to}
