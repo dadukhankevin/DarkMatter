@@ -7,6 +7,7 @@ Depends on: mcp/__init__, mcp/schemas, config, models, identity, state,
 
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid
@@ -20,8 +21,7 @@ from darkmatter.mcp import mcp, track_session
 from darkmatter.mcp.schemas import (
     ConnectionAction,
     ConnectionInput,
-    BeginMessageInput,
-    EndMessageInput,
+    SendMessageInput,
     UpdateBioInput,
     CreateShardInput,
     ViewShardsInput,
@@ -36,7 +36,7 @@ from darkmatter.config import (
 from darkmatter.identity import (
     validate_url,
 )
-from darkmatter.security import sign_message, prepare_outbound
+from darkmatter.security import prepare_outbound
 from darkmatter.models import (
     AgentStatus,
     Connection,
@@ -206,53 +206,8 @@ async def _connection_disconnect(state, agent_id: str) -> str:
     })
 
 
-# In-flight messages started by begin_message, keyed by message_id
-_pending_streams: dict[str, dict] = {}
-
-
-def _is_streamable(conn, state=None) -> bool:
-    """Check if a connection supports chunk streaming.
-
-    Returns True for WebRTC peers and LAN/local HTTP peers where
-    per-chunk POSTs are cheap. Returns False for remote HTTP peers
-    where one POST per ~512-byte chunk would be wasteful.
-    """
-    # WebRTC data channel = true streaming
-    ch = getattr(conn, "webrtc_channel", None)
-    if ch is not None and getattr(ch, "readyState", None) == "open":
-        return True
-    # LAN/local HTTP = fine for chunks (low latency, negligible cost)
-    from darkmatter.network.manager import is_local_url
-    url = getattr(conn, "agent_url", "") or ""
-    if is_local_url(url):
-        return True
-    if state and conn.agent_id in getattr(state, "discovered_peers", {}):
-        peer_url = state.discovered_peers[conn.agent_id].get("url", "")
-        if is_local_url(peer_url):
-            return True
-    return False
-
-
-async def _send_chunk(state, message_id: str, content: str, targets: list) -> None:
-    """Send a chunk signal to streamable targets via the standard transport stack."""
-    payload = {
-        "message_id": message_id,
-        "type": "chunk",
-        "from_agent_id": state.agent_id,
-        "content": content,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    for conn in targets:
-        if not _is_streamable(conn, state):
-            continue
-        try:
-            await send_to_peer(conn, "/__darkmatter__/message_stream", payload)
-        except Exception as e:
-            print(f"[DarkMatter] CHUNK: error sending to {getattr(conn, 'agent_display_name', conn.agent_id[:12])}: {e}", file=sys.stderr)
-
-
-async def _begin_message(state, params: BeginMessageInput) -> str:
-    """Start composing a message. Sends typing indicator to the target(s)."""
+async def _send_message(state, params: SendMessageInput) -> str:
+    """Send a message to one or more connected agents (single-shot delivery)."""
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
@@ -284,25 +239,6 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
             "error": "No connections available to send to."
         })
 
-    # Send typing indicator to targets (best-effort)
-    signal_payload = {
-        "message_id": message_id,
-        "type": "begin",
-        "from_agent_id": state.agent_id,
-        "from_public_key_hex": state.public_key_hex,
-        "from_display_name": state.display_name,
-        "in_reply_to": params.in_reply_to,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "metadata": metadata,
-    }
-    signaled = []
-    for conn in targets:
-        try:
-            await send_to_peer(conn, "/__darkmatter__/message_stream", signal_payload)
-            signaled.append(conn.agent_id)
-        except Exception:
-            pass
-
     # Consume forwarded messages from the queue
     forwarded_msgs = []
     if params.forward_message_ids:
@@ -315,143 +251,54 @@ async def _begin_message(state, params: BeginMessageInput) -> str:
                 "error": f"Messages not found in queue: {list(not_found)}"
             })
 
-    # Store pending stream state
-    _pending_streams[message_id] = {
-        "from_agent_id": state.agent_id,
-        "targets": [c.agent_id for c in targets],
-        "in_reply_to": params.in_reply_to,
-        "hops_remaining": params.hops_remaining,
-        "metadata": metadata,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "_content": [],  # accumulate chunks for delivery on end
-        "_forwarded_msgs": forwarded_msgs,  # messages to include in delivery
-    }
+    full_content = params.content
 
-    # Hook into spawned agent's stdout to stream chunks to streamable targets
-    if params.in_reply_to:
-        from darkmatter.spawn import get_spawned_agents
-        for agent in get_spawned_agents():
-            if agent.message_id == params.in_reply_to:
-                async def _on_chunk(chunk: str, _mid=message_id, _st=state, _tgts=targets):
-                    _pending_streams[_mid]["_content"].append(chunk)
-                    await _send_chunk(_st, _mid, chunk, _tgts)
-                agent.stdout_callbacks[message_id] = _on_chunk
-                _pending_streams[message_id]["_spawned_agent"] = agent
-                break
-
-    # Hint based on whether any target is streamable (human/entrypoint)
-    has_streamable = any(_is_streamable(c, state) for c in targets)
-    if has_streamable:
-        style = "Your output streams live to a human. Write naturally, use detail, include tool calls and reasoning — they see it all in real time. Longer is better."
-    else:
-        style = "Sending to another agent. Be concise and direct."
-
-    result = {
-        "success": True,
-        "message_id": message_id,
-        "targets": [c.agent_id for c in targets],
-        "style": style,
-        "next_step": f"Write your response, then call darkmatter_end_message(message_id='{message_id}').",
-    }
-    if forwarded_msgs:
-        result["forwarding"] = [
-            {"message_id": m["message_id"], "from": m["from_agent_id"], "content": m["content"][:200]}
-            for m in forwarded_msgs
-        ]
-    return json.dumps(result)
-
-
-async def _end_message(state, params: EndMessageInput) -> str:
-    """Signal that streaming is complete. Sends end signal and logs to history."""
-    stream_info = _pending_streams.pop(params.message_id, None)
-
-    # Stop stdout streaming for this message (other nested streams continue)
-    spawned = stream_info.get("_spawned_agent") if stream_info else None
-    if spawned:
-        spawned.stdout_callbacks.pop(params.message_id, None)
-
-    if not stream_info:
-        return json.dumps({
-            "success": False,
-            "error": f"No pending message with ID '{params.message_id}'. Call begin_message first.",
-        })
-
-    metadata = stream_info.get("metadata") or {}
-    in_reply_to = stream_info.get("in_reply_to")
-    forwarded_msgs = stream_info.get("_forwarded_msgs", [])
-
-    # Deliver to the targets set at begin_message time
-    targets = []
-    for tid in stream_info["targets"]:
-        conn = state.connections.get(tid)
-        if conn:
-            targets.append(conn)
-    msg_type = "broadcast" if len(targets) > 1 else "direct"
-
-    msg_timestamp = datetime.now(timezone.utc).isoformat()
-
-    # Collect accumulated content from streaming
-    content_parts = stream_info.get("_content", [])
-    full_content = "\n\n".join(content_parts).strip() if content_parts else "(no content)"
-
-    # Build forwarded content section if any
+    # Append forwarded content if any
     if forwarded_msgs:
         fwd_sections = []
         for fwd in forwarded_msgs:
             fwd_sections.append(f"[Forwarded from {fwd['from_agent_id'][:12]}]: {fwd['content']}")
         fwd_block = "\n\n".join(fwd_sections)
-        if full_content != "(no content)":
-            full_content = f"{full_content}\n\n---\n{fwd_block}"
-        else:
-            full_content = fwd_block
+        full_content = f"{full_content}\n\n---\n{fwd_block}"
         metadata["forwarded"] = True
         metadata["forwarded_by"] = state.agent_id
         metadata["forwarded_message_ids"] = [m["message_id"] for m in forwarded_msgs]
 
+    msg_type = "broadcast" if len(targets) > 1 else "direct"
+    msg_timestamp = datetime.now(timezone.utc).isoformat()
+    hops = params.hops_remaining
+    if forwarded_msgs:
+        hops = min(m.get("hops_remaining", 10) for m in forwarded_msgs)
+        hops = max(0, hops - 1)
+
     sent_to = []
     for conn in targets:
         try:
-            if _is_streamable(conn, state):
-                # Streamable target (entrypoint): send end signal — they have the chunks
-                end_signal = {
-                    "message_id": params.message_id,
-                    "type": "end",
-                    "from_agent_id": state.agent_id,
-                    "timestamp": msg_timestamp,
-                }
-                await send_to_peer(conn, "/__darkmatter__/message_stream", end_signal)
-            else:
-                # Non-streamable target (agent): deliver the full message directly
-                hops = stream_info.get("hops_remaining", 10)
-                if forwarded_msgs:
-                    # Use lowest hops from forwarded messages
-                    hops = min(m.get("hops_remaining", 10) for m in forwarded_msgs)
-                    hops = max(0, hops - 1)
-                msg_payload = {
-                    "message_id": params.message_id,
-                    "content": full_content,
-                    "hops_remaining": hops,
-                    "metadata": metadata,
-                    "timestamp": msg_timestamp,
-                    "in_reply_to": in_reply_to,
-                }
-                envelope = prepare_outbound(
-                    msg_payload, state.private_key_hex,
-                    state.agent_id, state.public_key_hex,
-                )
-                await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
+            msg_payload = {
+                "message_id": message_id,
+                "content": full_content,
+                "hops_remaining": hops,
+                "metadata": metadata,
+                "timestamp": msg_timestamp,
+                "in_reply_to": params.in_reply_to,
+            }
+            envelope = prepare_outbound(
+                msg_payload, state.private_key_hex,
+                state.agent_id, state.public_key_hex,
+            )
+            await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
             conn.messages_sent += 1
             conn.last_activity = datetime.now(timezone.utc).isoformat()
             sent_to.append(conn.agent_id)
             adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DarkMatter] send_message: error sending to {conn.agent_id[:12]}: {e}", file=sys.stderr)
 
-    # Log conversation with actual content
+    # Log conversation
     entry_type = "forward" if forwarded_msgs else msg_type
     if sent_to:
         log_conversation(
-            state, params.message_id, full_content,
+            state, message_id, full_content,
             from_id=state.agent_id, to_ids=sent_to,
             entry_type=entry_type, direction="outbound",
             metadata=metadata,
@@ -459,19 +306,13 @@ async def _end_message(state, params: EndMessageInput) -> str:
 
     save_state()
 
-    # Kill the spawned agent process — it's done with this message.
-    # Without -p mode, Claude runs interactively and won't exit on its own.
-    if spawned:
-        try:
-            spawned.process.terminate()
-        except Exception:
-            pass
-
     result = {
         "success": len(sent_to) > 0,
-        "message_id": params.message_id,
+        "message_id": message_id,
         "routed_to": sent_to,
     }
+    if forwarded_msgs:
+        result["forwarded_count"] = len(forwarded_msgs)
     return json.dumps(result)
 
 
@@ -545,37 +386,20 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
 
 
 @mcp.tool(
-    name="darkmatter_begin_message",
+    name="darkmatter_send_message",
     annotations={
-        "title": "Begin Composing Message",
+        "title": "Send Message",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     }
 )
-async def begin_message(params: BeginMessageInput, ctx: Context) -> str:
-    """Start composing a message. Call this EARLY — respond fast. Follow the style hint in the response. Call end_message when done."""
+async def send_message(params: SendMessageInput, ctx: Context) -> str:
+    """Send a message to connected agents. Include your full message in content. For long tasks, send frequent status updates."""
     track_session(ctx)
     state = get_state()
-    return await _begin_message(state, params)
-
-
-@mcp.tool(
-    name="darkmatter_end_message",
-    annotations={
-        "title": "Complete Message",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def end_message(params: EndMessageInput, ctx: Context) -> str:
-    """Finish and deliver the message. Set broadcast=true to send to all peers instead of just the original target."""
-    track_session(ctx)
-    state = get_state()
-    return await _end_message(state, params)
+    return await _send_message(state, params)
 
 
 
@@ -1044,8 +868,6 @@ async def wait_for_message(
                 })
 
     except asyncio.TimeoutError:
-        if event in state._inbox_events:
-            state._inbox_events.remove(event)
         mins = int(timeout_seconds / 60)
         filter_desc = f" from {from_agents}" if from_agents else ""
         return json.dumps({
@@ -1054,6 +876,9 @@ async def wait_for_message(
             "error": f"No message{filter_desc} received after {mins} minutes.",
             "action": "Proactively reach out to peers, share updates, or broadcast. Then resume listening with darkmatter_wait_for_message.",
         })
+    finally:
+        if event in state._inbox_events:
+            state._inbox_events.remove(event)
 
 
 def _drain_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
@@ -1171,4 +996,3 @@ async def complete_and_summarize(params: CompleteAndSummarizeInput, ctx: Context
 
 
 # Genome tools moved to HTTP API + skill (see /__darkmatter__/genome)
-

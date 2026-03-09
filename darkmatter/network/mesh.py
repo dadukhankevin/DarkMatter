@@ -39,6 +39,7 @@ from darkmatter.models import (
     AgentStatus,
     Connection,
     AntiMatterSignal,
+
     PendingConnectionRequest,
     QueuedMessage,
     RouterAction,
@@ -76,6 +77,11 @@ from darkmatter.network.manager import get_network_manager
 from darkmatter.spawn import get_spawned_agents
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+
+
+def local_delivery_capabilities(state: AgentState) -> dict:
+    """Capabilities this node advertises for message delivery."""
+    return {}
 
 
 # =============================================================================
@@ -213,6 +219,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     )
     from_agent_created_at = data.get("created_at")
     mutual = data.get("mutual", False)
+    from_agent_capabilities = data.get("capabilities", {}) or {}
 
     if not from_agent_id or not from_agent_url:
         missing = [f for f, v in [("from_agent_id", from_agent_id), ("from_agent_url", from_agent_url)] if not v]
@@ -241,6 +248,9 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         if from_agent_wallets and not existing.wallets:
             existing.wallets = from_agent_wallets
             changed = True
+        if from_agent_capabilities and existing.capabilities != from_agent_capabilities:
+            existing.capabilities = from_agent_capabilities
+            changed = True
         if changed:
             save_state()
         return {
@@ -251,6 +261,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
             "wallets": state.wallets,
+            "capabilities": local_delivery_capabilities(state),
             "wallet_address": state.wallets.get("solana"),
             "created_at": state.created_at,
             "message": "Already connected.",
@@ -272,6 +283,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             peer_created_at=from_agent_created_at,
             tls_secure=tls_info["secure"],
             identity_verified=bool(from_agent_public_key_hex),
+            capabilities=from_agent_capabilities,
         )
         state.connections[from_agent_id] = conn
         save_state()
@@ -293,6 +305,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
             "wallets": state.wallets,
+            "capabilities": local_delivery_capabilities(state),
             "wallet_address": state.wallets.get("solana"),
             "created_at": state.created_at,
             "message": "Auto-accepted (local network).",
@@ -390,6 +403,7 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
     agent_wallets = _wallets_raw if _wallets_raw is not None else (
         {"solana": data["wallet_address"]} if data.get("wallet_address") else {}
     )
+    agent_capabilities = data.get("capabilities", {}) or {}
 
     if not agent_id or not agent_url:
         missing = [f for f, v in [("agent_id", agent_id), ("agent_url", agent_url)] if not v]
@@ -432,6 +446,7 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
         wallets=agent_wallets,
         peer_created_at=data.get("created_at"),
         tls_secure=tls_info["secure"],
+        capabilities=agent_capabilities,
     )
     state.connections[agent_id] = conn
 
@@ -506,6 +521,7 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
         "agent_public_key_hex": state.public_key_hex,
         "agent_display_name": state.display_name,
         "wallets": state.wallets,
+        "capabilities": local_delivery_capabilities(state),
         "wallet_address": state.wallets.get("solana"),
         "created_at": state.created_at,
     }
@@ -531,6 +547,7 @@ def build_outbound_request_payload(state: AgentState, public_url: str, mutual: b
         "from_agent_public_key_hex": state.public_key_hex,
         "from_agent_display_name": state.display_name,
         "wallets": state.wallets,
+        "capabilities": local_delivery_capabilities(state),
         "from_agent_wallet_address": state.wallets.get("solana"),
         "created_at": state.created_at,
     }
@@ -553,6 +570,7 @@ def build_connection_from_accepted(result_data: dict) -> Connection:
         agent_display_name=result_data.get("agent_display_name"),
         wallets=peer_wallets,
         peer_created_at=result_data.get("created_at"),
+        capabilities=result_data.get("capabilities", {}) or {},
     )
 
 
@@ -796,6 +814,85 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
         state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
 
 
+
+async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
+    """Commit a verified inbound message into state and route it."""
+    state.message_queue.append(msg)
+    state.messages_handled += 1
+
+    _agents_waiting_at_receive = len(state._inbox_events) > 0
+    for evt in state._inbox_events:
+        evt.set()
+    state._inbox_events.clear()
+
+    log_conversation(
+        state, msg.message_id, msg.content,
+        from_id=msg.from_agent_id, to_ids=[state.agent_id],
+        entry_type="direct", direction="inbound",
+        metadata=msg.metadata,
+    )
+
+    if msg.from_agent_id and msg.from_agent_id in state.connections:
+        conn = state.connections[msg.from_agent_id]
+        conn.messages_received += 1
+        conn.last_activity = datetime.now(timezone.utc).isoformat()
+
+    save_state()
+
+    msg_meta = msg.metadata or {}
+    if (msg_meta.get("type") == "solana_payment"
+            and msg_meta.get("antimatter_eligible")
+            and msg_meta.get("amount")
+            and msg_meta.get("tx_signature")):
+        asyncio.create_task(initiate_antimatter_from_payment(
+            state, msg,
+            get_public_url_fn=lambda port: get_network_manager().get_public_url(),
+            save_state_fn=save_state,
+        ))
+
+    if _agents_waiting_at_receive:
+        print(f"[DarkMatter] Agent already waiting — message delivered via inbox event, skipping router", file=sys.stderr)
+        routed_to = "agent"
+    elif state.router_mode == "queue_only":
+        routed_to = "queued"
+    else:
+        routed_to = "queued"
+        from darkmatter.router import execute_routing
+        try:
+            decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
+            if decision.action == RouterAction.HANDLE:
+                import darkmatter.config as _cfg
+                routed_to = "agent" if _cfg.AGENT_SPAWN_ENABLED else "queued"
+            elif decision.action == RouterAction.FORWARD:
+                routed_to = "forwarded"
+            elif decision.action == RouterAction.DROP:
+                routed_to = "dropped"
+        except Exception as e:
+            import traceback
+            print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+    if routed_to == "agent" and not state._inbox_events:
+        import darkmatter.config as _cfg
+        if _cfg.AGENT_SPAWN_ENABLED:
+            from darkmatter.spawn import spawn_standby_agent
+            asyncio.create_task(spawn_standby_agent(state))
+    return routed_to
+
+
+async def _commit_verified_message(state: AgentState, data: dict, verified: bool = True) -> tuple[QueuedMessage, str]:
+    """Build and persist a verified inbound direct message."""
+    msg = QueuedMessage(
+        message_id=truncate_field(data["message_id"], 128),
+        content=data["content"],
+        hops_remaining=data.get("hops_remaining", 10),
+        metadata=data.get("metadata", {}) or {},
+        from_agent_id=data.get("from_agent_id"),
+        verified=verified,
+    )
+    routed_to = await _record_inbound_message(state, msg)
+    return msg, routed_to
+
+
 async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict, int]:
     """Core message processing logic, shared by HTTP and WebRTC receive paths.
 
@@ -879,85 +976,13 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         print(f"[DarkMatter] Applied security push from {from_agent_id[:12]}", file=sys.stderr)
         return {"status": "security_push_applied"}, 200
 
-    msg = QueuedMessage(
-        message_id=truncate_field(message_id, 128),
-        content=content,
-        hops_remaining=hops_remaining,
-        metadata=msg_metadata,
-        from_agent_id=from_agent_id,
-        verified=verified,
-    )
-    state.message_queue.append(msg)
-    state.messages_handled += 1
-
-    # Wake any agents waiting for new inbox messages
-    _agents_waiting_at_receive = len(state._inbox_events) > 0
-    for evt in state._inbox_events:
-        evt.set()
-    state._inbox_events.clear()
-
-    # Log conversation
-    log_conversation(
-        state, msg.message_id, content,
-        from_id=from_agent_id, to_ids=[state.agent_id],
-        entry_type="direct", direction="inbound",
-        metadata=msg_metadata,
-    )
-
-    # Update telemetry for the sending agent
-    if msg.from_agent_id and msg.from_agent_id in state.connections:
-        conn = state.connections[msg.from_agent_id]
-        conn.messages_received += 1
-        conn.last_activity = datetime.now(timezone.utc).isoformat()
-
-    save_state()
-
-    # AntiMatter economy: if this is a payment notification with antimatter_eligible flag, initiate match game
-    msg_meta = msg.metadata or {}
-    if (msg_meta.get("type") == "solana_payment"
-            and msg_meta.get("antimatter_eligible")
-            and msg_meta.get("amount")
-            and msg_meta.get("tx_signature")):
-        asyncio.create_task(initiate_antimatter_from_payment(
-            state, msg,
-            get_public_url_fn=lambda port: get_network_manager().get_public_url(),
-            save_state_fn=save_state,
-        ))
-
-    # If an agent was already waiting (via wait_for_message), the inbox event
-    # woke it — it will drain the message from the queue.  Skip routing/spawn.
-    if _agents_waiting_at_receive:
-        print(f"[DarkMatter] Agent already waiting — message delivered via inbox event, skipping router", file=sys.stderr)
-        routed_to = "agent"
-    elif state.router_mode == "queue_only":
-        # queue_only mode (entrypoints) skips routing — messages just
-        # sit in the queue for the human to handle.
-        routed_to = "queued"
-    else:
-        # Route message through the extensible router chain.
-        routed_to = "queued"
-        from darkmatter.router import execute_routing
-        try:
-            decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
-            if decision.action == RouterAction.HANDLE:
-                import darkmatter.config as _cfg
-                routed_to = "agent" if _cfg.AGENT_SPAWN_ENABLED else "queued"
-            elif decision.action == RouterAction.FORWARD:
-                routed_to = "forwarded"
-            elif decision.action == RouterAction.DROP:
-                routed_to = "dropped"
-        except Exception as e:
-            import traceback
-            print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-
-    # Ensure there's always one standby agent ready for the next message.
-    # If we just used the standby (or spawned fresh), and no one else is waiting, spawn one.
-    if routed_to == "agent" and not state._inbox_events:
-        import darkmatter.config as _cfg
-        if _cfg.AGENT_SPAWN_ENABLED:
-            from darkmatter.spawn import spawn_standby_agent
-            asyncio.create_task(spawn_standby_agent(state))
+    msg, routed_to = await _commit_verified_message(state, {
+        "message_id": message_id,
+        "content": content,
+        "hops_remaining": hops_remaining,
+        "metadata": msg_metadata,
+        "from_agent_id": from_agent_id,
+    }, verified=verified)
 
     return {
         "status": "received",
@@ -965,6 +990,7 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         "routed_to": routed_to,
         "queue_position": len(state.message_queue),
     }, 200
+
 
 
 # =============================================================================
@@ -1156,53 +1182,6 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
 
     return JSONResponse(result, status_code=status)
 
-
-async def handle_message_stream(request: Request) -> JSONResponse:
-    """Handle message stream signals (typing indicators).
-
-    POST /__darkmatter__/message_stream
-    Body: {message_id, type: "begin"|"end", from_agent_id, ...}
-    """
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    from_id = data.get("from_agent_id", "")
-    signal_type = data.get("type", "")
-    message_id = data.get("message_id", "")
-
-    if not from_id or not message_id or signal_type not in ("begin", "chunk", "end"):
-        return JSONResponse({"error": "Invalid stream signal"}, status_code=400)
-
-    # Only accept signals from connected peers
-    if from_id not in state.connections:
-        return JSONResponse({"error": "Not connected"}, status_code=403)
-
-    # Store/clear typing state
-    if not hasattr(state, "_typing_indicators"):
-        state._typing_indicators = {}
-
-    if signal_type == "begin":
-        state._typing_indicators[from_id] = {
-            "message_id": message_id,
-            "in_reply_to": data.get("in_reply_to"),
-            "display_name": data.get("from_display_name", ""),
-            "started_at": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
-            "content": "",
-        }
-    elif signal_type == "chunk":
-        indicator = state._typing_indicators.get(from_id)
-        if indicator:
-            indicator["content"] = indicator.get("content", "") + data.get("content", "")
-    elif signal_type == "end":
-        state._typing_indicators.pop(from_id, None)
-
-    return JSONResponse({"ok": True})
 
 
 async def handle_message(request: Request) -> JSONResponse:

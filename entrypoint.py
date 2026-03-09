@@ -14,6 +14,7 @@ import atexit
 import hashlib
 import json
 import os
+import queue
 import re
 import socket
 import sys
@@ -25,7 +26,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
-from flask import Flask, request, jsonify, render_template, redirect, url_for, session as flask_session, send_from_directory
+from flask import Flask, Response, request, jsonify, render_template, redirect, url_for, session as flask_session, send_from_directory
 from werkzeug.utils import secure_filename
 
 
@@ -55,6 +56,7 @@ from darkmatter.config import (
 from darkmatter.network.mesh import (
     process_connection_request, process_connection_accepted,
     process_accept_pending, _process_incoming_message,
+
     build_outbound_request_payload, build_connection_from_accepted,
     process_antimatter_match, process_antimatter_signal,
     process_antimatter_result,
@@ -872,88 +874,32 @@ def dm_accept_pending():
     return jsonify(result), status
 
 
-# Typing indicators from connected agents
-_typing_indicators: dict[str, dict] = {}
-_TYPING_TIMEOUT_S = 120  # Auto-expire after 2 minutes
-
-
-def _strip_stream_artifacts(text: str) -> str:
-    """Normalize streamed terminal output into readable markdown text."""
-    if not text:
-        return ""
-    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b[=<>]|\r", "", text)
-
-
-_streamed_responses: dict[str, list[dict]] = {}  # message_id -> list of responses
-
-def _persist_streamed_reply(from_id: str, indicator: dict, ended_at: str | None = None) -> None:
-    """Finalize a streamed reply into the local responses store."""
-    parent_id = indicator.get("in_reply_to")
-    if not parent_id:
-        return
-
-    # Save chunks as-is (already filtered by _drain_stdout)
-    chunks = [c for c in indicator.get("chunks", []) if c.strip()]
-    # Prefer accumulated content; fall back to joining chunks; last resort placeholder
-    content = indicator.get("content", "").strip()
-    if not content and chunks:
-        content = _strip_stream_artifacts("".join(chunks)).strip()
-    if not content:
-        return  # No prose extracted — don't persist an empty response
-
-    if parent_id not in _streamed_responses:
-        _streamed_responses[parent_id] = []
-
-    # Deduplicate
-    for existing in _streamed_responses[parent_id]:
-        if existing.get("agent_id") == from_id and existing.get("chunks"):
-            return
-
-    _streamed_responses[parent_id].append({
-        "agent_id": from_id,
-        "response": content,
-        "chunks": chunks,
-        "timestamp": ended_at or datetime.now(timezone.utc).isoformat(),
-    })
-
-
 def _get_typing_indicators() -> list[dict]:
-    """Return active typing indicators, auto-expiring stale ones."""
-    now = datetime.now(timezone.utc)
-    expired = []
-    result = []
-    for agent_id, info in _typing_indicators.items():
+    """Return typing indicators (stub — streaming removed)."""
+    return []
+
+
+_live_subscribers: list[queue.Queue] = []
+
+
+def _notify_live_update() -> None:
+    """Nudge Wormhole clients to refresh immediately."""
+    stale = []
+    for q in list(_live_subscribers):
         try:
-            started = datetime.fromisoformat(info["started_at"])
-            if (now - started).total_seconds() > _TYPING_TIMEOUT_S:
-                expired.append(agent_id)
-                continue
+            q.put_nowait("update")
         except Exception:
-            expired.append(agent_id)
-            continue
-        result.append({
-            "agent_id": agent_id,
-            "display_name": info.get("display_name") or _display_name_for(agent_id),
-            "in_reply_to": info.get("in_reply_to"),
-            "started_at": info["started_at"],
-            "content": info.get("content", ""),
-            "chunks": info.get("chunks", []),
-        })
-    for aid in expired:
-        indicator = _typing_indicators.pop(aid, None)
-        if indicator and indicator.get("chunks"):
-            _persist_streamed_reply(aid, indicator)
-    return result
+            stale.append(q)
+    for q in stale:
+        try:
+            _live_subscribers.remove(q)
+        except ValueError:
+            pass
 
 
 @app.route("/__darkmatter__/message", methods=["POST"])
 def dm_message():
     data = request.get_json(silent=True) or {}
-
-    # Clear typing indicator when actual message arrives
-    from_id = data.get("from_agent_id", "")
-    if from_id:
-        _typing_indicators.pop(from_id, None)
 
     loop = asyncio.new_event_loop()
     try:
@@ -963,47 +909,9 @@ def dm_message():
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
-
+    _notify_live_update()
     return jsonify(result), status
 
-
-@app.route("/__darkmatter__/message_stream", methods=["POST"])
-def dm_message_stream():
-    data = request.get_json(silent=True) or {}
-    from_id = data.get("from_agent_id", "")
-    signal_type = data.get("type", "")
-    message_id = data.get("message_id", "")
-
-    if not from_id or not message_id or signal_type not in ("begin", "chunk", "end"):
-        return jsonify({"error": "Invalid stream signal"}), 400
-
-    if from_id not in state.connections:
-        return jsonify({"error": "Not connected"}), 403
-
-    if signal_type == "begin":
-        conn = state.connections[from_id]
-        _typing_indicators[from_id] = {
-            "message_id": message_id,
-            "in_reply_to": data.get("in_reply_to"),
-            "display_name": data.get("from_display_name") or getattr(conn, "agent_display_name", ""),
-            "started_at": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
-            "content": "",
-            "chunks": [],  # Each chunk kept separate for frontend rendering
-        }
-    elif signal_type == "chunk":
-        indicator = _typing_indicators.get(from_id)
-        if indicator:
-            chunk_text = data.get("content", "")
-            if chunk_text:
-                indicator["chunks"].append(chunk_text)
-                # Also accumulate full content for end_message persistence
-                indicator["content"] = indicator.get("content", "") + chunk_text
-    elif signal_type == "end":
-        indicator = _typing_indicators.pop(from_id, None)
-        if indicator:
-            _persist_streamed_reply(from_id, indicator, data.get("timestamp"))
-
-    return jsonify({"ok": True})
 
 
 @app.route("/__darkmatter__/peer_update", methods=["POST"])
@@ -1481,15 +1389,6 @@ def poll():
     outbox = []
     for e in reversed(state.conversation_log):
         if e.direction == "outbound" and e.from_agent_id == state.agent_id:
-            responses = []
-            for r in _streamed_responses.get(e.message_id, []):
-                responses.append({
-                    "agent_id": r["agent_id"],
-                    "display_name": _display_name_for(r["agent_id"]),
-                    "response": r.get("response", ""),
-                    "chunks": r.get("chunks", []),
-                    "timestamp": r.get("timestamp"),
-                })
             outbox.append({
                 "message_id": e.message_id,
                 "status": "sent",
@@ -1497,7 +1396,6 @@ def poll():
                 "routed_to": e.to_agent_ids,
                 "routed_to_names": [_display_name_for(rid) for rid in e.to_agent_ids],
                 "created_at": e.timestamp,
-                "responses": responses,
                 "from_self": True,
                 "metadata": e.metadata,
             })
@@ -1588,6 +1486,32 @@ def poll():
             "tags": s.tags,
             "created_at": s.created_at,
         } for s in getattr(state, "shared_shards", [])],
+    })
+
+
+@app.route("/api/live", methods=["GET"])
+def live_updates():
+    """Server-sent events channel that nudges the browser to refresh immediately."""
+    def event_stream():
+        q = queue.Queue()
+        _live_subscribers.append(q)
+        yield "event: ready\ndata: connected\n\n"
+        try:
+            while True:
+                try:
+                    q.get(timeout=25)
+                    yield "event: update\ndata: refresh\n\n"
+                except queue.Empty:
+                    yield "event: keepalive\ndata: ping\n\n"
+        finally:
+            try:
+                _live_subscribers.remove(q)
+            except ValueError:
+                pass
+
+    return Response(event_stream(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
     })
 
 

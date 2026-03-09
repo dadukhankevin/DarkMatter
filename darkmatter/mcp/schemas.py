@@ -29,21 +29,16 @@ class ConnectionInput(BaseModel):
     agent_id: Optional[str] = Field(default=None, description="Agent ID (for disconnect)")
 
 
-class BeginMessageInput(BaseModel):
-    """Start composing a message. Sends a typing indicator to the target(s)."""
+class SendMessageInput(BaseModel):
+    """Send a message to one or more connected agents."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    content: str = Field(..., description="Message content to send", min_length=1, max_length=MAX_CONTENT_LENGTH)
     target_agent_id: Optional[str] = Field(default=None, description="Single agent to send to (omit for auto-select)")
     target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to send to (explicit list)")
     in_reply_to: Optional[str] = Field(default=None, description="Message ID this is replying to")
     forward_message_ids: Optional[list[str]] = Field(default=None, description="Queue message IDs to forward with this message. Content is included in delivery and messages are consumed from inbox.")
     hops_remaining: int = Field(default=10, ge=1, le=50, description="TTL for mesh routing")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
-
-
-class EndMessageInput(BaseModel):
-    """Finish and deliver the message."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="Message ID returned by begin_message")
 
 
 

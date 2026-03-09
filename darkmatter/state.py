@@ -255,6 +255,7 @@ def save_state() -> None:
                 "peer_created_at": c.peer_created_at,
                 "identity_verified": c.identity_verified,
                 "tls_secure": c.tls_secure,
+                "capabilities": c.capabilities,
             }
             for aid, c in state.connections.items()
         },
@@ -425,6 +426,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             peer_created_at=cd.get("peer_created_at"),
             identity_verified=cd.get("identity_verified", False),
             tls_secure=cd.get("tls_secure", False),
+            capabilities=cd.get("capabilities", {}),
         )
 
     message_queue = []

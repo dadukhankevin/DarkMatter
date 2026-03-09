@@ -121,6 +121,8 @@ def sign_relay_poll(private_key_hex: str, agent_id: str, timestamp: str) -> str:
     return sign_payload(private_key_hex, DOMAIN_RELAY_POLL, agent_id, timestamp)
 
 
+
+
 # =============================================================================
 # Inbound Message Verification
 # =============================================================================
@@ -213,6 +215,7 @@ def verify_inbound(data: dict, connections: dict) -> VerifiedPayload:
             error="Not connected — unsigned messages require a connection.",
             status_code=403,
         )
+
 
 
 # =============================================================================

@@ -37,6 +37,7 @@ class SpawnedAgent:
     spawned_at: float
     pid: int
     spawn_mcp_config: str = ""  # .mcp.json path to clean up when agent exits
+    raw_output_log_path: str = ""
     # Stdout streaming: dict of message_id → async callable(chunk: str)
     # Multiple callbacks = nested messages, chunks go to all active targets
     stdout_callbacks: dict = None  # Initialized to {} in __post_init__
@@ -195,13 +196,12 @@ Message {msg.message_id} from {msg.from_agent_id[:12]}:
 {msg.content}
 
 HOW TO RESPOND:
-- begin_message(target_agent_id="{msg.from_agent_id}", in_reply_to="{msg.message_id}") starts streaming your output live to the receiver.
-- Write your response naturally — everything between begin and end streams in real time.
-- end_message(message_id=...) signals you're done writing.
-- To forward instead: begin_message(target_agent_id=<peer>, forward_message_ids=["{msg.message_id}"]).
+- darkmatter_send_message(content="your reply", target_agent_id="{msg.from_agent_id}", in_reply_to="{msg.message_id}")
+- For long tasks, send frequent status updates so the receiver sees progress (e.g. "Researching...", "Found the issue, working on a fix...").
+- To forward instead: darkmatter_send_message(content="your commentary", target_agent_id=<peer>, forward_message_ids=["{msg.message_id}"]).
 
 STAY ALIVE:
-After responding, call darkmatter_wait_for_message(timeout_seconds=1200) and stay available for follow-ups. This is a conversation — keep the loop going. Respond to each new message the same way (begin/end), then wait again. You are the agent for this conversation; don't exit after one reply.
+After responding, call darkmatter_wait_for_message(timeout_seconds=1200) and stay available for follow-ups. This is a conversation — keep the loop going. Respond to each new message the same way (send_message), then wait again. You are the agent for this conversation; don't exit after one reply.
 
 WHEN TO EXIT:
 Call darkmatter_complete_and_summarize ONLY when the conversation has naturally concluded — the task is done, the topic is resolved, or the human says goodbye. Write a dense summary of what you did, reference peers with @agent_id, and note anything the hivemind should know.
@@ -306,7 +306,16 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             print("[DarkMatter] Sandbox unavailable, spawning without sandbox", file=sys.stderr)
 
     try:
+        debug_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "agent_stdout_logs")
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_log_path = os.path.join(
+            debug_dir,
+            f"{int(time.time())}-{msg.message_id[:12]}-pidpending.log",
+        )
+
         # PTY gives us a headless terminal — output streams in real time.
+        # Both stdin AND stdout must be connected to the PTY so that TUI
+        # frameworks (Ink/Claude Code) can set raw mode on stdin.
         import pty as _pty
         import fcntl, struct, termios
         pty_master_fd, pty_slave_fd = _pty.openpty()
@@ -317,7 +326,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         process = await asyncio.create_subprocess_exec(
             *exec_argv,
             env=env,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=pty_slave_fd,
             stdout=pty_slave_fd,
             stderr=asyncio.subprocess.PIPE,
             cwd=spawn_dir,
@@ -338,6 +347,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             spawned_at=time.monotonic(),
             pid=process.pid,
             spawn_mcp_config=spawn_mcp_path,
+            raw_output_log_path=debug_log_path.replace("pidpending", str(process.pid)),
         )
         # Attach PTY reader so _drain_stdout can use it instead of process.stdout
         agent._pty_reader = pty_reader
@@ -350,6 +360,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             f"{msg.message_id[:12]}... from {msg.from_agent_id or 'unknown'}",
             file=sys.stderr,
         )
+        print(f"[DarkMatter] Raw agent stdout log: {agent.raw_output_log_path}", file=sys.stderr)
 
         asyncio.create_task(agent_timeout_watchdog(agent))
         asyncio.create_task(_drain_stdout(agent))
@@ -381,6 +392,12 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
             chunk = await reader.read(4096)
             if not chunk:
                 break
+            if agent.raw_output_log_path:
+                try:
+                    with open(agent.raw_output_log_path, "a", encoding="utf-8") as f:
+                        f.write(chunk.decode("utf-8", errors="replace"))
+                except Exception:
+                    pass
             if not agent.stdout_callbacks:
                 continue
             for section in adapter.feed(chunk):

@@ -642,10 +642,16 @@
     updateThemeIcons();
 
     let _pollInterval = null;
+    let _liveEvents = null;
 
     function startPolling() {
       _pollInterval = setInterval(pollServer, 3000);
       pollServer();
+      if (window.EventSource) {
+        _liveEvents = new EventSource('/api/live');
+        _liveEvents.addEventListener('update', () => pollServer());
+        _liveEvents.onerror = () => {};
+      }
     }
 
     function pollServer() {

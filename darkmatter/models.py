@@ -71,6 +71,8 @@ class Connection:
     # NAT traversal connectivity tracking (ephemeral)
     connectivity_level: int = 0    # 0=unknown, 1=direct, 2=lan_webrtc, 3=peer_relay
     connectivity_method: str = ""  # human label set alongside level
+    # Peer delivery capabilities advertised during handshake
+    capabilities: dict = field(default_factory=dict)
 
     @property
     def avg_response_time_ms(self) -> float:
@@ -247,6 +249,7 @@ class QueuedMessage:
     received_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     from_agent_id: Optional[str] = None
     verified: bool = False
+
 
 
 # =============================================================================

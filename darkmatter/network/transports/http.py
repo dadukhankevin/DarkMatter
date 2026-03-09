@@ -47,6 +47,7 @@ class HttpTransport(Transport):
             return self._get_public_url()
         return None
 
+
     async def send(self, conn, path: str, payload: dict) -> SendResult:
         """Send via HTTP POST. On failure, attempt peer URL recovery and retry once."""
         # Try direct HTTP

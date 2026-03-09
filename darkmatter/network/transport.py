@@ -61,6 +61,7 @@ class Transport(ABC):
         """Check if a peer is reachable via this transport."""
         ...
 
+
     def get_address(self, state) -> "str | None":
         """Return this transport's reachable address for the local agent."""
         return None

@@ -8,7 +8,9 @@ Depends on: everything (by design — this IS the composition root)
 import asyncio
 import contextlib
 import os
+import subprocess
 import sys
+import time
 from typing import Optional
 
 import anyio
@@ -48,7 +50,7 @@ from darkmatter.network.mesh import (
     handle_connection_accepted,
     handle_accept_pending,
     handle_message,
-    handle_message_stream,
+
     handle_status,
     handle_network_info,
     handle_impression_get,
@@ -259,7 +261,7 @@ def create_app() -> Router:
         Route("/connection_proof", handle_connection_proof, methods=["POST"]),
         Route("/accept_pending", handle_accept_pending, methods=["POST"]),
         Route("/message", handle_message, methods=["POST"]),
-        Route("/message_stream", handle_message_stream, methods=["POST"]),
+
         Route("/status", handle_status, methods=["GET"]),
         Route("/network_info", handle_network_info, methods=["GET"]),
         Route("/impression/{agent_id}", handle_impression_get, methods=["GET"]),
@@ -373,6 +375,54 @@ def find_free_port(host: str, start: int) -> int:
 # Dual transport — stdio + HTTP
 # =============================================================================
 
+def _init_shared_stdio_session(port: int) -> None:
+    """Initialize state + networking for a stdio MCP session that shares an HTTP mesh node."""
+    init_state(port)
+
+    manager = NetworkManager(state_getter=get_state, state_saver=save_state)
+    manager.register_transport(HttpTransport())
+    manager.register_transport(WebRTCTransport())
+    set_network_manager(manager)
+    set_antimatter_network_fns(
+        send_fn=manager.send,
+        http_request_fn=manager.http_request,
+    )
+
+
+def _spawn_http_daemon(port: int) -> subprocess.Popen:
+    """Spawn a detached HTTP-mode DarkMatter daemon for persistent discovery."""
+    spawn_env = dict(os.environ)
+    spawn_env["DARKMATTER_TRANSPORT"] = "http"
+    spawn_env["DARKMATTER_PORT"] = str(port)
+    spawn_env.pop("WERKZEUG_RUN_MAIN", None)
+
+    daemon_log = os.path.join(os.path.expanduser("~"), ".darkmatter", "http_daemon.log")
+    daemon_log_fh = open(daemon_log, "a")
+    kwargs = {
+        "cwd": os.getcwd(),
+        "env": spawn_env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": daemon_log_fh,
+        "stderr": daemon_log_fh,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    return subprocess.Popen([sys.executable, "-m", "darkmatter"], **kwargs)
+
+
+def _wait_for_our_server(host: str, port: int, expected_agent_id: str, timeout_s: float = 15.0) -> bool:
+    """Wait until the HTTP mesh port is owned by our agent."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        owner = check_port_owner(host, port)
+        if owner == expected_agent_id:
+            return True
+        time.sleep(0.25)
+    return False
+
 async def run_stdio_with_http() -> None:
     """Run MCP over stdio while serving HTTP mesh endpoints in the background.
 
@@ -399,41 +449,33 @@ async def run_stdio_with_http() -> None:
     port_owner = check_port_owner(host, port)
 
     if port_owner is None:
-        # Port is free — start normally
-        app = create_app()
-        discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
-        print_startup_banner(port, "stdio (with HTTP mesh on port " + str(port) + ")", discovery_enabled)
+        # Port is free — promote the HTTP mesh node to a detached daemon so
+        # discovery survives MCP client restarts, then attach this stdio
+        # session to the shared on-disk state.
+        print(f"[DarkMatter] No HTTP mesh daemon detected on port {port}; spawning a persistent daemon.", file=sys.stderr)
+        proc = _spawn_http_daemon(port)
+        if proc.poll() is not None:
+            raise RuntimeError("Failed to spawn persistent DarkMatter HTTP daemon")
+        if not _wait_for_our_server(host, port, our_agent_id):
+            raise RuntimeError(f"Persistent DarkMatter HTTP daemon did not become ready on port {port}")
 
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-        server = uvicorn.Server(config)
+        print(f"[DarkMatter] Persistent HTTP mesh daemon is online on port {port}.", file=sys.stderr)
+        print(f"[DarkMatter] Running stdio-only MCP against shared state.", file=sys.stderr)
+
+        _init_shared_stdio_session(port)
 
         async with stdio_server() as (read_stream, write_stream):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(server.serve)
-                await mcp._mcp_server.run(
-                    read_stream,
-                    write_stream,
-                    mcp._mcp_server.create_initialization_options(),
-                )
-                server.should_exit = True
-                shutdown_entrypoint()
+            await mcp._mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
 
     elif port_owner == our_agent_id:
         # Our server is already running — parallel session, share state
         print(f"[DarkMatter] Port {port} is already running our server (agent {our_agent_id[:12]}...).", file=sys.stderr)
         print(f"[DarkMatter] Running stdio-only MCP (parallel session, shared state).", file=sys.stderr)
-
-        init_state(port)
-
-        # Initialize NetworkManager so MCP tools work (outbound HTTP via primary session's port)
-        manager = NetworkManager(state_getter=get_state, state_saver=save_state)
-        manager.register_transport(HttpTransport())
-        manager.register_transport(WebRTCTransport())
-        set_network_manager(manager)
-        set_antimatter_network_fns(
-            send_fn=manager.send,
-            http_request_fn=manager.http_request,
-        )
+        _init_shared_stdio_session(port)
 
         async with stdio_server() as (read_stream, write_stream):
             await mcp._mcp_server.run(
@@ -450,23 +492,21 @@ async def run_stdio_with_http() -> None:
 
         # Override port for this session
         os.environ["DARKMATTER_PORT"] = str(new_port)
+        print(f"[DarkMatter] Spawning persistent daemon on alternate port {new_port}.", file=sys.stderr)
+        proc = _spawn_http_daemon(new_port)
+        if proc.poll() is not None:
+            raise RuntimeError(f"Failed to spawn persistent DarkMatter HTTP daemon on port {new_port}")
+        if not _wait_for_our_server(host, new_port, our_agent_id):
+            raise RuntimeError(f"Persistent DarkMatter HTTP daemon did not become ready on port {new_port}")
 
-        app = create_app()
-        discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
-        print_startup_banner(new_port, "stdio (with HTTP mesh on port " + str(new_port) + ")", discovery_enabled)
-
-        config = uvicorn.Config(app, host=host, port=new_port, log_level="warning")
-        server = uvicorn.Server(config)
+        _init_shared_stdio_session(new_port)
 
         async with stdio_server() as (read_stream, write_stream):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(server.serve)
-                await mcp._mcp_server.run(
-                    read_stream,
-                    write_stream,
-                    mcp._mcp_server.create_initialization_options(),
-                )
-                server.should_exit = True
+            await mcp._mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
 
 
 # =============================================================================

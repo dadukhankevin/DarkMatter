@@ -214,6 +214,7 @@ class WebRTCTransport(Transport):
             return False
         return getattr(conn.webrtc_channel, "readyState", None) == "open"
 
+
     async def upgrade(self, state, conn, signaling: Optional[SignalingChannel] = None) -> bool:
         """Upgrade a connection from HTTP to WebRTC via SDP offer/answer.
 

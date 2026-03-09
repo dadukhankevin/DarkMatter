@@ -180,8 +180,14 @@ class ClaudeCodeAdapter(StdoutAdapter):
             if ch == '⏺':
                 # Flush any accumulated prose
                 self._flush_prose(results)
-                # Don't decide yet — wait for the text color after the marker
-                self._state = self._PENDING
+                # Decide NOW based on the marker's color. Claude Code colors the
+                # ⏺ itself (gray/green for tools, white for prose) then resets
+                # color before the text. Waiting for text color would always
+                # see default/white and misclassify tool calls as prose.
+                if self._colored:
+                    self._state = self._SKIP
+                else:
+                    self._state = self._PROSE
                 i += 1
                 continue
 
@@ -213,13 +219,6 @@ class ClaudeCodeAdapter(StdoutAdapter):
             if ch in '\n\t' or (ch == ' ' and self._state != self._PROSE):
                 i += 1
                 continue
-
-            # Resolve pending state on first real text character
-            if self._state == self._PENDING:
-                if self._colored:
-                    self._state = self._SKIP
-                else:
-                    self._state = self._PROSE
 
             if self._state == self._PROSE:
                 self._prose_buf.append(ch)

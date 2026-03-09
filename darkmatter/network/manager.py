@@ -91,7 +91,7 @@ def try_upnp_mapping(local_port: int) -> Optional[tuple]:
                 continue
 
         return None
-    except (ImportError, OSError) as e:
+    except Exception as e:
         print(f"[DarkMatter] UPnP mapping failed: {e}", file=sys.stderr)
         return None
 
@@ -177,6 +177,18 @@ class NetworkManager:
             transport_name="none",
             error="; ".join(errors) if errors else "No transports available",
         )
+
+    def preferred_transport_for(self, agent_id: str):
+        """Return the first currently-usable transport for a peer, or None."""
+        state = self._get_state()
+        conn = state.connections.get(agent_id) if state else None
+        if conn is None:
+            return None
+        for transport in self._transports:
+            if transport.available:
+                return transport
+        return None
+
 
     def peers(self) -> dict:
         """Return all current connections."""
