@@ -500,6 +500,26 @@ def _is_lan_url(url):
         return False
 
 
+def _start_local_daemon(base_url):
+    """Start the local darkmatter daemon and wait up to 15s for it. Returns True if up."""
+    import shutil, subprocess as _subp
+    dm = shutil.which("darkmatter")
+    if not dm:
+        return False
+    print(f"[DarkMatter Entrypoint] Waking daemon...", file=sys.stderr)
+    _subp.Popen([dm], start_new_session=True, stdin=_subp.DEVNULL, stdout=_subp.DEVNULL, stderr=_subp.DEVNULL)
+    for _ in range(15):
+        time.sleep(1)
+        try:
+            resp = httpx.get(base_url + "/.well-known/darkmatter.json", timeout=2.0)
+            if resp.status_code == 200:
+                print("[DarkMatter Entrypoint] Daemon is up!", file=sys.stderr)
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _display_name_for(agent_id):
     """Get display name for an agent from connections or discovered peers."""
     conn = state.connections.get(agent_id)
@@ -1089,6 +1109,18 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
                     ack = resp.json() if resp.status_code == 200 else {}
                     sent_to.append({"agent_id": conn.agent_id, "routed_to": ack.get("routed_to", "unknown")})
         except Exception as e:
+            # If local daemon is down, start it and retry once
+            if _is_lan_url(base) and _start_local_daemon(base):
+                try:
+                    with httpx.Client(timeout=10.0) as client:
+                        resp = client.post(base + "/__darkmatter__/message", json=payload)
+                        if resp.status_code < 400:
+                            conn.messages_sent += 1
+                            ack = resp.json() if resp.status_code == 200 else {}
+                            sent_to.append({"agent_id": conn.agent_id, "routed_to": ack.get("routed_to", "unknown")})
+                            continue
+                except Exception:
+                    pass
             conn.messages_declined += 1
             conn._consecutive_failures = getattr(conn, "_consecutive_failures", 0) + 1
             failed.append({"agent_id": conn.agent_id, "error": str(e)})
@@ -1655,13 +1687,19 @@ def update_agents():
 
     succeeded = sum(1 for r in results if r["success"])
 
-    # Schedule a restart of the entrypoint process after responding
-    def _restart_self():
-        import time, signal
-        time.sleep(1)  # Let the HTTP response complete
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    threading.Thread(target=_restart_self, daemon=True).start()
+    # Spawn a detached shell script that:
+    # 1. Waits for us to finish responding
+    # 2. Kills all darkmatter processes
+    # 3. Starts a fresh entrypoint
+    import subprocess as _subp
+    _entrypoint_path = os.path.abspath(sys.argv[0])
+    _python = sys.executable
+    _subp.Popen(
+        ["bash", "-c",
+         f'sleep 2; pkill -f darkmatter; sleep 2; nohup "{_python}" "{_entrypoint_path}" '
+         f'>> ~/.darkmatter/entrypoint_restart.log 2>&1 &'],
+        start_new_session=True,
+    )
 
     return jsonify({
         "success": True,
