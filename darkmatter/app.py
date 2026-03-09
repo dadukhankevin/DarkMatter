@@ -33,7 +33,7 @@ from darkmatter.config import (
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.names import generate_agent_name
 from darkmatter.identity import load_or_create_passport
-from darkmatter.state import set_state, get_state, save_state, state_file_path, load_state_from_file
+from darkmatter.state import set_state, get_state, save_state, state_file_path, load_state_from_file, clear_waiting_signal
 from darkmatter.mcp import mcp
 import darkmatter.mcp.tools  # noqa: F401 — registers @mcp.tool() decorators
 from darkmatter.mcp.visibility import initialize_tool_visibility, status_updater
@@ -154,6 +154,7 @@ def init_state(port: int = None) -> None:
         print(f"[DarkMatter] Solana wallet: {state.wallets['solana']}", file=sys.stderr)
 
     save_state()
+    clear_waiting_signal()
 
 
 # =============================================================================

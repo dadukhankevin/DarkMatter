@@ -58,6 +58,7 @@ from darkmatter.state import (
     get_state,
     save_state,
     check_message_replay,
+    check_waiting,
 )
 from darkmatter.context import log_conversation
 from darkmatter.wallet.antimatter import (
@@ -1248,7 +1249,7 @@ async def handle_status(request: Request) -> JSONResponse:
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "spawned_agents": len(spawned_agents),
-        "is_waiting": getattr(state, "_is_waiting", False),
+        "is_waiting": getattr(state, "_is_waiting", False) or (state.public_key_hex and check_waiting(state.public_key_hex)),
     })
 
 

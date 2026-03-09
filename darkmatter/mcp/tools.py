@@ -27,7 +27,7 @@ from darkmatter.mcp.schemas import (
     ViewShardsInput,
     CompleteAndSummarizeInput,
 )
-from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, consume_message
+from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, consume_message, set_waiting
 from darkmatter.context import log_conversation
 from darkmatter.config import (
     MAX_CONNECTIONS,
@@ -840,6 +840,7 @@ async def wait_for_message(
     event = asyncio.Event()
     state._inbox_events.append(event)
     state._is_waiting = True
+    set_waiting(True)
 
     try:
         # Loop: wake on any inbox event, then check filter
@@ -879,6 +880,7 @@ async def wait_for_message(
         })
     finally:
         state._is_waiting = False
+        set_waiting(False)
         if event in state._inbox_events:
             state._inbox_events.remove(event)
 

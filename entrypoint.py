@@ -38,10 +38,6 @@ def _is_ajax():
 # Import DarkMatter internals from darkmatter/ package
 # ---------------------------------------------------------------------------
 
-# Entrypoint never spawns sub-agents — human handles messages via the UI.
-# Must be set BEFORE importing darkmatter.config (which reads this env var).
-os.environ["DARKMATTER_AGENT_ENABLED"] = "false"
-
 from darkmatter.app import init_state
 from darkmatter.state import get_state, set_state, save_state
 from darkmatter.models import AgentState, AgentStatus, Connection
@@ -54,6 +50,9 @@ from darkmatter.config import (
     PROTOCOL_VERSION, MAX_CONNECTIONS, MAX_BIO_LENGTH,
     SPL_TOKENS, ANTIMATTER_RATE,
 )
+import darkmatter.config
+# Entrypoint never spawns sub-agents — human handles messages via the UI.
+darkmatter.config.AGENT_SPAWN_ENABLED = False
 from darkmatter.network.mesh import (
     process_connection_request, process_connection_accepted,
     process_accept_pending, _process_incoming_message,
@@ -64,7 +63,6 @@ from darkmatter.network.mesh import (
 )
 from darkmatter.network.manager import NetworkManager, get_network_manager, set_network_manager
 from darkmatter.wallet.solana import get_solana_balance, send_solana_sol, send_solana_token
-import darkmatter.config
 from darkmatter import __version__ as DARKMATTER_VERSION
 import struct
 
@@ -508,7 +506,10 @@ def _start_local_daemon(base_url):
     if not dm:
         return False
     print(f"[DarkMatter Entrypoint] Waking daemon...", file=sys.stderr)
-    _subp.Popen([dm], start_new_session=True, stdin=_subp.DEVNULL, stdout=_subp.DEVNULL, stderr=_subp.DEVNULL)
+    daemon_log_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "daemon.log")
+    daemon_log_fh = open(daemon_log_path, "a")
+    _subp.Popen([dm], start_new_session=True, stdin=_subp.DEVNULL, stdout=daemon_log_fh, stderr=daemon_log_fh)
+    daemon_log_fh.close()  # subprocess inherited the fd
     for _ in range(15):
         time.sleep(1)
         try:

@@ -156,6 +156,10 @@ def restore_seen_message_ids(saved: dict[str, float]) -> None:
 # State File Path
 # =============================================================================
 
+_STATE_DIR = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
+os.makedirs(_STATE_DIR, exist_ok=True)
+
+
 def state_file_path() -> str:
     """Return the state file path, keyed by the agent's public key hex."""
     override = os.environ.get("DARKMATTER_STATE_FILE")
@@ -164,13 +168,48 @@ def state_file_path() -> str:
         return override
     state = _agent_state
     if state is not None and state.public_key_hex:
-        state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
-        os.makedirs(state_dir, exist_ok=True)
-        return os.path.join(state_dir, f"{state.public_key_hex}.json")
-    state_dir = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
-    os.makedirs(state_dir, exist_ok=True)
+        return os.path.join(_STATE_DIR, f"{state.public_key_hex}.json")
     port = os.environ.get("DARKMATTER_PORT", "8100")
-    return os.path.join(state_dir, f"{port}.json")
+    return os.path.join(_STATE_DIR, f"{port}.json")
+
+
+def waiting_signal_path(public_key_hex: str) -> str:
+    """Return the path to the .waiting signal file for a given agent."""
+    return os.path.join(_STATE_DIR, f"{public_key_hex}.waiting")
+
+
+def set_waiting(waiting: bool) -> None:
+    """Create or remove the .waiting signal file for cross-process visibility."""
+    state = _agent_state
+    if state is None or not state.public_key_hex:
+        return
+    path = waiting_signal_path(state.public_key_hex)
+    if waiting:
+        try:
+            with open(path, "w") as f:
+                f.write(str(time.time()))
+        except OSError as e:
+            print(f"[DarkMatter] Warning: could not write waiting signal: {e}", file=sys.stderr)
+    else:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def check_waiting(public_key_hex: str) -> bool:
+    """Check whether an agent's .waiting signal file exists (cross-process)."""
+    return os.path.exists(waiting_signal_path(public_key_hex))
+
+
+def clear_waiting_signal() -> None:
+    """Remove any stale .waiting signal file for this agent."""
+    state = _agent_state
+    if state and state.public_key_hex:
+        try:
+            os.remove(waiting_signal_path(state.public_key_hex))
+        except FileNotFoundError:
+            pass
 
 
 # =============================================================================
