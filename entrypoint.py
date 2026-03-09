@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import signal
 import socket
 import sys
 import tempfile
@@ -1669,7 +1670,7 @@ def update_agents():
     # Also run the update command locally (entrypoint's own pip upgrade)
     import shlex
     import subprocess as _sp
-    update_cmd = os.environ.get("DARKMATTER_UPDATE_COMMAND", "pip3 install --upgrade dmagent")
+    update_cmd = os.environ.get("DARKMATTER_UPDATE_COMMAND", "pip3 install --upgrade --break-system-packages dmagent")
     try:
         local_result = _sp.run(shlex.split(update_cmd), capture_output=True, text=True, timeout=60)
         local_success = local_result.returncode == 0
@@ -1687,19 +1688,13 @@ def update_agents():
 
     succeeded = sum(1 for r in results if r["success"])
 
-    # Spawn a detached shell script that:
-    # 1. Waits for us to finish responding
-    # 2. Kills all darkmatter processes
-    # 3. Starts a fresh entrypoint
+    # Kill everything, wait, restart entrypoint
     import subprocess as _subp
-    _entrypoint_path = os.path.abspath(sys.argv[0])
-    _python = sys.executable
-    _subp.Popen(
-        ["bash", "-c",
-         f'sleep 2; pkill -f darkmatter; sleep 2; nohup "{_python}" "{_entrypoint_path}" '
-         f'>> ~/.darkmatter/entrypoint_restart.log 2>&1 &'],
-        start_new_session=True,
-    )
+    _subp.Popen(["bash", "-c",
+        f"sleep 2; pkill -f darkmatter; lsof -ti:{PORT} | xargs kill -9 2>/dev/null; "
+        f"sleep 3; nohup {sys.executable} {os.path.abspath(sys.argv[0])} "
+        f">> ~/.darkmatter/entrypoint_restart.log 2>&1 &"],
+        start_new_session=True)
 
     return jsonify({
         "success": True,
@@ -2037,6 +2032,7 @@ def wallet_disconnect():
 # Main
 # ---------------------------------------------------------------------------
 
+
 if __name__ == "__main__":
     url = f"http://localhost:{PORT}"
     print(f"[DarkMatter Entrypoint] Human node on {url}", file=sys.stderr)
@@ -2050,7 +2046,4 @@ if __name__ == "__main__":
         import webbrowser
         webbrowser.open(url)
 
-    # Disable reloader when spawned as a subprocess (no TTY) to avoid
-    # inheriting stale file descriptors from the parent process.
-    is_tty = sys.stderr.isatty()
-    app.run(host="0.0.0.0", port=PORT, debug=True, use_reloader=is_tty)
+    app.run(host="0.0.0.0", port=PORT, debug=True, use_reloader=False)
