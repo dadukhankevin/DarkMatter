@@ -1022,16 +1022,18 @@ function renderFeedItem(item) {
     const tint = agentTint(item.from_agent_id);
     el.innerHTML = `
       <div class="msg-block msg-block-in group" style="background:${tint}">
-        <div class="flex items-baseline gap-3 mb-1.5">
-          <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
-          <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
-          <button class="msg-reply-btn msg-meta opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 hover:text-primary cursor-pointer ml-auto" data-agent-id="${item.from_agent_id}" data-agent-name="${esc(item.from_name)}" data-message-id="${item.message_id}">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
-            Reply
-          </button>
+        <div class="agent-contrib" data-agent-id="${item.from_agent_id}" style="--agent-tint:${tint}; --agent-color:${aColor}">
+          <div class="agent-header flex items-baseline gap-3 mb-1.5">
+            <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+            <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
+            <button class="msg-reply-btn msg-meta opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 hover:text-primary cursor-pointer ml-auto" data-agent-id="${item.from_agent_id}" data-agent-name="${esc(item.from_name)}" data-message-id="${item.message_id}">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+              Reply
+            </button>
+          </div>
+          <div class="msg-content">${renderMd(item.content)}</div>
+          ${renderAttachmentsInMessage(item.attachments)}
         </div>
-        <div class="msg-content">${renderMd(item.content)}</div>
-        ${renderAttachmentsInMessage(item.attachments)}
         <div class="reply-area" data-reply-for="${item.message_id}">
           <div class="flex gap-2">
             <input type="text" placeholder="Reply to ${esc(item.from_name)}..." data-message-id="${item.message_id}"
@@ -1058,21 +1060,25 @@ function renderFeedItem(item) {
     const content = item.content && item.content.trim().length ? renderMd(item.content) : '<span class="msg-meta">Thinking...</span>';
     el.innerHTML = `
       <div class="msg-block msg-block-in" style="background:${tint};${item.is_streaming ? 'opacity:0.9' : ''}">
-        <div class="flex items-baseline gap-3 mb-1.5">
-          <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
-          <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
-          ${item.is_streaming ? `<span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>` : ''}
+        <div class="agent-contrib" data-agent-id="${item.from_agent_id}" style="--agent-tint:${tint}; --agent-color:${aColor}">
+          <div class="agent-header flex items-baseline gap-3 mb-1.5">
+            <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+            <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
+            ${item.is_streaming ? `<span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>` : ''}
+          </div>
+          <div class="msg-content">${content}</div>
         </div>
-        <div class="msg-content">${content}</div>
       </div>`;
   } else if (item.type === 'typing') {
     const aColor = agentColor(item.agent_id);
     const tint = agentTint(item.agent_id);
     el.innerHTML = `
       <div class="msg-block msg-block-in" style="background:${tint};opacity:0.85">
-        <div class="flex items-baseline gap-3 mb-1.5">
-          <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
-          <span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>
+        <div class="agent-contrib" style="--agent-color:${aColor}">
+          <div class="flex items-baseline gap-3 mb-1.5">
+            <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+            <span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>
+          </div>
         </div>
       </div>`;
   } else if (item.type === 'shard') {
@@ -1198,22 +1204,112 @@ function reGroupAgentMessages() {
 
   const children = Array.from(feedContainer.children);
   let currentGroup = null;
+  let lastAgentId = null;
+  let lastAgentName = null;
+  let prevAgentInGroup = null;
 
   for (const child of children) {
     const isOutbound = child.querySelector('.msg-block-out') !== null;
     const isSystemEvent = child.querySelector('.sys-event') !== null;
 
     if (isOutbound || isSystemEvent) {
+      // Add a group reply button at the bottom of the finished group
+      if (currentGroup && lastAgentId) {
+        addGroupReply(currentGroup, lastAgentId, lastAgentName);
+      }
       currentGroup = null;
+      lastAgentId = null;
+      lastAgentName = null;
+      prevAgentInGroup = null;
     } else {
       if (!currentGroup) {
         currentGroup = document.createElement('div');
         currentGroup.className = 'agent-group';
         feedContainer.insertBefore(currentGroup, child);
+        prevAgentInGroup = null;
       }
       currentGroup.appendChild(child);
+
+      // Mark agent-contrib with data-new-sender when sender changes
+      const contrib = child.querySelector('.agent-contrib');
+      if (contrib) {
+        const agentId = contrib.dataset.agentId;
+        if (agentId !== prevAgentInGroup) {
+          contrib.setAttribute('data-new-sender', '');
+        } else {
+          contrib.removeAttribute('data-new-sender');
+        }
+        prevAgentInGroup = agentId;
+      }
+
+      // Track the last agent for the group reply
+      const replyBtn = child.querySelector('[data-agent-id]');
+      if (replyBtn) {
+        lastAgentId = replyBtn.dataset.agentId;
+        lastAgentName = replyBtn.dataset.agentName;
+      }
     }
   }
+  // Handle final group
+  if (currentGroup && lastAgentId) {
+    addGroupReply(currentGroup, lastAgentId, lastAgentName);
+  }
+}
+
+function addGroupReply(group, agentId, agentName) {
+  // Don't add duplicate reply areas
+  if (group.querySelector('.agent-group-reply')) return;
+  const replyDiv = document.createElement('div');
+  replyDiv.className = 'agent-group-reply';
+  replyDiv.innerHTML = `
+    <button class="agent-group-reply-btn flex items-center gap-1" type="button">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+      Reply
+    </button>
+    <div class="agent-group-reply-area">
+      <div class="flex gap-2">
+        <input type="text" placeholder="Reply..." data-agent-id="${agentId}"
+          class="group-reply-input flex-1 compose-ring px-4 py-2.5 text-[14px] text-primary placeholder-muted/50 min-w-0">
+        <button type="button" data-agent-id="${agentId}" data-agent-name="${esc(agentName || '')}"
+          class="group-reply-send glass-btn text-[13px] px-5 py-2.5">Send</button>
+      </div>
+    </div>`;
+  group.appendChild(replyDiv);
+
+  const toggleBtn = replyDiv.querySelector('.agent-group-reply-btn');
+  const area = replyDiv.querySelector('.agent-group-reply-area');
+  const input = replyDiv.querySelector('.group-reply-input');
+  const sendBtn = replyDiv.querySelector('.group-reply-send');
+
+  toggleBtn.addEventListener('click', () => {
+    area.classList.toggle('open');
+    if (area.classList.contains('open')) input.focus();
+  });
+
+  async function doSend() {
+    const text = input.value.trim();
+    if (!text) return;
+    sendBtn.disabled = true;
+    input.disabled = true;
+    try {
+      const result = await ajaxPost('/send', { content: text, target_agent_id: agentId });
+      if (result.success) {
+        input.value = '';
+        area.classList.remove('open');
+        pollServer();
+      } else {
+        showToast(result.error || 'Send failed', 'error');
+      }
+    } catch (e) {
+      showToast('Send failed', 'error');
+    }
+    sendBtn.disabled = false;
+    input.disabled = false;
+  }
+  sendBtn.addEventListener('click', doSend);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+  });
 }
 
 function renderFeed(data) {

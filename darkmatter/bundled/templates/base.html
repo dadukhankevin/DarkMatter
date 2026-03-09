@@ -383,37 +383,73 @@
     }
     .msg-block + .msg-block { border-top: 1px solid var(--glass-border); }
 
-    /* ---- Agent message groups ---- */
+    /* ---- Agent message groups (one unified block) ---- */
     .agent-group {
       margin: 4px 0;
       border-radius: 14px;
-      overflow: hidden;
       border: 1px solid var(--glass-border);
       box-shadow: 0 2px 8px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.03);
+      padding: 14px 18px;
+      background: var(--glass-bg);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
     }
-    @media (min-width: 640px) { .agent-group { margin: 6px 16px; } }
+    @media (min-width: 640px) { .agent-group { margin: 6px 16px; padding: 16px 22px; } }
     .agent-group:hover {
       border-color: rgba(78, 70, 62, 0.8);
       box-shadow: 0 4px 20px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.04);
     }
+    /* Strip all individual message styling — everything flows as one block */
     .agent-group .msg-block {
-      border-radius: 0;
-      margin: 0;
-      border: none;
-      box-shadow: none;
+      all: unset !important;
+      display: block !important;
     }
-    .agent-group .msg-block:hover {
-      border-color: transparent;
-      box-shadow: none;
+    /* Google Docs-style: subtle background highlight behind text per agent */
+    .agent-group .agent-contrib {
+      margin: 0; padding: 3px 6px; border-radius: 4px;
+      background: var(--agent-tint, transparent);
     }
-    .agent-group .msg-block + .msg-block {
-      border-top: 1px solid rgba(var(--c-border), 0.04);
+    .agent-group .agent-contrib + .agent-contrib {
+      margin-top: 2px;
     }
-    @media (min-width: 640px) { .agent-group .msg-block { margin: 0; } }
+    /* When sender changes, add a bit more spacing */
+    .agent-group .agent-contrib[data-new-sender] {
+      margin-top: 8px;
+    }
+    /* Hide sender header by default in groups; show only on sender change */
+    .agent-group .agent-contrib .agent-header {
+      display: none;
+    }
+    .agent-group .agent-contrib[data-new-sender] .agent-header {
+      display: flex;
+    }
+    .agent-group .agent-contrib .msg-sender {
+      font-size: 12px; font-weight: 600; opacity: 0.85;
+    }
+    .agent-group .agent-contrib .msg-content {
+      font-size: 14px; line-height: 1.55;
+    }
+    .agent-group .agent-contrib .msg-meta { font-size: 11px; opacity: 0.4; }
+    .agent-group .agent-contrib .mb-1\.5 { margin-bottom: 2px; }
+    /* Hide per-message reply UI; keep group-level reply */
+    .agent-group .reply-area { display: none; }
+    .agent-group .msg-reply-btn { display: none; }
     [data-theme="light"] .agent-group {
       background: rgba(236, 231, 222, 0.3);
       box-shadow: 0 2px 8px rgba(42,37,32,0.03), inset 0 1px 0 rgba(255,255,255,0.4);
     }
+    /* Group-level reply */
+    .agent-group-reply {
+      padding: 8px 0 0; margin-top: 8px;
+      border-top: 1px solid rgba(var(--c-border), 0.08);
+    }
+    .agent-group-reply-btn {
+      font-size: 11px; cursor: pointer; transition: opacity 0.15s;
+      color: rgb(var(--c-muted)); opacity: 0.5; background: none; border: none;
+    }
+    .agent-group-reply-btn:hover { opacity: 1; }
+    .agent-group-reply-area { display: none; margin-top: 8px; }
+    .agent-group-reply-area.open { display: block; }
 
     /* ---- Typing indicator ---- */
     .typing-indicator { padding: 0.75rem 1.25rem; margin: 4px 12px; }
