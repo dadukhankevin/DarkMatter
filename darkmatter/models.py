@@ -319,6 +319,8 @@ class AgentState:
     inactive_until: Optional[str] = None
     # Inbox waiters — agents blocking on wait_for_message for new inbound messages
     _inbox_events: list[asyncio.Event] = field(default_factory=list)
+    # Typing indicator: True when agent is blocked in wait_for_message
+    _is_waiting: bool = False
     # Extensible message routing
     routing_rules: list = field(default_factory=list)
     router_mode: str = "spawn"

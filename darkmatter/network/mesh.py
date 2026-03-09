@@ -826,8 +826,13 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
 
 async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
     """Commit a verified inbound message into state and route it."""
-    state.message_queue.append(msg)
     state.messages_handled += 1
+
+    # queue_only (entrypoint) skips the queue entirely — messages go straight
+    # to conversation_log for the human to see.  Agents use the queue so
+    # wait_for_message can drain it.
+    if state.router_mode != "queue_only":
+        state.message_queue.append(msg)
 
     _agents_waiting_at_receive = len(state._inbox_events) > 0
     for evt in state._inbox_events:
@@ -859,11 +864,13 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
             save_state_fn=save_state,
         ))
 
+    # queue_only (entrypoint) — human-facing, no routing or spawning.
+    if state.router_mode == "queue_only":
+        return "queued"
+
     if _agents_waiting_at_receive:
         print(f"[DarkMatter] Agent already waiting — message delivered via inbox event, skipping router", file=sys.stderr)
         routed_to = "agent"
-    elif state.router_mode == "queue_only":
-        routed_to = "queued"
     else:
         routed_to = "queued"
         from darkmatter.router import execute_routing
@@ -880,6 +887,7 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
             import traceback
             print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+
     # Ensure the main agent is running — if no agent is waiting and none is
     # alive, spawn one.  The main agent will pick up queued messages via
     # wait_for_message on its next loop iteration.
@@ -914,7 +922,9 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if state.status == AgentStatus.INACTIVE:
         return {"error": "Agent is currently inactive"}, 503
 
-    if len(state.message_queue) >= MESSAGE_QUEUE_MAX:
+    # queue_only (entrypoint) doesn't use the queue — messages go straight to
+    # conversation_log.  Skip the queue-full check for it.
+    if state.router_mode != "queue_only" and len(state.message_queue) >= MESSAGE_QUEUE_MAX:
         return {"error": "Message queue full"}, 429
 
     message_id = data.get("message_id", "")
@@ -1238,6 +1248,7 @@ async def handle_status(request: Request) -> JSONResponse:
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "spawned_agents": len(spawned_agents),
+        "is_waiting": getattr(state, "_is_waiting", False),
     })
 
 

@@ -179,7 +179,6 @@ HOW TO WORK:
    Accept/reject via darkmatter_connection(action="accept/reject", request_id=...).
 6. Messages with from_entrypoint metadata are from a HUMAN using the chat UI.
    They can ONLY see darkmatter_send_message output — your stdout is invisible.
-   Send frequent short status messages as you work so they see progress.
 
 WHEN TO EXIT:
 Call darkmatter_complete_and_summarize when:

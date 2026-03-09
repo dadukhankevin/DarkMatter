@@ -81,7 +81,7 @@
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Connections</span>
         <div class="flex items-center gap-2">
           <button id="update-all-btn" onclick="updateAllAgents()" title="pip upgrade &amp; restart all LAN agents"
-            class="glass-btn text-[10px] px-2 py-0.5"
+            class="glass-btn text-[10px] px-2 py-0.5">
             Update All
           </button>
           <span class="text-[11px] text-muted" id="sidebar-conn-count">0</span>
@@ -848,6 +848,7 @@ function buildFeedItems(data) {
   const items = [];
   const conns = data.connections || [];
   const findConn = (id) => conns.find(cn => cn.agent_id === id);
+  const selfId = data.self ? data.self.agent_id : null;
   const responseItems = new Map();
 
   function upsertResponseItem(parentId, agentId, next) {
@@ -866,59 +867,68 @@ function buildFeedItems(data) {
     });
   }
 
-  // Outbound messages
-  for (const msg of (data.outbox || [])) {
-    items.push({
-      id: 'out_' + msg.message_id,
-      type: 'outbound',
-      content: msg.content,
-      timestamp: msg.created_at,
-      status: msg.status,
-      routed_to: msg.routed_to || [],
-      routed_to_names: msg.routed_to_names || [],
-      updates: msg.updates || [],
-      message_id: msg.message_id,
-      attachments: (msg.metadata || {}).attachments || [],
-    });
+  // Build feed from conversation_log — the single source of truth
+  for (const e of (data.conversation || [])) {
+    const meta = e.metadata || {};
+    if (e.direction === 'outbound' && e.from_agent_id === selfId) {
+      // Human's outbound messages
+      items.push({
+        id: 'out_' + e.message_id,
+        type: 'outbound',
+        content: e.content,
+        timestamp: e.timestamp,
+        status: 'sent',
+        routed_to: e.to_agent_ids || [],
+        routed_to_names: (e.to_agent_ids || []).map(id => {
+          const c = findConn(id);
+          return c ? agentLabel(c) : shortId(id);
+        }),
+        message_id: e.message_id,
+        attachments: meta.attachments || [],
+      });
+    } else if (e.direction === 'inbound') {
+      // Agent replies — nest under parent if in_reply_to, else standalone
+      const c = findConn(e.from_agent_id);
+      const name = c ? agentLabel(c) : (e.from_name || shortId(e.from_agent_id));
+      const replyTo = meta.in_reply_to || null;
+      if (replyTo) {
+        upsertResponseItem(replyTo, e.from_agent_id, {
+          content: e.content,
+          timestamp: e.timestamp,
+          from_name: name,
+          is_streaming: false,
+        });
+      } else {
+        items.push({
+          id: 'in_' + e.message_id,
+          type: 'inbound',
+          content: e.content,
+          timestamp: e.timestamp,
+          from_name: name,
+          from_agent_id: e.from_agent_id,
+          message_id: e.message_id,
+          attachments: meta.attachments || [],
+        });
+      }
+    }
   }
 
+  // Typing indicators — shown when an agent is NOT in wait_for_message
   for (const t of (data.typing || [])) {
-    if (!t.in_reply_to) continue;
     const c = findConn(t.agent_id);
-    upsertResponseItem(t.in_reply_to, t.agent_id, {
-      content: t.content || '',
-      timestamp: t.started_at,
-      from_name: c ? agentLabel(c) : (t.display_name || shortId(t.agent_id)),
+    const displayName = c ? agentLabel(c) : (t.display_name || shortId(t.agent_id));
+    items.push({
+      id: 'typing_' + t.agent_id,
+      type: 'typing',
+      content: '',
+      timestamp: new Date().toISOString(),
+      from_name: displayName,
+      agent_id: t.agent_id,
       is_streaming: true,
     });
   }
 
   items.push(...responseItems.values());
-
-  // Inbound messages
-  for (const msg of (data.inbox || [])) {
-    const c = findConn(msg.from_agent_id);
-    const replyTo = ((msg.metadata || {}).in_reply_to) || null;
-    if (replyTo) {
-      upsertResponseItem(replyTo, msg.from_agent_id, {
-        content: msg.content,
-        timestamp: msg.received_at,
-        from_name: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
-        is_streaming: false,
-      });
-      continue;
-    }
-    items.push({
-      id: 'in_' + msg.message_id,
-      type: 'inbound',
-      content: msg.content,
-      timestamp: msg.received_at,
-      from_name: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
-      from_agent_id: msg.from_agent_id,
-      message_id: msg.message_id,
-      attachments: (msg.metadata || {}).attachments || [],
-    });
-  }
 
   // Shards
   for (const shard of (data.shards || [])) {
@@ -1053,6 +1063,16 @@ function renderFeedItem(item) {
           ${item.is_streaming ? `<span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>` : ''}
         </div>
         <div class="msg-content">${content}</div>
+      </div>`;
+  } else if (item.type === 'typing') {
+    const aColor = agentColor(item.agent_id);
+    const tint = agentTint(item.agent_id);
+    el.innerHTML = `
+      <div class="msg-block msg-block-in" style="background:${tint};opacity:0.85">
+        <div class="flex items-baseline gap-3 mb-1.5">
+          <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+          <span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>
+        </div>
       </div>`;
   } else if (item.type === 'shard') {
     const shardId = 'shard-content-' + item.id.replace(/[^a-zA-Z0-9]/g, '_');
@@ -1241,6 +1261,15 @@ function renderFeed(data) {
 
   // Check if near bottom for auto-scroll
   const nearBottom = feedScroll.scrollHeight - feedScroll.scrollTop - feedScroll.clientHeight < 80;
+
+  // Remove stale typing indicators (agent went back to waiting)
+  const activeTypingIds = new Set(items.filter(i => i.type === 'typing').map(i => i.id));
+  for (const [id, el] of renderedFeedItems) {
+    if (id.startsWith('typing_') && !activeTypingIds.has(id)) {
+      el.remove();
+      renderedFeedItems.delete(id);
+    }
+  }
 
   // Add new items (skip items cleared by user)
   for (const item of items) {
@@ -1746,11 +1775,27 @@ async function updateAllAgents() {
     const data = await ajaxPost('/api/update-agents', {});
     if (data.results && data.results.length > 0) {
       const succeeded = data.results.filter(r => r.success).length;
-      showToast(`Updated ${succeeded}/${data.results.length} agents`, succeeded > 0 ? 'success' : 'error');
       data.results.forEach(r => {
         const status = r.success ? 'ok' : 'FAILED';
         console.log(`[Update] ${r.display_name}: ${status} — ${r.git_output || ''}`);
       });
+      if (data.restarting) {
+        showToast(`Updated ${succeeded}/${data.results.length}. Restarting...`, 'success');
+        btn.textContent = 'Restarting...';
+        // Wait for the server to come back up, then reload
+        setTimeout(async () => {
+          for (let i = 0; i < 30; i++) {
+            try {
+              const resp = await fetch('/api/state', {method: 'GET'});
+              if (resp.ok) { location.reload(); return; }
+            } catch {}
+            await new Promise(r => setTimeout(r, 1000));
+          }
+          location.reload();
+        }, 2000);
+        return;
+      }
+      showToast(`Updated ${succeeded}/${data.results.length} agents`, succeeded > 0 ? 'success' : 'error');
     } else {
       showToast(data.message || 'No local agents found', 'info');
     }

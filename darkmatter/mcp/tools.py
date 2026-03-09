@@ -839,6 +839,7 @@ async def wait_for_message(
     # Register event and wait for new message
     event = asyncio.Event()
     state._inbox_events.append(event)
+    state._is_waiting = True
 
     try:
         # Loop: wake on any inbox event, then check filter
@@ -877,6 +878,7 @@ async def wait_for_message(
             "action": "Proactively reach out to peers, share updates, or broadcast. Then resume listening with darkmatter_wait_for_message.",
         })
     finally:
+        state._is_waiting = False
         if event in state._inbox_events:
             state._inbox_events.remove(event)
 

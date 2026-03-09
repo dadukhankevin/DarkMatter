@@ -686,16 +686,17 @@ _multicast_thread.start()
 # Peer spawned agent count
 # ---------------------------------------------------------------------------
 
-def _get_peer_spawned_agents(conn):
-    """GET <peer_url>/__darkmatter__/status and return spawned_agents count."""
+def _get_peer_status(conn):
+    """GET <peer_url>/__darkmatter__/status and return (spawned_agents, is_waiting)."""
     try:
         base = _resolve_base_url(conn)
         resp = requests.get(f"{base}/__darkmatter__/status", timeout=1)
         if resp.ok:
-            return resp.json().get("spawned_agents", 0)
+            data = resp.json()
+            return data.get("spawned_agents", 0), data.get("is_waiting", True)
     except Exception:
         pass
-    return 0
+    return 0, True  # Default: assume waiting (no typing indicator)
 
 
 
@@ -874,47 +875,26 @@ def dm_accept_pending():
     return jsonify(result), status
 
 
-def _get_typing_indicators() -> list[dict]:
-    """Return typing indicators for outbound messages awaiting a reply.
+def _get_typing_indicators(waiting_states: dict[str, bool] | None = None) -> list[dict]:
+    """Return typing indicators for connected agents that are NOT in a waiting state.
 
-    If we sent a message and the peer has spawned agents (meaning our message
-    is being processed), but no reply has arrived yet, show a typing indicator
-    so the human knows the agent is still working.
+    Simple iMessage-style logic: if the agent isn't blocked in wait_for_message,
+    it's working/typing. When it calls wait_for_message, the indicator disappears.
     """
-    # Collect message IDs that have received replies (via in_reply_to metadata)
-    replied_ids = set()
-    for msg in state.message_queue:
-        meta = getattr(msg, "metadata", {}) or {}
-        irt = meta.get("in_reply_to")
-        if irt:
-            replied_ids.add(irt)
-    for e in state.conversation_log:
-        if e.direction == "inbound":
-            meta = e.metadata or {}
-            irt = meta.get("in_reply_to")
-            if irt:
-                replied_ids.add(irt)
+    if waiting_states is None:
+        waiting_states = {}
 
     indicators = []
-    # Look at recent outbound messages (last 10) for ones still awaiting reply
-    for e in reversed(state.conversation_log):
-        if len(indicators) >= 5:
-            break
-        if e.direction != "outbound" or e.from_agent_id != state.agent_id:
+    for conn in state.connections.values():
+        if conn.agent_id == state.agent_id:
             continue
-        if e.message_id in replied_ids:
-            continue
-        # Check if any target peer has spawned agents (i.e. is working on it)
-        for target_id in (e.to_agent_ids or []):
-            conn = state.connections.get(target_id)
-            if not conn:
-                continue
+        # If the agent is NOT waiting, it's working — show typing indicator
+        is_waiting = waiting_states.get(conn.agent_id, True)  # Default: assume waiting
+        if not is_waiting:
             indicators.append({
-                "agent_id": target_id,
-                "display_name": conn.agent_display_name or target_id[:12],
-                "in_reply_to": e.message_id,
+                "agent_id": conn.agent_id,
+                "display_name": conn.agent_display_name or conn.agent_id[:12],
                 "content": "",
-                "started_at": e.timestamp,
             })
     return indicators
 
@@ -1077,10 +1057,12 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             state.private_key_hex, state.agent_id, message_id, msg_timestamp, content
         )
 
-    # Tag messages as coming from the entrypoint (human) so receiving agents
-    # know to send frequent status updates via send_message instead of stdout.
+    # Tag messages as coming from the entrypoint (human).
     merged_metadata = dict(metadata or {})
     merged_metadata["from_entrypoint"] = True
+
+    # Append a hint so agents send frequent updates visible in the chat UI.
+    entrypoint_content = content + "\n\n[Send frequent quick updates as you work.]"
 
     sent_to = []
     failed = []
@@ -1088,7 +1070,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
         try:
             base = _resolve_base_url(conn)
             payload = {
-                "message_id": message_id, "content": content,
+                "message_id": message_id, "content": entrypoint_content,
                 "hops_remaining": 10,
                 "from_agent_id": state.agent_id, "metadata": merged_metadata,
                 "timestamp": msg_timestamp, "from_public_key_hex": state.public_key_hex,
@@ -1421,31 +1403,6 @@ def disconnect(agent_id):
 
 @app.route("/api/poll", methods=["GET"])
 def poll():
-    inbox = [{
-        "message_id": msg.message_id,
-        "from_agent_id": msg.from_agent_id,
-        "from_display_name": _display_name_for(msg.from_agent_id),
-        "content": msg.content,
-        "received_at": msg.received_at,
-        "metadata": getattr(msg, "metadata", {}),
-    } for msg in state.message_queue]
-
-    # Outbox: outbound messages from conversation log
-    outbox = []
-    for e in reversed(state.conversation_log):
-        if e.direction == "outbound" and e.from_agent_id == state.agent_id:
-            outbox.append({
-                "message_id": e.message_id,
-                "status": "sent",
-                "content": e.content,
-                "routed_to": e.to_agent_ids,
-                "routed_to_names": [_display_name_for(rid) for rid in e.to_agent_ids],
-                "created_at": e.timestamp,
-                "from_self": True,
-                "metadata": e.metadata,
-            })
-            if len(outbox) >= 50:
-                break
 
     pending = [{
         "request_id": req.request_id, "from_agent_id": req.from_agent_id,
@@ -1453,18 +1410,22 @@ def poll():
         "from_bio": req.from_agent_bio, "requested_at": req.requested_at,
     } for req in state.pending_requests.values()]
 
-    # Query peers for spawned agent counts in parallel
+    # Query peers for spawned agent counts and waiting state in parallel
     peer_conns = [c for c in state.connections.values() if c.agent_id != state.agent_id]
     spawned_counts = {}
+    waiting_states = {}
     if peer_conns:
         with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(_get_peer_spawned_agents, c): c.agent_id for c in peer_conns}
+            futures = {pool.submit(_get_peer_status, c): c.agent_id for c in peer_conns}
             for future in as_completed(futures):
                 agent_id = futures[future]
                 try:
-                    spawned_counts[agent_id] = future.result()
+                    count, is_waiting = future.result()
+                    spawned_counts[agent_id] = count
+                    waiting_states[agent_id] = is_waiting
                 except Exception:
                     spawned_counts[agent_id] = 0
+                    waiting_states[agent_id] = True
 
     connections = [{
         "agent_id": c.agent_id,
@@ -1494,19 +1455,19 @@ def poll():
 
     total_active_agents = sum(c.get("spawned_agents", 0) for c in connections)
 
-    # Conversation log — same data agents see via get_context().
-    # Last 50 entries, chronological.  Includes broadcasts, forwards, and
-    # handled messages that are no longer in inbox/outbox.
+    # Conversation log is the single source of truth for the chat feed.
+    # Last 100 entries, chronological.  Both inbound and outbound.
     conversation = [{
         "message_id": e.message_id,
         "from_agent_id": e.from_agent_id,
         "from_name": _display_name_for(e.from_agent_id),
         "to_agent_ids": e.to_agent_ids,
-        "content": e.content[:500],
+        "content": e.content,
         "timestamp": e.timestamp,
         "entry_type": e.entry_type,
         "direction": e.direction,
-    } for e in state.conversation_log[-50:]]
+        "metadata": e.metadata,
+    } for e in state.conversation_log[-100:]]
 
     return jsonify({
         "self": {
@@ -1518,8 +1479,8 @@ def poll():
             "total_active_agents": total_active_agents,
             "wallets": state.wallets,
         },
-        "typing": _get_typing_indicators(),
-        "inbox": inbox, "outbox": outbox, "pending_requests": pending,
+        "typing": _get_typing_indicators(waiting_states),
+        "pending_requests": pending,
         "connections": connections, "discovered": discovered,
         "conversation": conversation,
         "shards": [{
@@ -1673,11 +1634,40 @@ def update_agents():
         for future in as_completed(futures):
             results.append(future.result())
 
+    # Also run the update command locally (entrypoint's own pip upgrade)
+    import shlex
+    import subprocess as _sp
+    update_cmd = os.environ.get("DARKMATTER_UPDATE_COMMAND", "pip3 install --upgrade dmagent")
+    try:
+        local_result = _sp.run(shlex.split(update_cmd), capture_output=True, text=True, timeout=60)
+        local_success = local_result.returncode == 0
+        local_output = local_result.stdout.strip() or local_result.stderr.strip()
+    except Exception as e:
+        local_success = False
+        local_output = str(e)
+
+    results.append({
+        "agent_id": state.agent_id,
+        "display_name": "Entrypoint (self)",
+        "success": local_success,
+        "git_output": local_output,
+    })
+
     succeeded = sum(1 for r in results if r["success"])
+
+    # Schedule a restart of the entrypoint process after responding
+    def _restart_self():
+        import time, signal
+        time.sleep(1)  # Let the HTTP response complete
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_restart_self, daemon=True).start()
+
     return jsonify({
         "success": True,
         "results": results,
-        "message": f"Updated {succeeded}/{len(results)} agents",
+        "restarting": True,
+        "message": f"Updated {succeeded}/{len(results)} agents. Restarting...",
     })
 
 
