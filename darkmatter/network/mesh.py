@@ -155,12 +155,12 @@ async def _gather_peer_trust(state: AgentState, about_agent_id: str) -> dict:
 # Connection Request → Agent Spawn
 #
 # IMPORTANT — DO NOT REMOVE OR DISABLE THIS FUNCTION.
-# Every connection request (auto-accepted OR pending) MUST spawn a sub-agent.
-# The spawned agent introduces itself, sets trust, exchanges capabilities, etc.
+# Every connection request (auto-accepted OR pending) MUST be queued so the
+# main agent can introduce itself, set trust, exchange capabilities, etc.
 # This has been accidentally removed/broken in multiple past sessions.
-# If you are refactoring, ensure spawn still happens for EVERY connection request.
+# If you are refactoring, ensure EVERY connection request reaches the main agent.
 # =============================================================================
-def _spawn_for_connection_request(
+def _queue_connection_request(
     state: AgentState,
     from_agent_id: str,
     from_agent_display_name: str | None,
@@ -168,15 +168,17 @@ def _spawn_for_connection_request(
     status: str,  # "auto-accepted" or "pending"
     request_id: str | None = None,
 ) -> None:
-    """Spawn an agent to handle a connection request. Always called, never skipped."""
+    """Queue a connection request as a message for the main agent.
+
+    DO NOT REMOVE — every connection request (auto-accepted OR pending) MUST
+    be queued so the main agent can introduce itself, set trust, etc.
+    """
     import darkmatter.config as _cfg
     if not (_cfg.AGENT_SPAWN_ENABLED and state.router_mode == "spawn"):
         print(f"[DarkMatter] Spawn disabled (AGENT_SPAWN_ENABLED={_cfg.AGENT_SPAWN_ENABLED}, "
-              f"router_mode={state.router_mode!r}) — skipping spawn for {status} connection request "
+              f"router_mode={state.router_mode!r}) — skipping connection request "
               f"from {from_agent_id[:12]}...", file=sys.stderr)
         return
-
-    from darkmatter.spawn import spawn_agent_for_message
 
     display = from_agent_display_name or from_agent_id[:16] + "..."
     msg_id = request_id or f"conn-{uuid.uuid4().hex[:8]}"
@@ -192,8 +194,19 @@ def _spawn_for_connection_request(
         metadata={"type": "connection_request", "request_id": request_id or msg_id, "status": status},
         from_agent_id=from_agent_id,
     )
-    asyncio.get_event_loop().create_task(spawn_agent_for_message(state, synthetic_msg))
-    print(f"[DarkMatter] Spawned agent for {status} connection request from {display}", file=sys.stderr)
+    # Queue the message — the main agent picks it up via wait_for_message.
+    # If no main agent is running, _record_inbound_message will spawn one.
+    state.message_queue.append(synthetic_msg)
+    for evt in state._inbox_events:
+        evt.set()
+    state._inbox_events.clear()
+    save_state()
+
+    # Ensure main agent is running to handle it
+    from darkmatter.spawn import is_main_agent_running, spawn_main_agent
+    if not is_main_agent_running():
+        asyncio.get_event_loop().create_task(spawn_main_agent(state))
+    print(f"[DarkMatter] Queued {status} connection request from {display} for main agent", file=sys.stderr)
 
 
 async def process_connection_request(state: AgentState, data: dict, public_url: str) -> tuple[dict, int]:
@@ -290,10 +303,10 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         print(f"[DarkMatter] Auto-accepted local agent {from_agent_display_name or from_agent_id[:12]}... "
               f"({from_agent_url})", file=sys.stderr)
 
-        # IMPORTANT: Always spawn an agent for connection requests — even auto-accepted ones.
+        # IMPORTANT: Always queue connection requests for the main agent — even auto-accepted ones.
         # The spawned agent can introduce itself, set trust, exchange capabilities, etc.
         # DO NOT remove this spawn. It has been accidentally removed multiple times.
-        _spawn_for_connection_request(
+        _queue_connection_request(
             state, from_agent_id, from_agent_display_name, from_agent_bio, "auto-accepted"
         )
 
@@ -367,9 +380,9 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         )
         save_state()
 
-    # IMPORTANT: Always spawn an agent for connection requests — pending ones too.
+    # IMPORTANT: Always queue connection requests for the main agent — pending ones too.
     # DO NOT remove this spawn. It has been accidentally removed multiple times.
-    _spawn_for_connection_request(
+    _queue_connection_request(
         state, from_agent_id, from_agent_display_name, from_agent_bio,
         "pending", request_id=request_id
     )
@@ -784,11 +797,7 @@ async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict
 async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decision: RouterDecision) -> None:
     """Execute a router decision — spawn, forward, respond, or drop."""
     if decision.action == RouterAction.HANDLE:
-        import darkmatter.config as _cfg
-        if _cfg.AGENT_SPAWN_ENABLED:
-            from darkmatter.spawn import spawn_agent_for_message
-            await spawn_agent_for_message(state, msg)
-        # If spawn disabled, message stays in queue for manual handling
+        pass  # Message stays in queue; main agent picks it up via wait_for_message
 
     elif decision.action == RouterAction.FORWARD:
         from darkmatter.network import send_to_peer
@@ -871,11 +880,15 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
             import traceback
             print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-    if routed_to == "agent" and not state._inbox_events:
+    # Ensure the main agent is running — if no agent is waiting and none is
+    # alive, spawn one.  The main agent will pick up queued messages via
+    # wait_for_message on its next loop iteration.
+    if not state._inbox_events:
         import darkmatter.config as _cfg
         if _cfg.AGENT_SPAWN_ENABLED:
-            from darkmatter.spawn import spawn_standby_agent
-            asyncio.create_task(spawn_standby_agent(state))
+            from darkmatter.spawn import is_main_agent_running, spawn_main_agent
+            if not is_main_agent_running():
+                asyncio.create_task(spawn_main_agent(state))
     return routed_to
 
 

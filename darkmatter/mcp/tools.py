@@ -978,13 +978,8 @@ async def complete_and_summarize(params: CompleteAndSummarizeInput, ctx: Context
             except Exception:
                 pass
 
-    # Ensure a standby agent exists — if no one is waiting, spawn one
-    if not state._inbox_events:
-        from darkmatter.spawn import spawn_standby_agent
-        try:
-            await spawn_standby_agent(state)
-        except Exception as e:
-            print(f"[DarkMatter] Warning: failed to spawn standby: {e}", file=sys.stderr)
+    # The main agent will be respawned automatically by _reap_agent_when_done
+    # when this agent's process exits. No need to spawn here.
 
     result = {
         "success": True,

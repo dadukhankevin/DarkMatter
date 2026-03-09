@@ -48,8 +48,8 @@ from darkmatter.identity import (
 )
 from darkmatter.app import create_app
 from darkmatter.spawn import (
-    SpawnedAgent, can_spawn_agent, spawn_agent_for_message,
-    cleanup_finished_agents, build_agent_prompt,
+    SpawnedAgent, can_spawn_agent, spawn_main_agent,
+    cleanup_finished_agents, build_main_agent_prompt,
     _spawned_agents, _spawn_timestamps,
 )
 from darkmatter.network.manager import get_network_manager
@@ -1811,8 +1811,8 @@ async def test_agent_cleanup_finished() -> None:
     _spawned_agents.extend(orig_agents)
 
 
-async def test_agent_spawn_deduplication() -> None:
-    """Test that spawn_agent_for_message won't spawn twice for the same message."""
+async def test_main_agent_single_instance() -> None:
+    """Test that spawn_main_agent won't spawn a second agent if one is running."""
     sf = make_state_file()
     try:
         app, state = create_agent(sf, port=9900)
@@ -1821,40 +1821,24 @@ async def test_agent_spawn_deduplication() -> None:
         orig_agents = _spawned_agents[:]
         orig_enabled = _spawn_module.AGENT_SPAWN_ENABLED
 
-        # Disable actual spawning but test dedup logic
         _spawn_module.AGENT_SPAWN_ENABLED = True
 
-        # Pre-populate with a fake agent for msg-dedup
+        # Pre-populate with a fake running main agent
         fake_proc = type("FakeProc", (), {"returncode": None, "pid": 33333})()
         _spawned_agents.clear()
         _spawned_agents.append(SpawnedAgent(
-            process=fake_proc, message_id="msg-dedup",
+            process=fake_proc, label="main-agent",
             spawned_at=time.monotonic(), pid=33333,
         ))
 
-        msg = QueuedMessage(
-            message_id="msg-dedup",
-            content="duplicate test",
-            webhook="http://localhost:9900/__darkmatter__/webhook/msg-dedup",
-            hops_remaining=10,
-            metadata={},
-            from_agent_id="fake-sender",
-            verified=False,
-        )
-
-        # Mock can_spawn_agent to always allow
-        orig_can_spawn = _spawn_module.can_spawn_agent
-        _spawn_module.can_spawn_agent = lambda: (True, "")
-
         count_before = len(_spawned_agents)
-        await spawn_agent_for_message(state, msg)
+        await spawn_main_agent(state)
         count_after = len(_spawned_agents)
 
-        report("dedup: does not spawn duplicate for same message_id",
+        report("main-agent: does not spawn duplicate when already running",
                count_after == count_before)
 
         # Restore
-        _spawn_module.can_spawn_agent = orig_can_spawn
         _spawn_module.AGENT_SPAWN_ENABLED = orig_enabled
         _spawned_agents.clear()
         _spawned_agents.extend(orig_agents)

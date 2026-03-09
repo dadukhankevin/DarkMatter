@@ -76,7 +76,7 @@ from darkmatter.network.mesh import (
     handle_local_config,
     handle_ping,
 )
-from darkmatter.spawn import spawn_agent_for_message
+from darkmatter.spawn import spawn_main_agent
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
 
 
@@ -227,32 +227,26 @@ def create_app() -> Router:
         # Auto-start entrypoint (human node) if not already running
         asyncio.create_task(ensure_entrypoint_running())
 
-        # Re-spawn agents for any queued messages left from a previous session
-        # Skip messages older than 30 minutes — they're stale and the sender
-        # has likely moved on.  Stale messages are removed from the queue.
-        if AGENT_SPAWN_ENABLED and state.router_mode == "spawn" and state.message_queue:
+        # Prune stale messages from a previous session, then spawn the main agent.
+        if AGENT_SPAWN_ENABLED and state.router_mode == "spawn":
             from datetime import datetime, timezone
             MAX_AGE_SECONDS = 30 * 60  # 30 minutes
             now = datetime.now(timezone.utc)
-            fresh, stale = [], []
+            stale = []
             for msg in list(state.message_queue):
                 try:
                     received = datetime.fromisoformat(msg.received_at)
                     age = (now - received).total_seconds()
                 except (ValueError, TypeError):
                     age = float("inf")
-                if age <= MAX_AGE_SECONDS:
-                    fresh.append(msg)
-                else:
+                if age > MAX_AGE_SECONDS:
                     stale.append(msg)
             if stale:
-                print(f"[DarkMatter] Dropping {len(stale)} stale message(s) from previous session (older than {MAX_AGE_SECONDS//60}m)", file=sys.stderr)
+                print(f"[DarkMatter] Dropping {len(stale)} stale message(s) from previous session", file=sys.stderr)
                 state.message_queue = [m for m in state.message_queue if m not in stale]
                 save_state()
-            if fresh:
-                print(f"[DarkMatter] {len(fresh)} fresh message(s) in queue, spawning agents...", file=sys.stderr)
-                for msg in fresh:
-                    asyncio.create_task(spawn_agent_for_message(state, msg))
+            # Spawn the main agent — it will pick up any queued messages
+            asyncio.create_task(spawn_main_agent(state))
 
     # DarkMatter mesh protocol routes
     darkmatter_routes = [

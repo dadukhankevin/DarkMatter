@@ -171,7 +171,7 @@ AGENT_ROUTER_MODE = os.environ.get("DARKMATTER_ROUTER_MODE", "spawn")
 AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
 AGENT_SANDBOX = os.environ.get("DARKMATTER_SANDBOX", "false").lower() == "true"
 AGENT_SANDBOX_NETWORK = os.environ.get("DARKMATTER_SANDBOX_NETWORK", "true").lower() == "true"
-AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
+AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "1"))
 AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "15"))
 AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "1500"))  # 25 min — enough for 20 min idle wait
 

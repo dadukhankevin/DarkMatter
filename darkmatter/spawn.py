@@ -1,5 +1,9 @@
 """
-Agent auto-spawn system — SpawnedAgent, spawn/kill/cleanup, prompt building.
+Main agent lifecycle — spawn, kill, cleanup, respawn.
+
+Single long-lived agent model: ONE main agent handles all messages via
+wait_for_message, delegates heavy work to its own sub-agents, and respawns
+when it exits (via complete_and_summarize or timeout).
 
 Depends on: config, models
 """
@@ -13,16 +17,14 @@ from dataclasses import dataclass
 import darkmatter.config as _cfg
 from darkmatter.config import (
     AGENT_SPAWN_ENABLED,
-    AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
     AGENT_SPAWN_TIMEOUT,
     ACTIVE_CLIENT,
 )
-from darkmatter.models import AgentState, QueuedMessage
+from darkmatter.models import AgentState
 from darkmatter.state import get_state
 
-# Capture the project directory at import time so spawned agents run here,
-# not in a temporary directory.
+# Capture the project directory at import time so spawned agents run here.
 _PROJECT_DIR = os.getcwd()
 
 
@@ -33,20 +35,17 @@ _PROJECT_DIR = os.getcwd()
 @dataclass
 class SpawnedAgent:
     process: asyncio.subprocess.Process
-    message_id: str
+    label: str  # e.g. "main-agent"
     spawned_at: float
     pid: int
-    spawn_mcp_config: str = ""  # .mcp.json path to clean up when agent exits
+    spawn_mcp_config: str = ""
     raw_output_log_path: str = ""
-    # Stdout streaming: dict of message_id → async callable(chunk: str)
-    # Multiple callbacks = nested messages, chunks go to all active targets
-    stdout_callbacks: dict = None  # Initialized to {} in __post_init__
-    _returncode: int = None  # Tracks exit code (Process.returncode is read-only in Python 3.14+)
+    stdout_callbacks: dict = None
+    _returncode: int = None
 
     def __post_init__(self):
         if self.stdout_callbacks is None:
             self.stdout_callbacks = {}
-
 
 
 _spawned_agents: list[SpawnedAgent] = []
@@ -54,7 +53,6 @@ _spawn_timestamps: list[float] = []
 
 
 def get_spawned_agents() -> list[SpawnedAgent]:
-    """Get the list of spawned agents."""
     return _spawned_agents
 
 
@@ -66,13 +64,12 @@ def can_spawn_agent() -> tuple[bool, str]:
     """Check whether we can spawn a new agent subprocess."""
     import darkmatter.config as _cfg
     if not _cfg.AGENT_SPAWN_ENABLED:
-        return False, "Agent spawning is disabled (DARKMATTER_AGENT_ENABLED=false)"
+        return False, "Agent spawning is disabled"
 
     cleanup_finished_agents()
 
-    active = len(_spawned_agents)
-    if active >= AGENT_SPAWN_MAX_CONCURRENT:
-        return False, f"Concurrency limit reached ({active}/{AGENT_SPAWN_MAX_CONCURRENT})"
+    if len(_spawned_agents) > 0:
+        return False, "Main agent already running"
 
     now = time.monotonic()
     cutoff = now - 3600
@@ -89,33 +86,21 @@ def can_spawn_agent() -> tuple[bool, str]:
 # =============================================================================
 
 def is_agent_running(agent: SpawnedAgent) -> bool:
-    """Check if a spawned agent is still running.
-
-    For asyncio.Process, returncode stays None until the process is reaped.
-    We check liveness via os.kill(pid, 0) and try os.waitpid(WNOHANG) to
-    reap zombies so the slot is freed for new spawns.
-    """
     if agent._returncode is not None:
         return False
-    # Also check the process object's own returncode (set by asyncio reaping)
     if agent.process.returncode is not None:
         agent._returncode = agent.process.returncode
         return False
-    # Check if process is still alive
     try:
         os.kill(agent.pid, 0)
     except ProcessLookupError:
-        # Process is gone
         agent._returncode = -1
         return False
     except PermissionError:
-        # Process exists but we can't signal it — treat as alive
         return True
-    # Process exists — try to reap if it's a zombie
     try:
         pid, status = os.waitpid(agent.pid, os.WNOHANG)
         if pid != 0:
-            # Zombie reaped
             if os.WIFEXITED(status):
                 agent._returncode = os.WEXITSTATUS(status)
             elif os.WIFSIGNALED(status):
@@ -132,7 +117,6 @@ def is_agent_running(agent: SpawnedAgent) -> bool:
 
 
 def kill_agent(agent: SpawnedAgent, force: bool = False) -> None:
-    """Send terminate/kill signal to a spawned agent."""
     if force:
         agent.process.kill()
     else:
@@ -140,97 +124,69 @@ def kill_agent(agent: SpawnedAgent, force: bool = False) -> None:
 
 
 def cleanup_finished_agents() -> None:
-    """Remove finished agent processes from the tracking list."""
     still_running = []
     for agent in _spawned_agents:
         if not is_agent_running(agent):
             print(
-                f"[DarkMatter] Spawned agent PID {agent.pid} exited "
-                f"(code={agent.process.returncode}, msg={agent.message_id[:12]}...)",
+                f"[DarkMatter] Agent PID {agent.pid} exited "
+                f"(code={agent.process.returncode}, label={agent.label})",
                 file=sys.stderr,
             )
             if agent.spawn_mcp_config:
                 try:
                     os.remove(agent.spawn_mcp_config)
                 except Exception as e:
-                    print(f"[DarkMatter] Failed to clean up spawn config {agent.spawn_mcp_config}: {e}", file=sys.stderr)
+                    print(f"[DarkMatter] Failed to clean up spawn config: {e}", file=sys.stderr)
         else:
             still_running.append(agent)
     _spawned_agents.clear()
     _spawned_agents.extend(still_running)
 
 
+def is_main_agent_running() -> bool:
+    cleanup_finished_agents()
+    return len(_spawned_agents) > 0
+
+
 # =============================================================================
-# Prompt Building
+# Prompt
 # =============================================================================
 
-def build_agent_prompt(state: AgentState, msg: QueuedMessage) -> str:
-    """Build the prompt for a spawned agent with conversation context."""
+def build_main_agent_prompt(state: AgentState) -> str:
+    """Build the fixed prompt for the main agent."""
     from darkmatter.context import get_context
     context = get_context(state, mode="full")
 
-    meta = msg.metadata or {}
-    if meta.get("type") == "connection_request":
-        request_id = meta.get("request_id", msg.message_id)
-        return f"""\
-CONNECTION REQUEST — Act now.
-
-{context}
-
-Request ID: {request_id}
-Message: {msg.content}
-
-Accept: darkmatter_connection(action="accept", request_id="{request_id}")
-Reject: darkmatter_connection(action="reject", request_id="{request_id}")
-
-After accepting, introduce yourself and share what you can help with.
-MANDATORY: When done, call darkmatter_complete_and_summarize summarizing what happened (accepted/rejected, who, why).
-"""
-
-    is_human = bool(meta.get("from_entrypoint"))
-
-    if is_human:
-        human_instructions = """
-⚠️  CRITICAL — HUMAN CONVERSATION ⚠️
-This message is from a HUMAN using the DarkMatter entrypoint chat UI, NOT another agent.
-The human can ONLY see messages you send via darkmatter_send_message. Your normal text
-output (stdout) is COMPLETELY INVISIBLE to them. If you don't send_message, they see nothing.
-
-YOU MUST follow these rules:
-1. BEFORE every tool call or research step, send a short status message explaining what
-   you're about to do. Example: "Checking the git log for recent changes..."
-2. AFTER getting results, send a message with what you found before moving to the next step.
-3. NEVER go more than ~10 seconds without sending a message. If you're reading files,
-   running commands, or thinking, tell the human what you're doing.
-4. Prefer MANY short messages (1-3 sentences each) over fewer long messages.
-5. Be conversational — you're chatting with a person, not writing a report.
-6. Every piece of information the human needs MUST go through darkmatter_send_message.
-   Think of it as your ONLY output channel. Stdout does not exist for this conversation.
-
-BAD:  [read 5 files silently] → [one big summary message]
-GOOD: "Let me check that..." → "Found the config file..." → "Reading the handler..." → "Here's what I see: ..."
-"""
-    else:
-        human_instructions = ""
-
     return f"""\
-INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
+You are the MAIN AGENT for this DarkMatter node. You are long-lived — handle
+messages, do work, and stay alive until your task or conversation naturally ends.
 
 {context}
 
-Message {msg.message_id} from {msg.from_agent_id[:12]}:
-{msg.content}
-{human_instructions}
-HOW TO RESPOND:
-- darkmatter_send_message(content="your reply", target_agent_id="{msg.from_agent_id}", in_reply_to="{msg.message_id}")
-- For long tasks, send frequent status updates so the receiver sees progress (e.g. "Researching...", "Found the issue, working on a fix...").
-- To forward instead: darkmatter_send_message(content="your commentary", target_agent_id=<peer>, forward_message_ids=["{msg.message_id}"]).
+START:
+Call darkmatter_wait_for_message() to receive your first message.
 
-STAY ALIVE:
-After responding, call darkmatter_wait_for_message(timeout_seconds=1200) and stay available for follow-ups. This is a conversation — keep the loop going. Respond to each new message the same way (send_message), then wait again. You are the agent for this conversation; don't exit after one reply.
+HOW TO WORK:
+1. Reply via darkmatter_send_message(content=..., target_agent_id=<sender>, in_reply_to=<msg_id>).
+2. For BIG TASKS (refactors, multi-file changes, deep research), use your CLI's
+   built-in Agent tool with run_in_background=true to delegate to sub-agents.
+   Send a status message to the sender, then call darkmatter_wait_for_message()
+   with a short timeout (10-30s) so you can check on background work and relay results.
+3. For QUICK TASKS (questions, small edits, status checks), just do them directly.
+4. After handling a message, call darkmatter_wait_for_message() for the next one.
+   YOU choose the timeout — short if you have background sub-agents, long if idle.
+5. Connection requests arrive as messages with metadata type "connection_request".
+   Accept/reject via darkmatter_connection(action="accept/reject", request_id=...).
+6. Messages with from_entrypoint metadata are from a HUMAN using the chat UI.
+   They can ONLY see darkmatter_send_message output — your stdout is invisible.
+   Send frequent short status messages as you work so they see progress.
 
 WHEN TO EXIT:
-Call darkmatter_complete_and_summarize ONLY when the conversation has naturally concluded — the task is done, the topic is resolved, or the human says goodbye. Write a dense summary of what you did, reference peers with @agent_id, and note anything the hivemind should know.
+Call darkmatter_complete_and_summarize when:
+- A conversation thread or feature is done
+- The human says goodbye
+- Your context is getting large and you need a fresh start
+Write a dense summary. A fresh main agent will be spawned with the collapsed context.
 """
 
 
@@ -238,32 +194,23 @@ Call darkmatter_complete_and_summarize ONLY when the conversation has naturally 
 # Spawn
 # =============================================================================
 
-async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
-                                   save_state_fn=None) -> None:
-    """Spawn an agent subprocess to handle an incoming message."""
-    print(f"[DarkMatter] DEBUG: spawn_agent_for_message called for {msg.message_id[:12]}...", file=sys.stderr)
-    ok, reason = can_spawn_agent()
-    if not ok:
-        print(f"[DarkMatter] Not spawning agent: {reason}", file=sys.stderr)
+async def spawn_main_agent(state: AgentState) -> None:
+    """Spawn the main agent if one isn't already running."""
+    if is_main_agent_running():
+        print("[DarkMatter] Main agent already running, skipping spawn", file=sys.stderr)
         return
 
-    for agent in _spawned_agents:
-        if agent.message_id == msg.message_id:
-            print(f"[DarkMatter] Agent already spawned for message {msg.message_id[:12]}...", file=sys.stderr)
-            return
+    ok, reason = can_spawn_agent()
+    if not ok:
+        print(f"[DarkMatter] Not spawning main agent: {reason}", file=sys.stderr)
+        return
 
-    if save_state_fn:
-        save_state_fn()
+    prompt = build_main_agent_prompt(state)
+    await _spawn_process(state, prompt, label="main-agent")
 
-    # Consume the message from the queue — it's being delivered to the spawned agent
-    from darkmatter.state import consume_message
-    for i, m in enumerate(state.message_queue):
-        if m.message_id == msg.message_id:
-            state.message_queue.pop(i)
-            consume_message(msg.message_id)
-            break
 
-    prompt = build_agent_prompt(state, msg)
+async def _spawn_process(state: AgentState, prompt: str, label: str) -> None:
+    """Launch a CLI agent subprocess with the given prompt."""
 
     env = os.environ.copy()
     env["DARKMATTER_AGENT_ENABLED"] = "false"
@@ -271,10 +218,7 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     for var in ACTIVE_CLIENT["env_cleanup"]:
         env.pop(var, None)
 
-    # Write spawn MCP config to a TEMP FILE — never overwrite the project's
-    # .mcp.json. Previous approach backed up and restored the project config,
-    # but if the process was killed or the server crashed, the backup was never
-    # restored, leaving the primary session with a broken HTTP config.
+    # Write spawn MCP config to a temp file
     spawn_dir = _PROJECT_DIR
     import json as _json
     import tempfile as _tempfile
@@ -286,7 +230,6 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
             }
         }
     }
-    # Write to a temp file that gets cleaned up when the agent exits
     spawn_mcp_fd, spawn_mcp_path = _tempfile.mkstemp(
         prefix="darkmatter-spawn-mcp-", suffix=".json"
     )
@@ -296,13 +239,12 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
     command = ACTIVE_CLIENT["command"]
     args = list(ACTIVE_CLIENT["args"])
 
-    # Pass the temp MCP config via CLI flags instead of overwriting project config.
     mcp_via_cli = "mcp_stdio" in ACTIVE_CLIENT.get("capabilities", set())
     if mcp_via_cli:
         args.extend(["--mcp-config", spawn_mcp_path, "--strict-mcp-config"])
     prompt_style = ACTIVE_CLIENT.get("prompt_style", "positional")
 
-    # Sanitize prompt for shell safety — remove chars that break quoting
+    # Sanitize prompt for shell safety
     safe_prompt = prompt.replace('"', "'").replace('`', "'").replace('$', '')
 
     if prompt_style == "positional":
@@ -311,11 +253,11 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         flag_name = prompt_style.split(":", 1)[1]
         args.extend([f"--{flag_name}", safe_prompt])
     elif prompt_style == "stdin":
-        stdin_pipe = asyncio.subprocess.PIPE
+        pass  # stdin_pipe handled below
     else:
         args.append(safe_prompt)
 
-    # Optionally wrap in OS-native sandbox
+    # Optionally wrap in sandbox
     exec_argv = [command] + args
     sandboxed = False
     if _cfg.AGENT_SANDBOX:
@@ -336,17 +278,13 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         os.makedirs(debug_dir, exist_ok=True)
         debug_log_path = os.path.join(
             debug_dir,
-            f"{int(time.time())}-{msg.message_id[:12]}-pidpending.log",
+            f"{int(time.time())}-{label}-pidpending.log",
         )
 
-        # PTY gives us a headless terminal — output streams in real time.
-        # Both stdin AND stdout must be connected to the PTY so that TUI
-        # frameworks (Ink/Claude Code) can set raw mode on stdin.
         import pty as _pty
         import fcntl, struct, termios
         pty_master_fd, pty_slave_fd = _pty.openpty()
-        # Set PTY size to match the xterm.js widget on the frontend
-        winsize = struct.pack("HHHH", 24, 120, 0, 0)  # rows=24, cols=120
+        winsize = struct.pack("HHHH", 24, 120, 0, 0)
         fcntl.ioctl(pty_slave_fd, termios.TIOCSWINSZ, winsize)
 
         process = await asyncio.create_subprocess_exec(
@@ -359,7 +297,6 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
         )
         os.close(pty_slave_fd)
 
-        # Wrap PTY master fd in an asyncio-friendly stream reader
         loop = asyncio.get_event_loop()
         pty_reader = asyncio.StreamReader()
         read_transport, _ = await loop.connect_read_pipe(
@@ -369,42 +306,43 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
         agent = SpawnedAgent(
             process=process,
-            message_id=msg.message_id,
+            label=label,
             spawned_at=time.monotonic(),
             pid=process.pid,
             spawn_mcp_config=spawn_mcp_path,
             raw_output_log_path=debug_log_path.replace("pidpending", str(process.pid)),
         )
-        # Attach PTY reader so _drain_stdout can use it instead of process.stdout
         agent._pty_reader = pty_reader
         agent._pty_transport = read_transport
         _spawned_agents.append(agent)
         _spawn_timestamps.append(time.monotonic())
         sandbox_label = " [sandboxed]" if sandboxed else ""
         print(
-            f"[DarkMatter] Spawned agent PID {process.pid}{sandbox_label} for message "
-            f"{msg.message_id[:12]}... from {msg.from_agent_id or 'unknown'}",
+            f"[DarkMatter] Spawned {label} PID {process.pid}{sandbox_label}",
             file=sys.stderr,
         )
-        print(f"[DarkMatter] Raw agent stdout log: {agent.raw_output_log_path}", file=sys.stderr)
 
-        asyncio.create_task(agent_timeout_watchdog(agent))
+        asyncio.create_task(_agent_timeout_watchdog(agent))
         asyncio.create_task(_drain_stdout(agent))
         asyncio.create_task(_reap_agent_when_done(agent))
 
     except FileNotFoundError:
         print(
-            f"[DarkMatter] Agent spawn failed: command '{command}' not found. "
-            f"Set DARKMATTER_CLIENT to a valid profile or DARKMATTER_AGENT_COMMAND to the correct path.",
+            f"[DarkMatter] Spawn failed: command '{command}' not found. "
+            f"Set DARKMATTER_CLIENT to a valid profile or DARKMATTER_AGENT_COMMAND.",
             file=sys.stderr,
         )
         try: os.remove(spawn_mcp_path)
         except OSError: pass
     except Exception as e:
-        print(f"[DarkMatter] Agent spawn failed: {e}", file=sys.stderr)
+        print(f"[DarkMatter] Spawn failed: {e}", file=sys.stderr)
         try: os.remove(spawn_mcp_path)
         except OSError: pass
 
+
+# =============================================================================
+# Background tasks for a spawned agent
+# =============================================================================
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
     """Read PTY output through a client-specific adapter, stream prose sections."""
@@ -432,7 +370,6 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
                         await cb(section)
                     except Exception:
                         pass
-        # Flush any remaining buffered prose
         for section in adapter.flush():
             for cb in list(agent.stdout_callbacks.values()):
                 try:
@@ -448,10 +385,7 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
 
 
 async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
-    """Await process completion so returncode gets set and the slot is freed.
-
-    Stdout is drained by _drain_stdout. We drain stderr here.
-    """
+    """Await process exit, then auto-respawn the main agent."""
     stderr_text = ""
     try:
         if agent.process.stderr:
@@ -461,24 +395,33 @@ async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
     except Exception:
         pass
     print(
-        f"[DarkMatter] Agent PID {agent.pid} finished (code={agent.process.returncode}), "
-        f"slot freed for new spawns",
+        f"[DarkMatter] Agent PID {agent.pid} finished (code={agent.process.returncode})",
         file=sys.stderr,
     )
     if stderr_text:
-        # Log last 2000 chars of stderr for debugging spawn failures
         tail = stderr_text[-2000:] if len(stderr_text) > 2000 else stderr_text
         print(f"[DarkMatter] Agent PID {agent.pid} stderr:\n{tail}", file=sys.stderr)
     cleanup_finished_agents()
 
+    # Auto-respawn
+    import darkmatter.config as _cfg
+    if _cfg.AGENT_SPAWN_ENABLED:
+        state = get_state()
+        if state:
+            print("[DarkMatter] Main agent exited — spawning fresh main agent", file=sys.stderr)
+            try:
+                await spawn_main_agent(state)
+            except Exception as e:
+                print(f"[DarkMatter] Failed to respawn main agent: {e}", file=sys.stderr)
 
-async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:
+
+async def _agent_timeout_watchdog(agent: SpawnedAgent) -> None:
     """Kill a spawned agent if it exceeds the timeout."""
     await asyncio.sleep(AGENT_SPAWN_TIMEOUT)
     if not is_agent_running(agent):
         return
     print(
-        f"[DarkMatter] Spawned agent PID {agent.pid} timed out after {AGENT_SPAWN_TIMEOUT}s, terminating...",
+        f"[DarkMatter] Agent PID {agent.pid} timed out after {AGENT_SPAWN_TIMEOUT}s, terminating...",
         file=sys.stderr,
     )
     try:
@@ -489,28 +432,3 @@ async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:
             kill_agent(agent, force=True)
     except ProcessLookupError:
         pass
-
-
-# =============================================================================
-# Standby Agent — spawn a ready agent immediately after one finishes
-# =============================================================================
-
-async def spawn_standby_agent(state: AgentState) -> None:
-    """Spawn a standby agent that waits for the next message.
-
-    Uses the same spawn_agent_for_message path as any other agent —
-    just with a "wait for activity" message. The agent calls
-    wait_for_message and responds when something arrives.
-    """
-    import uuid
-    ok, reason = can_spawn_agent()
-    if not ok:
-        print(f"[DarkMatter] Not spawning standby: {reason}", file=sys.stderr)
-        return
-
-    msg = QueuedMessage(
-        message_id=f"standby-{uuid.uuid4().hex[:12]}",
-        content="Wait for network activity.",
-        from_agent_id=state.agent_id,
-    )
-    await spawn_agent_for_message(state, msg)
