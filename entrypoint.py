@@ -1037,6 +1037,11 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             state.private_key_hex, state.agent_id, message_id, msg_timestamp, content
         )
 
+    # Tag messages as coming from the entrypoint (human) so receiving agents
+    # know to send frequent status updates via send_message instead of stdout.
+    merged_metadata = dict(metadata or {})
+    merged_metadata["from_entrypoint"] = True
+
     sent_to = []
     failed = []
     for conn in targets:
@@ -1045,7 +1050,7 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             payload = {
                 "message_id": message_id, "content": content,
                 "hops_remaining": 10,
-                "from_agent_id": state.agent_id, "metadata": metadata or {},
+                "from_agent_id": state.agent_id, "metadata": merged_metadata,
                 "timestamp": msg_timestamp, "from_public_key_hex": state.public_key_hex,
                 "signature_hex": signature_hex,
             }

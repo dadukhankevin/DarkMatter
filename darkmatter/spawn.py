@@ -187,6 +187,32 @@ After accepting, introduce yourself and share what you can help with.
 MANDATORY: When done, call darkmatter_complete_and_summarize summarizing what happened (accepted/rejected, who, why).
 """
 
+    is_human = bool(meta.get("from_entrypoint"))
+
+    if is_human:
+        human_instructions = """
+⚠️  CRITICAL — HUMAN CONVERSATION ⚠️
+This message is from a HUMAN using the DarkMatter entrypoint chat UI, NOT another agent.
+The human can ONLY see messages you send via darkmatter_send_message. Your normal text
+output (stdout) is COMPLETELY INVISIBLE to them. If you don't send_message, they see nothing.
+
+YOU MUST follow these rules:
+1. BEFORE every tool call or research step, send a short status message explaining what
+   you're about to do. Example: "Checking the git log for recent changes..."
+2. AFTER getting results, send a message with what you found before moving to the next step.
+3. NEVER go more than ~10 seconds without sending a message. If you're reading files,
+   running commands, or thinking, tell the human what you're doing.
+4. Prefer MANY short messages (1-3 sentences each) over fewer long messages.
+5. Be conversational — you're chatting with a person, not writing a report.
+6. Every piece of information the human needs MUST go through darkmatter_send_message.
+   Think of it as your ONLY output channel. Stdout does not exist for this conversation.
+
+BAD:  [read 5 files silently] → [one big summary message]
+GOOD: "Let me check that..." → "Found the config file..." → "Reading the handler..." → "Here's what I see: ..."
+"""
+    else:
+        human_instructions = ""
+
     return f"""\
 INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
 
@@ -194,7 +220,7 @@ INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
 
 Message {msg.message_id} from {msg.from_agent_id[:12]}:
 {msg.content}
-
+{human_instructions}
 HOW TO RESPOND:
 - darkmatter_send_message(content="your reply", target_agent_id="{msg.from_agent_id}", in_reply_to="{msg.message_id}")
 - For long tasks, send frequent status updates so the receiver sees progress (e.g. "Researching...", "Found the issue, working on a fix...").
