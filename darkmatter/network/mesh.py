@@ -945,6 +945,14 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         return {"error": "Message timestamp too old — possible replay"}, 403
 
     msg_metadata = data.get("metadata", {})
+
+    # Preserve in_reply_to in metadata so entrypoint UI can match replies to
+    # outbound messages.  The send_message tool puts in_reply_to at the top
+    # level of the payload, but the frontend looks for it inside metadata.
+    top_level_irt = data.get("in_reply_to")
+    if top_level_irt and "in_reply_to" not in msg_metadata:
+        msg_metadata["in_reply_to"] = top_level_irt
+
     is_broadcast = msg_metadata.get("type") == "broadcast"
 
     if is_broadcast:
@@ -1964,19 +1972,19 @@ async def handle_admin_update(request: Request) -> JSONResponse:
     if action != "pull_and_restart":
         return JSONResponse({"error": f"Unknown action: {action}"}, status_code=400)
 
+    import shlex
     import subprocess
-    import sys
+    from darkmatter.config import UPDATE_COMMAND
 
-    # Use pip upgrade since DarkMatter is pip-installed
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "dmagent"],
+            shlex.split(UPDATE_COMMAND),
             capture_output=True, text=True, timeout=60,
         )
         output = result.stdout.strip() or result.stderr.strip()
         success = result.returncode == 0
     except subprocess.TimeoutExpired:
-        output = "pip upgrade timed out after 60s"
+        output = f"Update command timed out after 60s: {UPDATE_COMMAND}"
         success = False
     except Exception as e:
         output = str(e)

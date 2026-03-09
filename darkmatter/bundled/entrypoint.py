@@ -875,8 +875,48 @@ def dm_accept_pending():
 
 
 def _get_typing_indicators() -> list[dict]:
-    """Return typing indicators (stub — streaming removed)."""
-    return []
+    """Return typing indicators for outbound messages awaiting a reply.
+
+    If we sent a message and the peer has spawned agents (meaning our message
+    is being processed), but no reply has arrived yet, show a typing indicator
+    so the human knows the agent is still working.
+    """
+    # Collect message IDs that have received replies (via in_reply_to metadata)
+    replied_ids = set()
+    for msg in state.message_queue:
+        meta = getattr(msg, "metadata", {}) or {}
+        irt = meta.get("in_reply_to")
+        if irt:
+            replied_ids.add(irt)
+    for e in state.conversation_log:
+        if e.direction == "inbound":
+            meta = e.metadata or {}
+            irt = meta.get("in_reply_to")
+            if irt:
+                replied_ids.add(irt)
+
+    indicators = []
+    # Look at recent outbound messages (last 10) for ones still awaiting reply
+    for e in reversed(state.conversation_log):
+        if len(indicators) >= 5:
+            break
+        if e.direction != "outbound" or e.from_agent_id != state.agent_id:
+            continue
+        if e.message_id in replied_ids:
+            continue
+        # Check if any target peer has spawned agents (i.e. is working on it)
+        for target_id in (e.to_agent_ids or []):
+            conn = state.connections.get(target_id)
+            if not conn:
+                continue
+            indicators.append({
+                "agent_id": target_id,
+                "display_name": conn.agent_display_name or target_id[:12],
+                "in_reply_to": e.message_id,
+                "content": "",
+                "started_at": e.timestamp,
+            })
+    return indicators
 
 
 _live_subscribers: list[queue.Queue] = []

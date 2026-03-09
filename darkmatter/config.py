@@ -275,6 +275,12 @@ def client_has(capability: str) -> bool:
     return capability in ACTIVE_CLIENT.get("capabilities", set())
 
 # =============================================================================
+# Update Command (used by admin_update route)
+# =============================================================================
+
+UPDATE_COMMAND = os.environ.get("DARKMATTER_UPDATE_COMMAND", "pip3 install --upgrade dmagent")
+
+# =============================================================================
 # Entrypoint (human node) Auto-Start
 # =============================================================================
 
