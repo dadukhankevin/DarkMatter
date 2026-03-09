@@ -1153,12 +1153,13 @@ async def complete_and_summarize(params: CompleteAndSummarizeInput, ctx: Context
             except Exception:
                 pass
 
-    # Spawn a fresh warm agent to replace this one
-    from darkmatter.spawn import spawn_warm_agent
-    try:
-        await spawn_warm_agent(state)
-    except Exception as e:
-        print(f"[DarkMatter] Warning: failed to spawn warm replacement: {e}", file=sys.stderr)
+    # Ensure a standby agent exists — if no one is waiting, spawn one
+    if not state._inbox_events:
+        from darkmatter.spawn import spawn_standby_agent
+        try:
+            await spawn_standby_agent(state)
+        except Exception as e:
+            print(f"[DarkMatter] Warning: failed to spawn standby: {e}", file=sys.stderr)
 
     result = {
         "success": True,

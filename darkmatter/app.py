@@ -225,14 +225,6 @@ def create_app() -> Router:
         # Auto-start entrypoint (human node) if not already running
         asyncio.create_task(ensure_entrypoint_running())
 
-        # Start warm agent pool maintainer
-        if AGENT_SPAWN_ENABLED:
-            from darkmatter.spawn import warm_pool_loop
-            from darkmatter.config import AGENT_WARM_POOL_ENABLED, AGENT_WARM_POOL_SIZE
-            if AGENT_WARM_POOL_ENABLED:
-                asyncio.create_task(warm_pool_loop())
-                print(f"[DarkMatter] Warm agent pool: ENABLED (size: {AGENT_WARM_POOL_SIZE})", file=sys.stderr)
-
         # Re-spawn agents for any queued messages left from a previous session
         # Skip messages older than 30 minutes — they're stale and the sender
         # has likely moved on.  Stale messages are removed from the queue.

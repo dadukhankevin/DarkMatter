@@ -768,9 +768,8 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
     if decision.action == RouterAction.HANDLE:
         import darkmatter.config as _cfg
         if _cfg.AGENT_SPAWN_ENABLED:
-            from darkmatter.spawn import claim_warm_agent, spawn_agent_for_message
-            if not claim_warm_agent(msg):
-                await spawn_agent_for_message(state, msg)
+            from darkmatter.spawn import spawn_agent_for_message
+            await spawn_agent_for_message(state, msg)
         # If spawn disabled, message stays in queue for manual handling
 
     elif decision.action == RouterAction.FORWARD:
@@ -892,6 +891,7 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     state.messages_handled += 1
 
     # Wake any agents waiting for new inbox messages
+    _agents_waiting_at_receive = len(state._inbox_events) > 0
     for evt in state._inbox_events:
         evt.set()
     state._inbox_events.clear()
@@ -924,11 +924,18 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
             save_state_fn=save_state,
         ))
 
-    # Route message through the extensible router chain.
-    # queue_only mode (entrypoints) skips routing entirely — messages just
-    # sit in the queue for the human to handle.
-    routed_to = "queued"
-    if state.router_mode != "queue_only":
+    # If an agent was already waiting (via wait_for_message), the inbox event
+    # woke it — it will drain the message from the queue.  Skip routing/spawn.
+    if _agents_waiting_at_receive:
+        print(f"[DarkMatter] Agent already waiting — message delivered via inbox event, skipping router", file=sys.stderr)
+        routed_to = "agent"
+    elif state.router_mode == "queue_only":
+        # queue_only mode (entrypoints) skips routing — messages just
+        # sit in the queue for the human to handle.
+        routed_to = "queued"
+    else:
+        # Route message through the extensible router chain.
+        routed_to = "queued"
         from darkmatter.router import execute_routing
         try:
             decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
@@ -943,6 +950,14 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
             import traceback
             print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+
+    # Ensure there's always one standby agent ready for the next message.
+    # If we just used the standby (or spawned fresh), and no one else is waiting, spawn one.
+    if routed_to == "agent" and not state._inbox_events:
+        import darkmatter.config as _cfg
+        if _cfg.AGENT_SPAWN_ENABLED:
+            from darkmatter.spawn import spawn_standby_agent
+            asyncio.create_task(spawn_standby_agent(state))
 
     return {
         "status": "received",
@@ -1214,8 +1229,6 @@ async def handle_status(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
     spawned_agents = get_spawned_agents()
-    from darkmatter.spawn import get_warm_agents
-    warm = get_warm_agents()
     return JSONResponse({
         "agent_id": state.agent_id,
         "display_name": state.display_name,
@@ -1225,8 +1238,6 @@ async def handle_status(request: Request) -> JSONResponse:
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "spawned_agents": len(spawned_agents),
-        "warm_agents": len(warm),
-        "active_agents": len(spawned_agents) - len(warm),
     })
 
 

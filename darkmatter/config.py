@@ -174,9 +174,7 @@ AGENT_SANDBOX = os.environ.get("DARKMATTER_SANDBOX", "false").lower() == "true"
 AGENT_SANDBOX_NETWORK = os.environ.get("DARKMATTER_SANDBOX_NETWORK", "true").lower() == "true"
 AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "2"))
 AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "15"))
-AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "300"))
-AGENT_WARM_POOL_ENABLED = os.environ.get("DARKMATTER_WARM_POOL", "true").lower() == "true"
-AGENT_WARM_POOL_SIZE = int(os.environ.get("DARKMATTER_WARM_POOL_SIZE", "1"))
+AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "1500"))  # 25 min — enough for 20 min idle wait
 
 # Client profiles — each entry describes how to invoke an MCP client as a spawned agent.
 # DARKMATTER_CLIENT env var selects the active profile (default: "claude-code").

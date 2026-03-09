@@ -899,7 +899,7 @@ def _persist_streamed_reply(from_id: str, indicator: dict, ended_at: str | None 
     if not content and chunks:
         content = _strip_stream_artifacts("".join(chunks)).strip()
     if not content:
-        content = "(streamed)"
+        return  # No prose extracted — don't persist an empty response
 
     if parent_id not in _streamed_responses:
         _streamed_responses[parent_id] = []

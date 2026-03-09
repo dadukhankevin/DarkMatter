@@ -166,6 +166,33 @@ def _cap_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words]) + "..."
 
 
+def _strip_tool_chrome(text: str) -> str:
+    """Remove MCP tool call chrome and terminal UI noise from content."""
+    import re
+    # Patterns that indicate tool call/response lines
+    _noise = re.compile(
+        r'darkmatter\s*-\s*\w.*\(MCP\).*'
+        r'|\(params:\s*\{.*'
+        r"|['\"]result['\"]:\s*['\"].*"
+        r'|⏺\s*darkmatter.*'
+        r'|⎿\s*(Running|{).*'
+        r'|[✶✻✽✳✢·]\s*(Channeling|Osmosing|Thinking|Reasoning).*'
+        r'|bypass\s*permissions?\s*on.*'
+        r'|shift\+tab\s*to\s*cycle.*'
+        r'|esc\s*to\s*interrupt.*'
+        r'|ctrl\+o\s*to\s*expand.*'
+        r'|\+\d+\s*lines\s*\(ctrl.*'
+        r'|▪▪▪.*'
+        r'|[⏵]+\s*bypass.*'
+    )
+    lines = text.split('\n')
+    cleaned = [l for l in lines if not _noise.search(l)]
+    result = '\n'.join(cleaned).strip()
+    # Collapse excessive whitespace left by removals
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result if result else '(no content)'
+
+
 def _format_entry(entry: ConversationEntry, state: AgentState,
                   full: bool = False) -> str:
     """Format a single conversation entry for prompt injection.
@@ -176,13 +203,16 @@ def _format_entry(entry: ConversationEntry, state: AgentState,
     ts = _format_time(entry.timestamp)
     sender = _agent_label(entry.from_agent_id, state)
 
+    # Strip tool call chrome from content before formatting
+    clean_content = _strip_tool_chrome(entry.content)
+
     if full:
         # Summaries get 5x the word cap — they're dense digests worth showing in full
         cap = CONTEXT_MAX_WORDS * 5 if entry.entry_type == "summary" else CONTEXT_MAX_WORDS
-        content = _cap_words(entry.content, cap)
+        content = _cap_words(clean_content, cap)
     else:
-        content = entry.content[:200]
-        if len(entry.content) > 200:
+        content = clean_content[:200]
+        if len(clean_content) > 200:
             content += "..."
 
     # Summaries get special formatting — show them prominently

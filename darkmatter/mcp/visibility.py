@@ -49,16 +49,9 @@ def build_status_line() -> str:
 
     agent_label = state.display_name or state.agent_id[:12]
     spawned = get_spawned_agents()
-    from darkmatter.spawn import get_warm_agents
-    warm_count = len(get_warm_agents())
-    active_count = len(spawned) - warm_count
+    active_count = len(spawned)
     if AGENT_SPAWN_ENABLED:
-        parts_a = []
-        if active_count > 0:
-            parts_a.append(f"{active_count} active")
-        if warm_count > 0:
-            parts_a.append(f"{warm_count} warm")
-        agent_suffix = f" | Agents: {', '.join(parts_a)}" if parts_a else " | Agents: 0"
+        agent_suffix = f" | Agents: {active_count}" if active_count > 0 else " | Agents: 0"
     else:
         agent_suffix = ""
     wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in state.wallets.items()]

@@ -16,8 +16,6 @@ from darkmatter.config import (
     AGENT_SPAWN_MAX_CONCURRENT,
     AGENT_SPAWN_MAX_PER_HOUR,
     AGENT_SPAWN_TIMEOUT,
-    AGENT_WARM_POOL_ENABLED,
-    AGENT_WARM_POOL_SIZE,
     ACTIVE_CLIENT,
 )
 from darkmatter.models import AgentState, QueuedMessage
@@ -39,7 +37,6 @@ class SpawnedAgent:
     spawned_at: float
     pid: int
     spawn_mcp_config: str = ""  # .mcp.json path to clean up when agent exits
-    is_warm: bool = False  # True for pre-spawned agents waiting for work
     # Stdout streaming: dict of message_id → async callable(chunk: str)
     # Multiple callbacks = nested messages, chunks go to all active targets
     stdout_callbacks: dict = None  # Initialized to {} in __post_init__
@@ -197,12 +194,17 @@ INCOMING MESSAGE — Act now. Be proactive: reply, forward, or both.
 Message {msg.message_id} from {msg.from_agent_id[:12]}:
 {msg.content}
 
-INSTRUCTIONS:
-1. Call begin_message(target_agent_id="{msg.from_agent_id}", in_reply_to="{msg.message_id}") FIRST. This starts streaming your stdout to the receiver in real time.
-2. Write your response naturally — everything you output between begin and end streams live to the receiver.
-3. Call end_message(message_id=...) when done. This just signals "stop streaming" — nothing else needed.
-4. If this message is better suited for another peer, forward it: begin_message(target_agent_id=<peer>, forward_message_ids=["{msg.message_id}"]).
-5. MANDATORY: When done, call darkmatter_complete_and_summarize with a dense summary of what you did, referencing peers with @agent_id, listing shard tags you created, and anything the hivemind should know.
+HOW TO RESPOND:
+- begin_message(target_agent_id="{msg.from_agent_id}", in_reply_to="{msg.message_id}") starts streaming your output live to the receiver.
+- Write your response naturally — everything between begin and end streams in real time.
+- end_message(message_id=...) signals you're done writing.
+- To forward instead: begin_message(target_agent_id=<peer>, forward_message_ids=["{msg.message_id}"]).
+
+STAY ALIVE:
+After responding, call darkmatter_wait_for_message(timeout_seconds=1200) and stay available for follow-ups. This is a conversation — keep the loop going. Respond to each new message the same way (begin/end), then wait again. You are the agent for this conversation; don't exit after one reply.
+
+WHEN TO EXIT:
+Call darkmatter_complete_and_summarize ONLY when the conversation has naturally concluded — the task is done, the topic is resolved, or the human says goodbye. Write a dense summary of what you did, reference peers with @agent_id, and note anything the hivemind should know.
 """
 
 
@@ -368,23 +370,12 @@ async def spawn_agent_for_message(state: AgentState, msg: QueuedMessage,
 
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
-    """Read PTY output, strip terminal control codes, stream text sections.
-
-    General-purpose: strips ANSI escapes, handles bare \\r (line overwrites),
-    and sends all non-empty sections via callbacks.  The frontend's word-count
-    threshold (CHUNK_WORD_THRESHOLD) decides what's prose vs tool chrome.
-    """
+    """Read PTY output through a client-specific adapter, stream prose sections."""
     reader = getattr(agent, "_pty_reader", None) or agent.process.stdout
     if not reader:
         return
-    import re
-    _ansi_re = re.compile(
-        r'\x1b\[[0-9;?]*[A-Za-z]'    # CSI sequences (colors, cursor, etc.)
-        r'|\x1b\][^\x07]*\x07'        # OSC sequences
-        r'|\x1b[()][A-Z0-9]'          # Charset designation
-        r'|\x1b[78=>cDEHMNOZ]'        # 2-byte escapes
-    )
-    esc_buf = ""
+    from darkmatter.adapters import get_adapter
+    adapter = get_adapter(ACTIVE_CLIENT)
     try:
         while True:
             chunk = await reader.read(4096)
@@ -392,30 +383,19 @@ async def _drain_stdout(agent: SpawnedAgent) -> None:
                 break
             if not agent.stdout_callbacks:
                 continue
-            raw = esc_buf + chunk.decode("utf-8", errors="replace")
-            esc_buf = ""
-            # Buffer incomplete escape sequence at end of chunk
-            last_esc = raw.rfind('\x1b')
-            if last_esc >= 0 and not _ansi_re.search(raw[last_esc:]):
-                esc_buf = raw[last_esc:]
-                raw = raw[:last_esc]
-            # Strip all ANSI escape sequences
-            text = _ansi_re.sub('', raw)
-            # Handle bare \r (terminal line overwrite): keep only text after last \r
-            lines = text.split('\n')
-            lines = [l.rsplit('\r', 1)[-1] for l in lines]
-            text = '\n'.join(lines)
-            # Collapse excessive blank lines, split into paragraph sections
-            text = re.sub(r'\n{3,}', '\n\n', text).strip()
-            if not text:
-                continue
-            sections = [s.strip() for s in text.split('\n\n') if s.strip()]
-            for section in sections:
+            for section in adapter.feed(chunk):
                 for cb in list(agent.stdout_callbacks.values()):
                     try:
                         await cb(section)
                     except Exception:
                         pass
+        # Flush any remaining buffered prose
+        for section in adapter.flush():
+            for cb in list(agent.stdout_callbacks.values()):
+                try:
+                    await cb(section)
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
@@ -429,9 +409,11 @@ async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
 
     Stdout is drained by _drain_stdout. We drain stderr here.
     """
+    stderr_text = ""
     try:
         if agent.process.stderr:
-            asyncio.ensure_future(agent.process.stderr.read())
+            stderr_data = await agent.process.stderr.read()
+            stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
         await agent.process.wait()
     except Exception:
         pass
@@ -440,23 +422,15 @@ async def _reap_agent_when_done(agent: SpawnedAgent) -> None:
         f"slot freed for new spawns",
         file=sys.stderr,
     )
+    if stderr_text:
+        # Log last 2000 chars of stderr for debugging spawn failures
+        tail = stderr_text[-2000:] if len(stderr_text) > 2000 else stderr_text
+        print(f"[DarkMatter] Agent PID {agent.pid} stderr:\n{tail}", file=sys.stderr)
     cleanup_finished_agents()
 
 
 async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:
-    """Kill a spawned agent if it exceeds the timeout.
-
-    Warm agents don't timeout — their whole purpose is to stay alive and wait.
-    Once claimed (is_warm flipped to False), the normal timeout applies from
-    that point.
-    """
-    # While the agent is warm, just sleep and re-check. Don't kill it.
-    while agent.is_warm:
-        await asyncio.sleep(30)
-        if not is_agent_running(agent):
-            return
-
-    # Agent is active (either never warm, or just claimed). Apply normal timeout.
+    """Kill a spawned agent if it exceeds the timeout."""
     await asyncio.sleep(AGENT_SPAWN_TIMEOUT)
     if not is_agent_running(agent):
         return
@@ -475,215 +449,25 @@ async def agent_timeout_watchdog(agent: SpawnedAgent) -> None:
 
 
 # =============================================================================
-# Warm Agent Pool
+# Standby Agent — spawn a ready agent immediately after one finishes
 # =============================================================================
 
-def build_warm_agent_prompt(state: AgentState) -> str:
-    """Build the prompt for a pre-spawned warm agent that waits for work."""
-    from darkmatter.context import get_context
-    context = get_context(state, mode="full")
+async def spawn_standby_agent(state: AgentState) -> None:
+    """Spawn a standby agent that waits for the next message.
 
-    return f"""\
-PRE-SPAWNED AGENT — You are already running and waiting for work. Act IMMEDIATELY when a message arrives.
-
-{context}
-
-INSTRUCTIONS:
-1. Call darkmatter_update_bio to set your display name and bio.
-2. Call darkmatter_wait_for_message(timeout_seconds=86400) to block until a message arrives.
-3. When a message arrives (returned by wait_for_message), respond: call begin_message(target_agent_id=<sender>, in_reply_to=<id>) FIRST, write your response, then end_message.
-4. If the message is better suited for a peer, forward it: begin_message(target_agent_id=<peer>, forward_message_ids=[<id>]).
-5. MANDATORY: When done, call darkmatter_complete_and_summarize with a dense summary of what you did, referencing peers with @agent_id, listing shard tags you created, and anything the hivemind should know. This ends your session.
-"""
-
-
-def get_warm_agents() -> list[SpawnedAgent]:
-    """Return currently running warm agents."""
-    return [a for a in _spawned_agents if a.is_warm and is_agent_running(a)]
-
-
-def claim_warm_agent(msg: QueuedMessage) -> bool:
-    """Claim a warm agent for a specific message. Returns True if one was available.
-
-    The warm agent is already blocked on wait_for_message — when the inbox event
-    fires (from message arrival), it wakes up and handles the message automatically.
-    We just mark it as non-warm so it's not reclaimed.
+    Uses the same spawn_agent_for_message path as any other agent —
+    just with a "wait for activity" message. The agent calls
+    wait_for_message and responds when something arrives.
     """
-    warm = get_warm_agents()
-    if not warm:
-        return False
-    agent = warm[0]
-    agent.is_warm = False
-    agent.message_id = msg.message_id
-    print(
-        f"[DarkMatter] Warm agent PID {agent.pid} claimed for message {msg.message_id[:12]}...",
-        file=sys.stderr,
-    )
-    return True
-
-
-async def spawn_warm_agent(state: AgentState) -> None:
-    """Spawn a warm agent that blocks on wait_for_message until work arrives."""
     import uuid
     ok, reason = can_spawn_agent()
     if not ok:
+        print(f"[DarkMatter] Not spawning standby: {reason}", file=sys.stderr)
         return
 
-    synthetic_id = f"warm-{uuid.uuid4().hex[:16]}"
-    prompt = build_warm_agent_prompt(state)
-
-    # Build a synthetic QueuedMessage so we can reuse spawn_agent_for_message's
-    # subprocess machinery without duplicating it.
     msg = QueuedMessage(
-        message_id=synthetic_id,
-        content="",
+        message_id=f"standby-{uuid.uuid4().hex[:12]}",
+        content="Wait for network activity.",
         from_agent_id=state.agent_id,
     )
-
-    env = os.environ.copy()
-    env["DARKMATTER_AGENT_ENABLED"] = "false"
-    env["DARKMATTER_ENTRYPOINT_AUTOSTART"] = "false"
-    for var in ACTIVE_CLIENT["env_cleanup"]:
-        env.pop(var, None)
-
-    import json as _json
-    import tempfile as _tempfile
-    spawn_dir = _PROJECT_DIR
-    mcp_config = {
-        "mcpServers": {
-            "darkmatter": {
-                "type": "http",
-                "url": f"http://127.0.0.1:{state.port}/mcp",
-            }
-        }
-    }
-    spawn_mcp_fd, spawn_mcp_path = _tempfile.mkstemp(
-        prefix="darkmatter-warm-mcp-", suffix=".json"
-    )
-    with os.fdopen(spawn_mcp_fd, "w") as f:
-        _json.dump(mcp_config, f)
-
-    command = ACTIVE_CLIENT["command"]
-    args = list(ACTIVE_CLIENT["args"])
-
-    mcp_via_cli = "mcp_stdio" in ACTIVE_CLIENT.get("capabilities", set())
-    if mcp_via_cli:
-        args.extend(["--mcp-config", spawn_mcp_path, "--strict-mcp-config"])
-    prompt_style = ACTIVE_CLIENT.get("prompt_style", "positional")
-
-    safe_prompt = prompt.replace('"', "'").replace('`', "'").replace('$', '')
-
-    if prompt_style == "positional":
-        args.append(safe_prompt)
-    elif prompt_style.startswith("flag:"):
-        flag_name = prompt_style.split(":", 1)[1]
-        args.extend([f"--{flag_name}", safe_prompt])
-
-    exec_argv = [command] + args
-    sandboxed = False
-    if _cfg.AGENT_SANDBOX:
-        from darkmatter.sandbox import build_sandbox_command
-        sandbox_argv = build_sandbox_command(
-            command=exec_argv,
-            writable_roots=[spawn_dir],
-            network=_cfg.AGENT_SANDBOX_NETWORK,
-        )
-        if sandbox_argv is not None:
-            exec_argv = sandbox_argv
-            sandboxed = True
-
-    try:
-        import pty as _pty
-        import fcntl, struct, termios
-        pty_master_fd, pty_slave_fd = _pty.openpty()
-        winsize = struct.pack("HHHH", 24, 120, 0, 0)
-        fcntl.ioctl(pty_slave_fd, termios.TIOCSWINSZ, winsize)
-
-        process = await asyncio.create_subprocess_exec(
-            *exec_argv,
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=pty_slave_fd,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=spawn_dir,
-        )
-        os.close(pty_slave_fd)
-
-        loop = asyncio.get_event_loop()
-        pty_reader = asyncio.StreamReader()
-        read_transport, _ = await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(pty_reader),
-            os.fdopen(pty_master_fd, "rb", 0),
-        )
-
-        agent = SpawnedAgent(
-            process=process,
-            message_id=synthetic_id,
-            spawned_at=time.monotonic(),
-            pid=process.pid,
-            spawn_mcp_config=spawn_mcp_path,
-            is_warm=True,
-        )
-        agent._pty_reader = pty_reader
-        agent._pty_transport = read_transport
-        _spawned_agents.append(agent)
-        _spawn_timestamps.append(time.monotonic())
-        sandbox_label = " [sandboxed]" if sandboxed else ""
-        print(
-            f"[DarkMatter] Warm agent spawned PID {process.pid}{sandbox_label} "
-            f"(pool slot, waiting for work)",
-            file=sys.stderr,
-        )
-
-        asyncio.create_task(agent_timeout_watchdog(agent))
-        asyncio.create_task(_drain_stdout(agent))
-        asyncio.create_task(_reap_agent_when_done(agent))
-
-    except FileNotFoundError:
-        print(
-            f"[DarkMatter] Warm agent spawn failed: command '{command}' not found.",
-            file=sys.stderr,
-        )
-        try: os.remove(spawn_mcp_path)
-        except OSError: pass
-    except Exception as e:
-        print(f"[DarkMatter] Warm agent spawn failed: {e}", file=sys.stderr)
-        try: os.remove(spawn_mcp_path)
-        except OSError: pass
-
-
-async def warm_pool_loop() -> None:
-    """Background loop that maintains the warm agent pool."""
-    # Wait for startup spawns to settle
-    await asyncio.sleep(15)
-
-    while True:
-        try:
-            state = get_state()
-            if state is None:
-                await asyncio.sleep(10)
-                continue
-
-            if not (_cfg.AGENT_SPAWN_ENABLED and AGENT_WARM_POOL_ENABLED
-                    and state.router_mode == "spawn"):
-                await asyncio.sleep(30)
-                continue
-
-            # Don't pre-spawn warm agents until at least one cold spawn has happened.
-            # Avoids wasting resources on nodes that aren't actively receiving messages.
-            if state.messages_handled == 0:
-                await asyncio.sleep(30)
-                continue
-
-            cleanup_finished_agents()
-            warm_count = len(get_warm_agents())
-            if warm_count < AGENT_WARM_POOL_SIZE:
-                ok, reason = can_spawn_agent()
-                if ok:
-                    await spawn_warm_agent(state)
-                else:
-                    print(f"[DarkMatter] Warm pool: can't spawn ({reason}), will retry", file=sys.stderr)
-        except Exception as e:
-            print(f"[DarkMatter] Warm pool loop error: {e}", file=sys.stderr)
-
-        await asyncio.sleep(10)
+    await spawn_agent_for_message(state, msg)
