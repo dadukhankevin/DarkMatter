@@ -95,6 +95,7 @@ class HttpTransport(Transport):
         base_url = strip_base_url(conn.agent_url)
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(base_url + path, json=payload)
+            resp.raise_for_status()
             result = resp.json()
             result["transport"] = "http"
             return result

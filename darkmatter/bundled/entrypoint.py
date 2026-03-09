@@ -1050,19 +1050,19 @@ def _sync_send_message(content, target_agent_id=None, metadata=None):
             return {"success": False, "error": "No agents connected."}
         targets = [best]
 
+    # Append a hint so agents send frequent updates visible in the chat UI.
+    entrypoint_content = content + "\n\n[Send frequent quick updates as you work.]"
+
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     signature_hex = None
     if state.private_key_hex:
         signature_hex = sign_message(
-            state.private_key_hex, state.agent_id, message_id, msg_timestamp, content
+            state.private_key_hex, state.agent_id, message_id, msg_timestamp, entrypoint_content
         )
 
     # Tag messages as coming from the entrypoint (human).
     merged_metadata = dict(metadata or {})
     merged_metadata["from_entrypoint"] = True
-
-    # Append a hint so agents send frequent updates visible in the chat UI.
-    entrypoint_content = content + "\n\n[Send frequent quick updates as you work.]"
 
     sent_to = []
     failed = []

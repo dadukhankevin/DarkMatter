@@ -7,10 +7,12 @@ Depends on: everything (by design — this IS the composition root)
 
 import asyncio
 import contextlib
+import logging
 import os
 import subprocess
 import sys
 import time
+import traceback
 from typing import Optional
 
 import anyio
@@ -288,6 +290,85 @@ def create_app() -> Router:
     mcp_handler = mcp_starlette.routes[0].app  # StreamableHTTPASGIApp
     session_manager = mcp_handler.session_manager
 
+    # Monkey-patch _handle_stateful_request to make session tasks fault-tolerant.
+    # The MCP SDK uses a single anyio task group for ALL sessions — if one session's
+    # run_server task raises, the ENTIRE server crashes. We wrap each run_server to
+    # catch all exceptions so one session dying doesn't kill the others.
+    _original_handle_stateful = session_manager._handle_stateful_request
+
+    async def _resilient_handle_stateful(scope, receive, send):
+        from starlette.requests import Request as _Request
+        from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
+
+        request = _Request(scope, receive)
+        request_session_id = request.headers.get(MCP_SESSION_ID_HEADER)
+
+        # For existing sessions, delegate directly (no new task spawned)
+        if request_session_id is not None and request_session_id in session_manager._server_instances:
+            transport = session_manager._server_instances[request_session_id]
+            await transport.handle_request(scope, receive, send)
+            return
+
+        if request_session_id is None:
+            # New session — wrap run_server to be fault-tolerant
+            async with session_manager._session_creation_lock:
+                from uuid import uuid4 as _uuid4
+                from mcp.server.streamable_http import StreamableHTTPServerTransport
+                from anyio.abc import TaskStatus as _TaskStatus
+
+                new_session_id = _uuid4().hex
+                http_transport = StreamableHTTPServerTransport(
+                    mcp_session_id=new_session_id,
+                    is_json_response_enabled=session_manager.json_response,
+                    event_store=session_manager.event_store,
+                    security_settings=session_manager.security_settings,
+                    retry_interval=session_manager.retry_interval,
+                )
+                assert http_transport.mcp_session_id is not None
+                session_manager._server_instances[http_transport.mcp_session_id] = http_transport
+                print(f"[DarkMatter] New MCP session: {new_session_id[:16]}...", file=sys.stderr)
+
+                async def run_server_resilient(*, task_status: _TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
+                    try:
+                        async with http_transport.connect() as streams:
+                            read_stream, write_stream = streams
+                            task_status.started()
+                            try:
+                                await session_manager.app.run(
+                                    read_stream,
+                                    write_stream,
+                                    session_manager.app.create_initialization_options(),
+                                    stateless=False,
+                                )
+                            except Exception as e:
+                                print(f"[DarkMatter] MCP session {new_session_id[:16]} app.run error: {e}", file=sys.stderr)
+                    except BaseException as e:
+                        # Catch EVERYTHING — prevent one session from killing the task group
+                        print(f"[DarkMatter] MCP session {new_session_id[:16]} crashed: {type(e).__name__}: {e}", file=sys.stderr)
+                    finally:
+                        if (
+                            http_transport.mcp_session_id
+                            and http_transport.mcp_session_id in session_manager._server_instances
+                            and not http_transport.is_terminated
+                        ):
+                            del session_manager._server_instances[http_transport.mcp_session_id]
+                            print(f"[DarkMatter] Cleaned up session {new_session_id[:16]}", file=sys.stderr)
+
+                assert session_manager._task_group is not None
+                await session_manager._task_group.start(run_server_resilient)
+                await http_transport.handle_request(scope, receive, send)
+        else:
+            # Unknown session ID
+            from starlette.responses import Response as _Response
+            response = _Response(
+                '{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}',
+                status_code=404,
+                media_type="application/json",
+            )
+            await response(scope, receive, send)
+
+    session_manager._handle_stateful_request = _resilient_handle_stateful
+
     @contextlib.asynccontextmanager
     async def lifespan(app):
         # Start MCP session manager + run our startup hooks
@@ -523,6 +604,40 @@ def main() -> None:
         anyio.run(run_stdio_with_http)
     else:
         # Standalone HTTP mode (manual start, or DARKMATTER_TRANSPORT=http)
+        # Enable MCP SDK debug logging to catch session crashes
+        logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+        logging.getLogger("mcp").setLevel(logging.DEBUG)
+        logging.getLogger("mcp.server.streamable_http").setLevel(logging.DEBUG)
+        logging.getLogger("mcp.server.streamable_http_manager").setLevel(logging.DEBUG)
+
+        # Install asyncio exception handler to catch unhandled task failures
+        def _asyncio_exception_handler(loop, context):
+            exc = context.get("exception")
+            msg = context.get("message", "")
+            print(f"[DarkMatter] ASYNCIO UNHANDLED EXCEPTION: {msg}", file=sys.stderr)
+            if exc:
+                print(f"[DarkMatter]   Exception: {type(exc).__name__}: {exc}", file=sys.stderr)
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+            else:
+                print(f"[DarkMatter]   Context: {context}", file=sys.stderr)
+
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(_asyncio_exception_handler)
+        asyncio.set_event_loop(loop)
+
+        # Install signal trackers to log what triggers shutdown
+        import signal as _signal
+        for sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
+            old_handler = _signal.getsignal(sig)
+            def _sig_handler(signum, frame, _old=old_handler, _name=sig.name):
+                print(f"[DarkMatter] RECEIVED SIGNAL {_name} ({signum})", file=sys.stderr)
+                traceback.print_stack(frame, file=sys.stderr)
+                if callable(_old) and _old not in (_signal.SIG_DFL, _signal.SIG_IGN):
+                    _old(signum, frame)
+                elif _old == _signal.SIG_DFL:
+                    raise SystemExit(128 + signum)
+            _signal.signal(sig, _sig_handler)
+
         app = create_app()
         discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
         print_startup_banner(port, "streamable-http", discovery_enabled)

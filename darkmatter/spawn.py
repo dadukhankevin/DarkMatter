@@ -280,6 +280,9 @@ async def _spawn_process(state: AgentState, prompt: str, label: str) -> None:
             f"{int(time.time())}-{label}-pidpending.log",
         )
 
+        # PTY needed so Claude Code detects a terminal and runs interactively.
+        # start_new_session=True isolates child from daemon's process group,
+        # preventing SIGTERM propagation that previously killed the daemon.
         import pty as _pty
         import fcntl, struct, termios
         pty_master_fd, pty_slave_fd = _pty.openpty()
@@ -293,6 +296,7 @@ async def _spawn_process(state: AgentState, prompt: str, label: str) -> None:
             stdout=pty_slave_fd,
             stderr=asyncio.subprocess.PIPE,
             cwd=spawn_dir,
+            start_new_session=True,
         )
         os.close(pty_slave_fd)
 
@@ -344,7 +348,7 @@ async def _spawn_process(state: AgentState, prompt: str, label: str) -> None:
 # =============================================================================
 
 async def _drain_stdout(agent: SpawnedAgent) -> None:
-    """Read PTY output through a client-specific adapter, stream prose sections."""
+    """Read PTY/stdout through a client-specific adapter, stream prose sections."""
     reader = getattr(agent, "_pty_reader", None) or agent.process.stdout
     if not reader:
         return
