@@ -81,8 +81,9 @@
         <span class="text-[11px] text-muted font-semibold uppercase tracking-wider">Connections</span>
         <div class="flex items-center gap-2">
           <button id="update-all-btn" onclick="updateAllAgents()" title="pip upgrade &amp; restart all LAN agents"
-            class="glass-btn text-[10px] px-2 py-0.5"
-            Update All
+            class="glass-btn text-[10px] px-2 py-0.5 flex items-center gap-1">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+            Update Software
           </button>
           <span class="text-[11px] text-muted" id="sidebar-conn-count">0</span>
         </div>
@@ -277,7 +278,6 @@
       <div class="text-[12px] text-label mt-1.5" id="tooltip-bio"></div>
       <div class="text-[11px] text-muted mt-1" id="tooltip-level"></div>
       <button id="tooltip-connect-btn" class="hidden mt-2 w-full glass-btn text-[12px] py-1.5" onclick="connectFromTooltip()">Connect</button>
-      <button id="tooltip-disconnect-btn" class="hidden mt-2 w-full glass-btn text-[12px] py-1.5 text-red-400 hover:text-red-300" onclick="disconnectFromTooltip()">Disconnect</button>
     </div>
   </div>
 
@@ -849,6 +849,7 @@ function buildFeedItems(data) {
   const items = [];
   const conns = data.connections || [];
   const findConn = (id) => conns.find(cn => cn.agent_id === id);
+  const selfId = data.self ? data.self.agent_id : null;
   const responseItems = new Map();
 
   function upsertResponseItem(parentId, agentId, next) {
@@ -864,88 +865,71 @@ function buildFeedItems(data) {
       from_name: next.from_name || prev.from_name || shortId(agentId),
       content: next.content !== undefined ? next.content : (prev.content || ''),
       is_streaming: next.is_streaming !== undefined ? next.is_streaming : !!prev.is_streaming,
-      chunks: next.chunks || prev.chunks || [],
     });
   }
 
-  // Outbound messages
-  for (const msg of (data.outbox || [])) {
-    items.push({
-      id: 'out_' + msg.message_id,
-      type: 'outbound',
-      content: msg.content,
-      timestamp: msg.created_at,
-      status: msg.status,
-      routed_to: msg.routed_to || [],
-      routed_to_names: msg.routed_to_names || [],
-      updates: msg.updates || [],
-      responses: msg.responses || [],
-      message_id: msg.message_id,
-      attachments: (msg.metadata || {}).attachments || [],
-    });
-
-    // Responses to sent messages appear as inbound replies
-    for (const r of (msg.responses || [])) {
-      const c = findConn(r.agent_id);
-      upsertResponseItem(msg.message_id, r.agent_id, {
-        content: r.response,
-        chunks: r.chunks || [],
-        timestamp: r.timestamp || msg.created_at,
-        from_name: c ? agentLabel(c) : (r.display_name || shortId(r.agent_id)),
-        is_streaming: false,
+  // Build feed from conversation_log — the single source of truth
+  for (const e of (data.conversation || [])) {
+    const meta = e.metadata || {};
+    if (e.direction === 'outbound' && e.from_agent_id === selfId) {
+      // Human's outbound messages
+      items.push({
+        id: 'out_' + e.message_id,
+        type: 'outbound',
+        content: e.content,
+        timestamp: e.timestamp,
+        status: 'sent',
+        routed_to: e.to_agent_ids || [],
+        routed_to_names: (e.to_agent_ids || []).map(id => {
+          const c = findConn(id);
+          return c ? agentLabel(c) : shortId(id);
+        }),
+        message_id: e.message_id,
+        attachments: meta.attachments || [],
       });
+    } else if (e.direction === 'inbound') {
+      // Agent replies — nest under parent if in_reply_to, else standalone
+      const c = findConn(e.from_agent_id);
+      const name = c ? agentLabel(c) : (e.from_name || shortId(e.from_agent_id));
+      const replyTo = meta.in_reply_to || null;
+      if (replyTo) {
+        upsertResponseItem(replyTo, e.from_agent_id, {
+          content: e.content,
+          timestamp: e.timestamp,
+          from_name: name,
+          is_streaming: false,
+        });
+      } else {
+        items.push({
+          id: 'in_' + e.message_id,
+          type: 'inbound',
+          content: e.content,
+          timestamp: e.timestamp,
+          from_name: name,
+          from_agent_id: e.from_agent_id,
+          message_id: e.message_id,
+          attachments: meta.attachments || [],
+        });
+      }
     }
   }
 
+  // Typing indicators — shown when an agent is NOT in wait_for_message
   for (const t of (data.typing || [])) {
-    if (!t.in_reply_to) continue;
     const c = findConn(t.agent_id);
-    upsertResponseItem(t.in_reply_to, t.agent_id, {
-      content: t.content || '',
-      timestamp: t.started_at,
-      from_name: c ? agentLabel(c) : (t.display_name || shortId(t.agent_id)),
+    const displayName = c ? agentLabel(c) : (t.display_name || shortId(t.agent_id));
+    items.push({
+      id: 'typing_' + t.agent_id,
+      type: 'typing',
+      content: '',
+      timestamp: new Date().toISOString(),
+      from_name: displayName,
+      agent_id: t.agent_id,
       is_streaming: true,
-      chunks: t.chunks || [],
     });
   }
 
   items.push(...responseItems.values());
-
-  // Inbound messages
-  for (const msg of (data.inbox || [])) {
-    const c = findConn(msg.from_agent_id);
-    items.push({
-      id: 'in_' + msg.message_id,
-      type: 'inbound',
-      content: msg.content,
-      timestamp: msg.received_at,
-      from_name: c ? agentLabel(c) : (msg.from_display_name || shortId(msg.from_agent_id)),
-      from_agent_id: msg.from_agent_id,
-      message_id: msg.message_id,
-      attachments: (msg.metadata || {}).attachments || [],
-    });
-  }
-
-  // Conversation log entries (broadcasts, forwards, handled messages).
-  // Skip entries already shown as inbox/outbox items to avoid duplicates.
-  const seenMsgIds = new Set(items.map(i => i.message_id).filter(Boolean));
-  for (const entry of (data.conversation || [])) {
-    if (seenMsgIds.has(entry.message_id)) continue;
-    const c = findConn(entry.from_agent_id);
-    const fromName = c ? agentLabel(c) : (entry.from_name || shortId(entry.from_agent_id));
-    items.push({
-      id: 'conv_' + entry.message_id,
-      type: entry.entry_type === 'broadcast' ? 'broadcast'
-          : entry.direction === 'outbound' ? 'outbound_log'
-          : 'inbound_log',
-      content: entry.content,
-      timestamp: entry.timestamp,
-      from_name: fromName,
-      from_agent_id: entry.from_agent_id,
-      entry_type: entry.entry_type,
-      direction: entry.direction,
-    });
-  }
 
   // Shards
   for (const shard of (data.shards || [])) {
@@ -977,7 +961,6 @@ function feedItemSignature(item) {
     status: item.status || '',
     timestamp: item.timestamp || '',
     is_streaming: !!item.is_streaming,
-    chunks_len: (item.chunks || []).length,
     updates: item.updates || [],
     routed_to: item.routed_to || [],
     routed_to_names: item.routed_to_names || [],
@@ -1072,29 +1055,7 @@ function renderFeedItem(item) {
   } else if (item.type === 'response') {
     const aColor = agentColor(item.from_agent_id);
     const tint = agentTint(item.from_agent_id);
-    const chunks = item.chunks || [];
-    const CHUNK_WORD_THRESHOLD = 12;  // word count — prose has many words, tool chrome has few
-    function wordCount(s) { return s.split(/\s+/).filter(Boolean).length; }
-    // Render chunks: prose (many words) as markdown, tool chrome (few words) as collapsed lines
-    let chunksHtml = '';
-    if (chunks.length > 0) {
-      for (let i = 0; i < chunks.length; i++) {
-        const c = chunks[i].trim();
-        if (!c) continue;
-        if (wordCount(c) >= CHUNK_WORD_THRESHOLD) {
-          chunksHtml += `<div class="msg-content">${renderMd(c)}</div>`;
-        } else {
-          chunksHtml += `<div class="chunk-tool" title="${esc(c)}">${esc(c)}</div>`;
-        }
-      }
-    }
-    if (!chunksHtml && item.content && item.content.trim()) {
-      // Fallback: no chunks (completed response from history), render full content
-      chunksHtml = `<div class="msg-content">${renderMd(item.content)}</div>`;
-    }
-    if (!chunksHtml) {
-      chunksHtml = '<span class="msg-meta">Thinking...</span>';
-    }
+    const content = item.content && item.content.trim().length ? renderMd(item.content) : '<span class="msg-meta">Thinking...</span>';
     el.innerHTML = `
       <div class="msg-block msg-block-in" style="background:${tint};${item.is_streaming ? 'opacity:0.9' : ''}">
         <div class="flex items-baseline gap-3 mb-1.5">
@@ -1102,7 +1063,17 @@ function renderFeedItem(item) {
           <span class="msg-meta" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
           ${item.is_streaming ? `<span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>` : ''}
         </div>
-        ${chunksHtml}
+        <div class="msg-content">${content}</div>
+      </div>`;
+  } else if (item.type === 'typing') {
+    const aColor = agentColor(item.agent_id);
+    const tint = agentTint(item.agent_id);
+    el.innerHTML = `
+      <div class="msg-block msg-block-in" style="background:${tint};opacity:0.85">
+        <div class="flex items-baseline gap-3 mb-1.5">
+          <span class="msg-sender" style="color:${aColor}">${esc(item.from_name)}</span>
+          <span class="typing-dots" style="margin-left:4px"><span></span><span></span><span></span></span>
+        </div>
       </div>`;
   } else if (item.type === 'shard') {
     const shardId = 'shard-content-' + item.id.replace(/[^a-zA-Z0-9]/g, '_');
@@ -1124,34 +1095,6 @@ function renderFeedItem(item) {
             ${item.tags.length ? `<div class="flex flex-wrap gap-1.5 mt-3 pt-3" style="border-top:1px solid rgb(var(--c-border)/0.06)">${item.tags.map(t => `<span class="text-[11px] px-2.5 py-0.5 rounded-full font-medium" style="background: rgb(var(--c-surface) / 0.5); color: rgb(var(--c-muted))">${esc(t)}</span>`).join('')}</div>` : ''}
           </div>
         </div>
-      </div>`;
-  } else if (item.type === 'broadcast') {
-    const aColor = agentColor(item.from_agent_id);
-    const tint = agentTint(item.from_agent_id);
-    const label = item.direction === 'outbound' ? 'You' : esc(item.from_name);
-    el.innerHTML = `
-      <div class="msg-block" style="background:${tint};opacity:0.85">
-        <div class="flex items-baseline gap-3 mb-1.5">
-          <span class="msg-sender" style="color:${aColor}">${label}</span>
-          <span class="text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-md" style="background:rgba(var(--c-muted)/0.1);color:rgb(var(--c-muted))">broadcast</span>
-          <span class="msg-meta ml-auto" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
-        </div>
-        <div class="msg-content">${renderMd(item.content)}</div>
-      </div>`;
-  } else if (item.type === 'inbound_log' || item.type === 'outbound_log') {
-    const isOut = item.type === 'outbound_log';
-    const aColor = isOut ? agentTint(selfAgentId) : agentColor(item.from_agent_id);
-    const tint = isOut ? agentTint(selfAgentId) : agentTint(item.from_agent_id);
-    const label = isOut ? 'You' : esc(item.from_name);
-    const typeLabel = item.entry_type === 'forward' ? 'forwarded' : '';
-    el.innerHTML = `
-      <div class="msg-block" style="background:${tint};opacity:0.7">
-        <div class="flex items-baseline gap-3 mb-1.5">
-          <span class="msg-sender" style="color:${isOut ? 'rgb(var(--c-primary))' : aColor}">${label}</span>
-          ${typeLabel ? `<span class="text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-md" style="background:rgba(var(--c-muted)/0.1);color:rgb(var(--c-muted))">${typeLabel}</span>` : ''}
-          <span class="msg-meta ml-auto" title="${item.timestamp || ''}">${timeAgo(item.timestamp)}</span>
-        </div>
-        <div class="msg-content">${renderMd(item.content)}</div>
       </div>`;
   } else if (item.type === 'connection_event') {
     const aColor = item.agent_id ? agentColor(item.agent_id) : null;
@@ -1246,6 +1189,33 @@ function wireReply(el, item) {
   });
 }
 
+function reGroupAgentMessages() {
+  // First, unwrap any existing agent-group wrappers back to flat list
+  feedContainer.querySelectorAll('.agent-group').forEach(g => {
+    while (g.firstChild) feedContainer.insertBefore(g.firstChild, g);
+    g.remove();
+  });
+
+  const children = Array.from(feedContainer.children);
+  let currentGroup = null;
+
+  for (const child of children) {
+    const isOutbound = child.querySelector('.msg-block-out') !== null;
+    const isSystemEvent = child.querySelector('.sys-event') !== null;
+
+    if (isOutbound || isSystemEvent) {
+      currentGroup = null;
+    } else {
+      if (!currentGroup) {
+        currentGroup = document.createElement('div');
+        currentGroup.className = 'agent-group';
+        feedContainer.insertBefore(currentGroup, child);
+      }
+      currentGroup.appendChild(child);
+    }
+  }
+}
+
 function renderFeed(data) {
   const items = buildFeedItems(data);
 
@@ -1320,6 +1290,15 @@ function renderFeed(data) {
   // Check if near bottom for auto-scroll
   const nearBottom = feedScroll.scrollHeight - feedScroll.scrollTop - feedScroll.clientHeight < 80;
 
+  // Remove stale typing indicators (agent went back to waiting)
+  const activeTypingIds = new Set(items.filter(i => i.type === 'typing').map(i => i.id));
+  for (const [id, el] of renderedFeedItems) {
+    if (id.startsWith('typing_') && !activeTypingIds.has(id)) {
+      el.remove();
+      renderedFeedItems.delete(id);
+    }
+  }
+
   // Add new items (skip items cleared by user)
   for (const item of items) {
     if (clearedAtTs > 0 && item.timestamp) {
@@ -1342,6 +1321,9 @@ function renderFeed(data) {
     feedContainer.appendChild(el);
     renderedFeedItems.set(item.id, el);
   }
+
+  // Group consecutive agent messages
+  reGroupAgentMessages();
 
   // Auto-scroll
   if (nearBottom) {
@@ -1824,11 +1806,27 @@ async function updateAllAgents() {
     const data = await ajaxPost('/api/update-agents', {});
     if (data.results && data.results.length > 0) {
       const succeeded = data.results.filter(r => r.success).length;
-      showToast(`Updated ${succeeded}/${data.results.length} agents`, succeeded > 0 ? 'success' : 'error');
       data.results.forEach(r => {
         const status = r.success ? 'ok' : 'FAILED';
         console.log(`[Update] ${r.display_name}: ${status} — ${r.git_output || ''}`);
       });
+      if (data.restarting) {
+        showToast(`Updated ${succeeded}/${data.results.length}. Restarting...`, 'success');
+        btn.textContent = 'Restarting...';
+        // Wait for the server to come back up, then reload
+        setTimeout(async () => {
+          for (let i = 0; i < 30; i++) {
+            try {
+              const resp = await fetch('/api/state', {method: 'GET'});
+              if (resp.ok) { location.reload(); return; }
+            } catch {}
+            await new Promise(r => setTimeout(r, 1000));
+          }
+          location.reload();
+        }, 2000);
+        return;
+      }
+      showToast(`Updated ${succeeded}/${data.results.length} agents`, succeeded > 0 ? 'success' : 'error');
     } else {
       showToast(data.message || 'No local agents found', 'info');
     }
@@ -2322,7 +2320,6 @@ let _meshVisible = false;
 let _meshSimulation = null;
 let _meshPollTimer = null;
 let _meshTooltipTarget = null;
-let _meshDiscoveredUrls = {};
 
 function toggleMeshView() {
   if (_meshVisible) showChatView();
@@ -2359,7 +2356,6 @@ async function fetchMeshTopology() {
     const nodesMap = {};
     const edgesSet = new Set();
     const edges = [];
-    const discoveredUrls = {};  // agent_id -> URL for nodes found via fan-out
 
     for (const n of topo.nodes) nodesMap[n.id] = n;
     for (const e of topo.edges) {
@@ -2383,10 +2379,6 @@ async function fetchMeshTopology() {
     for (const pr of peerResults) {
       if (pr.status !== 'fulfilled' || !pr.value) continue;
       const info = pr.value;
-      // Track this peer's URL from its own network_info response
-      if (info.agent_id && info.agent_url) {
-        discoveredUrls[info.agent_id] = info.agent_url;
-      }
       // Add the node itself if not present
       if (!nodesMap[info.agent_id]) {
         nodesMap[info.agent_id] = {
@@ -2396,18 +2388,16 @@ async function fetchMeshTopology() {
           is_self: false,
         };
       }
-      // Add edges from this peer's connections (uses 'peers' key from network_info)
-      for (const conn of (info.peers || info.connections || [])) {
+      // Add edges from this peer's connections
+      for (const conn of (info.connections || [])) {
         if (!nodesMap[conn.agent_id]) {
           nodesMap[conn.agent_id] = {
             id: conn.agent_id,
             display_name: conn.display_name || conn.agent_id.slice(0,8) + '...',
-            bio: conn.agent_bio || '',
+            bio: conn.bio || '',
             is_self: false,
           };
         }
-        // Track discovered URLs for peers-of-peers
-        if (conn.agent_url) discoveredUrls[conn.agent_id] = conn.agent_url;
         const key = [info.agent_id, conn.agent_id].sort().join('|');
         if (!edgesSet.has(key)) {
           edgesSet.add(key);
@@ -2418,13 +2408,13 @@ async function fetchMeshTopology() {
 
     const nodes = Object.values(nodesMap);
     document.getElementById('mesh-node-count').textContent = nodes.length + ' node' + (nodes.length !== 1 ? 's' : '');
-    renderMeshGraph(nodes, edges, topo.self_id, topo.peer_urls, discoveredUrls);
+    renderMeshGraph(nodes, edges, topo.self_id, topo.peer_urls);
   } catch (e) {
     console.error('Mesh topology fetch failed:', e);
   }
 }
 
-function renderMeshGraph(nodes, edges, selfId, peerUrls, discoveredUrls) {
+function renderMeshGraph(nodes, edges, selfId, peerUrls) {
   const container = document.getElementById('mesh-graph');
   const width = container.clientWidth;
   const height = container.clientHeight;
@@ -2503,7 +2493,7 @@ function renderMeshGraph(nodes, edges, selfId, peerUrls, discoveredUrls) {
   // Click handler for tooltip
   node.on('click', (event, d) => {
     event.stopPropagation();
-    showMeshTooltip(event, d, selfId, peerUrls, discoveredUrls);
+    showMeshTooltip(event, d, selfId, peerUrls);
   });
   svg.on('click', () => hideMeshTooltip());
 
@@ -2515,7 +2505,7 @@ function renderMeshGraph(nodes, edges, selfId, peerUrls, discoveredUrls) {
   });
 }
 
-function showMeshTooltip(event, d, selfId, peerUrls, discoveredUrls) {
+function showMeshTooltip(event, d, selfId, peerUrls) {
   const tip = document.getElementById('mesh-tooltip');
   document.getElementById('tooltip-name').textContent = d.display_name || 'Unknown';
   document.getElementById('tooltip-id').textContent = d.id.slice(0, 16) + '...' + d.id.slice(-8);
@@ -2524,21 +2514,17 @@ function showMeshTooltip(event, d, selfId, peerUrls, discoveredUrls) {
   document.getElementById('tooltip-level').textContent = lvl;
 
   const connectBtn = document.getElementById('tooltip-connect-btn');
-  const disconnectBtn = document.getElementById('tooltip-disconnect-btn');
+  // Show connect button if this node is not self and not already in our connections
   const isConnected = !!peerUrls[d.id];
-  const hasUrl = !!(peerUrls[d.id] || (discoveredUrls && discoveredUrls[d.id]));
-  // Show connect or disconnect button based on connection state
-  connectBtn.classList.add('hidden');
-  disconnectBtn.classList.add('hidden');
-  if (d.id !== selfId) {
-    if (isConnected) {
-      disconnectBtn.classList.remove('hidden');
-    } else if (hasUrl) {
-      connectBtn.classList.remove('hidden');
-    }
+  if (d.id !== selfId && !isConnected && peerUrls[d.id] === undefined) {
+    // Discovered through a peer — we have no direct URL, can't connect yet
+    connectBtn.classList.add('hidden');
+  } else if (d.id !== selfId && !isConnected) {
+    connectBtn.classList.remove('hidden');
+  } else {
+    connectBtn.classList.add('hidden');
   }
   _meshTooltipTarget = d;
-  _meshDiscoveredUrls = discoveredUrls || {};
 
   tip.classList.remove('hidden');
   tip.style.left = Math.min(event.pageX + 12, window.innerWidth - 260) + 'px';
@@ -2553,16 +2539,12 @@ function hideMeshTooltip() {
 async function connectFromTooltip() {
   if (!_meshTooltipTarget) return;
   const aid = _meshTooltipTarget.id;
-  const name = _meshTooltipTarget.display_name || aid.slice(0, 12);
   hideMeshTooltip();
   try {
-    // Try discovered URLs first, then fall back to mesh topology
-    let url = _meshDiscoveredUrls[aid];
-    if (!url) {
-      const topoResp = await fetch('/api/mesh-topology');
-      const topo = await topoResp.json();
-      url = topo.peer_urls[aid];
-    }
+    // Find the peer URL from mesh topology data
+    const topoResp = await fetch('/api/mesh-topology');
+    const topo = await topoResp.json();
+    const url = topo.peer_urls[aid];
     if (!url) { showToast('No URL available for this agent', 'error'); return; }
     const resp = await fetch('/connect', {
       method: 'POST',
@@ -2570,36 +2552,10 @@ async function connectFromTooltip() {
       body: JSON.stringify({url: url}),
     });
     const data = await resp.json();
-    if (data.success) {
-      showToast(`Connected to ${name}`, 'success');
-      fetchMeshTopology();
-    } else {
-      showToast(data.error || 'Connection failed', 'error');
-    }
+    if (data.success) showToast('Connection request sent', 'success');
+    else showToast(data.error || 'Connection failed', 'error');
   } catch (e) {
     showToast('Connection failed: ' + e.message, 'error');
-  }
-}
-
-async function disconnectFromTooltip() {
-  if (!_meshTooltipTarget) return;
-  const aid = _meshTooltipTarget.id;
-  const name = _meshTooltipTarget.display_name || aid.slice(0, 12);
-  hideMeshTooltip();
-  try {
-    const resp = await fetch(`/disconnect/${aid}`, {
-      method: 'POST',
-      headers: {'X-Requested-With': 'XMLHttpRequest'},
-    });
-    const data = await resp.json();
-    if (data.success) {
-      showToast(`Disconnected from ${name}`, 'success');
-      fetchMeshTopology();
-    } else {
-      showToast(data.error || 'Disconnect failed', 'error');
-    }
-  } catch (e) {
-    showToast('Disconnect failed: ' + e.message, 'error');
   }
 }
 
@@ -2607,25 +2563,5 @@ function onThemeChange() {
   if (_meshVisible) fetchMeshTopology();
 }
 </script>
-
-<style>
-.chunk-tool {
-  font-size: 11px;
-  font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
-  color: rgb(var(--c-muted));
-  opacity: 0.45;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 100%;
-  padding: 2px 0;
-  cursor: default;
-  transition: opacity 0.15s;
-}
-.chunk-tool:hover {
-  opacity: 0.85;
-  white-space: normal;
-}
-</style>
 
 {% endblock %}

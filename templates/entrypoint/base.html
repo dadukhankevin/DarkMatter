@@ -383,6 +383,38 @@
     }
     .msg-block + .msg-block { border-top: 1px solid var(--glass-border); }
 
+    /* ---- Agent message groups ---- */
+    .agent-group {
+      margin: 4px 0;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid var(--glass-border);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.03);
+    }
+    @media (min-width: 640px) { .agent-group { margin: 6px 16px; } }
+    .agent-group:hover {
+      border-color: rgba(78, 70, 62, 0.8);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+    .agent-group .msg-block {
+      border-radius: 0;
+      margin: 0;
+      border: none;
+      box-shadow: none;
+    }
+    .agent-group .msg-block:hover {
+      border-color: transparent;
+      box-shadow: none;
+    }
+    .agent-group .msg-block + .msg-block {
+      border-top: 1px solid rgba(var(--c-border), 0.04);
+    }
+    @media (min-width: 640px) { .agent-group .msg-block { margin: 0; } }
+    [data-theme="light"] .agent-group {
+      background: rgba(236, 231, 222, 0.3);
+      box-shadow: 0 2px 8px rgba(42,37,32,0.03), inset 0 1px 0 rgba(255,255,255,0.4);
+    }
+
     /* ---- Typing indicator ---- */
     .typing-indicator { padding: 0.75rem 1.25rem; margin: 4px 12px; }
     @media (min-width: 640px) { .typing-indicator { padding: 0.75rem 2rem; margin: 4px 16px; } }
