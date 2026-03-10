@@ -6,7 +6,7 @@ user-invocable: false
 
 # DarkMatter Operations — HTTP API Reference
 
-Your DarkMatter node runs an HTTP API alongside the MCP server. Core actions (messaging, connections, inbox, shards) are MCP tools. Everything else below is available via `curl`.
+Your DarkMatter node runs an HTTP API alongside the MCP server. Core actions (messaging, connections, inbox, insights) are MCP tools. Everything else below is available via `curl`.
 
 **Base URL**: `http://localhost:$PORT` where `$PORT` is the DarkMatter port (check the status tool description or use `curl -s http://localhost:8100/.well-known/darkmatter.json`).
 

@@ -38,7 +38,7 @@ DOMAIN_MESSAGE = "darkmatter.message.v1"
 DOMAIN_PEER_UPDATE = "peer_update"  # matches existing wire format
 DOMAIN_RELAY_POLL = "relay_poll"    # matches existing wire format
 DOMAIN_SDP = "darkmatter.sdp.v1"
-DOMAIN_SHARD = "darkmatter.shard.v1"
+DOMAIN_INSIGHT = "darkmatter.insight.v1"
 DOMAIN_LAN_BEACON = "darkmatter.lan_beacon.v1"
 DOMAIN_CHALLENGE_RESPONSE = "darkmatter.challenge_response.v1"
 DOMAIN_GENOME = "darkmatter.genome.v1"
@@ -439,21 +439,21 @@ def _prune_expired_challenges():
 
 
 # =============================================================================
-# Shard / SDP / LAN Beacon Signing Helpers
+# Insight / SDP / LAN Beacon Signing Helpers
 # =============================================================================
 
-def sign_shard(private_key_hex: str, shard_id: str, author_agent_id: str,
-               content: str, tags_str: str) -> str:
-    """Sign a shared shard. Returns signature hex."""
-    return sign_payload(private_key_hex, DOMAIN_SHARD, shard_id, author_agent_id, content, tags_str)
+def sign_insight(private_key_hex: str, insight_id: str, author_agent_id: str,
+                 content: str, tags_str: str) -> str:
+    """Sign an insight. Returns signature hex."""
+    return sign_payload(private_key_hex, DOMAIN_INSIGHT, insight_id, author_agent_id, content, tags_str)
 
 
-def verify_shard_signature(public_key_hex: str, signature_hex: str,
-                           shard_id: str, author_agent_id: str,
-                           content: str, tags_str: str) -> bool:
-    """Verify a shared shard's signature."""
+def verify_insight_signature(public_key_hex: str, signature_hex: str,
+                             insight_id: str, author_agent_id: str,
+                             content: str, tags_str: str) -> bool:
+    """Verify an insight's signature."""
     return verify_signed_payload(public_key_hex, signature_hex,
-                                 DOMAIN_SHARD, shard_id, author_agent_id, content, tags_str)
+                                 DOMAIN_INSIGHT, insight_id, author_agent_id, content, tags_str)
 
 
 def sign_sdp(private_key_hex: str, agent_id: str, sdp: str) -> str:

@@ -1,7 +1,7 @@
 """
 Dynamic tool show/hide, status line builder.
 
-Depends on: config, models, mcp/__init__, spawn
+Depends on: config, models, mcp/__init__
 """
 
 import asyncio
@@ -15,15 +15,14 @@ import json
 from darkmatter.config import (
     MAX_CONNECTIONS,
     CORE_TOOLS,
-    AGENT_SPAWN_ENABLED,
-    client_has,
 )
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional
-from darkmatter.spawn import get_spawned_agents, cleanup_finished_agents
 from darkmatter.state import get_state, save_state
 from darkmatter.context import build_activity_hint
+from darkmatter.logging import get_logger
 
+_log = get_logger("visibility")
 
 
 
@@ -48,26 +47,20 @@ def build_status_line() -> str:
     peers = ", ".join(peer_labels) if peer_labels else "none"
 
     agent_label = state.display_name or state.agent_id[:12]
-    spawned = get_spawned_agents()
-    active_count = len(spawned)
-    if AGENT_SPAWN_ENABLED:
-        agent_suffix = f" | Agents: {active_count}" if active_count > 0 else " | Agents: 0"
-    else:
-        agent_suffix = ""
     wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in state.wallets.items()]
     wallet_suffix = f" | Wallets: {', '.join(wallet_parts)}" if wallet_parts else ""
     # Conversation memory stats
     conv_total = len(state.conversation_log)
     broadcast_count = sum(1 for e in state.conversation_log if e.entry_type == "broadcast")
-    peer_shards = sum(1 for s in state.shared_shards if s.author_agent_id != state.agent_id)
-    own_shards = sum(1 for s in state.shared_shards if s.author_agent_id == state.agent_id)
-    context_suffix = f" | Memory: {conv_total} conversations, {broadcast_count} broadcasts, {own_shards} own shards, {peer_shards} peer shards"
+    peer_insights = sum(1 for s in state.insights if s.author_agent_id != state.agent_id)
+    own_insights = sum(1 for s in state.insights if s.author_agent_id == state.agent_id)
+    context_suffix = f" | Memory: {conv_total} conversations, {broadcast_count} broadcasts, {own_insights} own insights, {peer_insights} peer insights"
 
     stats = (
         f"Agent: {agent_label} | Status: {state.status.value} | "
         f"Connections: {conns}/{MAX_CONNECTIONS} ({peers}) | "
         f"Inbox: {msgs} | Handled: {handled} | Pending requests: {pending}"
-        f"{agent_suffix}{wallet_suffix}{context_suffix}"
+        f"{wallet_suffix}{context_suffix}"
     )
 
     actions = []
@@ -88,6 +81,8 @@ def build_status_line() -> str:
         actions.append("Bio is generic — update it with darkmatter_update_bio(bio=...)")
     if not state.display_name:
         actions.append("No display name — set one with darkmatter_update_bio(display_name=...)")
+    if own_insights == 0:
+        actions.append("No insights yet — create insights for code regions you've explored (darkmatter_create_insight). Insights are live pointers that never go stale.")
 
     recent_broadcasts = sum(
         1 for e in state.conversation_log[-50:]
@@ -95,8 +90,8 @@ def build_status_line() -> str:
     )
     if recent_broadcasts > 0:
         actions.append(f"{recent_broadcasts} peer broadcast(s) — review and respond")
-    if peer_shards > 0:
-        actions.append(f"{peer_shards} peer shard(s) — darkmatter_view_shards to explore")
+    if peer_insights > 0:
+        actions.append(f"{peer_insights} peer insight(s) — darkmatter_view_insights to explore")
 
     if actions:
         action_block = "\n".join(f"ACTION: {a}" for a in actions)
@@ -120,7 +115,7 @@ async def notify_tools_changed() -> None:
         try:
             await session.send_tool_list_changed()
         except Exception as e:
-            print(f"[DarkMatter] Warning: failed to notify session of tool list change: {e}", file=sys.stderr)
+            _log.warning("failed to notify session of tool list change: %s", e)
             dead.add(session)
     _active_sessions.difference_update(dead)
 
@@ -149,10 +144,9 @@ async def update_status_tool() -> None:
         mcp_module._visible_optional = desired_optional
         added_str = ", ".join(sorted(to_add)) if to_add else "none"
         removed_str = ", ".join(sorted(to_remove)) if to_remove else "none"
-        print(f"[DarkMatter] Tool visibility: +[{added_str}] -[{removed_str}] (total: {len(mcp._tool_manager._tools)})", file=sys.stderr)
+        _log.info("Tool visibility: +[%s] -[%s] (total: %s)", added_str, removed_str, len(mcp._tool_manager._tools))
 
-    if client_has("tools_list_changed"):
-        await notify_tools_changed()
+    await notify_tools_changed()
 
 
 def _inject_activity_hint(result, session_id=None):
@@ -203,16 +197,16 @@ def initialize_tool_visibility() -> None:
 
     visible_count = len(mcp._tool_manager._tools)
     hidden_count = len(to_hide)
-    print(f"[DarkMatter] Tool visibility initialized: {visible_count} visible, {hidden_count} hidden", file=sys.stderr)
+    _log.info("Tool visibility initialized: %s visible, %s hidden", visible_count, hidden_count)
     if mcp_module._visible_optional:
-        print(f"[DarkMatter] Optional tools shown: {', '.join(sorted(mcp_module._visible_optional))}", file=sys.stderr)
+        _log.info("Optional tools shown: %s", ", ".join(sorted(mcp_module._visible_optional)))
 
     original_call_tool = mcp._tool_manager.call_tool
 
     async def _patched_call_tool(name, arguments, **kwargs):
         if name not in mcp._tool_manager._tools and name in mcp_module._all_tools:
             mcp._tool_manager._tools[name] = mcp_module._all_tools[name]
-            print(f"[DarkMatter] Graceful fallback: restored hidden tool '{name}' on demand", file=sys.stderr)
+            _log.info("Graceful fallback: restored hidden tool '%s' on demand", name)
             mcp_module._visible_optional.add(name)
         result = await original_call_tool(name, arguments, **kwargs)
         # Derive session_id from MCP context for per-session tracking
@@ -241,7 +235,7 @@ def check_webrtc_health() -> None:
         ready = getattr(conn.webrtc_channel, "readyState", None)
         if ready not in ("open", "connecting"):
             peer = conn.agent_display_name or conn.agent_id[:12]
-            print(f"[DarkMatter] WebRTC: cleaning up dead channel (peer: {peer}, state: {ready})", file=sys.stderr)
+            _log.info("WebRTC: cleaning up dead channel (peer: %s, state: %s)", peer, ready)
             conn.webrtc_channel = None
             conn.webrtc_pc = None
             conn.transport = "http"
@@ -259,9 +253,9 @@ def purge_stale_inbox(state: AgentState) -> None:
             if age < cutoff_seconds:
                 keep.append(msg)
             else:
-                print(f"[DarkMatter] Auto-purged stale message {msg.message_id} (age: {int(age)}s)", file=sys.stderr)
+                _log.info("Auto-purged stale message %s (age: %ss)", msg.message_id, int(age))
         except Exception as e:
-            print(f"[DarkMatter] Warning: failed to parse received_at for message {msg.message_id}, keeping: {e}", file=sys.stderr)
+            _log.warning("failed to parse received_at for message %s, keeping: %s", msg.message_id, e)
             keep.append(msg)
     if len(keep) != len(state.message_queue):
         state.message_queue = keep
@@ -278,9 +272,9 @@ def check_auto_reactivate(state: AgentState) -> None:
             state.status = AgentStatus.ACTIVE
             state.inactive_until = None
             save_state()
-            print("[DarkMatter] Auto-reactivated (inactive timer expired)", file=sys.stderr)
+            _log.info("Auto-reactivated (inactive timer expired)")
     except Exception as e:
-        print(f"[DarkMatter] Warning: failed to parse inactive_until timestamp: {e}", file=sys.stderr)
+        _log.warning("failed to parse inactive_until timestamp: %s", e)
 
 
 def _write_status_file(state) -> None:
@@ -304,7 +298,6 @@ async def status_updater() -> None:
             if state is None:
                 continue
             check_webrtc_health()
-            cleanup_finished_agents()
             check_auto_reactivate(state)
             _purge_cycle += 1
             if _purge_cycle >= 6:
@@ -313,4 +306,4 @@ async def status_updater() -> None:
             await update_status_tool()
             _write_status_file(state)
         except Exception as e:
-            print(f"[DarkMatter] Status updater error: {e}", file=sys.stderr)
+            _log.error("Status updater error: %s", e)

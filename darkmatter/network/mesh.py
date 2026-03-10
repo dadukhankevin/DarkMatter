@@ -33,6 +33,9 @@ from darkmatter.config import (
     TRUST_ANTIMATTER_SUCCESS,
     WEBRTC_ICE_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
+    MIN_CHAIN_TRUST,
+    MESH_ROUTE_PER_SOURCE_LIMIT,
+    MESH_ROUTE_PER_SOURCE_WINDOW,
 )
 from darkmatter.models import (
     AgentState,
@@ -56,6 +59,7 @@ from darkmatter.identity import (
 from darkmatter.security import verify_inbound
 from darkmatter.state import (
     get_state,
+    get_state_for,
     save_state,
     check_message_replay,
     check_waiting,
@@ -75,9 +79,23 @@ from darkmatter.wallet.solana import (
     send_solana_token,
 )
 from darkmatter.network.manager import get_network_manager
-from darkmatter.spawn import get_spawned_agents
-
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+
+from darkmatter.logging import get_logger
+_log = get_logger("mesh")
+
+
+def resolve_state(request: "Request") -> Optional[AgentState]:
+    """Resolve the target agent state from a request.
+
+    If the URL contains a {target_agent_id} path param, look up that specific
+    agent. Otherwise fall back to the default agent (backward compat).
+    Returns None if the target agent is not found.
+    """
+    target = request.path_params.get("target_agent_id")
+    if target:
+        return get_state_for(target)
+    return get_state()
 
 
 def local_delivery_capabilities(state: AgentState) -> dict:
@@ -86,8 +104,7 @@ def local_delivery_capabilities(state: AgentState) -> dict:
 
 
 # =============================================================================
-# Shared Pure Logic — Framework-agnostic functions used by both Starlette
-# handlers (app.py) and Flask handlers (entrypoint.py).
+# Shared Pure Logic — Framework-agnostic functions used by Starlette handlers.
 #
 # Convention: process_* takes (state, data_dict) and returns (response_dict, status_code).
 # build_* constructs payloads or objects without side effects.
@@ -112,7 +129,7 @@ async def _gather_peer_trust(state: AgentState, about_agent_id: str) -> dict:
                             "note": data.get("note", ""),
                         }
         except Exception as e:
-            print(f"[DarkMatter] Peer trust query failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
+            _log.warning("Peer trust query failed for %s...: %s", conn.agent_id[:12], e)
         return None
 
     tasks = [_query_peer(conn) for conn in state.connections.values()]
@@ -153,13 +170,10 @@ async def _gather_peer_trust(state: AgentState, about_agent_id: str) -> dict:
 
 
 # =============================================================================
-# Connection Request → Agent Spawn
+# Connection Request Notification
 #
-# IMPORTANT — DO NOT REMOVE OR DISABLE THIS FUNCTION.
-# Every connection request (auto-accepted OR pending) MUST be queued so the
-# main agent can introduce itself, set trust, exchange capabilities, etc.
-# This has been accidentally removed/broken in multiple past sessions.
-# If you are refactoring, ensure EVERY connection request reaches the main agent.
+# Every connection request (auto-accepted OR pending) is queued as a message
+# so the active MCP session can see it via wait_for_message or context.
 # =============================================================================
 def _queue_connection_request(
     state: AgentState,
@@ -169,18 +183,7 @@ def _queue_connection_request(
     status: str,  # "auto-accepted" or "pending"
     request_id: str | None = None,
 ) -> None:
-    """Queue a connection request as a message for the main agent.
-
-    DO NOT REMOVE — every connection request (auto-accepted OR pending) MUST
-    be queued so the main agent can introduce itself, set trust, etc.
-    """
-    import darkmatter.config as _cfg
-    if not (_cfg.AGENT_SPAWN_ENABLED and state.router_mode == "spawn"):
-        print(f"[DarkMatter] Spawn disabled (AGENT_SPAWN_ENABLED={_cfg.AGENT_SPAWN_ENABLED}, "
-              f"router_mode={state.router_mode!r}) — skipping connection request "
-              f"from {from_agent_id[:12]}...", file=sys.stderr)
-        return
-
+    """Queue a connection request as a message for the active MCP session."""
     display = from_agent_display_name or from_agent_id[:16] + "..."
     msg_id = request_id or f"conn-{uuid.uuid4().hex[:8]}"
     content = (
@@ -188,6 +191,11 @@ def _queue_connection_request(
         if from_agent_bio
         else f"Connection request ({status}) from {display}."
     )
+    # Guard against queue overflow
+    if len(state.message_queue) >= MESSAGE_QUEUE_MAX:
+        _log.warning("Queue full — dropping connection request notification from %s", display)
+        return
+
     synthetic_msg = QueuedMessage(
         message_id=msg_id,
         content=content,
@@ -195,19 +203,12 @@ def _queue_connection_request(
         metadata={"type": "connection_request", "request_id": request_id or msg_id, "status": status},
         from_agent_id=from_agent_id,
     )
-    # Queue the message — the main agent picks it up via wait_for_message.
-    # If no main agent is running, _record_inbound_message will spawn one.
     state.message_queue.append(synthetic_msg)
     for evt in state._inbox_events:
         evt.set()
     state._inbox_events.clear()
     save_state()
-
-    # Ensure main agent is running to handle it
-    from darkmatter.spawn import is_main_agent_running, spawn_main_agent
-    if not is_main_agent_running():
-        asyncio.get_event_loop().create_task(spawn_main_agent(state))
-    print(f"[DarkMatter] Queued {status} connection request from {display} for main agent", file=sys.stderr)
+    _log.info("Queued %s connection request from %s", status, display)
 
 
 async def process_connection_request(state: AgentState, data: dict, public_url: str) -> tuple[dict, int]:
@@ -251,8 +252,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         existing = state.connections[from_agent_id]
         changed = False
         if from_agent_url and existing.agent_url != from_agent_url:
-            print(f"[DarkMatter] Updating URL for {from_agent_id[:12]}...: "
-                  f"{existing.agent_url} -> {from_agent_url}", file=sys.stderr)
+            _log.info("Updating URL for %s...: %s -> %s", from_agent_id[:12], existing.agent_url, from_agent_url)
             existing.agent_url = from_agent_url
             changed = True
         if from_agent_public_key_hex and not existing.agent_public_key_hex:
@@ -301,12 +301,9 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         )
         state.connections[from_agent_id] = conn
         save_state()
-        print(f"[DarkMatter] Auto-accepted local agent {from_agent_display_name or from_agent_id[:12]}... "
-              f"({from_agent_url})", file=sys.stderr)
+        _log.info("Auto-accepted local agent %s... (%s)", from_agent_display_name or from_agent_id[:12], from_agent_url)
 
-        # IMPORTANT: Always queue connection requests for the main agent — even auto-accepted ones.
-        # The spawned agent can introduce itself, set trust, exchange capabilities, etc.
-        # DO NOT remove this spawn. It has been accidentally removed multiple times.
+        # Queue so MCP session sees the new connection via wait_for_message / context.
         _queue_connection_request(
             state, from_agent_id, from_agent_display_name, from_agent_bio, "auto-accepted"
         )
@@ -334,7 +331,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             if (now - req_time).total_seconds() > REQUEST_EXPIRY_S:
                 expired_ids.append(rid)
         except (ValueError, TypeError):
-            print(f"[DarkMatter] Malformed timestamp in pending request {rid}: {req.requested_at!r}, marking expired", file=sys.stderr)
+            _log.warning("Malformed timestamp in pending request %s: %r, marking expired", rid, req.requested_at)
             expired_ids.append(rid)
     for rid in expired_ids:
         del state.pending_requests[rid]
@@ -381,8 +378,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         )
         save_state()
 
-    # IMPORTANT: Always queue connection requests for the main agent — pending ones too.
-    # DO NOT remove this spawn. It has been accidentally removed multiple times.
+    # Queue so MCP session sees the pending request via wait_for_message / context.
     _queue_connection_request(
         state, from_agent_id, from_agent_display_name, from_agent_bio,
         "pending", request_id=request_id
@@ -465,7 +461,7 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
     state.connections[agent_id] = conn
 
     if not tls_info["secure"] and not tls_info["is_local"]:
-        print(f"[DarkMatter] WARNING: Connection to {agent_id[:12]}... uses insecure HTTP: {tls_info.get('warning', '')}", file=sys.stderr)
+        _log.warning("Connection to %s... uses insecure HTTP: %s", agent_id[:12], tls_info.get('warning', ''))
 
     save_state()
 
@@ -484,7 +480,7 @@ async def notify_connection_accepted(conn: Connection, payload: dict) -> None:
     if result.success:
         return
 
-    print(f"[DarkMatter] Failed to notify {conn.agent_id[:12]}... of acceptance: {result.error}", file=sys.stderr)
+    _log.error("Failed to notify %s... of acceptance: %s", conn.agent_id[:12], result.error)
 
 
 def process_accept_pending(state: AgentState, request_id: str, public_url: str) -> tuple[dict, int, dict | None]:
@@ -526,7 +522,7 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
     state.connections[pending.from_agent_id] = conn
 
     if not tls_info["secure"] and not tls_info["is_local"]:
-        print(f"[DarkMatter] WARNING: Connection to {pending.from_agent_id[:12]}... uses insecure HTTP", file=sys.stderr)
+        _log.warning("Connection to %s... uses insecure HTTP", pending.from_agent_id[:12])
 
     notify_payload = {
         "agent_id": state.agent_id,
@@ -685,7 +681,7 @@ async def process_antimatter_signal(state: AgentState, data: dict) -> tuple[dict
             if age > ANTIMATTER_MAX_AGE_S:
                 return {"error": "Signal expired (age)"}, 400
         except (ValueError, TypeError):
-            print(f"[DarkMatter] Malformed antimatter signal timestamp: {sig.created_at!r}, skipping age check", file=sys.stderr)
+            _log.warning("Malformed antimatter signal timestamp: %r, skipping age check", sig.created_at)
 
     if state.agent_id in sig.path:
         return {"error": "Loop detected"}, 400
@@ -782,7 +778,7 @@ async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict
                     "amount": amount,
                 })
             except Exception as e:
-                print(f"[DarkMatter] Antimatter timeout send to {sa_wallet[:12]}... failed: {e}", file=sys.stderr)
+                _log.error("Antimatter timeout send to %s... failed: %s", sa_wallet[:12], e)
     else:
         log_antimatter_event(state, {
             "type": "antimatter_kept",
@@ -816,7 +812,7 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
                         "hops_remaining": (msg.hops_remaining or 10) - 1,
                     })
                 except Exception as e:
-                    print(f"[DarkMatter] Forward to {target_id[:12]}... failed: {e}", file=sys.stderr)
+                    _log.error("Forward to %s... failed: %s", target_id[:12], e)
         # Remove from queue after forwarding
         state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
 
@@ -865,12 +861,12 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
             save_state_fn=save_state,
         ))
 
-    # queue_only (entrypoint) — human-facing, no routing or spawning.
+    # queue_only — no routing, just queue for the MCP session.
     if state.router_mode == "queue_only":
         return "queued"
 
     if _agents_waiting_at_receive:
-        print(f"[DarkMatter] Agent already waiting — message delivered via inbox event, skipping router", file=sys.stderr)
+        _log.debug("MCP session waiting — message delivered via inbox event, skipping router")
         routed_to = "agent"
     else:
         routed_to = "queued"
@@ -878,26 +874,16 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
         try:
             decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
             if decision.action == RouterAction.HANDLE:
-                import darkmatter.config as _cfg
-                routed_to = "agent" if _cfg.AGENT_SPAWN_ENABLED else "queued"
+                routed_to = "agent" if state._inbox_events else "queued"
             elif decision.action == RouterAction.FORWARD:
                 routed_to = "forwarded"
             elif decision.action == RouterAction.DROP:
                 routed_to = "dropped"
         except Exception as e:
             import traceback
-            print(f"[DarkMatter] Routing FAILED for {msg.message_id[:12]}...: {e}", file=sys.stderr)
+            _log.error("Routing FAILED for %s...: %s", msg.message_id[:12], e)
             traceback.print_exc(file=sys.stderr)
 
-    # Ensure the main agent is running — if no agent is waiting and none is
-    # alive, spawn one.  The main agent will pick up queued messages via
-    # wait_for_message on its next loop iteration.
-    if not state._inbox_events:
-        import darkmatter.config as _cfg
-        if _cfg.AGENT_SPAWN_ENABLED:
-            from darkmatter.spawn import is_main_agent_running, spawn_main_agent
-            if not is_main_agent_running():
-                asyncio.create_task(spawn_main_agent(state))
     return routed_to
 
 
@@ -970,9 +956,8 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
 
     msg_metadata = data.get("metadata", {})
 
-    # Preserve in_reply_to in metadata so entrypoint UI can match replies to
-    # outbound messages.  The send_message tool puts in_reply_to at the top
-    # level of the payload, but the frontend looks for it inside metadata.
+    # Preserve in_reply_to in metadata. The send_message tool puts in_reply_to
+    # at the top level of the payload; copy it into metadata for consistency.
     top_level_irt = data.get("in_reply_to")
     if top_level_irt and "in_reply_to" not in msg_metadata:
         msg_metadata["in_reply_to"] = top_level_irt
@@ -995,17 +980,14 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
         save_state()
         return {"status": "broadcast_received"}, 200
 
-    # Security push: apply settings at the node level, don't queue or spawn
+    # Security push: apply settings at the node level, don't queue
     if msg_metadata.get("type") == "security_push":
-        import darkmatter.config as _cfg
         ss = state.security_settings
-        for key in ("auto_accept_local", "sandbox_enabled", "sandbox_network"):
+        for key in ("auto_accept_local",):
             if key in msg_metadata:
                 ss[key] = bool(msg_metadata[key])
-        _cfg.AGENT_SANDBOX = ss.get("sandbox_enabled", False)
-        _cfg.AGENT_SANDBOX_NETWORK = ss.get("sandbox_network", True)
         save_state()
-        print(f"[DarkMatter] Applied security push from {from_agent_id[:12]}", file=sys.stderr)
+        _log.info("Applied security push from %s", from_agent_id[:12])
         return {"status": "security_push_applied"}, 200
 
     msg, routed_to = await _commit_verified_message(state, {
@@ -1036,7 +1018,7 @@ async def handle_ping(request: Request) -> JSONResponse:
     Body: {"agent_id": str, "timestamp": str}
     Response: {"your_ip": str, "agent_id": str, "timestamp": str}
     """
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1083,7 +1065,7 @@ async def handle_ping(request: Request) -> JSONResponse:
 
 async def handle_connection_request(request: Request) -> JSONResponse:
     """Handle an incoming connection request from another agent."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1114,7 +1096,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
 
 async def handle_connection_accepted(request: Request) -> JSONResponse:
     """Handle notification that our connection request was accepted."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1140,7 +1122,7 @@ async def handle_connection_proof(request: Request) -> JSONResponse:
     POST /__darkmatter__/connection_proof
     Body: {challenge_id, proof_hex, agent_id}
     """
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1186,7 +1168,7 @@ async def handle_connection_proof(request: Request) -> JSONResponse:
 
 async def handle_accept_pending(request: Request) -> JSONResponse:
     """Accept a pending connection request via HTTP (no MCP needed)."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1216,9 +1198,636 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
 
 
 
+# =============================================================================
+# Extracted Processing Functions (shared by HTTP handlers and WebRTC dispatch)
+#
+# Convention: _process_* takes (state, data) and returns (response_dict, status_code).
+# These are framework-agnostic — no Request/Response objects.
+# =============================================================================
+
+async def _process_status_broadcast(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process an incoming status broadcast. Returns (response_dict, status_code)."""
+    payload = data.get("payload") or data
+    from_id = payload.get("from_agent_id")
+    content = payload.get("content", "")
+    metadata = payload.get("metadata", {})
+    message_id = payload.get("message_id", f"status-{uuid.uuid4().hex[:8]}")
+
+    if not from_id or from_id not in state.connections:
+        return {"error": "Not connected"}, 403
+
+    log_conversation(
+        state, message_id, content,
+        from_id=from_id, to_ids=[state.agent_id],
+        entry_type="mesh_observation", direction="inbound",
+        metadata=metadata,
+    )
+
+    return {"status": "received", "logged": True}, 200
+
+
+async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process an incoming peer URL/bio update. Returns (response_dict, status_code)."""
+    agent_id = data.get("agent_id", "")
+    new_url = data.get("new_url", "")
+    public_key_hex = data.get("public_key_hex")
+    signature = data.get("signature")
+    timestamp = data.get("timestamp", "")
+
+    if not agent_id or not new_url:
+        return {"error": "Missing agent_id or new_url"}, 400
+
+    url_err = validate_url(new_url)
+    if url_err:
+        return {"error": url_err}, 400
+
+    conn = state.connections.get(agent_id)
+    if conn is None:
+        return {"error": "Unknown agent"}, 404
+
+    if timestamp and not is_timestamp_fresh(timestamp):
+        return {"error": "Timestamp expired"}, 403
+
+    if public_key_hex and conn.agent_public_key_hex:
+        if public_key_hex != conn.agent_public_key_hex:
+            return {"error": "Public key mismatch"}, 403
+
+    verify_key = conn.agent_public_key_hex or public_key_hex
+    if conn.agent_public_key_hex:
+        if not signature or not timestamp:
+            return {"error": "Signature required — known public key on file"}, 403
+        if not verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
+            return {"error": "Invalid signature"}, 403
+    elif verify_key and signature and timestamp:
+        if not verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
+            return {"error": "Invalid signature"}, 403
+
+    old_url = conn.agent_url
+    conn.agent_url = new_url
+
+    addresses = data.get("addresses")
+    if addresses and isinstance(addresses, dict):
+        conn.addresses = addresses
+    elif new_url:
+        conn.addresses["http"] = new_url
+
+    new_bio = data.get("bio")
+    if new_bio is not None and isinstance(new_bio, str):
+        conn.agent_bio = new_bio[:MAX_BIO_LENGTH]
+    new_display_name = data.get("display_name")
+    if new_display_name is not None and isinstance(new_display_name, str):
+        conn.agent_display_name = new_display_name[:100]
+
+    save_state()
+
+    _log.info("Peer %s... updated URL: %s -> %s", agent_id[:12], old_url, new_url)
+    return {"success": True, "updated": True}, 200
+
+
+async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process an incoming insight push. Returns (response_dict, status_code)."""
+    author_id = data.get("author_agent_id", "")
+    insight_id = data.get("insight_id") or data.get("shard_id", "")
+
+    if not author_id or not insight_id:
+        missing = [f for f, v in [("author_agent_id", author_id), ("insight_id", insight_id)] if not v]
+        return {"error": f"Missing required fields: {', '.join(missing)}"}, 400
+
+    signature_hex = data.get("signature_hex")
+    if not signature_hex:
+        return {"error": "Missing insight signature"}, 403
+
+    author_conn = state.connections.get(author_id)
+    author_pub_key = author_conn.agent_public_key_hex if author_conn else None
+    if not author_pub_key:
+        return {"error": "Unknown insight author — no public key on file"}, 403
+
+    from darkmatter.security import verify_insight_signature
+    tags_str = ",".join(sorted(data.get("tags", [])))
+    if not verify_insight_signature(author_pub_key, signature_hex, insight_id, author_id,
+                                     data.get("content", ""), tags_str):
+        return {"error": "Invalid insight signature"}, 403
+
+    from darkmatter.models import Insight
+    from darkmatter.config import SHARED_INSIGHT_MAX
+
+    existing_idx = None
+    for i, s in enumerate(state.insights):
+        if s.insight_id == insight_id and s.author_agent_id == author_id:
+            existing_idx = i
+            break
+
+    insight = Insight(
+        insight_id=insight_id,
+        author_agent_id=author_id,
+        content=data.get("content", "")[:MAX_CONTENT_LENGTH],
+        tags=data.get("tags", []),
+        share_with_top_n=data.get("share_with_top_n", -1),
+        created_at=data.get("created_at", ""),
+        updated_at=data.get("updated_at", ""),
+        summary=data.get("summary"),
+        signature_hex=signature_hex,
+        file=data.get("file"),
+        from_text=data.get("from_text"),
+        to_text=data.get("to_text"),
+        function_anchor=data.get("function_anchor"),
+        original_content=data.get("original_content"),
+        original_hash=data.get("original_hash"),
+    )
+
+    if existing_idx is not None:
+        state.insights[existing_idx] = insight
+    else:
+        if len(state.insights) >= SHARED_INSIGHT_MAX:
+            for i, s in enumerate(state.insights):
+                if s.author_agent_id != state.agent_id:
+                    state.insights.pop(i)
+                    break
+        state.insights.append(insight)
+
+    save_state()
+    return {"success": True, "insight_id": insight_id}, 200
+
+
+def _process_get_peers(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process a get_peers request. Returns (response_dict, status_code)."""
+    n = 10
+    try:
+        n = int(data.get("n", 10))
+    except (ValueError, TypeError):
+        pass
+    n = max(1, min(n, 50))
+
+    ranked = sorted(
+        state.connections.items(),
+        key=lambda item: (
+            state.impressions.get(item[0]).score
+            if state.impressions.get(item[0]) else 0.0
+        ),
+        reverse=True,
+    )[:n]
+
+    peers = []
+    for agent_id, conn in ranked:
+        peers.append({
+            "agent_id": agent_id,
+            "display_name": conn.agent_display_name or "",
+            "bio": conn.agent_bio or "",
+            "connectivity_level": conn.connectivity_level,
+            "connectivity_method": conn.connectivity_method,
+        })
+
+    return {
+        "agent_id": state.agent_id,
+        "display_name": state.display_name,
+        "peer_count": len(state.connections),
+        "peers": peers,
+    }, 200
+
+
+# =============================================================================
+# WebRTC Message Dispatcher
+# =============================================================================
+
+async def dispatch_webrtc_message(state: AgentState, conn, path: str, payload: dict) -> Optional[dict]:
+    """Dispatch an incoming WebRTC data channel message to the appropriate handler.
+
+    Returns a response dict for request/response paths (e.g. get_peers),
+    or None for fire-and-forget paths (message, broadcast, insight_push, peer_update).
+    """
+    # Strip any agent-scoped prefix: /__darkmatter__/{agent_id}/path -> /__darkmatter__/path
+    # WebRTC channels are already bound to a specific connection, so agent routing is implicit.
+    clean_path = path
+    if path.startswith("/__darkmatter__/"):
+        suffix = path[len("/__darkmatter__/"):]
+        # Check if the first segment looks like an agent_id (64-char hex) rather than a route
+        parts = suffix.split("/", 1)
+        if len(parts) == 2 and len(parts[0]) == 64:
+            clean_path = f"/__darkmatter__/{parts[1]}"
+
+    if clean_path == "/__darkmatter__/message":
+        result, status_code = await _process_incoming_message(state, payload)
+        if status_code >= 400:
+            _log.warning("WebRTC message rejected (%s): %s", status_code, result.get("error", "unknown"))
+        return None  # Fire-and-forget
+
+    if clean_path == "/__darkmatter__/status_broadcast":
+        result, status_code = await _process_status_broadcast(state, payload)
+        if status_code >= 400:
+            _log.warning("WebRTC broadcast rejected (%s): %s", status_code, result.get("error", "unknown"))
+        return None
+
+    if clean_path == "/__darkmatter__/peer_update":
+        result, status_code = await _process_peer_update(state, payload)
+        if status_code >= 400:
+            _log.warning("WebRTC peer_update rejected (%s): %s", status_code, result.get("error", "unknown"))
+        return None
+
+    if clean_path in ("/__darkmatter__/insight_push", "/__darkmatter__/shard_push"):
+        result, status_code = await _process_insight_push(state, payload)
+        if status_code >= 400:
+            _log.warning("WebRTC insight_push rejected (%s): %s", status_code, result.get("error", "unknown"))
+        return None
+
+    if clean_path == "/__darkmatter__/get_peers":
+        result, _ = _process_get_peers(state, payload)
+        return result  # Request/response — send result back
+
+    if clean_path == "/__darkmatter__/mesh_route":
+        route_type = payload.get("route_type", "")
+        if route_type == "connection_response":
+            await _process_mesh_route_response(state, payload)
+        else:
+            await _process_mesh_route(state, payload)
+        return None
+
+    _log.warning("WebRTC: unhandled path %s", path)
+    return None
+
+
+# =============================================================================
+# Mesh-Routed Connection Requests (Trust-Guided Routing)
+#
+# Instead of flooding, routes follow the highest-trust path through the mesh.
+# Each hop checks its own connections for the target, then forwards to its
+# single most-trusted unvisited peer. A trust_chain accumulates scores at
+# each hop — the product gives a "transitive trust" metric that the target
+# can use to prioritize incoming connection requests.
+# =============================================================================
+
+# Dedup: track recently seen route_ids to prevent re-processing
+_seen_route_ids: dict[str, float] = {}  # {route_id: timestamp}
+_ROUTE_ID_TTL = 120.0  # seconds
+
+# Per-source mesh route rate limiter: {source_agent_id: [timestamp, ...]}
+_mesh_route_sources: dict[str, list[float]] = {}
+
+
+def _prune_seen_routes() -> None:
+    """Remove expired route IDs and stale source rate-limit entries."""
+    now = time.time()
+    expired = [rid for rid, ts in _seen_route_ids.items() if now - ts > _ROUTE_ID_TTL]
+    for rid in expired:
+        del _seen_route_ids[rid]
+    # Prune source rate-limit windows
+    cutoff = now - MESH_ROUTE_PER_SOURCE_WINDOW
+    stale_sources = []
+    for src, timestamps in _mesh_route_sources.items():
+        _mesh_route_sources[src] = [t for t in timestamps if t > cutoff]
+        if not _mesh_route_sources[src]:
+            stale_sources.append(src)
+    for src in stale_sources:
+        del _mesh_route_sources[src]
+
+
+def _check_mesh_route_source_limit(source_agent_id: str) -> bool:
+    """Check if a source has exceeded its mesh route forwarding budget.
+
+    Returns True if the source is over the limit (should be dropped).
+    """
+    now = time.time()
+    cutoff = now - MESH_ROUTE_PER_SOURCE_WINDOW
+    timestamps = _mesh_route_sources.get(source_agent_id, [])
+    recent = [t for t in timestamps if t > cutoff]
+    if len(recent) >= MESH_ROUTE_PER_SOURCE_LIMIT:
+        return True
+    recent.append(now)
+    _mesh_route_sources[source_agent_id] = recent
+    return False
+
+
+def _pick_most_trusted_peer(state: AgentState, visited: set[str]) -> Optional[str]:
+    """Pick the most trusted connected peer not in the visited set."""
+    candidates = [
+        (aid, state.impressions.get(aid))
+        for aid in state.connections
+        if aid not in visited
+    ]
+    if not candidates:
+        return None
+    # Sort by trust score descending, default 0.0 for unscored
+    candidates.sort(key=lambda x: x[1].score if x[1] else 0.0, reverse=True)
+    return candidates[0][0]
+
+
+def _compute_chain_trust(trust_chain: list[dict]) -> float:
+    """Compute transitive trust as the product of all scores in the chain."""
+    result = 1.0
+    for hop in trust_chain:
+        score = hop.get("trust_to_next", 0.0)
+        result *= max(score, 0.0)  # floor at 0 — negative trust kills the chain
+    return round(result, 6)
+
+
+async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process a mesh-routed connection request. Trust-guided single-path routing.
+
+    Envelope format:
+    {
+        "route_id": "unique-id",
+        "route_type": "connection_request",
+        "target_agent_id": "...",
+        "source_agent_id": "...",
+        "hops_remaining": 10,
+        "visited": ["source_id", "hop1_id", ...],
+        "trust_chain": [
+            {"agent_id": "source_id", "trust_to_next": 0.85},
+            {"agent_id": "hop1_id", "trust_to_next": 0.92},
+        ],
+        "payload": { ... the actual connection request ... },
+    }
+
+    Routing logic at each hop:
+    1. Am I the target (or hosting it)? → Deliver.
+    2. Am I connected to the target? → Forward directly to them.
+    3. Neither → Forward to my single most-trusted peer not in visited.
+    """
+    route_id = data.get("route_id", "")
+    route_type = data.get("route_type", "")
+    target_agent_id = data.get("target_agent_id", "")
+    source_agent_id = data.get("source_agent_id", "")
+    hops_remaining = data.get("hops_remaining", 0)
+    visited = data.get("visited", [])
+    trust_chain = data.get("trust_chain", [])
+    payload = data.get("payload", {})
+
+    if not route_id or not target_agent_id or not source_agent_id:
+        return {"error": "Missing required mesh_route fields"}, 400
+
+    if route_type != "connection_request":
+        return {"error": f"Unknown route_type: {route_type}"}, 400
+
+    # Dedup
+    _prune_seen_routes()
+    if route_id in _seen_route_ids:
+        return {"status": "duplicate", "route_id": route_id}, 200
+    _seen_route_ids[route_id] = time.time()
+
+    # Don't route our own requests back
+    if source_agent_id == state.agent_id:
+        return {"status": "origin", "route_id": route_id}, 200
+
+    # Per-source rate limit — prevent any single source from flooding the mesh
+    if _check_mesh_route_source_limit(source_agent_id):
+        _log.info("Mesh route: rate-limited source %s... (route %s)",
+                   source_agent_id[:12], route_id)
+        return {"status": "rate_limited", "route_id": route_id}, 200
+
+    visited_set = set(visited)
+
+    # --- Step 1: Am I the target (or hosting it)? ---
+    from darkmatter.state import get_state_for
+    target_state = get_state_for(target_agent_id)
+    if target_state is not None:
+        chain_trust = _compute_chain_trust(trust_chain)
+
+        # Chain trust floor — requests with insufficient transitive trust are dropped
+        if chain_trust < MIN_CHAIN_TRUST:
+            _log.info("Mesh route: dropping connection_request from %s... — "
+                       "chain_trust %.6f < %.6f threshold",
+                       source_agent_id[:12], chain_trust, MIN_CHAIN_TRUST)
+            return {"status": "insufficient_trust", "route_id": route_id}, 200
+
+        _log.info("Mesh route: delivering connection_request from %s... to local agent %s... "
+                   "(chain_trust=%.4f, hops=%d)",
+                   source_agent_id[:12], target_agent_id[:12],
+                   chain_trust, len(trust_chain))
+
+        mgr = get_network_manager()
+        public_url = mgr.get_public_url(target_agent_id)
+
+        # Inject chain trust into the payload so the target can see it
+        enriched_payload = {**payload, "chain_trust": chain_trust, "trust_chain": trust_chain}
+        result, status = await process_connection_request(target_state, enriched_payload, public_url)
+
+        # Sign the response so the source can verify authenticity
+        from darkmatter.security import sign_payload
+        sig_fields = [route_id, target_agent_id, source_agent_id, result.get("agent_id", "")]
+        response_signature = ""
+        if target_state.private_key_hex:
+            response_signature = sign_payload(
+                target_state.private_key_hex, "mesh_route_response", *sig_fields
+            )
+
+        # Route the response back to the source
+        response_envelope = {
+            "route_id": f"{route_id}-resp",
+            "route_type": "connection_response",
+            "target_agent_id": source_agent_id,
+            "source_agent_id": target_agent_id,
+            "hops_remaining": 10,
+            "visited": [target_agent_id],
+            "trust_chain": trust_chain,
+            "payload": result,
+            "response_signature_hex": response_signature,
+            "original_route_id": route_id,
+        }
+        asyncio.ensure_future(_forward_trust_guided(target_state, response_envelope))
+        return {"status": "delivered", "route_id": route_id}, 200
+
+    # --- Step 2: Am I connected to the target? Forward directly. ---
+    target_conn = state.connections.get(target_agent_id)
+    if target_conn:
+        # Add our trust for the target to the chain
+        imp = state.impressions.get(target_agent_id)
+        trust_score = imp.score if imp else 0.5
+        updated_chain = trust_chain + [{"agent_id": state.agent_id, "trust_to_next": round(trust_score, 3)}]
+
+        updated_visited = list(visited_set | {state.agent_id})
+        forwarded = {
+            **data,
+            "visited": updated_visited,
+            "trust_chain": updated_chain,
+            "hops_remaining": hops_remaining - 1,
+        }
+
+        _log.info("Mesh route: forwarding to connected target %s... (trust=%.2f)",
+                   target_agent_id[:12], trust_score)
+        from darkmatter.network import send_to_peer
+        try:
+            await send_to_peer(target_conn, "/__darkmatter__/mesh_route", forwarded)
+            return {"status": "forwarded_direct", "route_id": route_id}, 200
+        except Exception as e:
+            _log.warning("Mesh route: direct forward to %s... failed: %s",
+                         target_agent_id[:12], e)
+
+    # --- Step 3: Forward to most-trusted unvisited peer ---
+    if hops_remaining <= 0:
+        _log.info("Mesh route: TTL expired for route %s targeting %s...",
+                   route_id, target_agent_id[:12])
+        return {"status": "ttl_expired", "route_id": route_id}, 200
+
+    next_peer_id = _pick_most_trusted_peer(state, visited_set | {state.agent_id})
+    if next_peer_id is None:
+        _log.info("Mesh route: dead end — no unvisited peers for route %s", route_id)
+        return {"status": "dead_end", "route_id": route_id}, 200
+
+    # Add our trust for the next hop to the chain
+    imp = state.impressions.get(next_peer_id)
+    trust_score = imp.score if imp else 0.5
+    updated_chain = trust_chain + [{"agent_id": state.agent_id, "trust_to_next": round(trust_score, 3)}]
+    updated_visited = list(visited_set | {state.agent_id})
+
+    forwarded = {
+        **data,
+        "visited": updated_visited,
+        "trust_chain": updated_chain,
+        "hops_remaining": hops_remaining - 1,
+    }
+
+    next_conn = state.connections[next_peer_id]
+    _log.info("Mesh route: trust-guided forward to %s... (trust=%.2f)",
+               next_peer_id[:12], trust_score)
+
+    from darkmatter.network import send_to_peer
+    try:
+        await send_to_peer(next_conn, "/__darkmatter__/mesh_route", forwarded)
+        return {"status": "forwarded", "route_id": route_id, "via": next_peer_id[:12]}, 200
+    except Exception as e:
+        _log.warning("Mesh route: forward to %s... failed: %s", next_peer_id[:12], e)
+        return {"status": "forward_failed", "route_id": route_id}, 200
+
+
+async def _process_mesh_route_response(state: AgentState, data: dict) -> tuple[dict, int]:
+    """Process a mesh-routed connection response traveling back to the source.
+
+    Uses trust-guided routing (same as forward path) to find the way back.
+    Response is cryptographically signed by the target — verified at the source.
+    """
+    route_id = data.get("route_id", "")
+    target_agent_id = data.get("target_agent_id", "")
+    source_agent_id = data.get("source_agent_id", "")
+    payload = data.get("payload", {})
+
+    if not route_id or not target_agent_id:
+        return {"error": "Missing required fields"}, 400
+
+    _prune_seen_routes()
+    if route_id in _seen_route_ids:
+        return {"status": "duplicate"}, 200
+    _seen_route_ids[route_id] = time.time()
+
+    # Are we the target of this response (the original requester)?
+    from darkmatter.state import get_state_for
+    target_state = get_state_for(target_agent_id)
+    if target_state is not None:
+        _log.info("Mesh route: connection_response arrived for local agent %s... from %s...",
+                   target_agent_id[:12], source_agent_id[:12])
+
+        # Verify signature — proves it came from the real target
+        response_sig = data.get("response_signature_hex")
+        original_route_id = data.get("original_route_id", "")
+        if not response_sig:
+            _log.warning("Mesh route: dropping unsigned connection_response from %s...",
+                         source_agent_id[:12])
+            return {"error": "Missing response signature"}, 403
+
+        from darkmatter.security import verify_signed_payload
+        sig_fields = [original_route_id, source_agent_id, target_agent_id,
+                      payload.get("agent_id", "")]
+        if not verify_signed_payload(source_agent_id, response_sig,
+                                     "mesh_route_response", *sig_fields):
+            _log.warning("Mesh route: invalid signature on connection_response from %s... — "
+                         "possible spoofing attempt", source_agent_id[:12])
+            return {"error": "Invalid response signature"}, 403
+
+        # Establish the connection
+        if payload.get("auto_accepted"):
+            conn = build_connection_from_accepted(payload)
+            target_state.connections[payload["agent_id"]] = conn
+            save_state()
+
+            chain_trust = _compute_chain_trust(data.get("trust_chain", []))
+            _log.info("Mesh route: connection to %s... established (verified, chain_trust=%.4f)",
+                       payload.get("agent_id", "")[:12], chain_trust)
+
+            _queue_connection_request(
+                target_state,
+                payload.get("agent_id", ""),
+                payload.get("agent_display_name"),
+                payload.get("agent_bio", ""),
+                f"mesh-routed (chain_trust={chain_trust:.3f})",
+            )
+        return {"status": "delivered"}, 200
+
+    # Not for us — forward toward the original requester (trust-guided)
+    if data.get("hops_remaining", 0) <= 0:
+        return {"status": "ttl_expired"}, 200
+
+    await _forward_trust_guided(state, data)
+    return {"status": "forwarded"}, 200
+
+
+async def _forward_trust_guided(state: AgentState, envelope: dict) -> None:
+    """Forward a mesh route envelope to the most-trusted unvisited peer."""
+    from darkmatter.network import send_to_peer
+
+    visited = set(envelope.get("visited", []))
+    visited.add(state.agent_id)
+
+    target_agent_id = envelope.get("target_agent_id", "")
+
+    # Check if we're directly connected to the target — shortcut
+    target_conn = state.connections.get(target_agent_id)
+    if target_conn and target_agent_id not in visited:
+        forwarded = {
+            **envelope,
+            "hops_remaining": envelope.get("hops_remaining", 10) - 1,
+            "visited": list(visited),
+        }
+        try:
+            await send_to_peer(target_conn, "/__darkmatter__/mesh_route", forwarded)
+            return
+        except Exception as e:
+            _log.warning("Mesh route: direct forward to %s... failed: %s",
+                         target_agent_id[:12], e)
+
+    # Trust-guided: pick most trusted unvisited peer
+    next_peer_id = _pick_most_trusted_peer(state, visited)
+    if next_peer_id is None:
+        _log.info("Mesh route: dead end forwarding response for route %s",
+                   envelope.get("route_id", ""))
+        return
+
+    forwarded = {
+        **envelope,
+        "hops_remaining": envelope.get("hops_remaining", 10) - 1,
+        "visited": list(visited),
+    }
+
+    try:
+        await send_to_peer(state.connections[next_peer_id],
+                           "/__darkmatter__/mesh_route", forwarded)
+    except Exception as e:
+        _log.warning("Mesh route: forward to %s... failed: %s", next_peer_id[:12], e)
+
+
+async def handle_mesh_route(request: Request) -> JSONResponse:
+    """Handle a mesh-routed packet (HTTP transport)."""
+    state = resolve_state(request)
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    route_type = data.get("route_type", "")
+    if route_type == "connection_response":
+        result, status_code = await _process_mesh_route_response(state, data)
+    else:
+        result, status_code = await _process_mesh_route(state, data)
+    return JSONResponse(result, status_code=status_code)
+
+
+# =============================================================================
+# HTTP Handlers — Thin wrappers around the processing functions above
+# =============================================================================
+
 async def handle_message(request: Request) -> JSONResponse:
     """Handle an incoming routed message from another agent (HTTP transport)."""
-    state = get_state()
+    state = resolve_state(request)
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1234,12 +1843,11 @@ async def handle_message(request: Request) -> JSONResponse:
 
 async def handle_status(request: Request) -> JSONResponse:
     """Return this agent's public status (for health checks and discovery)."""
-    state = get_state()
+    state = resolve_state(request)
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
-    spawned_agents = get_spawned_agents()
     return JSONResponse({
         "agent_id": state.agent_id,
         "display_name": state.display_name,
@@ -1248,14 +1856,13 @@ async def handle_status(request: Request) -> JSONResponse:
         "status": state.status.value,
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
-        "spawned_agents": len(spawned_agents),
         "is_waiting": getattr(state, "_is_waiting", False) or (state.public_key_hex and check_waiting(state.public_key_hex)),
     })
 
 
 async def handle_network_info(request: Request) -> JSONResponse:
     """Return this agent's network info for peer discovery."""
-    state = get_state()
+    state = resolve_state(request)
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1279,9 +1886,24 @@ async def handle_network_info(request: Request) -> JSONResponse:
     })
 
 
+async def handle_status_broadcast(request: Request) -> JSONResponse:
+    """Receive a passive status broadcast from a peer (HTTP transport)."""
+    state = resolve_state(request)
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    result, status_code = await _process_status_broadcast(state, data)
+    return JSONResponse(result, status_code=status_code)
+
+
 async def handle_impression_get(request: Request) -> JSONResponse:
     """Return this agent's impression of a specific agent (asked by peers)."""
-    state = get_state()
+    state = resolve_state(request)
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1312,16 +1934,11 @@ async def handle_impression_get(request: Request) -> JSONResponse:
 # =============================================================================
 
 async def handle_peer_update(request: Request) -> JSONResponse:
-    """Accept a URL change notification from a connected peer.
-
-    Verifies the agent_id is a known connection and optionally validates
-    the public key matches before updating the stored URL.
-    """
-    state = get_state()
+    """Accept a URL change notification from a connected peer (HTTP transport)."""
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
-    # Global rate limit (per-connection checked after we know the agent_id)
     rate_err = check_rate_limit(state)
     if rate_err:
         return JSONResponse({"error": rate_err}, status_code=429)
@@ -1331,66 +1948,8 @@ async def handle_peer_update(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    agent_id = body.get("agent_id", "")
-    new_url = body.get("new_url", "")
-    public_key_hex = body.get("public_key_hex")
-    signature = body.get("signature")
-    timestamp = body.get("timestamp", "")
-
-    if not agent_id or not new_url:
-        return JSONResponse({"error": "Missing agent_id or new_url"}, status_code=400)
-
-    # Validate URL
-    url_err = validate_url(new_url)
-    if url_err:
-        return JSONResponse({"error": url_err}, status_code=400)
-
-    conn = state.connections.get(agent_id)
-    if conn is None:
-        return JSONResponse({"error": "Unknown agent"}, status_code=404)
-
-    # Replay protection: reject stale timestamps
-    if timestamp and not is_timestamp_fresh(timestamp):
-        return JSONResponse({"error": "Timestamp expired"}, status_code=403)
-
-    # Verify public key matches if both sides have one
-    if public_key_hex and conn.agent_public_key_hex:
-        if public_key_hex != conn.agent_public_key_hex:
-            return JSONResponse({"error": "Public key mismatch"}, status_code=403)
-
-    # Signature is REQUIRED when we have a stored key for this peer
-    verify_key = conn.agent_public_key_hex or public_key_hex
-    if conn.agent_public_key_hex:
-        if not signature or not timestamp:
-            return JSONResponse({"error": "Signature required — known public key on file"}, status_code=403)
-        if not verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
-            return JSONResponse({"error": "Invalid signature"}, status_code=403)
-    elif verify_key and signature and timestamp:
-        if not verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
-            return JSONResponse({"error": "Invalid signature"}, status_code=403)
-
-    old_url = conn.agent_url
-    conn.agent_url = new_url
-
-    # Update transport-aware addresses
-    addresses = body.get("addresses")
-    if addresses and isinstance(addresses, dict):
-        conn.addresses = addresses
-    elif new_url:
-        conn.addresses["http"] = new_url
-
-    # Update bio and display name if included in the peer_update payload
-    new_bio = body.get("bio")
-    if new_bio is not None and isinstance(new_bio, str):
-        conn.agent_bio = new_bio[:MAX_BIO_LENGTH]
-    new_display_name = body.get("display_name")
-    if new_display_name is not None and isinstance(new_display_name, str):
-        conn.agent_display_name = new_display_name[:100]
-
-    save_state()
-
-    print(f"[DarkMatter] Peer {agent_id[:12]}... updated URL: {old_url} -> {new_url}", file=sys.stderr)
-    return JSONResponse({"success": True, "updated": True})
+    result, status_code = await _process_peer_update(state, body)
+    return JSONResponse(result, status_code=status_code)
 
 
 async def handle_peer_lookup(request: Request) -> JSONResponse:
@@ -1399,7 +1958,7 @@ async def handle_peer_lookup(request: Request) -> JSONResponse:
     Used by other peers to find an agent's current URL when direct
     communication fails.
     """
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1419,6 +1978,28 @@ async def handle_peer_lookup(request: Request) -> JSONResponse:
     })
 
 
+async def handle_get_peers(request: Request) -> JSONResponse:
+    """Return this agent's top-N most trusted connected peers with bios (HTTP transport)."""
+    state = resolve_state(request)
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    data = {}
+    if request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            pass
+    else:
+        try:
+            data = {"n": int(request.query_params.get("n", "10"))}
+        except (ValueError, TypeError):
+            pass
+
+    result, status_code = _process_get_peers(state, data)
+    return JSONResponse(result, status_code=status_code)
+
+
 # =============================================================================
 # AntiMatter HTTP Endpoints
 # =============================================================================
@@ -1436,7 +2017,7 @@ async def handle_antimatter_match(request: Request) -> JSONResponse:
 
 async def handle_antimatter_signal(request: Request) -> JSONResponse:
     """Receive a forwarded antimatter signal and run the match game."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
     try:
@@ -1449,7 +2030,7 @@ async def handle_antimatter_signal(request: Request) -> JSONResponse:
 
 async def handle_antimatter_result(request: Request) -> JSONResponse:
     """B receives this when a downstream node resolves the antimatter signal."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
     try:
@@ -1494,7 +2075,7 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     Body: {from_agent_id, sdp_offer}
     Returns: {sdp_answer}
     """
-    state = get_state()
+    state = resolve_state(request)
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1543,21 +2124,13 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
         conn.transport = "webrtc"
 
         @channel.on("message")
-        async def on_message(message):
-            try:
-                envelope = json.loads(message)
-                path = envelope.get("path", "")
-                payload = envelope.get("payload", {})
-                if path == "/__darkmatter__/message":
-                    result, status_code = await _process_incoming_message(state, payload)
-                    if status_code >= 400:
-                        print(f"[DarkMatter] WebRTC message rejected ({status_code}): {result.get('error', 'unknown')}", file=sys.stderr)
-            except Exception as e:
-                print(f"[DarkMatter] WebRTC message processing error: {e}", file=sys.stderr)
+        def on_message(message):
+            if _webrtc_t:
+                _webrtc_t._handle_incoming(state, conn, message)
 
         @channel.on("close")
         def on_close():
-            print(f"[DarkMatter] WebRTC data channel closed (peer: {from_agent_id})", file=sys.stderr)
+            _log.info("WebRTC data channel closed (peer: %s)", from_agent_id)
             if _webrtc_t:
                 _webrtc_t.cleanup_sync(conn)
 
@@ -1566,7 +2139,7 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     @pc.on("connectionstatechange")
     async def on_connection_state_change():
         if pc.connectionState in ("failed", "closed"):
-            print(f"[DarkMatter] WebRTC connection {pc.connectionState} (peer: {from_agent_id})", file=sys.stderr)
+            _log.info("WebRTC connection %s (peer: %s)", pc.connectionState, from_agent_id)
             if _webrtc_t:
                 _webrtc_t.cleanup_sync(conn)
 
@@ -1579,7 +2152,7 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     # Wait for ICE gathering
     await _wait_for_ice_gathering(pc)
 
-    print(f"[DarkMatter] WebRTC: answered offer from {conn.agent_display_name or from_agent_id}", file=sys.stderr)
+    _log.info("WebRTC: answered offer from %s", conn.agent_display_name or from_agent_id)
 
     from darkmatter.security import sign_sdp
     answer_sdp = pc.localDescription.sdp
@@ -1595,16 +2168,12 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
 
 
 # =============================================================================
-# Shared Shard Push Endpoint
+# Insight Push Endpoint
 # =============================================================================
 
-async def handle_shard_push(request: Request) -> JSONResponse:
-    """Receive a shared shard from a peer.
-
-    POST /__darkmatter__/shard_push
-    Body: SharedShard fields
-    """
-    state = get_state()
+async def handle_insight_push(request: Request) -> JSONResponse:
+    """Receive an insight from a peer (HTTP transport)."""
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1613,73 +2182,11 @@ async def handle_shard_push(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    author_id = data.get("author_agent_id", "")
-    shard_id = data.get("shard_id", "")
+    result, status_code = await _process_insight_push(state, data)
+    return JSONResponse(result, status_code=status_code)
 
-    if not author_id or not shard_id:
-        missing = [f for f, v in [("author_agent_id", author_id), ("shard_id", shard_id)] if not v]
-        return JSONResponse({"error": f"Missing required fields: {', '.join(missing)}"}, status_code=400)
-
-    # Verify shard signature (mandatory)
-    signature_hex = data.get("signature_hex")
-    if not signature_hex:
-        return JSONResponse({"error": "Missing shard signature"}, status_code=403)
-
-    # Look up author's public key
-    author_conn = state.connections.get(author_id)
-    author_pub_key = author_conn.agent_public_key_hex if author_conn else None
-    if not author_pub_key:
-        return JSONResponse({"error": "Unknown shard author — no public key on file"}, status_code=403)
-
-    from darkmatter.security import verify_shard_signature
-    tags_str = ",".join(sorted(data.get("tags", [])))
-    if not verify_shard_signature(author_pub_key, signature_hex, shard_id, author_id,
-                                   data.get("content", ""), tags_str):
-        return JSONResponse({"error": "Invalid shard signature"}, status_code=403)
-
-    # If the sender pushed this shard to us, we're already in their top-N — accept it.
-
-    # Upsert: replace existing shard from same author with same ID
-    from darkmatter.models import SharedShard
-    from darkmatter.config import SHARED_SHARD_MAX
-
-    existing_idx = None
-    for i, s in enumerate(state.shared_shards):
-        if s.shard_id == shard_id and s.author_agent_id == author_id:
-            existing_idx = i
-            break
-
-    shard = SharedShard(
-        shard_id=shard_id,
-        author_agent_id=author_id,
-        content=data.get("content", "")[:MAX_CONTENT_LENGTH],
-        tags=data.get("tags", []),
-        share_with_top_n=data.get("share_with_top_n", -1),
-        created_at=data.get("created_at", ""),
-        updated_at=data.get("updated_at", ""),
-        summary=data.get("summary"),
-        signature_hex=signature_hex,
-        file=data.get("file"),
-        from_text=data.get("from_text"),
-        to_text=data.get("to_text"),
-        function_anchor=data.get("function_anchor"),
-        original_content=data.get("original_content"),
-        original_hash=data.get("original_hash"),
-    )
-
-    if existing_idx is not None:
-        state.shared_shards[existing_idx] = shard
-    else:
-        if len(state.shared_shards) >= SHARED_SHARD_MAX:
-            # Evict oldest peer shard
-            for i, s in enumerate(state.shared_shards):
-                if s.author_agent_id != state.agent_id:
-                    state.shared_shards.pop(i)
-                    break
-        state.shared_shards.append(shard)
-
-    save_state()
-    return JSONResponse({"success": True, "shard_id": shard_id})
+# Backward compat alias
+handle_shard_push = handle_insight_push
 
 
 # =============================================================================
@@ -1693,7 +2200,7 @@ async def handle_sdp_relay(request: Request) -> JSONResponse:
     Body: {target_agent_id, offer_data, from_agent_id}
     Returns: {sdp, type} — the SDP answer from the target, or error.
     """
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1742,7 +2249,7 @@ async def handle_sdp_relay_deliver(request: Request) -> JSONResponse:
     Body: {from_agent_id, offer_data, relay_agent_id}
     Returns: {sdp, type} — the SDP answer.
     """
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1780,256 +2287,12 @@ async def handle_sdp_relay_deliver(request: Request) -> JSONResponse:
     return JSONResponse(answer)
 
 
-# =============================================================================
-# Pool Endpoints
-# =============================================================================
-
-async def handle_pool_buy(request: Request) -> Response:
-    """POST /__darkmatter__/pool_buy — Consumer buys access to a pool.
-
-    Creates an access token for the consumer with the deposited balance.
-    """
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    pool_id = data.get("pool_id", "")
-    consumer_agent_id = data.get("consumer_agent_id", "")
-    amount = data.get("amount", 0)
-    payment_token = data.get("payment_token", "SOL")
-
-    if not pool_id or not consumer_agent_id or amount <= 0:
-        return JSONResponse({"error": "Missing pool_id, consumer_agent_id, or invalid amount"}, status_code=400)
-
-    # Consumer must be connected
-    if consumer_agent_id not in state.connections:
-        return JSONResponse({"error": "Consumer not connected"}, status_code=403)
-
-    from darkmatter.pool import find_pool
-    from darkmatter.config import POOL_MAX_ACCESS_TOKENS
-
-    pool = find_pool(state.pools, pool_id)
-    if not pool:
-        return JSONResponse({"success": False, "error": "Pool not found"}, status_code=404)
-
-    if len(pool.access_tokens) >= POOL_MAX_ACCESS_TOKENS:
-        return JSONResponse({"success": False, "error": "Access token limit reached"}, status_code=429)
-
-    from darkmatter.models import PoolAccessToken
-    now = datetime.now(timezone.utc).isoformat()
-    token_id = f"at-{secrets.token_hex(16)}"
-    access_token = PoolAccessToken(
-        token_id=token_id,
-        consumer_agent_id=consumer_agent_id,
-        balance=amount,
-        token_mint=payment_token,
-        total_deposited=amount,
-        total_spent=0.0,
-        created_at=now,
-    )
-    pool.access_tokens.append(access_token)
-    save_state()
-
-    return JSONResponse({
-        "success": True,
-        "token_id": token_id,
-        "pool_id": pool_id,
-        "balance": amount,
-        "payment_token": payment_token,
-    })
-
-
-async def handle_pool_proxy(request: Request) -> Response:
-    """POST /__darkmatter__/pool_proxy — Proxied API call through a pool.
-
-    Validates access token and balance, selects a provider, proxies the request,
-    debits the consumer's balance.
-    """
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    pool_id = data.get("pool_id", "")
-    token_id = data.get("access_token", "")
-    method = data.get("method", "GET")
-    path = data.get("path", "")
-    headers = data.get("headers", {})
-    body = data.get("body")
-
-    if not pool_id or not token_id or not path:
-        return JSONResponse({"error": "Missing pool_id, access_token, or path"}, status_code=400)
-
-    from darkmatter.pool import find_pool, find_access_token, select_provider, get_handler
-
-    pool = find_pool(state.pools, pool_id)
-    if not pool:
-        return JSONResponse({"success": False, "error": "Pool not found"}, status_code=404)
-
-    access_token = find_access_token(pool, token_id)
-    if not access_token:
-        return JSONResponse({"success": False, "error": "Invalid access token"}, status_code=403)
-    if access_token.revoked:
-        return JSONResponse({"success": False, "error": "Access token revoked"}, status_code=403)
-
-    provider = select_provider(pool, path)
-    if not provider:
-        return JSONResponse({"success": False, "error": "No provider available for this path"}, status_code=404)
-
-    # Resolve handler
-    handler = get_handler(pool.handler_type)
-    if not handler:
-        return JSONResponse({"success": False, "error": f"Unknown handler type: {pool.handler_type}"}, status_code=500)
-
-    # Validate request
-    validation_error = handler.validate_request(provider, method, path, headers, body)
-    if validation_error:
-        return JSONResponse({"success": False, "error": validation_error}, status_code=400)
-
-    # Estimate cost for balance pre-check
-    estimated_cost = handler.estimate_cost(provider, method, path, body)
-    if access_token.balance < estimated_cost:
-        return JSONResponse({"success": False, "error": "Insufficient balance"}, status_code=402)
-
-    # Proxy via handler
-    try:
-        result = await handler.proxy(provider, method, path, headers, body)
-        provider.calls_served += 1
-    except Exception as e:
-        provider.failures += 1
-        save_state()
-        # Try another provider on failure
-        provider2 = select_provider(pool, path)
-        if provider2 and provider2.provider_id != provider.provider_id:
-            try:
-                result = await handler.proxy(provider2, method, path, headers, body)
-                provider2.calls_served += 1
-            except Exception as e2:
-                provider2.failures += 1
-                save_state()
-                return JSONResponse({"success": False, "error": f"All providers failed: {e2}"}, status_code=502)
-        else:
-            return JSONResponse({"success": False, "error": f"Provider failed: {e}"}, status_code=502)
-
-    # Debit actual cost from handler result
-    access_token.balance -= result.cost
-    access_token.total_spent += result.cost
-    access_token.calls_made += 1
-    access_token.last_used = datetime.now(timezone.utc).isoformat()
-    save_state()
-
-    if result.streaming and result.body_stream is not None:
-        from starlette.responses import StreamingResponse
-        return StreamingResponse(
-            result.body_stream,
-            status_code=result.status_code,
-            headers=result.headers,
-        )
-
-    import base64
-    return JSONResponse({
-        "success": True,
-        "status_code": result.status_code,
-        "headers": result.headers,
-        "body_b64": base64.b64encode(result.body).decode(),
-        "balance_remaining": access_token.balance,
-    })
-
-
-async def handle_pool_info(request: Request) -> Response:
-    """GET /__darkmatter__/pool_info/{pool_id} — Public pool metadata (no credentials)."""
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    pool_id = request.path_params.get("pool_id", "")
-
-    from darkmatter.pool import find_pool
-
-    pool = find_pool(state.pools, pool_id)
-    if not pool:
-        return JSONResponse({"error": "Pool not found"}, status_code=404)
-
-    enabled_providers = [pv for pv in pool.providers if pv.enabled]
-    return JSONResponse({
-        "pool_id": pool.pool_id,
-        "name": pool.name,
-        "tags": pool.tags,
-        "description": pool.description,
-        "handler_type": pool.handler_type,
-        "provider_count": len(enabled_providers),
-        "endpoints": sorted(set(p for pv in enabled_providers for p in pv.allowed_paths)),
-        "prices": [
-            {"price_per_call": pv.price_per_call, "price_token": pv.price_token}
-            for pv in enabled_providers
-        ],
-        "created_at": pool.created_at,
-    })
-
-
-async def handle_admin_update(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/admin_update — Pull latest code from git.
-
-    Only processes requests from connected peers.
-    Runs `git pull origin main` on the repo containing the darkmatter package.
-    """
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    # Verify the request comes from a connected peer
-    from_id = data.get("from_agent_id", "")
-    if from_id not in state.connections:
-        return JSONResponse({"error": "Not a connected peer"}, status_code=403)
-
-    action = data.get("action", "")
-    if action != "pull_and_restart":
-        return JSONResponse({"error": f"Unknown action: {action}"}, status_code=400)
-
-    import shlex
-    import subprocess
-    from darkmatter.config import UPDATE_COMMAND
-
-    try:
-        result = subprocess.run(
-            shlex.split(UPDATE_COMMAND),
-            capture_output=True, text=True, timeout=60,
-        )
-        output = result.stdout.strip() or result.stderr.strip()
-        success = result.returncode == 0
-    except subprocess.TimeoutExpired:
-        output = f"Update command timed out after 60s: {UPDATE_COMMAND}"
-        success = False
-    except Exception as e:
-        output = str(e)
-        success = False
-
-    return JSONResponse({
-        "success": success,
-        "git_output": output,
-    })
-
-
 async def handle_admin_connect(request: Request) -> JSONResponse:
     """POST /__darkmatter__/admin_connect — Tell this agent to connect to a URL.
 
     Only processes requests from connected peers.
     """
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2092,7 +2355,7 @@ async def handle_genome(request: Request) -> Response:
     from starlette.responses import Response as StarletteResponse
     from darkmatter.genome import get_genome_version, build_genome_zip, hash_bytes, sign_genome_zip
 
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2131,7 +2394,7 @@ async def handle_genome(request: Request) -> Response:
 
 async def handle_local_inbox(request: Request) -> JSONResponse:
     """GET /__darkmatter__/inbox — list all queued messages."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2150,7 +2413,7 @@ async def handle_local_inbox(request: Request) -> JSONResponse:
 
 async def handle_local_pending(request: Request) -> JSONResponse:
     """GET /__darkmatter__/pending_requests — list pending connection requests."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2169,7 +2432,7 @@ async def handle_local_pending(request: Request) -> JSONResponse:
 
 async def handle_local_connections(request: Request) -> JSONResponse:
     """GET /__darkmatter__/connections — list connections with details."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2198,7 +2461,7 @@ async def handle_local_set_impression(request: Request) -> JSONResponse:
     """POST /__darkmatter__/set_impression — set trust score for a peer."""
     from darkmatter.models import Impression
 
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2234,7 +2497,7 @@ async def handle_local_set_impression(request: Request) -> JSONResponse:
 
 async def handle_local_config(request: Request) -> JSONResponse:
     """POST /__darkmatter__/config — set agent configuration."""
-    state = get_state()
+    state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 

@@ -25,15 +25,15 @@ from darkmatter.config import (
     DISCOVERY_MCAST_GROUP,
     DISCOVERY_LOCAL_PORTS,
     AGENT_ROUTER_MODE,
-    AGENT_SPAWN_ENABLED,
-    AGENT_SPAWN_MAX_CONCURRENT,
-    AGENT_SPAWN_MAX_PER_HOUR,
-    ACTIVE_CLIENT,
 )
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.names import generate_agent_name
 from darkmatter.identity import load_or_create_passport
-from darkmatter.state import set_state, get_state, save_state, state_file_path, load_state_from_file, clear_waiting_signal
+from darkmatter.state import (
+    set_state, get_state, get_state_for, save_state, state_file_path,
+    load_state_from_file, clear_waiting_signal, register_agent, list_hosted_agents,
+    scan_state_files,
+)
 from darkmatter.mcp import mcp
 import darkmatter.mcp.tools  # noqa: F401 — registers @mcp.tool() decorators
 from darkmatter.mcp.visibility import initialize_tool_visibility, status_updater
@@ -43,11 +43,10 @@ from darkmatter.network.transports.webrtc import WebRTCTransport
 from darkmatter.network.discovery import (
     DiscoveryProtocol,
     discovery_loop,
-    ensure_entrypoint_running,
     handle_well_known,
-    shutdown_entrypoint,
 )
 from darkmatter.network.mesh import (
+    dispatch_webrtc_message,
     handle_connection_request,
     handle_connection_accepted,
     handle_accept_pending,
@@ -55,21 +54,21 @@ from darkmatter.network.mesh import (
 
     handle_status,
     handle_network_info,
+    handle_status_broadcast,
     handle_impression_get,
     handle_webrtc_offer,
     handle_peer_update,
     handle_peer_lookup,
+    handle_get_peers,
+    handle_mesh_route,
     handle_antimatter_match,
     handle_antimatter_signal,
     handle_antimatter_result,
+    handle_insight_push,
     handle_shard_push,
     handle_sdp_relay,
     handle_sdp_relay_deliver,
     handle_connection_proof,
-    handle_pool_buy,
-    handle_pool_proxy,
-    handle_pool_info,
-    handle_admin_update,
     handle_admin_connect,
     handle_genome,
     handle_local_inbox,
@@ -79,8 +78,10 @@ from darkmatter.network.mesh import (
     handle_local_config,
     handle_ping,
 )
-from darkmatter.spawn import spawn_main_agent
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
+from darkmatter.logging import get_logger
+
+_log = get_logger("app")
 
 
 # =============================================================================
@@ -138,24 +139,68 @@ def init_state(port: int = None) -> None:
         elif not restored.display_name:
             restored.display_name = generate_agent_name()
         set_state(restored)
-        print(f"[DarkMatter] Restored state (display: {restored.display_name or 'none'}, "
-              f"{len(restored.connections)} connections)", file=sys.stderr)
+        _log.info("Restored state (display: %s, %d connections)",
+                  restored.display_name or "none", len(restored.connections))
     else:
         # state already set to fresh state above
-        print(f"[DarkMatter] Starting fresh (display: {display_name or 'none'}) "
-              f"on port {port}", file=sys.stderr)
+        _log.info("Starting fresh (display: %s) on port %d", display_name or "none", port)
 
-    print(f"[DarkMatter] Identity: {agent_id[:16]}...{agent_id[-8:]}", file=sys.stderr)
+    _log.info("Identity: %s...%s", agent_id[:16], agent_id[-8:])
 
     # Derive Solana wallet (ephemeral — not persisted, derived from passport each startup)
     state = get_state()
     if state.private_key_hex:
         from darkmatter.wallet.solana import _get_solana_wallet_address
         state.wallets["solana"] = _get_solana_wallet_address(state.private_key_hex)
-        print(f"[DarkMatter] Solana wallet: {state.wallets['solana']}", file=sys.stderr)
+        _log.info("Solana wallet: %s", state.wallets["solana"])
 
     save_state()
     clear_waiting_signal()
+
+
+# =============================================================================
+# Multi-agent daemon scanning
+# =============================================================================
+
+def _register_discovered_agents(daemon_port: int) -> None:
+    """Scan state files and register any agents not yet in the registry.
+
+    Only registers agents whose state file indicates the same port as this daemon
+    (to avoid claiming agents from other daemons).
+    """
+    from darkmatter.config import AGENT_ROUTER_MODE
+
+    current_agents = set(list_hosted_agents())
+    for info in scan_state_files():
+        agent_id = info["agent_id"]
+        if agent_id in current_agents:
+            continue
+        # Only adopt agents on our port
+        if info.get("port", daemon_port) != daemon_port:
+            continue
+
+        state = load_state_from_file(info["path"], agent_id=agent_id)
+        if state is None:
+            continue
+
+        state.port = daemon_port
+        state.status = AgentStatus.ACTIVE
+        state.router_mode = AGENT_ROUTER_MODE
+        register_agent(agent_id, state)
+        _log.info("Discovered and registered agent %s... (%s)",
+                  agent_id[:12], state.display_name or "unnamed")
+
+
+async def _agent_scan_loop(daemon_port: int) -> None:
+    """Periodically scan for new/removed agent state files."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            _register_discovered_agents(daemon_port)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            _log.error("Agent scan loop error: %s", e)
 
 
 # =============================================================================
@@ -174,7 +219,9 @@ def create_app() -> Router:
     # Create and register NetworkManager with transport plugins
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
     manager.register_transport(HttpTransport())
-    manager.register_transport(WebRTCTransport())
+    webrtc = WebRTCTransport()
+    webrtc.set_message_dispatcher(dispatch_webrtc_message)
+    manager.register_transport(webrtc)
     set_network_manager(manager)
 
     # Wire antimatter economy into NetworkManager for transport-agnostic sends
@@ -210,47 +257,34 @@ def create_app() -> Router:
                     sock=sock,
                 )
             except OSError as e:
-                print(f"[DarkMatter] LAN multicast listener failed ({e}), local HTTP discovery still active", file=sys.stderr)
+                _log.warning("LAN multicast listener failed (%s), local HTTP discovery still active", e)
 
             # Start discovery loop (local HTTP scan + LAN multicast beacons)
             asyncio.create_task(discovery_loop(state))
-            print(f"[DarkMatter] Discovery: ENABLED (local: HTTP scan ports "
-                  f"{DISCOVERY_LOCAL_PORTS.start}-{DISCOVERY_LOCAL_PORTS.stop - 1}, "
-                  f"LAN: multicast {DISCOVERY_MCAST_GROUP}:{DISCOVERY_PORT})", file=sys.stderr)
+            _log.info(
+                "Discovery: ENABLED (local: HTTP scan ports %d-%d, LAN: multicast %s:%d)",
+                DISCOVERY_LOCAL_PORTS.start,
+                DISCOVERY_LOCAL_PORTS.stop - 1,
+                DISCOVERY_MCAST_GROUP,
+                DISCOVERY_PORT,
+            )
 
         # Start live status updater (updates tool description and notifies clients)
         asyncio.create_task(status_updater())
-        print(f"[DarkMatter] Live status updater: ENABLED (5s interval)", file=sys.stderr)
+        _log.info("Live status updater: ENABLED (5s interval)")
 
         # Initialize dynamic tool visibility (hide optional tools until needed)
         initialize_tool_visibility()
 
+        # Scan for other agents on this machine and register them
+        _register_discovered_agents(port)
+
+        # Start periodic agent scanning task
+        asyncio.create_task(_agent_scan_loop(port))
+        _log.info("Multi-agent scanner: ENABLED (10s interval)")
+
         # Start NetworkManager (discovers public URL, starts health loop + ping loop)
         await manager.start()
-
-        # Auto-start entrypoint (human node) if not already running
-        asyncio.create_task(ensure_entrypoint_running())
-
-        # Prune stale messages from a previous session, then spawn the main agent.
-        if AGENT_SPAWN_ENABLED and state.router_mode == "spawn":
-            from datetime import datetime, timezone
-            MAX_AGE_SECONDS = 30 * 60  # 30 minutes
-            now = datetime.now(timezone.utc)
-            stale = []
-            for msg in list(state.message_queue):
-                try:
-                    received = datetime.fromisoformat(msg.received_at)
-                    age = (now - received).total_seconds()
-                except (ValueError, TypeError):
-                    age = float("inf")
-                if age > MAX_AGE_SECONDS:
-                    stale.append(msg)
-            if stale:
-                print(f"[DarkMatter] Dropping {len(stale)} stale message(s) from previous session", file=sys.stderr)
-                state.message_queue = [m for m in state.message_queue if m not in stale]
-                save_state()
-            # Spawn the main agent — it will pick up any queued messages
-            asyncio.create_task(spawn_main_agent(state))
 
     # DarkMatter mesh protocol routes
     darkmatter_routes = [
@@ -262,20 +296,20 @@ def create_app() -> Router:
 
         Route("/status", handle_status, methods=["GET"]),
         Route("/network_info", handle_network_info, methods=["GET"]),
+        Route("/status_broadcast", handle_status_broadcast, methods=["POST"]),
         Route("/impression/{agent_id}", handle_impression_get, methods=["GET"]),
         Route("/webrtc_offer", handle_webrtc_offer, methods=["POST"]),
         Route("/peer_update", handle_peer_update, methods=["POST"]),
         Route("/peer_lookup/{agent_id}", handle_peer_lookup, methods=["GET"]),
+        Route("/get_peers", handle_get_peers, methods=["GET", "POST"]),
+        Route("/mesh_route", handle_mesh_route, methods=["POST"]),
         Route("/antimatter_match", handle_antimatter_match, methods=["POST"]),
         Route("/antimatter_signal", handle_antimatter_signal, methods=["POST"]),
         Route("/antimatter_result", handle_antimatter_result, methods=["POST"]),
-        Route("/shard_push", handle_shard_push, methods=["POST"]),
+        Route("/insight_push", handle_insight_push, methods=["POST"]),
+        Route("/shard_push", handle_shard_push, methods=["POST"]),  # backward compat
         Route("/sdp_relay", handle_sdp_relay, methods=["POST"]),
         Route("/sdp_relay_deliver", handle_sdp_relay_deliver, methods=["POST"]),
-        Route("/pool_buy", handle_pool_buy, methods=["POST"]),
-        Route("/pool_proxy", handle_pool_proxy, methods=["POST"]),
-        Route("/pool_info/{pool_id}", handle_pool_info, methods=["GET"]),
-        Route("/admin_update", handle_admin_update, methods=["POST"]),
         Route("/admin_connect", handle_admin_connect, methods=["POST"]),
         Route("/genome", handle_genome, methods=["GET"]),
         Route("/ping", handle_ping, methods=["POST"]),
@@ -329,7 +363,7 @@ def create_app() -> Router:
                 )
                 assert http_transport.mcp_session_id is not None
                 session_manager._server_instances[http_transport.mcp_session_id] = http_transport
-                print(f"[DarkMatter] New MCP session: {new_session_id[:16]}...", file=sys.stderr)
+                _log.info("New MCP session: %s...", new_session_id[:16])
 
                 async def run_server_resilient(*, task_status: _TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
                     try:
@@ -344,10 +378,10 @@ def create_app() -> Router:
                                     stateless=False,
                                 )
                             except Exception as e:
-                                print(f"[DarkMatter] MCP session {new_session_id[:16]} app.run error: {e}", file=sys.stderr)
+                                _log.error("MCP session %s app.run error: %s", new_session_id[:16], e)
                     except BaseException as e:
                         # Catch EVERYTHING — prevent one session from killing the task group
-                        print(f"[DarkMatter] MCP session {new_session_id[:16]} crashed: {type(e).__name__}: {e}", file=sys.stderr)
+                        _log.error("MCP session %s crashed: %s: %s", new_session_id[:16], type(e).__name__, e)
                     finally:
                         if (
                             http_transport.mcp_session_id
@@ -355,7 +389,7 @@ def create_app() -> Router:
                             and not http_transport.is_terminated
                         ):
                             del session_manager._server_instances[http_transport.mcp_session_id]
-                            print(f"[DarkMatter] Cleaned up session {new_session_id[:16]}", file=sys.stderr)
+                            _log.info("Cleaned up session %s", new_session_id[:16])
 
                 assert session_manager._task_group is not None
                 await session_manager._task_group.start(run_server_resilient)
@@ -382,10 +416,12 @@ def create_app() -> Router:
 
     # Build the app. Use redirect_slashes=False so POST /mcp doesn't get
     # redirected to /mcp/ (which breaks MCP client connections).
+    # Dual-mount: agent-scoped routes first (more specific), then bare routes (backward compat)
     app = Router(
         routes=[
             Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
-Mount("/__darkmatter__", routes=darkmatter_routes),
+            Mount("/__darkmatter__/{target_agent_id}", routes=darkmatter_routes),
+            Mount("/__darkmatter__", routes=darkmatter_routes),
             Route("/mcp", mcp_handler),
         ],
         redirect_slashes=False,
@@ -400,21 +436,22 @@ Mount("/__darkmatter__", routes=darkmatter_routes),
 # =============================================================================
 
 def print_startup_banner(port: int, transport: str, discovery_enabled: bool) -> None:
-    """Print startup banner to stderr."""
-    print(f"[DarkMatter] Starting mesh protocol on http://localhost:{port}", file=sys.stderr)
-    print(f"[DarkMatter] MCP transport: {transport}", file=sys.stderr)
-    print(f"[DarkMatter] Discovery: {'ENABLED' if discovery_enabled else 'disabled'}", file=sys.stderr)
-    print(f"[DarkMatter] WebRTC: AVAILABLE", file=sys.stderr)
-    print(f"[DarkMatter] UPnP: AVAILABLE", file=sys.stderr)
-    spawn_info = f"ENABLED (max {AGENT_SPAWN_MAX_CONCURRENT} concurrent, {AGENT_SPAWN_MAX_PER_HOUR}/hr)" if AGENT_SPAWN_ENABLED else "disabled"
-    if AGENT_SPAWN_ENABLED:
-        spawn_info += f" [client: {ACTIVE_CLIENT['command']}]"
-    print(f"[DarkMatter] Agent auto-spawn: {spawn_info}", file=sys.stderr)
-    print(f"[DarkMatter] Install: pip install dmagent | https://github.com/dadukhankevin/DarkMatter", file=sys.stderr)
+    """Log startup banner."""
+    _log.info("Starting mesh protocol on http://localhost:%d", port)
+    _log.info("MCP transport: %s", transport)
+    _log.info("Discovery: %s", "ENABLED" if discovery_enabled else "disabled")
+    _log.info("WebRTC: AVAILABLE")
+    _log.info("UPnP: AVAILABLE")
+    _log.info("Install: pip install dmagent | https://github.com/dadukhankevin/DarkMatter")
 
 
-def check_port_owner(host: str, port: int) -> Optional[str]:
-    """Check if a port has a DarkMatter server and return its agent_id, or None if port is free."""
+def check_port_owner(host: str, port: int, check_agent_id: str = None) -> Optional[str]:
+    """Check if a port has a DarkMatter server and return its agent_id, or None if port is free.
+
+    If check_agent_id is provided, also checks the `agents` array in the
+    well-known response for a multi-tenant match (returns that agent_id if
+    the daemon hosts it, even if it's not the primary agent).
+    """
     import socket as _socket
     # First check if port is in use at all
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
@@ -430,7 +467,16 @@ def check_port_owner(host: str, port: int) -> Optional[str]:
         resp = httpx.get(f"http://127.0.0.1:{port}/.well-known/darkmatter.json", timeout=1.0)
         if resp.status_code == 200:
             info = resp.json()
-            return info.get("agent_id")
+            primary_id = info.get("agent_id")
+
+            # Multi-tenant: check if our agent is already hosted on this daemon
+            if check_agent_id and check_agent_id != primary_id:
+                agents = info.get("agents", [])
+                for agent in agents:
+                    if agent.get("agent_id") == check_agent_id:
+                        return check_agent_id
+
+            return primary_id
     except Exception:
         pass
     return "unknown"  # Port taken by non-DarkMatter process
@@ -459,7 +505,9 @@ def _init_shared_stdio_session(port: int) -> None:
 
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
     manager.register_transport(HttpTransport())
-    manager.register_transport(WebRTCTransport())
+    webrtc = WebRTCTransport()
+    webrtc.set_message_dispatcher(dispatch_webrtc_message)
+    manager.register_transport(webrtc)
     set_network_manager(manager)
     set_antimatter_network_fns(
         send_fn=manager.send,
@@ -523,22 +571,22 @@ async def run_stdio_with_http() -> None:
     _priv, _pub = load_or_create_passport()
     our_agent_id = _pub
 
-    # Check who owns the port
-    port_owner = check_port_owner(host, port)
+    # Check who owns the port (multi-tenant aware)
+    port_owner = check_port_owner(host, port, check_agent_id=our_agent_id)
 
     if port_owner is None:
         # Port is free — promote the HTTP mesh node to a detached daemon so
         # discovery survives MCP client restarts, then attach this stdio
         # session to the shared on-disk state.
-        print(f"[DarkMatter] No HTTP mesh daemon detected on port {port}; spawning a persistent daemon.", file=sys.stderr)
+        _log.info("No HTTP mesh daemon detected on port %d; spawning a persistent daemon.", port)
         proc = _spawn_http_daemon(port)
         if proc.poll() is not None:
             raise RuntimeError("Failed to spawn persistent DarkMatter HTTP daemon")
         if not _wait_for_our_server(host, port, our_agent_id):
             raise RuntimeError(f"Persistent DarkMatter HTTP daemon did not become ready on port {port}")
 
-        print(f"[DarkMatter] Persistent HTTP mesh daemon is online on port {port}.", file=sys.stderr)
-        print(f"[DarkMatter] Running stdio-only MCP against shared state.", file=sys.stderr)
+        _log.info("Persistent HTTP mesh daemon is online on port %d.", port)
+        _log.info("Running stdio-only MCP against shared state.")
 
         _init_shared_stdio_session(port)
 
@@ -551,8 +599,8 @@ async def run_stdio_with_http() -> None:
 
     elif port_owner == our_agent_id:
         # Our server is already running — parallel session, share state
-        print(f"[DarkMatter] Port {port} is already running our server (agent {our_agent_id[:12]}...).", file=sys.stderr)
-        print(f"[DarkMatter] Running stdio-only MCP (parallel session, shared state).", file=sys.stderr)
+        _log.info("Port %d is already running our server (agent %s...).", port, our_agent_id[:12])
+        _log.info("Running stdio-only MCP (parallel session, shared state).")
         _init_shared_stdio_session(port)
 
         async with stdio_server() as (read_stream, write_stream):
@@ -564,13 +612,14 @@ async def run_stdio_with_http() -> None:
 
     else:
         # Port taken by a different agent — find a new port
-        print(f"[DarkMatter] Port {port} is taken by another agent ({port_owner[:12] if port_owner != 'unknown' else 'unknown'}...).", file=sys.stderr)
+        _log.info("Port %d is taken by another agent (%s...).", port,
+                  port_owner[:12] if port_owner != "unknown" else "unknown")
         new_port = find_free_port(host, DEFAULT_PORT)
-        print(f"[DarkMatter] Using port {new_port} instead.", file=sys.stderr)
+        _log.info("Using port %d instead.", new_port)
 
         # Override port for this session
         os.environ["DARKMATTER_PORT"] = str(new_port)
-        print(f"[DarkMatter] Spawning persistent daemon on alternate port {new_port}.", file=sys.stderr)
+        _log.info("Spawning persistent daemon on alternate port %d.", new_port)
         proc = _spawn_http_daemon(new_port)
         if proc.poll() is not None:
             raise RuntimeError(f"Failed to spawn persistent DarkMatter HTTP daemon on port {new_port}")
@@ -593,9 +642,18 @@ async def run_stdio_with_http() -> None:
 
 def main() -> None:
     """Entry point — detect transport mode and run."""
-    if len(sys.argv) > 1 and sys.argv[1] == "install-mcp":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else None
+    if cmd == "install-mcp":
         from darkmatter.installer import main as installer_main
         raise SystemExit(installer_main(sys.argv[2:]))
+    if cmd == "init-entrypoint":
+        from darkmatter.entrypoint_init import init_entrypoint
+        init_entrypoint(sys.argv[2:])
+        return
+    if cmd == "open-entrypoint":
+        from darkmatter.entrypoint_init import open_entrypoint
+        open_entrypoint()
+        return
 
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     transport = os.environ.get("DARKMATTER_TRANSPORT", "auto")
@@ -617,12 +675,11 @@ def main() -> None:
         def _asyncio_exception_handler(loop, context):
             exc = context.get("exception")
             msg = context.get("message", "")
-            print(f"[DarkMatter] ASYNCIO UNHANDLED EXCEPTION: {msg}", file=sys.stderr)
             if exc:
-                print(f"[DarkMatter]   Exception: {type(exc).__name__}: {exc}", file=sys.stderr)
-                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+                _log.error("ASYNCIO UNHANDLED EXCEPTION: %s — %s: %s",
+                           msg, type(exc).__name__, exc, exc_info=exc)
             else:
-                print(f"[DarkMatter]   Context: {context}", file=sys.stderr)
+                _log.error("ASYNCIO UNHANDLED EXCEPTION: %s — context: %s", msg, context)
 
         loop = asyncio.new_event_loop()
         loop.set_exception_handler(_asyncio_exception_handler)
@@ -633,7 +690,7 @@ def main() -> None:
         for sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
             old_handler = _signal.getsignal(sig)
             def _sig_handler(signum, frame, _old=old_handler, _name=sig.name):
-                print(f"[DarkMatter] RECEIVED SIGNAL {_name} ({signum})", file=sys.stderr)
+                _log.warning("RECEIVED SIGNAL %s (%d)", _name, signum)
                 traceback.print_stack(frame, file=sys.stderr)
                 if callable(_old) and _old not in (_signal.SIG_DFL, _signal.SIG_IGN):
                     _old(signum, frame)

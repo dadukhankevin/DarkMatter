@@ -100,10 +100,10 @@ CORE_TOOLS = frozenset({
     "darkmatter_send_message",
     "darkmatter_connection",
     "darkmatter_update_bio",
-    "darkmatter_create_shard",
-    "darkmatter_view_shards",
+    "darkmatter_create_insight",
+    "darkmatter_view_insights",
     "darkmatter_wait_for_message",
-    "darkmatter_complete_and_summarize",
+    # complete_and_summarize merged into wait_for_message(start_fresh=True)
 })
 
 # =============================================================================
@@ -136,17 +136,8 @@ CONVERSATION_LOG_MAX = 500
 CONTEXT_MAX_MESSAGES = 20          # max entries shown in full context feed
 CONTEXT_MAX_WORDS = 1000           # max words per entry in context feed
 CONTEXT_PIGGYBACK_MAX = 5          # max entries injected into tool responses
-SHARED_SHARD_MAX = 200
-SHARD_CACHE_TTL = 86400           # 24h
-
-# =============================================================================
-# Pools
-# =============================================================================
-
-POOL_MAX = 10
-POOL_MAX_PROVIDERS = 20
-POOL_MAX_ACCESS_TOKENS = 100
-POOL_PROXY_TIMEOUT = 30.0
+SHARED_INSIGHT_MAX = 200
+INSIGHT_CACHE_TTL = 86400           # 24h
 
 # =============================================================================
 # Trust Dynamics
@@ -161,132 +152,21 @@ TRUST_RATE_TOLERANCE = 0.001            # float comparison tolerance for rate di
 SUPERAGENT_DEFAULT_URL = os.environ.get("DARKMATTER_SUPERAGENT", "")
 
 # =============================================================================
-# Agent Auto-Spawn
+# Mesh Route Spam Prevention
 # =============================================================================
 
-# Router mode: "spawn" (auto-spawn agents), "queue_only" (hold for manual handling),
+MIN_CHAIN_TRUST = 0.01                  # minimum chain_trust to deliver a mesh-routed request
+MESH_ROUTE_PER_SOURCE_LIMIT = 5         # max mesh_route forwards per source_agent_id per window
+MESH_ROUTE_PER_SOURCE_WINDOW = 60       # seconds
+
+# =============================================================================
+# Message Router
+# =============================================================================
+
+# Router mode: "spawn" (handle + route messages), "queue_only" (hold for manual handling),
 # "rules_first" (rules then queue), "rules_only" (rules only).
 AGENT_ROUTER_MODE = os.environ.get("DARKMATTER_ROUTER_MODE", "spawn")
 
-AGENT_SPAWN_ENABLED = os.environ.get("DARKMATTER_AGENT_ENABLED", "true").lower() == "true"
-AGENT_SANDBOX = os.environ.get("DARKMATTER_SANDBOX", "false").lower() == "true"
-AGENT_SANDBOX_NETWORK = os.environ.get("DARKMATTER_SANDBOX_NETWORK", "true").lower() == "true"
-AGENT_SPAWN_MAX_CONCURRENT = int(os.environ.get("DARKMATTER_AGENT_MAX_CONCURRENT", "1"))
-AGENT_SPAWN_MAX_PER_HOUR = int(os.environ.get("DARKMATTER_AGENT_MAX_PER_HOUR", "15"))
-AGENT_SPAWN_TIMEOUT = int(os.environ.get("DARKMATTER_AGENT_TIMEOUT", "1500"))  # 25 min — enough for 20 min idle wait
-
-# Client profiles — each entry describes how to invoke an MCP client as a spawned agent.
-# DARKMATTER_CLIENT env var selects the active profile (default: "claude-code").
-# prompt_style: "positional" = append prompt as trailing arg,
-#               "stdin" = pipe prompt to stdin,
-#               "flag:<name>" = add --<name> <prompt> as args.
-CLIENT_PROFILES: dict[str, dict] = {
-    "claude-code": {
-        "command": "claude",
-        "args": ["--dangerously-skip-permissions"],
-        "env_cleanup": ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"],
-        "prompt_style": "positional",
-        "capabilities": {"spawn", "tools_list_changed", "mcp_stdio"},
-        "config_file": ".mcp.json",
-        "install": "curl -fsSL https://claude.ai/install.sh | bash",
-    },
-    "cursor": {
-        "command": "cursor-agent",
-        "args": ["--print", "--force", "--trust", "--approve-mcps"],
-        "env_cleanup": ["CURSOR_CLI", "CURSOR_AGENT"],
-        "prompt_style": "positional",          # cursor-agent --print --force <prompt>
-        "capabilities": {"spawn", "mcp_stdio"},
-        "config_file": ".cursor/mcp.json",
-        "install": "curl https://cursor.com/install -fsSL | bash",
-    },
-    "gemini": {
-        "command": "gemini",
-        "args": ["-p", "--yolo"],
-        "env_cleanup": [],
-        "prompt_style": "positional",          # gemini -p --yolo <prompt>
-        "capabilities": {"spawn", "mcp_stdio"},
-        "config_file": ".gemini/settings.json",
-        "install": "npm install -g @google/gemini-cli",
-    },
-    "codex": {
-        "command": "codex",
-        "args": ["exec", "--full-auto"],
-        "env_cleanup": [],
-        "prompt_style": "positional",          # codex exec --full-auto <prompt>
-        "capabilities": {"spawn", "mcp_stdio"},
-        "config_file": ".codex/config.toml",
-        "install": "npm install -g @openai/codex",
-    },
-    "kimi": {
-        "command": "kimi",
-        "args": ["--print", "--yolo"],
-        "env_cleanup": [],
-        "prompt_style": "flag:prompt",         # kimi --print --yolo --prompt <prompt>
-        "capabilities": {"spawn", "mcp_stdio"},
-        "config_file": ".mcp.json",
-        "install": "curl -LsSf https://code.kimi.com/install.sh | bash",
-    },
-    "opencode": {
-        "command": "opencode",
-        "args": ["run"],
-        "env_cleanup": ["OPENCODE"],
-        "prompt_style": "positional",          # opencode run <prompt>
-        "capabilities": {"spawn", "tools_list_changed", "mcp_stdio"},
-        "config_file": "opencode.json",
-        "install": "curl -fsSL https://opencode.ai/install | bash",
-    },
-    "openclaw": {
-        "command": "openclaw",
-        "args": ["agent", "--non-interactive", "--yes", "--message"],
-        "env_cleanup": [],
-        "prompt_style": "positional",          # openclaw agent --non-interactive --yes --message <prompt>
-        "capabilities": {"spawn"},             # no native MCP client — uses DarkMatter skill instead
-        "config_file": "skills/darkmatter/SKILL.md",
-        "install": "npm install -g openclaw",
-    },
-}
-
-_client_name = os.environ.get("DARKMATTER_CLIENT", "claude-code")
-if _client_name not in CLIENT_PROFILES:
-    import sys as _sys
-    print(
-        f"[DarkMatter] WARNING: Unknown client profile '{_client_name}', falling back to 'claude-code'. "
-        f"Valid profiles: {', '.join(CLIENT_PROFILES.keys())}",
-        file=_sys.stderr,
-    )
-    _client_name = "claude-code"
-
-ACTIVE_CLIENT: dict = dict(CLIENT_PROFILES[_client_name])
-
-# Manual overrides (escape hatches)
-_cmd_override = os.environ.get("DARKMATTER_AGENT_COMMAND")
-if _cmd_override:
-    ACTIVE_CLIENT["command"] = _cmd_override
-_args_override = os.environ.get("DARKMATTER_AGENT_ARGS")
-if _args_override:
-    ACTIVE_CLIENT["args"] = [a.strip() for a in _args_override.split(",") if a.strip()]
-_env_cleanup_override = os.environ.get("DARKMATTER_AGENT_ENV_CLEANUP")
-if _env_cleanup_override:
-    ACTIVE_CLIENT["env_cleanup"] = [v.strip() for v in _env_cleanup_override.split(",") if v.strip()]
-
-
-def client_has(capability: str) -> bool:
-    """Check if the active client profile declares a capability."""
-    return capability in ACTIVE_CLIENT.get("capabilities", set())
-
-# =============================================================================
-# Update Command (used by admin_update route)
-# =============================================================================
-
-UPDATE_COMMAND = os.environ.get("DARKMATTER_UPDATE_COMMAND", "pip3 install --upgrade dmagent")
-
-# =============================================================================
-# Entrypoint (human node) Auto-Start
-# =============================================================================
-
-ENTRYPOINT_AUTOSTART = os.environ.get("DARKMATTER_ENTRYPOINT_AUTOSTART", "true").lower() == "true"
-ENTRYPOINT_PORT = int(os.environ.get("DARKMATTER_ENTRYPOINT_PORT", "8200"))
-ENTRYPOINT_PATH = os.environ.get("DARKMATTER_ENTRYPOINT_PATH")  # explicit path, or None to search
 
 # =============================================================================
 # Replay Protection

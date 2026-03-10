@@ -1,6 +1,9 @@
 """
 State persistence — save/load JSON, replay protection.
 
+Multi-tenant registry: supports multiple agents on a single daemon.
+Backward compatible — single-agent deployments work unchanged.
+
 Depends on: config, models, identity
 """
 
@@ -12,11 +15,12 @@ import threading
 from typing import Optional
 
 from darkmatter.filelock import lock_exclusive, unlock
+from darkmatter.logging import get_logger
 from darkmatter.config import (
     DEFAULT_PORT,
     ANTIMATTER_LOG_MAX,
     CONVERSATION_LOG_MAX,
-    SHARED_SHARD_MAX,
+    SHARED_INSIGHT_MAX,
     REPLAY_WINDOW,
     REPLAY_MAX_SIZE,
 )
@@ -26,40 +30,107 @@ from darkmatter.models import (
     Connection,
     ConversationEntry,
     Impression,
-    Pool,
-    PoolAccessToken,
-    PoolProvider,
     QueuedMessage,
     RoutingRule,
-    SharedShard,
+    Insight,
 )
 
+_log = get_logger("state")
+
 
 # =============================================================================
-# Module-level state (set by app.py at startup)
+# Module-level state — multi-agent registry
 # =============================================================================
 
-_agent_state: Optional[AgentState] = None
+_agent_states: dict[str, AgentState] = {}
+_default_agent_id: Optional[str] = None
 _state_write_lock = threading.Lock()
 
-# Replay dedup: track recently seen message IDs for REPLAY_WINDOW seconds
-_seen_message_ids: dict[str, float] = {}
+# Per-agent replay dedup: agent_id -> {message_id: timestamp}
+_seen_message_ids: dict[str, dict[str, float]] = {}
 
-# Track consumed (read/forwarded) message IDs so disk sync doesn't re-add them
-_consumed_message_ids: set[str] = set()
+# Per-agent consumed message IDs: agent_id -> set of message_ids
+_consumed_message_ids: dict[str, set[str]] = {}
 
+
+# =============================================================================
+# Registry API
+# =============================================================================
+
+def register_agent(agent_id: str, state: AgentState) -> None:
+    """Register an agent in the multi-tenant registry."""
+    global _default_agent_id
+    _agent_states[agent_id] = state
+    if _default_agent_id is None:
+        _default_agent_id = agent_id
+    if agent_id not in _seen_message_ids:
+        _seen_message_ids[agent_id] = {}
+    if agent_id not in _consumed_message_ids:
+        _consumed_message_ids[agent_id] = set()
+    _log.info("Registered agent %s... (total: %d)", agent_id[:12], len(_agent_states))
+
+
+def unregister_agent(agent_id: str) -> None:
+    """Remove an agent from the registry."""
+    global _default_agent_id
+    _agent_states.pop(agent_id, None)
+    _seen_message_ids.pop(agent_id, None)
+    _consumed_message_ids.pop(agent_id, None)
+    if _default_agent_id == agent_id:
+        _default_agent_id = next(iter(_agent_states), None)
+
+
+def get_state_for(agent_id: str) -> Optional[AgentState]:
+    """Get state for a specific agent by ID."""
+    return _agent_states.get(agent_id)
+
+
+def list_hosted_agents() -> list[str]:
+    """Return all registered agent IDs."""
+    return list(_agent_states.keys())
+
+
+# =============================================================================
+# Backward-compatible singleton API
+# =============================================================================
 
 def get_state() -> Optional[AgentState]:
-    """Get the current agent state."""
-    return _agent_state
+    """Get the current agent state (backward compat).
+
+    Returns the default agent's state, or the only registered agent,
+    or None if no agents are registered.
+    """
+    if _default_agent_id and _default_agent_id in _agent_states:
+        return _agent_states[_default_agent_id]
+    if len(_agent_states) == 1:
+        return next(iter(_agent_states.values()))
+    return None
 
 
-def consume_message(message_id: str) -> None:
+def set_state(state: AgentState) -> None:
+    """Set the current agent state (backward compat).
+
+    Registers the agent and sets it as default.
+    """
+    register_agent(state.agent_id, state)
+    global _default_agent_id
+    _default_agent_id = state.agent_id
+
+
+# =============================================================================
+# Per-agent consumed message tracking
+# =============================================================================
+
+def consume_message(message_id: str, agent_id: Optional[str] = None) -> None:
     """Mark a message as consumed so disk sync won't re-add it."""
-    _consumed_message_ids.add(message_id)
+    aid = agent_id or _default_agent_id
+    if aid:
+        if aid not in _consumed_message_ids:
+            _consumed_message_ids[aid] = set()
+        _consumed_message_ids[aid].add(message_id)
 
 
-def sync_message_queue_from_disk() -> None:
+def sync_message_queue_from_disk(agent_id: Optional[str] = None) -> None:
     """Reload message_queue from the on-disk state file into in-memory state.
 
     This handles the case where the HTTP mesh server (running in a separate
@@ -70,11 +141,12 @@ def sync_message_queue_from_disk() -> None:
     messages are left untouched, and messages removed from memory (e.g.
     by reading or forwarding) are not re-added.
     """
-    state = _agent_state
+    aid = agent_id or _default_agent_id
+    state = _agent_states.get(aid) if aid else get_state()
     if state is None:
         return
 
-    path = state_file_path()
+    path = state_file_path(agent_id=aid)
     if not os.path.exists(path):
         return
 
@@ -82,23 +154,24 @@ def sync_message_queue_from_disk() -> None:
         with open(path, "r") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        print(f"[DarkMatter] Warning: state file JSON corrupt during queue sync ({path}): {e}", file=sys.stderr)
+        _log.warning("state file JSON corrupt during queue sync (%s): %s", path, e)
         return
 
     disk_queue = data.get("message_queue", [])
     if not disk_queue:
-        print(f"[DarkMatter] Queue sync: no message_queue in state file (missing or empty)", file=sys.stderr)
+        _log.debug("Queue sync: no message_queue in state file (missing or empty)")
         return
 
     # Build set of message IDs already in memory + already consumed
     existing_ids = {m.message_id for m in state.message_queue}
+    consumed = _consumed_message_ids.get(state.agent_id, set())
 
     for qd in disk_queue:
         mid = qd.get("message_id", "")
         if not mid:
-            print(f"[DarkMatter] Queue sync: skipping queued message with empty message_id", file=sys.stderr)
+            _log.debug("Queue sync: skipping queued message with empty message_id")
             continue
-        if mid not in existing_ids and mid not in _consumed_message_ids:
+        if mid not in existing_ids and mid not in consumed:
             state.message_queue.append(QueuedMessage(
                 message_id=mid,
                 content=qd.get("content", ""),
@@ -110,43 +183,51 @@ def sync_message_queue_from_disk() -> None:
             ))
 
 
-def set_state(state: AgentState) -> None:
-    """Set the current agent state."""
-    global _agent_state
-    _agent_state = state
-
-
 # =============================================================================
-# Replay Protection
+# Replay Protection (per-agent)
 # =============================================================================
 
-def check_message_replay(message_id: str) -> bool:
+def check_message_replay(message_id: str, agent_id: Optional[str] = None) -> bool:
     """Return True if this message_id was already seen recently (replay)."""
+    aid = agent_id or _default_agent_id
+    if not aid:
+        return False
+    seen = _seen_message_ids.get(aid)
+    if seen is None:
+        seen = {}
+        _seen_message_ids[aid] = seen
+
     now = time.time()
 
-    if len(_seen_message_ids) > REPLAY_MAX_SIZE:
+    if len(seen) > REPLAY_MAX_SIZE:
         cutoff = now - REPLAY_WINDOW
-        expired = [mid for mid, ts in _seen_message_ids.items() if ts < cutoff]
+        expired = [mid for mid, ts in seen.items() if ts < cutoff]
         for mid in expired:
-            del _seen_message_ids[mid]
+            del seen[mid]
 
-    if message_id in _seen_message_ids:
-        ts = _seen_message_ids[message_id]
+    if message_id in seen:
+        ts = seen[message_id]
         if now - ts < REPLAY_WINDOW:
             return True
-    _seen_message_ids[message_id] = now
+    seen[message_id] = now
     return False
 
 
-def get_seen_message_ids() -> dict[str, float]:
+def get_seen_message_ids(agent_id: Optional[str] = None) -> dict[str, float]:
     """Get the seen message IDs dict (for persistence)."""
-    return _seen_message_ids
+    aid = agent_id or _default_agent_id
+    return _seen_message_ids.get(aid, {}) if aid else {}
 
 
-def restore_seen_message_ids(saved: dict[str, float]) -> None:
+def restore_seen_message_ids(saved: dict[str, float], agent_id: Optional[str] = None) -> None:
     """Restore seen message IDs from persistence."""
+    aid = agent_id or _default_agent_id
+    if not aid:
+        return
+    if aid not in _seen_message_ids:
+        _seen_message_ids[aid] = {}
     now = time.time()
-    _seen_message_ids.update({
+    _seen_message_ids[aid].update({
         mid: ts for mid, ts in saved.items()
         if isinstance(ts, (int, float)) and now - ts < REPLAY_WINDOW
     })
@@ -160,13 +241,26 @@ _STATE_DIR = os.path.join(os.path.expanduser("~"), ".darkmatter", "state")
 os.makedirs(_STATE_DIR, exist_ok=True)
 
 
-def state_file_path() -> str:
+def get_state_dir() -> str:
+    """Return the state directory path."""
+    return _STATE_DIR
+
+
+def state_file_path(agent_id: Optional[str] = None) -> str:
     """Return the state file path, keyed by the agent's public key hex."""
     override = os.environ.get("DARKMATTER_STATE_FILE")
     if override:
         os.makedirs(os.path.dirname(override) or ".", exist_ok=True)
         return override
-    state = _agent_state
+
+    # If agent_id specified, look up that agent's state
+    if agent_id:
+        state = _agent_states.get(agent_id)
+        if state and state.public_key_hex:
+            return os.path.join(_STATE_DIR, f"{state.public_key_hex}.json")
+
+    # Backward compat: use default agent
+    state = get_state()
     if state is not None and state.public_key_hex:
         return os.path.join(_STATE_DIR, f"{state.public_key_hex}.json")
     port = os.environ.get("DARKMATTER_PORT", "8100")
@@ -178,9 +272,10 @@ def waiting_signal_path(public_key_hex: str) -> str:
     return os.path.join(_STATE_DIR, f"{public_key_hex}.waiting")
 
 
-def set_waiting(waiting: bool) -> None:
+def set_waiting(waiting: bool, agent_id: Optional[str] = None) -> None:
     """Create or remove the .waiting signal file for cross-process visibility."""
-    state = _agent_state
+    aid = agent_id or _default_agent_id
+    state = _agent_states.get(aid) if aid else get_state()
     if state is None or not state.public_key_hex:
         return
     path = waiting_signal_path(state.public_key_hex)
@@ -189,7 +284,7 @@ def set_waiting(waiting: bool) -> None:
             with open(path, "w") as f:
                 f.write(str(time.time()))
         except OSError as e:
-            print(f"[DarkMatter] Warning: could not write waiting signal: {e}", file=sys.stderr)
+            _log.warning("could not write waiting signal: %s", e)
     else:
         try:
             os.remove(path)
@@ -202,9 +297,10 @@ def check_waiting(public_key_hex: str) -> bool:
     return os.path.exists(waiting_signal_path(public_key_hex))
 
 
-def clear_waiting_signal() -> None:
+def clear_waiting_signal(agent_id: Optional[str] = None) -> None:
     """Remove any stale .waiting signal file for this agent."""
-    state = _agent_state
+    aid = agent_id or _default_agent_id
+    state = _agent_states.get(aid) if aid else get_state()
     if state and state.public_key_hex:
         try:
             os.remove(waiting_signal_path(state.public_key_hex))
@@ -252,19 +348,17 @@ def routing_rule_from_dict(d: dict) -> RoutingRule:
 # Save State
 # =============================================================================
 
-def save_state() -> None:
-    """Persist durable state to disk."""
-    state = _agent_state
-    if state is None:
-        return
-
+def _save_single_state(state: AgentState) -> None:
+    """Persist a single agent's durable state to disk."""
     # Cap conversation_log
     if len(state.conversation_log) > CONVERSATION_LOG_MAX:
         state.conversation_log = state.conversation_log[-CONVERSATION_LOG_MAX:]
 
-    # Cap shared_shards
-    if len(state.shared_shards) > SHARED_SHARD_MAX:
-        state.shared_shards = state.shared_shards[-SHARED_SHARD_MAX:]
+    # Cap insights
+    if len(state.insights) > SHARED_INSIGHT_MAX:
+        state.insights = state.insights[-SHARED_INSIGHT_MAX:]
+
+    seen = _seen_message_ids.get(state.agent_id, {})
 
     data = {
         "agent_id": state.agent_id,
@@ -305,7 +399,6 @@ def save_state() -> None:
         "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
         # router_mode is NOT persisted — it's set from config.AGENT_ROUTER_MODE on startup.
-        # Persisting it caused bugs where stale state files overrode the intended mode.
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
         "superagent_url": state.superagent_url,
         "gas_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
@@ -323,9 +416,9 @@ def save_state() -> None:
             }
             for e in state.conversation_log[-CONVERSATION_LOG_MAX:]
         ],
-        "shared_shards": [
+        "insights": [
             {
-                "shard_id": s.shard_id,
+                "insight_id": s.insight_id,
                 "author_agent_id": s.author_agent_id,
                 "content": s.content,
                 "tags": s.tags,
@@ -342,56 +435,11 @@ def save_state() -> None:
                 "original_hash": s.original_hash,
                 "stale_views": s.stale_views,
             }
-            for s in state.shared_shards[-SHARED_SHARD_MAX:]
-        ],
-        "pools": [
-            {
-                "pool_id": p.pool_id,
-                "name": p.name,
-                "tags": p.tags,
-                "description": p.description,
-                "created_at": p.created_at,
-                "shard_id": p.shard_id,
-                "handler_type": p.handler_type,
-                "providers": [
-                    {
-                        "provider_id": pv.provider_id,
-                        "agent_id": pv.agent_id,
-                        "base_url": pv.base_url,
-                        "credential_header": pv.credential_header,
-                        "credential_value": pv.credential_value,
-                        "allowed_paths": pv.allowed_paths,
-                        "price_per_call": pv.price_per_call,
-                        "price_token": pv.price_token,
-                        "enabled": pv.enabled,
-                        "calls_served": pv.calls_served,
-                        "failures": pv.failures,
-                        "added_at": pv.added_at,
-                        "handler_config": pv.handler_config,
-                    }
-                    for pv in p.providers
-                ],
-                "access_tokens": [
-                    {
-                        "token_id": at.token_id,
-                        "consumer_agent_id": at.consumer_agent_id,
-                        "balance": at.balance,
-                        "token_mint": at.token_mint,
-                        "total_deposited": at.total_deposited,
-                        "total_spent": at.total_spent,
-                        "calls_made": at.calls_made,
-                        "created_at": at.created_at,
-                        "last_used": at.last_used,
-                        "revoked": at.revoked,
-                    }
-                    for at in p.access_tokens
-                ],
-            }
-            for p in state.pools
+            for s in state.insights[-SHARED_INSIGHT_MAX:]
         ],
         "security_settings": state.security_settings,
         "seen_message_ids": {
-            mid: ts for mid, ts in _seen_message_ids.items()
+            mid: ts for mid, ts in seen.items()
             if time.time() - ts < REPLAY_WINDOW
         },
         "message_queue": [
@@ -408,7 +456,7 @@ def save_state() -> None:
         ],
     }
 
-    path = state_file_path()
+    path = state_file_path(agent_id=state.agent_id)
     tmp = path + ".tmp"
     try:
         with _state_write_lock:
@@ -426,14 +474,38 @@ def save_state() -> None:
             except OSError:
                 pass
     except OSError as e:
-        print(f"[DarkMatter] Warning: could not save state to {path}: {e}", file=sys.stderr)
+        _log.warning("could not save state to %s: %s", path, e)
+
+
+def save_state(agent_id: Optional[str] = None) -> None:
+    """Persist durable state to disk.
+
+    If agent_id is given, save just that agent. Otherwise save the default agent
+    (backward compat for single-agent deployments).
+    """
+    if agent_id:
+        state = _agent_states.get(agent_id)
+        if state:
+            _save_single_state(state)
+        return
+
+    # Backward compat: save default agent
+    state = get_state()
+    if state is not None:
+        _save_single_state(state)
+
+
+def save_all_states() -> None:
+    """Persist all registered agents' state to disk."""
+    for state in _agent_states.values():
+        _save_single_state(state)
 
 
 # =============================================================================
 # Load State
 # =============================================================================
 
-def load_state_from_file(path: str) -> Optional[AgentState]:
+def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[AgentState]:
     """Load persisted state from a specific file path. Returns None on failure."""
     if not os.path.exists(path):
         return None
@@ -442,7 +514,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         with open(path, "r") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        print(f"[DarkMatter] Warning: could not load state file {path}: {e}", file=sys.stderr)
+        _log.warning("could not load state file %s: %s", path, e)
         return None
 
     connections = {}
@@ -480,10 +552,11 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             verified=qd.get("verified", False),
         ))
 
-    # Restore replay protection
+    # Restore replay protection (per-agent)
+    loaded_agent_id = agent_id or data.get("agent_id", "")
     saved_replay = data.get("seen_message_ids", {})
     if isinstance(saved_replay, dict):
-        restore_seen_message_ids(saved_replay)
+        restore_seen_message_ids(saved_replay, agent_id=loaded_agent_id)
 
     # Deserialize conversation log
     conversation_log = []
@@ -500,11 +573,12 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             metadata=ed.get("metadata", {}),
         ))
 
-    # Deserialize shared shards
-    shared_shards = []
-    for sd in data.get("shared_shards", []):
-        shared_shards.append(SharedShard(
-            shard_id=sd.get("shard_id", ""),
+    # Deserialize insights (backward compat: also check "shared_shards" key)
+    insights = []
+    insights_data = data.get("insights") or data.get("shared_shards", [])
+    for sd in insights_data:
+        insights.append(Insight(
+            insight_id=sd.get("insight_id") or sd.get("shard_id", ""),
             author_agent_id=sd.get("author_agent_id", ""),
             content=sd.get("content", ""),
             tags=sd.get("tags", []),
@@ -520,52 +594,6 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
             original_content=sd.get("original_content"),
             original_hash=sd.get("original_hash"),
             stale_views=sd.get("stale_views", 0),
-        ))
-
-    # Deserialize pools
-    pools = []
-    for pd in data.get("pools", []):
-        providers = []
-        for pvd in pd.get("providers", []):
-            providers.append(PoolProvider(
-                provider_id=pvd["provider_id"],
-                agent_id=pvd.get("agent_id", ""),
-                base_url=pvd.get("base_url", ""),
-                credential_header=pvd.get("credential_header", ""),
-                credential_value=pvd.get("credential_value", ""),
-                allowed_paths=pvd.get("allowed_paths", []),
-                price_per_call=pvd.get("price_per_call", 0.0),
-                price_token=pvd.get("price_token", "SOL"),
-                enabled=pvd.get("enabled", True),
-                calls_served=pvd.get("calls_served", 0),
-                failures=pvd.get("failures", 0),
-                added_at=pvd.get("added_at", ""),
-                handler_config=pvd.get("handler_config", {}),
-            ))
-        access_tokens = []
-        for atd in pd.get("access_tokens", []):
-            access_tokens.append(PoolAccessToken(
-                token_id=atd["token_id"],
-                consumer_agent_id=atd.get("consumer_agent_id", ""),
-                balance=atd.get("balance", 0.0),
-                token_mint=atd.get("token_mint", "SOL"),
-                total_deposited=atd.get("total_deposited", 0.0),
-                total_spent=atd.get("total_spent", 0.0),
-                calls_made=atd.get("calls_made", 0),
-                created_at=atd.get("created_at", ""),
-                last_used=atd.get("last_used"),
-                revoked=atd.get("revoked", False),
-            ))
-        pools.append(Pool(
-            pool_id=pd["pool_id"],
-            name=pd.get("name", ""),
-            tags=pd.get("tags", []),
-            description=pd.get("description", ""),
-            providers=providers,
-            access_tokens=access_tokens,
-            created_at=pd.get("created_at", ""),
-            shard_id=pd.get("shard_id"),
-            handler_type=pd.get("handler_type", "passthrough"),
         ))
 
     state = AgentState(
@@ -595,8 +623,7 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
         superagent_url=data.get("superagent_url"),
         antimatter_log=data.get("gas_log", []),
         conversation_log=conversation_log,
-        shared_shards=shared_shards,
-        pools=pools,
+        insights=insights,
         security_settings=data.get("security_settings", {
             "pin_hash": "",
             "auto_accept_local": True,
@@ -606,3 +633,32 @@ def load_state_from_file(path: str) -> Optional[AgentState]:
     )
 
     return state
+
+
+def scan_state_files() -> list[dict]:
+    """Scan ~/.darkmatter/state/*.json for all agent state files.
+
+    Returns a list of dicts with {agent_id, public_key_hex, path} for each
+    discovered state file. Used by the HTTP daemon to discover hosted agents.
+    """
+    results = []
+    for filename in os.listdir(_STATE_DIR):
+        if not filename.endswith(".json"):
+            continue
+        path = os.path.join(_STATE_DIR, filename)
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            agent_id = data.get("agent_id", "")
+            public_key_hex = data.get("public_key_hex", "")
+            if agent_id and public_key_hex:
+                results.append({
+                    "agent_id": agent_id,
+                    "public_key_hex": public_key_hex,
+                    "path": path,
+                    "display_name": data.get("display_name"),
+                    "port": data.get("port", DEFAULT_PORT),
+                })
+        except (json.JSONDecodeError, OSError):
+            continue
+    return results

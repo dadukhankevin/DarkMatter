@@ -2,7 +2,7 @@
 DarkMatter — A Self-Replicating MCP Server for Emergent Agent Networks
 """
 
-__version__ = "0.7.7"
+__version__ = "0.9.0"
 
 # Genome metadata — tracks evolutionary lineage when code propagates through the mesh
 __genome_version__ = None   # None = stock PyPI release

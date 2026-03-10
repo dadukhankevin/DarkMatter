@@ -23,14 +23,15 @@ from darkmatter.models import AgentState, ConversationEntry
 
 _session_last_seen: dict[str, dict[str, int]] = {}
 
-# Per-session high-water mark: tracks index into conversation_log already returned
+# Per-session high-water mark: tracks index into conversation_log already returned.
+# Used by piggyback context to avoid re-showing entries.
 _session_context_hwm: dict[str, int] = {}
 
 
 def _get_session_counters(session_id: str) -> dict[str, int]:
     """Get or create per-session last-seen counters."""
     if session_id not in _session_last_seen:
-        _session_last_seen[session_id] = {"msgs": 0, "network": 0, "shards": 0}
+        _session_last_seen[session_id] = {"msgs": 0, "network": 0, "insights": 0}
     return _session_last_seen[session_id]
 
 
@@ -40,47 +41,25 @@ def _get_session_counters(session_id: str) -> dict[str, int]:
 
 def get_context(state: AgentState, mode: str = "piggyback",
                 session_id: Optional[str] = None) -> str:
-    """Single entry point for all context retrieval.
+    """Retrieve conversation context for an MCP session.
 
-    Modes:
-        "full"      - Agent startup (cold spawn, warm wake). Last
-                      CONTEXT_MAX_MESSAGES entries chronologically,
-                      each capped at CONTEXT_MAX_WORDS words.
-                      Summaries are shown in full. Advances HWM.
-        "piggyback" - Injected into every tool response. Up to
-                      CONTEXT_PIGGYBACK_MAX most recent new entries.
+    First call for a new session returns CONTEXT_MAX_MESSAGES entries (full catchup).
+    Subsequent calls return up to CONTEXT_PIGGYBACK_MAX new entries since last check.
     """
-    if mode == "full":
-        return _context_full(state, session_id)
-    elif mode == "piggyback":
-        return _context_incremental(state, session_id, max_entries=CONTEXT_PIGGYBACK_MAX)
-    else:
-        return ""
-
-
-def _context_full(state: AgentState, session_id: Optional[str]) -> str:
-    """Last N conversation entries chronologically for agent startup."""
-    entries = state.conversation_log[-CONTEXT_MAX_MESSAGES:]
-
-    if not entries:
-        return "No recent conversation history."
-
-    lines = [_format_entry(e, state, full=True) for e in entries]
-    text = "RECENT CONTEXT:\n" + "\n".join(lines)
-
-    # Advance HWM so piggyback won't re-show these
-    if session_id:
-        _session_context_hwm[session_id] = len(state.conversation_log)
-
-    return text
+    return _context_incremental(state, session_id, max_entries=CONTEXT_PIGGYBACK_MAX)
 
 
 def _context_incremental(state: AgentState, session_id: Optional[str],
                          max_entries: int) -> str:
-    """Chronological new entries since last check."""
+    """Chronological new entries since last check.
+
+    First call for a new session gets CONTEXT_MAX_MESSAGES entries (full catchup).
+    Subsequent calls get max_entries (piggyback drip).
+    """
     if not session_id:
         return ""
 
+    is_first_call = session_id not in _session_context_hwm
     hwm = _session_context_hwm.get(session_id, 0)
     log = state.conversation_log
     new_entries = log[hwm:]
@@ -89,13 +68,16 @@ def _context_incremental(state: AgentState, session_id: Optional[str],
     if not new_entries:
         return ""
 
-    skipped = 0
-    if max_entries > 0 and len(new_entries) > max_entries:
-        skipped = len(new_entries) - max_entries
-        new_entries = new_entries[-max_entries:]
+    # First call: show full context window so the session starts informed
+    effective_max = CONTEXT_MAX_MESSAGES if is_first_call else max_entries
 
-    lines = [_format_entry(e, state) for e in new_entries]
-    header = "NEW CONTEXT"
+    skipped = 0
+    if effective_max > 0 and len(new_entries) > effective_max:
+        skipped = len(new_entries) - effective_max
+        new_entries = new_entries[-effective_max:]
+
+    lines = [_format_entry(e, state, full=is_first_call) for e in new_entries]
+    header = "RECENT CONTEXT" if is_first_call else "NEW CONTEXT"
     if skipped:
         header += f" ({skipped} older entries omitted)"
     return f"{header}:\n" + "\n".join(lines)
@@ -219,6 +201,11 @@ def _format_entry(entry: ConversationEntry, state: AgentState,
     if entry.entry_type == "summary":
         return f'[{ts}] SUMMARY by {sender}: {content}'
 
+    # Status broadcasts and mesh observations — passive awareness of peer activity
+    if entry.entry_type in ("status_broadcast", "mesh_observation"):
+        direction_label = "MESH" if entry.direction == "inbound" else "STATUS"
+        return f'[{ts}] {direction_label} {sender}: {content}'
+
     if entry.entry_type == "broadcast":
         return f'[{ts}] {sender} (broadcast): "{content}"'
 
@@ -253,30 +240,30 @@ def build_activity_hint(state: AgentState, session_id: Optional[str] = None) -> 
             else:
                 direct_count += 1
 
-    shard_count = sum(1 for s in state.shared_shards if s.author_agent_id != state.agent_id)
+    insight_count = sum(1 for s in state.insights if s.author_agent_id != state.agent_id)
 
     # If we have a session, compute deltas
     if session_id:
         counters = _get_session_counters(session_id)
         new_msgs = max(0, inbox_count - counters.get("msgs", 0))
         new_network = max(0, broadcast_count - counters.get("network", 0))
-        new_shards = max(0, shard_count - counters.get("shards", 0))
+        new_insights = max(0, insight_count - counters.get("insights", 0))
         # Update counters
         counters["msgs"] = inbox_count
         counters["network"] = broadcast_count
-        counters["shards"] = shard_count
+        counters["insights"] = insight_count
     else:
         new_msgs = inbox_count
         new_network = broadcast_count
-        new_shards = shard_count
+        new_insights = insight_count
 
     parts = []
     if new_msgs > 0:
         parts.append(f"{new_msgs} unread message{'s' if new_msgs != 1 else ''}")
     if new_network > 0:
         parts.append(f"{new_network} network update{'s' if new_network != 1 else ''}")
-    if new_shards > 0:
-        parts.append(f"{new_shards} peer shard{'s' if new_shards != 1 else ''}")
+    if new_insights > 0:
+        parts.append(f"{new_insights} peer insight{'s' if new_insights != 1 else ''}")
 
     if not parts:
         return "No new activity"

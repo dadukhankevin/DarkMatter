@@ -133,17 +133,17 @@ class ConversationEntry:
 
 
 # =============================================================================
-# Shared Shards
+# Insights (Live Code Knowledge)
 # =============================================================================
 
 @dataclass
-class SharedShard:
-    """A live code shard, trust-gated and push-synced.
+class Insight:
+    """A live code insight, trust-gated and push-synced.
 
     Anchored to a file region via from_text/to_text, resolved live on view.
     When the code changes, updates are automatically pushed to peers.
     """
-    shard_id: str
+    insight_id: str
     author_agent_id: str
     content: str                # snapshot of resolved content
     tags: list[str]
@@ -159,57 +159,6 @@ class SharedShard:
     original_content: Optional[str] = None
     original_hash: Optional[str] = None
     stale_views: int = 0
-
-
-# =============================================================================
-# Pools
-# =============================================================================
-
-@dataclass
-class PoolProvider:
-    """An API provider registered in a pool."""
-    provider_id: str          # "pv-{hex12}"
-    agent_id: str             # who registered this
-    base_url: str             # "https://api.openai.com"
-    credential_header: str    # "Authorization"
-    credential_value: str     # never exposed to consumers
-    allowed_paths: list[str]  # ["/v1/chat/completions"]
-    price_per_call: float
-    price_token: str          # "SOL" or mint address
-    enabled: bool = True
-    calls_served: int = 0
-    failures: int = 0
-    added_at: str = ""
-    handler_config: dict = field(default_factory=dict)
-
-
-@dataclass
-class PoolAccessToken:
-    """A consumer's access token with prepaid balance."""
-    token_id: str             # "at-{hex16}", bearer token for consumer
-    consumer_agent_id: str
-    balance: float
-    token_mint: str
-    total_deposited: float
-    total_spent: float
-    calls_made: int = 0
-    created_at: str = ""
-    last_used: Optional[str] = None
-    revoked: bool = False
-
-
-@dataclass
-class Pool:
-    """A DarkMatter pool — credentialless API access for agents."""
-    pool_id: str              # "pool-{hex12}"
-    name: str
-    tags: list[str]           # ["pool:llm", "pool:openai"]
-    description: str = ""
-    providers: list[PoolProvider] = field(default_factory=list)
-    access_tokens: list[PoolAccessToken] = field(default_factory=list)
-    created_at: str = ""
-    shard_id: Optional[str] = None
-    handler_type: str = "passthrough"
 
 
 # =============================================================================
@@ -329,10 +278,8 @@ class AgentState:
     antimatter_log: list[dict] = field(default_factory=list)
     # Conversation memory
     conversation_log: list[ConversationEntry] = field(default_factory=list)
-    # Shared shards
-    shared_shards: list[SharedShard] = field(default_factory=list)
-    # Pools
-    pools: list = field(default_factory=list)  # list[Pool]
+    # Insights (live code knowledge)
+    insights: list[Insight] = field(default_factory=list)
     # Security settings (persisted)
     security_settings: dict = field(default_factory=lambda: {
         "pin_hash": "",

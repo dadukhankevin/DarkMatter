@@ -10,7 +10,8 @@ Depends on: config, network/transport
 import asyncio
 import json
 import sys
-from typing import Optional
+import uuid
+from typing import Callable, Optional
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 
@@ -23,6 +24,9 @@ from darkmatter.config import (
 )
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
+from darkmatter.logging import get_logger
+
+_log = get_logger("webrtc")
 
 
 def _make_rtc_config():
@@ -76,7 +80,7 @@ class DirectSignaling(SignalingChannel):
                     return None
                 return answer_data
         except Exception as e:
-            print(f"[DarkMatter] DirectSignaling failed: {e}", file=sys.stderr)
+            _log.warning("DirectSignaling failed: %s", e)
             return None
 
 
@@ -90,7 +94,7 @@ class LANSignaling(SignalingChannel):
         try:
             return await lan_sdp_exchange(state, conn.agent_id, offer_data)
         except Exception as e:
-            print(f"[DarkMatter] LANSignaling failed: {e}", file=sys.stderr)
+            _log.warning("LANSignaling failed: %s", e)
             return None
 
 
@@ -127,8 +131,8 @@ class PeerRelaySignaling(SignalingChannel):
                         if data.get("sdp"):
                             return data
             except Exception as e:
-                print(f"[DarkMatter] PeerRelaySignaling: relay via {relay_conn.agent_id[:12]}... failed: {e}",
-                      file=sys.stderr)
+                _log.warning("PeerRelaySignaling: relay via %s... failed: %s",
+                             relay_conn.agent_id[:12], e)
             return None
 
         # Race — first answer wins
@@ -156,7 +160,7 @@ class PeerRelaySignaling(SignalingChannel):
                 for t in pending2:
                     t.cancel()
         except Exception as e:
-            print(f"[DarkMatter] PeerRelaySignaling failed: {e}", file=sys.stderr)
+            _log.warning("PeerRelaySignaling failed: %s", e)
             for t in tasks:
                 t.cancel()
         return None
@@ -166,8 +170,26 @@ class PeerRelaySignaling(SignalingChannel):
 # WebRTC Transport
 # =============================================================================
 
+# Timeout for waiting for a WebRTC request/response round-trip
+_WEBRTC_REQUEST_TIMEOUT = 10.0
+
 class WebRTCTransport(Transport):
     """WebRTC data channel transport — preferred when available."""
+
+    def __init__(self):
+        # Callback: async fn(state, conn, path, payload) -> Optional[dict]
+        # Set by the composition root (app.py) to dispatch incoming messages.
+        self._message_dispatcher: Optional[Callable] = None
+        # Pending request/response futures: {request_id: asyncio.Future}
+        self._pending_requests: dict[str, asyncio.Future] = {}
+
+    def set_message_dispatcher(self, fn: Callable) -> None:
+        """Set the callback for dispatching incoming WebRTC messages.
+
+        The dispatcher signature: async fn(state, conn, path, payload) -> Optional[dict]
+        Returns a response dict for request/response paths, or None for fire-and-forget.
+        """
+        self._message_dispatcher = fn
 
     @property
     def name(self) -> str:
@@ -185,7 +207,11 @@ class WebRTCTransport(Transport):
         return "available" if self.available else None
 
     async def send(self, conn, path: str, payload: dict) -> SendResult:
-        """Send via WebRTC data channel if open."""
+        """Send via WebRTC data channel if open.
+
+        For request/response paths, includes a request_id and waits for
+        a correlated response from the peer.
+        """
         if conn.webrtc_channel is None:
             return SendResult(success=False, transport_name="webrtc",
                               error="No WebRTC channel")
@@ -196,17 +222,80 @@ class WebRTCTransport(Transport):
                 return SendResult(success=False, transport_name="webrtc",
                                   error=f"Channel not open (state: {ready})")
 
-            data = json.dumps({"path": path, "payload": payload})
+            request_id = uuid.uuid4().hex[:16]
+            envelope = {"path": path, "payload": payload, "request_id": request_id}
+            data = json.dumps(envelope)
+
             if len(data) > WEBRTC_MESSAGE_SIZE_LIMIT:
                 return SendResult(success=False, transport_name="webrtc",
                                   error=f"Message too large ({len(data)} > {WEBRTC_MESSAGE_SIZE_LIMIT})")
 
+            # Create a future for the response before sending
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._pending_requests[request_id] = fut
+
             conn.webrtc_channel.send(data)
-            return SendResult(success=True, transport_name="webrtc",
-                              response={"success": True, "transport": "webrtc"})
+
+            # Wait for correlated response (with timeout)
+            try:
+                response = await asyncio.wait_for(fut, timeout=_WEBRTC_REQUEST_TIMEOUT)
+                return SendResult(success=True, transport_name="webrtc", response=response)
+            except asyncio.TimeoutError:
+                # Fire-and-forget paths won't get a response — that's fine
+                return SendResult(success=True, transport_name="webrtc",
+                                  response={"success": True, "transport": "webrtc"})
+            finally:
+                self._pending_requests.pop(request_id, None)
+
         except Exception as e:
-            print(f"[DarkMatter] WebRTC send failed: {e}", file=sys.stderr)
+            _log.error("WebRTC send failed: %s", e)
             return SendResult(success=False, transport_name="webrtc", error=str(e))
+
+    def _handle_incoming(self, state, conn, raw_message: str) -> None:
+        """Handle an incoming WebRTC data channel message.
+
+        Dispatches to the registered message dispatcher, or resolves
+        a pending request future if this is a response.
+        """
+        try:
+            envelope = json.loads(raw_message)
+        except (json.JSONDecodeError, TypeError):
+            _log.warning("WebRTC: invalid JSON from %s",
+                         getattr(conn, 'agent_id', 'unknown')[:12])
+            return
+
+        # Check if this is a response to a pending request
+        response_to = envelope.get("response_to")
+        if response_to:
+            fut = self._pending_requests.get(response_to)
+            if fut and not fut.done():
+                fut.set_result(envelope.get("payload", {}))
+            return
+
+        # Incoming request — dispatch
+        path = envelope.get("path", "")
+        payload = envelope.get("payload", {})
+        request_id = envelope.get("request_id")
+
+        if not self._message_dispatcher:
+            _log.warning("WebRTC: no dispatcher registered, dropping message on path %s", path)
+            return
+
+        async def _dispatch():
+            try:
+                result = await self._message_dispatcher(state, conn, path, payload)
+                # Send response back if the handler returned data and we have a request_id
+                if result is not None and request_id and conn.webrtc_channel:
+                    ready = getattr(conn.webrtc_channel, "readyState", None)
+                    if ready == "open":
+                        response = json.dumps({"response_to": request_id, "payload": result})
+                        if len(response) <= WEBRTC_MESSAGE_SIZE_LIMIT:
+                            conn.webrtc_channel.send(response)
+            except Exception as e:
+                _log.error("WebRTC dispatch error on %s: %s", path, e)
+
+        asyncio.ensure_future(_dispatch())
 
     async def is_reachable(self, conn) -> bool:
         """Check if WebRTC data channel is open."""
@@ -235,6 +324,7 @@ class WebRTCTransport(Transport):
 
             channel = pc.createDataChannel("darkmatter")
             channel_ready = asyncio.Event()
+            transport_ref = self  # capture for closure
 
             @channel.on("open")
             def on_open():
@@ -242,7 +332,7 @@ class WebRTCTransport(Transport):
 
             @channel.on("message")
             def on_message(msg):
-                pass  # Wired up by mesh layer
+                transport_ref._handle_incoming(state, conn, msg)
 
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
@@ -280,11 +370,11 @@ class WebRTCTransport(Transport):
             conn.transport = "webrtc"
             conn._signaling_method = signaling.name
             peer = conn.agent_display_name or conn.agent_id[:12]
-            print(f"[DarkMatter] WebRTC: upgraded connection to {peer} via {signaling.name}", file=sys.stderr)
+            _log.info("WebRTC: upgraded connection to %s via %s", peer, signaling.name)
             return True
 
         except Exception as e:
-            print(f"[DarkMatter] WebRTC upgrade failed for {conn.agent_id[:12]}...: {e}", file=sys.stderr)
+            _log.error("WebRTC upgrade failed for %s...: %s", conn.agent_id[:12], e)
             return False
 
     async def cleanup(self, conn) -> None:
@@ -322,17 +412,18 @@ class WebRTCTransport(Transport):
 
         try:
             pc = RTCPeerConnection(configuration=_make_rtc_config())
+            transport_ref = self  # capture for closure
 
             @pc.on("datachannel")
             def on_datachannel(channel):
                 conn.webrtc_channel = channel
                 conn.transport = "webrtc"
                 peer = conn.agent_display_name or conn.agent_id[:12]
-                print(f"[DarkMatter] WebRTC: incoming channel from {peer}", file=sys.stderr)
+                _log.info("WebRTC: incoming channel from %s", peer)
 
                 @channel.on("message")
                 def on_message(msg):
-                    pass  # Wired up by mesh layer
+                    transport_ref._handle_incoming(state, conn, msg)
 
             offer = RTCSessionDescription(
                 sdp=offer_data["sdp"],
@@ -353,5 +444,5 @@ class WebRTCTransport(Transport):
             }
 
         except Exception as e:
-            print(f"[DarkMatter] WebRTC offer handling failed: {e}", file=sys.stderr)
+            _log.error("WebRTC offer handling failed: %s", e)
             return None

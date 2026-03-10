@@ -2,7 +2,7 @@
 All MCP tool definitions for the DarkMatter mesh protocol.
 
 Depends on: mcp/__init__, mcp/schemas, config, models, identity, state,
-            wallet, network, spawn
+            wallet, network
 """
 
 import asyncio
@@ -23,12 +23,21 @@ from darkmatter.mcp.schemas import (
     ConnectionInput,
     SendMessageInput,
     UpdateBioInput,
-    CreateShardInput,
-    ViewShardsInput,
-    CompleteAndSummarizeInput,
+    CreateInsightInput,
+    ViewInsightsInput,
+    GetPeersFromInput,
 )
 from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, consume_message, set_waiting
+from darkmatter.logging import get_logger
 from darkmatter.context import log_conversation
+
+_log = get_logger("tools")
+
+# Cross-process poll interval for wait_for_message (seconds).
+# The HTTP daemon runs in a separate process, so asyncio.Event.set() from the
+# daemon never wakes the MCP process's event.  This poll interval ensures we
+# check the on-disk message queue regularly.
+_WAIT_POLL_INTERVAL = 2.0
 from darkmatter.config import (
     MAX_CONNECTIONS,
     TRUST_MESSAGE_SENT,
@@ -40,7 +49,7 @@ from darkmatter.security import prepare_outbound
 from darkmatter.models import (
     AgentStatus,
     Connection,
-    SharedShard,
+    Insight,
 )
 from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
 from darkmatter.network.mesh import (
@@ -116,7 +125,7 @@ async def _connection_request(state, target_url: str) -> str:
                         },
                     )
                 except Exception as e:
-                    print(f"[DarkMatter] Warning: failed to send identity proof: {e}", file=sys.stderr)
+                    _log.warning("Failed to send identity proof: %s", e)
 
             state.pending_outbound[target_base] = result.get("agent_id", "")
             return json.dumps({
@@ -142,6 +151,82 @@ async def _connection_request(state, target_url: str) -> str:
             "success": False,
             "error": f"Failed to connect to {target_base}: {str(e)}"
         })
+
+
+async def _connection_request_mesh(state, target_agent_id: str) -> str:
+    """Send a connection request via trust-guided mesh routing.
+
+    The request follows the highest-trust path through the mesh. At each hop,
+    the agent checks if it knows the target, then forwards to its most-trusted
+    unvisited peer. A trust_chain accumulates scores — the product gives the
+    target a "transitive trust" metric to prioritize connection requests.
+    """
+    if len(state.connections) >= MAX_CONNECTIONS:
+        return json.dumps({
+            "success": False,
+            "error": f"Connection limit reached ({MAX_CONNECTIONS}). Disconnect from an agent first."
+        })
+
+    if target_agent_id in state.connections:
+        return json.dumps({
+            "success": False,
+            "error": f"Already connected to {target_agent_id[:16]}..."
+        })
+
+    if not state.connections:
+        return json.dumps({
+            "success": False,
+            "error": "No connected peers to route through. Use target_url for direct connection."
+        })
+
+    mgr = get_network_manager()
+    payload = build_outbound_request_payload(state, mgr.get_public_url(state.agent_id))
+
+    # Pick the most-trusted peer as our first hop
+    from darkmatter.network.mesh import _pick_most_trusted_peer
+    first_hop = _pick_most_trusted_peer(state, {state.agent_id})
+    if first_hop is None:
+        return json.dumps({
+            "success": False,
+            "error": "No eligible peers to route through."
+        })
+
+    imp = state.impressions.get(first_hop)
+    trust_score = imp.score if imp else 0.5
+
+    route_id = f"route-{uuid.uuid4().hex[:12]}"
+    envelope = {
+        "route_id": route_id,
+        "route_type": "connection_request",
+        "target_agent_id": target_agent_id,
+        "source_agent_id": state.agent_id,
+        "hops_remaining": 10,
+        "visited": [state.agent_id],
+        "trust_chain": [{"agent_id": state.agent_id, "trust_to_next": round(trust_score, 3)}],
+        "payload": payload,
+    }
+
+    first_conn = state.connections[first_hop]
+    try:
+        await send_to_peer(first_conn, "/__darkmatter__/mesh_route", envelope)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": f"Failed to send to first hop {first_hop[:12]}...: {e}"
+        })
+
+    first_name = first_conn.agent_display_name or first_hop[:12]
+    return json.dumps({
+        "success": True,
+        "status": "mesh_routed",
+        "route_id": route_id,
+        "first_hop": first_hop,
+        "first_hop_name": first_name,
+        "trust_to_first_hop": round(trust_score, 3),
+        "message": f"Connection request routed through {first_name} (trust={trust_score:.2f}). "
+                   f"The mesh will follow trust-guided paths to find {target_agent_id[:16]}... "
+                   f"Response will arrive via your message queue.",
+    })
 
 
 async def _connection_respond(state, request_id: str, accept: bool) -> str:
@@ -194,7 +279,7 @@ async def _connection_disconnect(state, agent_id: str) -> str:
     try:
         await auto_disconnect_peer(state, agent_id)
     except Exception as e:
-        print(f"[DarkMatter] Warning: disconnect announcement failed for {agent_id}: {e}", file=sys.stderr)
+        _log.warning("Disconnect announcement failed for %s: %s", agent_id, e)
         # Fallback: just delete the connection
         if agent_id in state.connections:
             del state.connections[agent_id]
@@ -207,12 +292,27 @@ async def _connection_disconnect(state, agent_id: str) -> str:
 
 
 async def _send_message(state, params: SendMessageInput) -> str:
-    """Send a message to one or more connected agents (single-shot delivery)."""
+    """Send a message to one or more connected agents (single-shot delivery).
+
+    If broadcast=True, sends as a passive status_broadcast — logged in peers'
+    context but does NOT trigger wait_for_message or land in their inbox.
+    """
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
 
-    # Resolve targets — explicit list, single ID, or auto-select
-    if params.target_agent_ids:
+    # --- Resolve targets ---
+    if params.broadcast and not params.target_agent_id and not params.target_agent_ids:
+        # Broadcast: use share_with_top_n to select recipients
+        if params.share_with_top_n == -1:
+            targets = list(state.connections.values())
+        else:
+            ranked = sorted(
+                state.connections.values(),
+                key=lambda c: (state.impressions.get(c.agent_id).score if state.impressions.get(c.agent_id) else 0.0),
+                reverse=True,
+            )
+            targets = ranked[:params.share_with_top_n]
+    elif params.target_agent_ids:
         targets = []
         for tid in params.target_agent_ids:
             conn = state.connections.get(tid)
@@ -242,6 +342,8 @@ async def _send_message(state, params: SendMessageInput) -> str:
     # Consume forwarded messages from the queue
     forwarded_msgs = []
     if params.forward_message_ids:
+        if params.broadcast:
+            return json.dumps({"success": False, "error": "Cannot forward messages in a broadcast."})
         sync_message_queue_from_disk()
         forwarded_msgs = _consume_queue_messages(state, params.forward_message_ids)
         not_found = set(params.forward_message_ids) - {m["message_id"] for m in forwarded_msgs}
@@ -264,13 +366,47 @@ async def _send_message(state, params: SendMessageInput) -> str:
         metadata["forwarded_by"] = state.agent_id
         metadata["forwarded_message_ids"] = [m["message_id"] for m in forwarded_msgs]
 
-    msg_type = "broadcast" if len(targets) > 1 else "direct"
     msg_timestamp = datetime.now(timezone.utc).isoformat()
     hops = params.hops_remaining
     if forwarded_msgs:
         hops = min(m.get("hops_remaining", 10) for m in forwarded_msgs)
         hops = max(0, hops - 1)
 
+    # --- Dispatch ---
+    if params.broadcast:
+        # Passive broadcast — hits /__darkmatter__/status_broadcast on peers
+        metadata["type"] = "status_broadcast"
+        sent_to = []
+        for conn in targets:
+            try:
+                broadcast_payload = {
+                    "message_id": message_id,
+                    "from_agent_id": state.agent_id,
+                    "content": full_content,
+                    "metadata": metadata,
+                    "timestamp": msg_timestamp,
+                }
+                envelope = prepare_outbound(
+                    broadcast_payload, state.private_key_hex,
+                    state.agent_id, state.public_key_hex,
+                )
+                await send_to_peer(conn, "/__darkmatter__/status_broadcast", envelope.payload)
+                sent_to.append(conn.agent_id)
+            except Exception as e:
+                _log.error("broadcast: error sending to %s: %s", conn.agent_id[:12], e)
+
+        if sent_to:
+            log_conversation(
+                state, message_id, full_content,
+                from_id=state.agent_id, to_ids=sent_to,
+                entry_type="status_broadcast", direction="outbound",
+                metadata=metadata,
+            )
+        save_state()
+        return json.dumps({"success": len(sent_to) > 0, "message_id": message_id, "broadcast": True, "routed_to": sent_to})
+
+    # --- Normal direct/multi-target message ---
+    msg_type = "broadcast" if len(targets) > 1 else "direct"
     sent_to = []
     for conn in targets:
         try:
@@ -292,7 +428,7 @@ async def _send_message(state, params: SendMessageInput) -> str:
             sent_to.append(conn.agent_id)
             adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
         except Exception as e:
-            print(f"[DarkMatter] send_message: error sending to {conn.agent_id[:12]}: {e}", file=sys.stderr)
+            _log.error("send_message: error sending to %s: %s", conn.agent_id[:12], e)
 
     # Log conversation
     entry_type = "forward" if forwarded_msgs else msg_type
@@ -359,13 +495,16 @@ def _consume_queue_messages(state, message_ids: list[str]) -> list[dict]:
     }
 )
 async def connection(params: ConnectionInput, ctx: Context) -> str:
-    """Manage connections. Actions: request (target_url), accept/reject (request_id), disconnect (agent_id)."""
+    """Manage connections. Actions: request (target_url OR agent_id for mesh routing), accept/reject (request_id), disconnect (agent_id)."""
     state = get_state()
 
     if params.action == ConnectionAction.REQUEST:
-        if not params.target_url:
-            return json.dumps({"success": False, "error": "target_url is required for request."})
-        return await _connection_request(state, params.target_url)
+        if params.target_url:
+            return await _connection_request(state, params.target_url)
+        if params.agent_id:
+            # Mesh-routed: find the target through the mesh by agent_id
+            return await _connection_request_mesh(state, params.agent_id)
+        return json.dumps({"success": False, "error": "target_url or agent_id is required for request."})
 
     elif params.action == ConnectionAction.ACCEPT:
         if not params.request_id:
@@ -396,7 +535,12 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
     }
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send a message to connected agents. Include your full message in content. For long tasks, send frequent status updates."""
+    """Send a message to connected agents. Include your full message in content.
+
+    Set broadcast=True for passive updates (progress, FYI) — peers see it in their
+    context but it doesn't trigger wait_for_message. Use share_with_top_n to limit
+    broadcasts to your most trusted peers (-1 = all, N = top N by trust score).
+    """
     track_session(ctx)
     state = get_state()
     return await _send_message(state, params)
@@ -430,7 +574,7 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     try:
         await get_network_manager().broadcast_peer_update()
     except Exception as e:
-        print(f"[DarkMatter] Failed to broadcast update: {e}", file=sys.stderr)
+        _log.error("Failed to broadcast update: %s", e)
 
     return json.dumps({"success": True, "bio": state.bio, "display_name": state.display_name})
 
@@ -484,6 +628,53 @@ async def discover_local(ctx: Context) -> str:
     })
 
 
+@mcp.tool(
+    name="darkmatter_get_peers_from",
+    annotations={
+        "title": "Get Peers From Agent",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
+    """Ask a connected peer for their top trusted peers. Cross-network discovery — find agents beyond your direct reach."""
+    track_session(ctx)
+    state = get_state()
+
+    conn = state.connections.get(input.agent_id)
+    if conn is None:
+        return json.dumps({"success": False, "error": "Not connected to that agent"})
+
+    try:
+        result = await send_to_peer(conn, "/__darkmatter__/get_peers", {"n": input.n})
+        data = result
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+    # Filter out self and already-connected peers
+    new_peers = []
+    already_known = []
+    for peer in data.get("peers", []):
+        pid = peer.get("agent_id", "")
+        if pid == state.agent_id:
+            continue
+        if pid in state.connections:
+            already_known.append(peer)
+        else:
+            new_peers.append(peer)
+
+    return json.dumps({
+        "success": True,
+        "source_agent_id": input.agent_id,
+        "source_display_name": data.get("display_name", ""),
+        "source_peer_count": data.get("peer_count", 0),
+        "new_peers": new_peers,
+        "already_connected": already_known,
+    })
+
+
 # NOTE: Tools removed from MCP and moved to HTTP API + skill:
 # get_identity, list_connections, list_pending_requests, set_status,
 # list_inbox, get_message, list_messages, get_sent_message, expire_message,
@@ -504,38 +695,38 @@ _REMOVED_TOOL_MARKER = True  # noqa: F841 — placeholder for removed tools
 # get_balance, send_sol, send_token, wallet_balances, wallet_send
 
 # =============================================================================
-# Shared Shards Tools
+# Insight Tools
 # =============================================================================
 
-async def _push_shard_to_peers(state, shard) -> list[str]:
-    """Push a shard to all qualifying connected peers. Returns list of agent IDs pushed to."""
+async def _push_insight_to_peers(state, insight) -> list[str]:
+    """Push an insight to all qualifying connected peers. Returns list of agent IDs pushed to."""
     pushed_to = []
-    from darkmatter.security import sign_shard
+    from darkmatter.security import sign_insight
     # Re-sign with current content
-    tags_str = ",".join(sorted(shard.tags))
-    shard.signature_hex = sign_shard(
-        state.private_key_hex, shard.shard_id, state.agent_id, shard.content, tags_str,
+    tags_str = ",".join(sorted(insight.tags))
+    insight.signature_hex = sign_insight(
+        state.private_key_hex, insight.insight_id, state.agent_id, insight.content, tags_str,
     )
-    shard_payload = {
-        "shard_id": shard.shard_id,
-        "author_agent_id": shard.author_agent_id,
-        "content": shard.content,
-        "tags": shard.tags,
-        "share_with_top_n": shard.share_with_top_n,
-        "created_at": shard.created_at,
-        "updated_at": shard.updated_at,
-        "summary": shard.summary,
-        "signature_hex": shard.signature_hex,
-        "file": shard.file,
-        "from_text": shard.from_text,
-        "to_text": shard.to_text,
-        "function_anchor": shard.function_anchor,
-        "original_content": shard.original_content,
-        "original_hash": shard.original_hash,
+    insight_payload = {
+        "insight_id": insight.insight_id,
+        "author_agent_id": insight.author_agent_id,
+        "content": insight.content,
+        "tags": insight.tags,
+        "share_with_top_n": insight.share_with_top_n,
+        "created_at": insight.created_at,
+        "updated_at": insight.updated_at,
+        "summary": insight.summary,
+        "signature_hex": insight.signature_hex,
+        "file": insight.file,
+        "from_text": insight.from_text,
+        "to_text": insight.to_text,
+        "function_anchor": insight.function_anchor,
+        "original_content": insight.original_content,
+        "original_hash": insight.original_hash,
     }
 
     # Determine which peers to push to based on share_with_top_n
-    if shard.share_with_top_n == -1:
+    if insight.share_with_top_n == -1:
         # All peers
         eligible = list(state.connections.items())
     else:
@@ -545,44 +736,44 @@ async def _push_shard_to_peers(state, shard) -> list[str]:
             key=lambda item: (state.impressions.get(item[0]).score if state.impressions.get(item[0]) else 0.0),
             reverse=True,
         )
-        eligible = ranked[:shard.share_with_top_n]
+        eligible = ranked[:insight.share_with_top_n]
 
     for aid, conn in eligible:
         try:
-            await send_to_peer(conn, "/__darkmatter__/shard_push", shard_payload)
+            await send_to_peer(conn, "/__darkmatter__/insight_push", insight_payload)
             pushed_to.append(aid)
         except Exception as e:
-            print(f"[DarkMatter] Warning: failed to push shard {shard.shard_id} to peer {aid}: {e}", file=sys.stderr)
+            _log.warning("Failed to push insight %s to peer %s: %s", insight.insight_id, aid, e)
     return pushed_to
 
 
 @mcp.tool(
-    name="darkmatter_create_shard",
+    name="darkmatter_create_insight",
     annotations={
-        "title": "Create Shared Shard",
+        "title": "Create Insight",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     }
 )
-async def create_shard(params: CreateShardInput, ctx: Context) -> str:
-    """Create a live code shard anchored to a file region, and push to qualifying peers.
+async def create_insight(params: CreateInsightInput, ctx: Context) -> str:
+    """Create a live code insight anchored to a file region, and push to qualifying peers.
 
     Content is resolved live from the file. When the code changes,
     updates are automatically pushed to peers on next view.
 
     Prefer raw code over summaries. Only add a summary for very long code regions
-    where the full content would waste context. For most shards, skip summary.
+    where the full content would waste context. For most insights, skip summary.
     """
     track_session(ctx)
     state = get_state()
 
-    from darkmatter.config import SHARED_SHARD_MAX
-    if len(state.shared_shards) >= SHARED_SHARD_MAX:
-        return json.dumps({"success": False, "error": f"Shard limit reached ({SHARED_SHARD_MAX})"})
+    from darkmatter.config import SHARED_INSIGHT_MAX
+    if len(state.insights) >= SHARED_INSIGHT_MAX:
+        return json.dumps({"success": False, "error": f"Insight limit reached ({SHARED_INSIGHT_MAX})"})
 
-    from darkmatter.shard_resolver import resolve_region, hash_content
+    from darkmatter.insight_resolver import resolve_region, hash_content
     from pathlib import Path
     # Resolve file path
     p = Path(params.file)
@@ -604,25 +795,25 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
     content = original_content  # stored content = resolved snapshot
 
     now = datetime.now(timezone.utc).isoformat()
-    from darkmatter.security import sign_shard
+    from darkmatter.security import sign_insight
 
-    # Upsert: if a shard exists for same file+from_text, replace it
-    shard_id = f"shard-{uuid.uuid4().hex[:12]}"
+    # Upsert: if an insight exists for same file+from_text, replace it
+    insight_id = f"insight-{uuid.uuid4().hex[:12]}"
     was_update = False
-    for i, existing in enumerate(state.shared_shards):
+    for i, existing in enumerate(state.insights):
         if (existing.author_agent_id == state.agent_id
                 and existing.file == params.file
                 and existing.from_text == params.from_text):
-            shard_id = existing.shard_id
+            insight_id = existing.insight_id
             was_update = True
-            state.shared_shards.pop(i)
+            state.insights.pop(i)
             break
 
     tags_str = ",".join(sorted(params.tags))
-    sig = sign_shard(state.private_key_hex, shard_id, state.agent_id, content, tags_str)
+    sig = sign_insight(state.private_key_hex, insight_id, state.agent_id, content, tags_str)
 
-    shard = SharedShard(
-        shard_id=shard_id,
+    insight = Insight(
+        insight_id=insight_id,
         author_agent_id=state.agent_id,
         content=content,
         tags=params.tags,
@@ -638,17 +829,17 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
         original_content=original_content,
         original_hash=original_hash,
     )
-    state.shared_shards.append(shard)
+    state.insights.append(insight)
     save_state()
 
-    pushed_to = await _push_shard_to_peers(state, shard)
+    pushed_to = await _push_insight_to_peers(state, insight)
 
     result = {
         "success": True,
-        "shard_id": shard.shard_id,
+        "insight_id": insight.insight_id,
         "action": "updated" if was_update else "created",
-        "tags": shard.tags,
-        "share_with_top_n": shard.share_with_top_n,
+        "tags": insight.tags,
+        "share_with_top_n": insight.share_with_top_n,
         "pushed_to": pushed_to,
     }
     result["file"] = params.file
@@ -660,141 +851,141 @@ async def create_shard(params: CreateShardInput, ctx: Context) -> str:
 
 
 @mcp.tool(
-    name="darkmatter_view_shards",
+    name="darkmatter_view_insights",
     annotations={
-        "title": "View Shared Shards",
+        "title": "View Insights",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     }
 )
-async def view_shards(params: ViewShardsInput, ctx: Context) -> str:
-    """Query shards by tags, author, and/or file. Returns local + cached peer shards.
+async def view_insights(params: ViewInsightsInput, ctx: Context) -> str:
+    """Query insights by tags, author, and/or file. Returns local + cached peer insights.
 
-    Code shards resolve live content from files and include health status.
-    Remote code shards show the last-known snapshot.
+    Code insights resolve live content from files and include health status.
+    Remote code insights show the last-known snapshot.
     """
     track_session(ctx)
     state = get_state()
 
-    from darkmatter.shard_resolver import resolve_region, assess_health, hash_content
+    from darkmatter.insight_resolver import resolve_region, assess_health, hash_content
     from pathlib import Path
 
     results = []
     to_delete = []
-    to_push = []  # shards whose content changed — push updates to peers
+    to_push = []  # insights whose content changed — push updates to peers
 
-    for shard in state.shared_shards:
+    for insight in state.insights:
         # Filter by tags
         if params.tags:
             if not any(
                 st == qt or st.startswith(qt + ":")
                 for qt in params.tags
-                for st in shard.tags
+                for st in insight.tags
             ):
                 continue
         # Filter by author
-        if params.author and shard.author_agent_id != params.author:
+        if params.author and insight.author_agent_id != params.author:
             continue
         # Filter by file
-        if params.file and shard.file != params.file:
+        if params.file and insight.file != params.file:
             continue
 
-        is_local = shard.author_agent_id == state.agent_id
+        is_local = insight.author_agent_id == state.agent_id
 
         entry = {
-            "shard_id": shard.shard_id,
-            "author": shard.author_agent_id,
-            "tags": shard.tags,
-            "share_with_top_n": shard.share_with_top_n,
-            "created_at": shard.created_at,
-            "updated_at": shard.updated_at,
-            "file": shard.file,
+            "insight_id": insight.insight_id,
+            "author": insight.author_agent_id,
+            "tags": insight.tags,
+            "share_with_top_n": insight.share_with_top_n,
+            "created_at": insight.created_at,
+            "updated_at": insight.updated_at,
+            "file": insight.file,
             "type": "code",
         }
 
-        if is_local and shard.from_text and shard.to_text:
+        if is_local and insight.from_text and insight.to_text:
             # Resolve live content from file
-            p = Path(shard.file)
-            file_path = str(p) if p.is_absolute() else str(Path.cwd() / shard.file)
+            p = Path(insight.file)
+            file_path = str(p) if p.is_absolute() else str(Path.cwd() / insight.file)
             region = resolve_region(
-                file_path, shard.from_text, shard.to_text,
-                function_anchor=shard.function_anchor,
+                file_path, insight.from_text, insight.to_text,
+                function_anchor=insight.function_anchor,
             )
             current_content = region.content if region else None
 
-            if shard.original_content and shard.original_hash:
+            if insight.original_content and insight.original_hash:
                 health = assess_health(
-                    shard.original_content, shard.original_hash,
-                    current_content, shard.stale_views,
+                    insight.original_content, insight.original_hash,
+                    current_content, insight.stale_views,
                 )
                 entry["health"] = {"score": health.score, "status": health.status, "message": health.message}
 
                 if region:
                     entry["lines"] = f"{region.start_line}-{region.end_line}"
 
-                # If content changed, update the shard and queue for push
-                if current_content and hash_content(current_content) != shard.original_hash:
-                    shard.content = current_content
-                    shard.original_content = current_content
-                    shard.original_hash = hash_content(current_content)
-                    shard.updated_at = datetime.now(timezone.utc).isoformat()
-                    shard.stale_views = 0
+                # If content changed, update the insight and queue for push
+                if current_content and hash_content(current_content) != insight.original_hash:
+                    insight.content = current_content
+                    insight.original_content = current_content
+                    insight.original_hash = hash_content(current_content)
+                    insight.updated_at = datetime.now(timezone.utc).isoformat()
+                    insight.stale_views = 0
                     if region:
-                        shard.function_anchor = region.function_anchor
-                    to_push.append(shard)
+                        insight.function_anchor = region.function_anchor
+                    to_push.append(insight)
 
                 # Show content (raw code preferred)
-                if shard.summary and not params.raw:
-                    entry["summary"] = shard.summary
+                if insight.summary and not params.raw:
+                    entry["summary"] = insight.summary
                 else:
                     entry["content"] = current_content or "[Could not resolve]"
 
                 if health.should_delete():
-                    to_delete.append(shard.shard_id)
+                    to_delete.append(insight.insight_id)
                     entry["expired"] = True
                 elif health.status in ("stale", "degraded"):
-                    shard.stale_views += 1
+                    insight.stale_views += 1
             else:
-                # Shard without original tracking — show content
-                entry["content"] = current_content or shard.content
+                # Insight without original tracking — show content
+                entry["content"] = current_content or insight.content
         else:
-            # Remote shard — show last-known snapshot
+            # Remote insight — show last-known snapshot
             entry["cached"] = True
-            if shard.summary and not params.raw:
-                entry["summary"] = shard.summary
+            if insight.summary and not params.raw:
+                entry["summary"] = insight.summary
             else:
-                entry["content"] = shard.content[:500]
-                if len(shard.content) > 500:
+                entry["content"] = insight.content[:500]
+                if len(insight.content) > 500:
                     entry["truncated"] = True
 
         # Label if from peer
         if not is_local:
-            conn = state.connections.get(shard.author_agent_id)
+            conn = state.connections.get(insight.author_agent_id)
             if conn:
-                entry["author_name"] = conn.agent_display_name or shard.author_agent_id[:12]
+                entry["author_name"] = conn.agent_display_name or insight.author_agent_id[:12]
             if "cached" not in entry:
                 entry["cached"] = True
 
         results.append(entry)
 
-    # Delete expired shards
+    # Delete expired insights
     if to_delete:
-        state.shared_shards = [s for s in state.shared_shards if s.shard_id not in set(to_delete)]
+        state.insights = [s for s in state.insights if s.insight_id not in set(to_delete)]
 
-    # Push updated code shards to peers
+    # Push updated code insights to peers
     pushed_updates = []
-    for shard in to_push:
-        if shard.shard_id not in set(to_delete):
-            peers = await _push_shard_to_peers(state, shard)
+    for insight in to_push:
+        if insight.insight_id not in set(to_delete):
+            peers = await _push_insight_to_peers(state, insight)
             if peers:
-                pushed_updates.append({"shard_id": shard.shard_id, "pushed_to": peers})
+                pushed_updates.append({"insight_id": insight.insight_id, "pushed_to": peers})
 
     if to_delete or to_push:
         save_state()
 
-    response = {"success": True, "count": len(results), "shards": results}
+    response = {"success": True, "count": len(results), "insights": results}
     if to_delete:
         response["expired_deleted"] = to_delete
     if pushed_updates:
@@ -823,18 +1014,17 @@ async def wait_for_message(
     timeout_seconds: float = 900,
     ctx: Context = None,
 ) -> str:
-    """Block until a new inbox message arrives. Consumes and returns all matching messages. Optional from_agents filter."""
+    """Block until a new inbox message arrives. Consumes and returns all matching messages.
+
+    Use darkmatter_send_message(broadcast=True) for passive status updates to peers.
+    """
     state = get_state()
 
     # Check if matching messages already exist in inbox
     sync_message_queue_from_disk()
     existing = _drain_inbox(state, from_agents)
     if existing:
-        return json.dumps({
-            "success": True,
-            "messages": existing,
-            "waited": False,
-        })
+        return json.dumps({"success": True, "messages": existing, "waited": False})
 
     # Register event and wait for new message
     event = asyncio.Event()
@@ -842,8 +1032,12 @@ async def wait_for_message(
     state._is_waiting = True
     set_waiting(True)
 
+    _log.info("wait_for_message: waiting (timeout=%ds, filter=%s)", int(timeout_seconds), from_agents or "any")
+
     try:
-        # Loop: wake on any inbox event, then check filter
+        # Loop: wake on any inbox event OR poll disk every _WAIT_POLL_INTERVAL.
+        # Same-process events fire instantly; cross-process messages (from the
+        # HTTP daemon) are picked up via the disk poll.
         deadline = asyncio.get_event_loop().time() + timeout_seconds
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -853,25 +1047,24 @@ async def wait_for_message(
             if event not in state._inbox_events:
                 state._inbox_events.append(event)
             try:
-                await asyncio.wait_for(event.wait(), timeout=remaining)
+                await asyncio.wait_for(event.wait(), timeout=min(_WAIT_POLL_INTERVAL, remaining))
             except asyncio.TimeoutError:
-                raise
+                if asyncio.get_event_loop().time() >= deadline:
+                    raise
 
-            # Woke up — check if a matching message arrived
+            # Woke up (event or poll tick) — sync from disk and check for matches
             sync_message_queue_from_disk()
             matched = _drain_inbox(state, from_agents)
             if matched:
+                _log.info("wait_for_message: matched %d message(s)", len(matched))
                 if event in state._inbox_events:
                     state._inbox_events.remove(event)
-                return json.dumps({
-                    "success": True,
-                    "messages": matched,
-                    "waited": True,
-                })
+                return json.dumps({"success": True, "messages": matched, "waited": True})
 
     except asyncio.TimeoutError:
         mins = int(timeout_seconds / 60)
         filter_desc = f" from {from_agents}" if from_agents else ""
+        _log.info("wait_for_message: timed out after %d min%s", mins, filter_desc)
         return json.dumps({
             "success": False,
             "timed_out": True,
@@ -895,103 +1088,6 @@ def _drain_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
     if not matched_ids:
         return []
     return _consume_queue_messages(state, matched_ids)
-
-# =============================================================================
-# Complete and Summarize Tool
-# =============================================================================
-
-@mcp.tool(
-    name="darkmatter_complete_and_summarize",
-    annotations={
-        "title": "Complete & Summarize",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def complete_and_summarize(params: CompleteAndSummarizeInput, ctx: Context = None) -> str:
-    """MANDATORY when your task is done. Summarize what you did, what you learned, and what the hivemind should know. Uses @agent_id to reference peers. This terminates your session and spawns a fresh warm agent."""
-    state = get_state()
-
-    summary_id = f"summary-{uuid.uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Build metadata
-    meta = {
-        "type": "summary",
-        "shard_tags": params.shard_tags,
-        "share_with_top_n": params.share_with_top_n,
-    }
-
-    # Identify where this session started in the conversation log.
-    # The session HWM was set when get_context(mode="full") ran at spawn time.
-    session_id = "default"
-    try:
-        session_id = str(id(ctx.session))
-    except Exception:
-        pass
-    from darkmatter.context import _session_context_hwm
-    session_start_idx = _session_context_hwm.get(session_id, 0)
-
-    # Log the summary as a conversation entry
-    log_conversation(
-        state, summary_id, params.summary,
-        from_id=state.agent_id, to_ids=[],
-        entry_type="summary", direction="outbound",
-        metadata=meta,
-    )
-
-    # Prune non-summary entries created during this session only.
-    # Entries before session_start_idx are from prior sessions — keep them.
-    # The summary replaces this session's raw message history.
-    before_session = state.conversation_log[:session_start_idx]
-    during_session = state.conversation_log[session_start_idx:]
-    during_session = [e for e in during_session if e.entry_type == "summary"]
-    state.conversation_log = before_session + during_session
-    save_state()
-
-    # Push summary to qualifying peers
-    pushed_to = []
-    if state.connections:
-        summary_payload = {
-            "message_id": summary_id,
-            "content": params.summary,
-            "metadata": meta,
-            "timestamp": now,
-        }
-        envelope = prepare_outbound(
-            summary_payload, state.private_key_hex,
-            state.agent_id, state.public_key_hex,
-        )
-
-        if params.share_with_top_n == -1:
-            eligible = list(state.connections.items())
-        else:
-            ranked = sorted(
-                state.connections.items(),
-                key=lambda item: (state.impressions.get(item[0]).score if state.impressions.get(item[0]) else 0.0),
-                reverse=True,
-            )
-            eligible = ranked[:params.share_with_top_n]
-
-        for aid, conn in eligible:
-            try:
-                await send_to_peer(conn, "/__darkmatter__/message", envelope.payload)
-                pushed_to.append(aid)
-            except Exception:
-                pass
-
-    # The main agent will be respawned automatically by _reap_agent_when_done
-    # when this agent's process exits. No need to spawn here.
-
-    result = {
-        "success": True,
-        "summary_id": summary_id,
-        "pushed_to": pushed_to,
-        "message": "Summary stored. Session complete. A fresh warm agent has been spawned.",
-    }
-    return json.dumps(result)
 
 
 # Genome tools moved to HTTP API + skill (see /__darkmatter__/genome)

@@ -1,5 +1,5 @@
 """
-LAN discovery — UDP multicast, localhost port scanning, entrypoint auto-start.
+LAN discovery — UDP multicast, localhost port scanning.
 
 Depends on: config, models
 """
@@ -15,6 +15,8 @@ from typing import Optional
 import httpx
 
 import darkmatter
+from darkmatter.logging import get_logger
+_log = get_logger("discovery")
 from darkmatter.config import (
     DEFAULT_PORT,
     MAX_CONNECTIONS,
@@ -23,9 +25,6 @@ from darkmatter.config import (
     DISCOVERY_MCAST_GROUP,
     DISCOVERY_INTERVAL,
     DISCOVERY_LOCAL_PORTS,
-    ENTRYPOINT_AUTOSTART,
-    ENTRYPOINT_PORT,
-    ENTRYPOINT_PATH,
     PEER_RELAY_SDP_TIMEOUT,
 )
 from darkmatter.models import AgentState
@@ -78,7 +77,7 @@ async def lan_sdp_exchange(state: AgentState, target_agent_id: str,
                 (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT),
             )
         except OSError as e:
-            print(f"[DarkMatter] LAN SDP broadcast failed: {e}", file=sys.stderr)
+            _log.error("LAN SDP broadcast failed: %s", e)
             return None
 
         # Wait for answer
@@ -95,9 +94,13 @@ async def lan_sdp_exchange(state: AgentState, target_agent_id: str,
 # =============================================================================
 
 async def handle_well_known(request) -> "JSONResponse":
-    """Return /.well-known/darkmatter.json for global discovery."""
+    """Return /.well-known/darkmatter.json for global discovery.
+
+    Multi-tenant: includes an `agents` array with all hosted agents.
+    Backward compat: top-level fields still reference the default/primary agent.
+    """
     from starlette.responses import JSONResponse
-    from darkmatter.state import get_state
+    from darkmatter.state import get_state, get_state_for, list_hosted_agents
 
     state = get_state()
     if state is None:
@@ -109,9 +112,26 @@ async def handle_well_known(request) -> "JSONResponse":
         scheme = request.headers.get("x-forwarded-proto", "http")
         public_url = f"{scheme}://{host}"
 
-    return JSONResponse({
+    # Build agents array for multi-tenant discovery
+    agents = []
+    for agent_id in list_hosted_agents():
+        agent_state = get_state_for(agent_id)
+        if agent_state is None:
+            continue
+        agents.append({
+            "agent_id": agent_id,
+            "display_name": agent_state.display_name,
+            "public_key_hex": agent_state.public_key_hex,
+            "bio": agent_state.bio,
+            "status": agent_state.status.value,
+            "accepting_connections": len(agent_state.connections) < MAX_CONNECTIONS,
+            "mesh_url": f"{public_url}/__darkmatter__/{agent_id}",
+        })
+
+    response = {
         "darkmatter": True,
         "protocol_version": PROTOCOL_VERSION,
+        # Backward compat: primary agent fields at top level
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
@@ -123,7 +143,11 @@ async def handle_well_known(request) -> "JSONResponse":
         "webrtc_enabled": True,
         "genome_version": darkmatter.__genome_version__ or f"stock:{darkmatter.__version__}",
         "genome_author": darkmatter.__genome_author__,
-    })
+        # Multi-tenant: all hosted agents
+        "agents": agents,
+    }
+
+    return JSONResponse(response)
 
 
 # =============================================================================
@@ -187,13 +211,13 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         beacon_sig = packet.get("beacon_signature_hex")
         beacon_pub = packet.get("public_key_hex")
         if not beacon_sig or not beacon_pub:
-            print(f"[DarkMatter] Dropped unsigned beacon from {peer_id[:12]}…", file=sys.stderr)
+            _log.warning("Dropped unsigned beacon from %s…", peer_id[:12])
             return
         from darkmatter.security import verify_lan_beacon
         beacon_ts = str(packet.get("ts", ""))
         beacon_port = str(packet.get("port", DEFAULT_PORT))
         if not verify_lan_beacon(beacon_pub, beacon_sig, peer_id, beacon_port, beacon_ts):
-            print(f"[DarkMatter] Dropped beacon with invalid signature from {peer_id[:12]}…", file=sys.stderr)
+            _log.warning("Dropped beacon with invalid signature from %s…", peer_id[:12])
             return
 
         peer_port = packet.get("port", DEFAULT_PORT)
@@ -256,10 +280,10 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
                         (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT),
                     )
                 except OSError as e:
-                    print(f"[DarkMatter] LAN SDP answer multicast failed: {e}", file=sys.stderr)
+                    _log.error("LAN SDP answer multicast failed: %s", e)
 
         except Exception as e:
-            print(f"[DarkMatter] LAN SDP offer processing failed: {e}", file=sys.stderr)
+            _log.error("LAN SDP offer processing failed: %s", e)
 
     def _handle_sdp_answer(self, packet: dict) -> None:
         """Handle an incoming SDP answer via LAN multicast."""
@@ -284,7 +308,10 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
 # =============================================================================
 
 async def probe_port(client: httpx.AsyncClient, state: AgentState, port: int, host: str = "127.0.0.1") -> None:
-    """Probe a single host:port for a DarkMatter node."""
+    """Probe a single host:port for a DarkMatter node.
+
+    Multi-tenant aware: discovers all agents hosted on the probed daemon.
+    """
     try:
         resp = await client.get(f"http://{host}:{port}/.well-known/darkmatter.json")
         if resp.status_code != 200:
@@ -293,19 +320,38 @@ async def probe_port(client: httpx.AsyncClient, state: AgentState, port: int, ho
     except (httpx.HTTPError, json.JSONDecodeError, KeyError):
         return
 
-    peer_id = info.get("agent_id", "")
-    if not peer_id or peer_id == state.agent_id:
-        return
-
     source = "local" if host in ("127.0.0.1", "localhost") else "lan"
-    register_peer(
-        state, peer_id,
-        url=f"http://{host}:{port}",
-        bio=info.get("bio", ""),
-        status=info.get("status", "active"),
-        accepting=info.get("accepting_connections", True),
-        source=source,
-    )
+
+    # Multi-tenant: register all agents from the `agents` array
+    agents = info.get("agents", [])
+    if agents:
+        for agent in agents:
+            peer_id = agent.get("agent_id", "")
+            if not peer_id or peer_id == state.agent_id:
+                continue
+            # Use agent-scoped mesh_url if available
+            mesh_url = agent.get("mesh_url", f"http://{host}:{port}/__darkmatter__/{peer_id}")
+            register_peer(
+                state, peer_id,
+                url=f"http://{host}:{port}",
+                bio=agent.get("bio", ""),
+                status=agent.get("status", "active"),
+                accepting=agent.get("accepting_connections", True),
+                source=source,
+            )
+    else:
+        # Backward compat: single-agent response
+        peer_id = info.get("agent_id", "")
+        if not peer_id or peer_id == state.agent_id:
+            return
+        register_peer(
+            state, peer_id,
+            url=f"http://{host}:{port}",
+            bio=info.get("bio", ""),
+            status=info.get("status", "active"),
+            accepting=info.get("accepting_connections", True),
+            source=source,
+        )
 
 
 def _get_lan_ip() -> str:
@@ -344,265 +390,6 @@ async def scan_local_ports(state: AgentState) -> None:
 
 
 # =============================================================================
-# Entrypoint Auto-Start
-# =============================================================================
-
-def sync_entrypoint_files() -> None:
-    """Sync bundled entrypoint files to ~/.darkmatter/ if the package version is newer.
-
-    Copies entrypoint.py and templates/ from the installed darkmatter package
-    to ~/.darkmatter/ so the human node always runs the latest code.
-    """
-    import darkmatter
-    import shutil
-
-    dest_dir = os.path.join(os.path.expanduser("~"), ".darkmatter")
-    bundled_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bundled")
-
-    if not os.path.isdir(bundled_dir):
-        return  # No bundled files (dev install without bundled/)
-
-    def _latest_mtime(path: str) -> float:
-        latest = 0.0
-        if os.path.isfile(path):
-            return os.path.getmtime(path)
-        for root, _, files in os.walk(path):
-            for name in files:
-                try:
-                    latest = max(latest, os.path.getmtime(os.path.join(root, name)))
-                except OSError:
-                    continue
-        return latest
-
-    # Check version marker to avoid redundant copies in packaged installs, but
-    # still resync in dev when bundled files changed without a version bump.
-    version_file = os.path.join(dest_dir, ".entrypoint_version")
-    current_version = darkmatter.__version__
-    src_ep = os.path.join(bundled_dir, "entrypoint.py")
-    src_templates = os.path.join(bundled_dir, "templates")
-    source_mtime = max(_latest_mtime(src_ep), _latest_mtime(src_templates))
-    try:
-        with open(version_file) as f:
-            installed_version = f.read().strip()
-        version_mtime = os.path.getmtime(version_file)
-        if installed_version == current_version and source_mtime <= version_mtime:
-            return  # Already up to date
-    except FileNotFoundError:
-        pass
-
-    os.makedirs(dest_dir, exist_ok=True)
-
-    # Copy entrypoint.py
-    if os.path.isfile(src_ep):
-        shutil.copy2(src_ep, os.path.join(dest_dir, "entrypoint.py"))
-
-    # Copy templates/ into templates/entrypoint/ (entrypoint's template_folder)
-    if os.path.isdir(src_templates):
-        dest_templates = os.path.join(dest_dir, "templates")
-        dest_entrypoint = os.path.join(dest_templates, "entrypoint")
-        if os.path.islink(dest_templates):
-            os.remove(dest_templates)
-        if os.path.isdir(dest_entrypoint):
-            shutil.rmtree(dest_entrypoint)
-        os.makedirs(dest_templates, exist_ok=True)
-        shutil.copytree(src_templates, dest_entrypoint)
-
-    # Write version marker
-    with open(version_file, "w") as f:
-        f.write(current_version)
-
-    print(f"[DarkMatter] Synced entrypoint files to {dest_dir} (v{current_version})", file=sys.stderr)
-
-
-def find_entrypoint_path() -> Optional[str]:
-    """Locate the entrypoint.py script for the human node.
-
-    Search order:
-    1. DARKMATTER_ENTRYPOINT_PATH env var (explicit override)
-    2. ~/.darkmatter/entrypoint.py (canonical per-device location)
-    """
-    # Sync bundled files before searching
-    sync_entrypoint_files()
-
-    if ENTRYPOINT_PATH:
-        return ENTRYPOINT_PATH if os.path.isfile(ENTRYPOINT_PATH) else None
-    canonical = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.py")
-    return canonical if os.path.isfile(canonical) else None
-
-
-_entrypoint_pid: Optional[int] = None  # PID of entrypoint we spawned (so we can shut it down)
-
-
-async def _is_entrypoint_responding() -> bool:
-    """Check if the entrypoint is responding on its port."""
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(1.0, connect=0.5)) as client:
-            resp = await client.get(f"http://127.0.0.1:{ENTRYPOINT_PORT}/.well-known/darkmatter.json")
-            return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def _is_entrypoint_process_alive() -> bool:
-    """Check if the entrypoint process we spawned is still alive."""
-    if _entrypoint_pid is None:
-        return False
-    try:
-        os.kill(_entrypoint_pid, 0)  # signal 0 = check if process exists
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-async def ensure_entrypoint_running() -> None:
-    """Auto-start the entrypoint (human node) on port 8200 if not already running.
-
-    Called on startup and every discovery loop iteration (~30s). Acts as a
-    watchdog — if the entrypoint crashes, it will be restarted on the next call.
-    """
-    global _entrypoint_pid
-
-    if not ENTRYPOINT_AUTOSTART:
-        return
-
-    # Check if entrypoint is responding
-    if await _is_entrypoint_responding():
-        return
-
-    # Not responding — check if our spawned process died
-    if _entrypoint_pid is not None and not _is_entrypoint_process_alive():
-        print(f"[DarkMatter] Entrypoint process (PID {_entrypoint_pid}) died, will restart", file=sys.stderr)
-        _entrypoint_pid = None
-
-    import subprocess
-    pidfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.pid")
-
-    # PID-based spawn guard: check if another agent is already spawning
-    try:
-        if os.path.exists(pidfile_path):
-            with open(pidfile_path, "r") as f:
-                content = f.read().strip()
-            if content:
-                old_pid = int(content)
-                try:
-                    os.kill(old_pid, 0)  # Check if process is alive
-                    # Process exists — check if entrypoint is actually responding
-                    if await _is_entrypoint_responding():
-                        return
-                    # PID alive but not responding — could be a zombie or wrong process.
-                    # Give it a moment then proceed.
-                    await asyncio.sleep(2)
-                    if await _is_entrypoint_responding():
-                        return
-                    print(f"[DarkMatter] Stale entrypoint PID {old_pid} (alive but not responding), replacing", file=sys.stderr)
-                except (OSError, ProcessLookupError):
-                    print(f"[DarkMatter] Stale entrypoint PID {old_pid} (dead), cleaning up", file=sys.stderr)
-            os.remove(pidfile_path)
-    except (ValueError, IOError):
-        # Corrupt pid file — remove and proceed
-        try:
-            os.remove(pidfile_path)
-        except OSError:
-            pass
-
-    # Double-check after cleanup
-    if await _is_entrypoint_responding():
-        return
-
-    path = find_entrypoint_path()
-    if not path:
-        print(f"[DarkMatter] Entrypoint script not found, cannot auto-start", file=sys.stderr)
-        return
-
-    entrypoint_dir = os.path.dirname(os.path.abspath(path))
-    log_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.log")
-
-    spawn_env = {k: v for k, v in os.environ.items()
-                 if not k.startswith("WERKZEUG_")}
-    popen_kwargs = dict(
-        cwd=entrypoint_dir,
-        env=spawn_env,
-    )
-    if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
-
-    # Retry up to 3 times — handles port conflicts from recently-killed processes
-    for attempt in range(3):
-        if attempt > 0:
-            await asyncio.sleep(2)
-            if await _is_entrypoint_responding():
-                return
-        print(f"[DarkMatter] Spawning entrypoint: {path}" + (f" (attempt {attempt + 1})" if attempt else ""), file=sys.stderr)
-        log_file_handle = open(log_path, "a")
-        popen_kwargs["stdout"] = log_file_handle
-        popen_kwargs["stderr"] = log_file_handle
-        proc = subprocess.Popen([sys.executable, path], **popen_kwargs)
-        _entrypoint_pid = proc.pid
-
-        # Write PID file so other agents know we're spawning
-        try:
-            with open(pidfile_path, "w") as f:
-                f.write(str(_entrypoint_pid))
-        except IOError:
-            pass
-
-        # Wait up to 10s for the entrypoint to start responding
-        started = False
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            if proc.poll() is not None:
-                print(f"[DarkMatter] Entrypoint exited with code {proc.returncode} (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
-                _entrypoint_pid = None
-                break
-            if await _is_entrypoint_responding():
-                print(f"[DarkMatter] Entrypoint started on port {ENTRYPOINT_PORT} (PID {_entrypoint_pid})", file=sys.stderr)
-                started = True
-                break
-
-        if started:
-            return
-        if _entrypoint_pid is not None:
-            print(f"[DarkMatter] Entrypoint failed to respond within 10s (attempt {attempt + 1}, check {log_path})", file=sys.stderr)
-            _entrypoint_pid = None
-
-    # All attempts failed — clean up pid file
-    try:
-        os.remove(pidfile_path)
-    except OSError:
-        pass
-
-
-def shutdown_entrypoint() -> None:
-    """Kill the entrypoint process we spawned. Called on primary session shutdown."""
-    global _entrypoint_pid
-    import signal
-
-    if _entrypoint_pid is None:
-        return
-
-    try:
-        if sys.platform == "win32":
-            os.kill(_entrypoint_pid, signal.CTRL_BREAK_EVENT)
-        else:
-            os.kill(_entrypoint_pid, signal.SIGTERM)
-        print(f"[DarkMatter] Entrypoint (PID {_entrypoint_pid}) terminated", file=sys.stderr)
-    except ProcessLookupError:
-        pass  # already dead
-    except Exception as e:
-        print(f"[DarkMatter] Failed to kill entrypoint (PID {_entrypoint_pid}): {e}", file=sys.stderr)
-    _entrypoint_pid = None
-
-    # Clean up PID file
-    pidfile_path = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint.pid")
-    try:
-        os.remove(pidfile_path)
-    except OSError:
-        pass
-
-
-# =============================================================================
 # Discovery Loop
 # =============================================================================
 
@@ -622,12 +409,7 @@ async def discovery_loop(state: AgentState) -> None:
             try:
                 await scan_local_ports(state)
             except Exception as e:
-                print(f"[DarkMatter] Local port scan failed: {e}", file=sys.stderr)
-
-            try:
-                await ensure_entrypoint_running()
-            except Exception as e:
-                print(f"[DarkMatter] Entrypoint auto-start failed: {e}", file=sys.stderr)
+                _log.error("Local port scan failed: %s", e)
 
             from darkmatter.security import sign_lan_beacon
             ts_val = int(time.time())
@@ -654,7 +436,7 @@ async def discovery_loop(state: AgentState) -> None:
                     None, mcast_sock.sendto, packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT)
                 )
             except OSError as e:
-                print(f"[DarkMatter] Beacon multicast send failed: {e}", file=sys.stderr)
+                _log.error("Beacon multicast send failed: %s", e)
 
             await asyncio.sleep(DISCOVERY_INTERVAL)
     finally:
