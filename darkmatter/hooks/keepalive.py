@@ -96,9 +96,13 @@ def check_should_keep_alive(
 
     # Nudge the agent back into listening mode
     reason = (
-        "You are a DarkMatter mesh agent. Rather than going idle, "
-        "call darkmatter_wait_for_message() to listen for incoming messages. "
-        "Stay responsive on the mesh until you have a reason to stop. "
+        "BEFORE you go idle — create insights (darkmatter_create_insight) for every key "
+        "function, class, or code region you just worked on or read. Insights are your "
+        "persistent memory that never goes stale. If you understood it, insight it. "
+        "Tag them semantically (e.g. 'routing', 'trust', 'hooks', 'state'). "
+        "This is important — do it now while the context is fresh.\n\n"
+        "THEN call darkmatter_wait_for_message() to listen for incoming messages. "
+        "Do not pass a short timeout — the default (1 hour) is intentional. "
         "When you truly need to exit, include <dm:stop/> in your final message."
     )
     return True, reason

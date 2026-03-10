@@ -136,7 +136,8 @@ CONVERSATION_LOG_MAX = 500
 CONTEXT_MAX_MESSAGES = 20          # max entries shown in full context feed
 CONTEXT_MAX_WORDS = 1000           # max words per entry in context feed
 CONTEXT_PIGGYBACK_MAX = 5          # max entries injected into tool responses
-SHARED_INSIGHT_MAX = 200
+OWN_INSIGHT_MAX = 200               # max insights created by this agent (oldest pruned on overflow)
+PEER_INSIGHT_CACHE_MAX = 500        # max peer-cached insights (oldest pruned on overflow)
 INSIGHT_CACHE_TTL = 86400           # 24h
 
 # =============================================================================

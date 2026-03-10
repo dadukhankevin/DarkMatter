@@ -1289,7 +1289,7 @@ async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, in
         return {"error": "Invalid insight signature"}, 403
 
     from darkmatter.models import Insight
-    from darkmatter.config import SHARED_INSIGHT_MAX
+    from darkmatter.config import PEER_INSIGHT_CACHE_MAX
 
     existing_idx = None
     for i, s in enumerate(state.insights):
@@ -1318,11 +1318,10 @@ async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, in
     if existing_idx is not None:
         state.insights[existing_idx] = insight
     else:
-        if len(state.insights) >= SHARED_INSIGHT_MAX:
-            for i, s in enumerate(state.insights):
-                if s.author_agent_id != state.agent_id:
-                    state.insights.pop(i)
-                    break
+        peer_insights = [s for s in state.insights if s.author_agent_id != state.agent_id]
+        if len(peer_insights) >= PEER_INSIGHT_CACHE_MAX:
+            oldest = min(peer_insights, key=lambda s: s.created_at)
+            state.insights.remove(oldest)
         state.insights.append(insight)
 
     save_state()

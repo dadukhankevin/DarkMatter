@@ -761,9 +761,12 @@ async def create_insight(params: CreateInsightInput, ctx: Context) -> str:
     track_session(ctx)
     state = get_state()
 
-    from darkmatter.config import SHARED_INSIGHT_MAX
-    if len(state.insights) >= SHARED_INSIGHT_MAX:
-        return json.dumps({"success": False, "error": f"Insight limit reached ({SHARED_INSIGHT_MAX})"})
+    from darkmatter.config import OWN_INSIGHT_MAX
+    own_insights = [s for s in state.insights if s.author_agent_id == state.agent_id]
+    if len(own_insights) >= OWN_INSIGHT_MAX:
+        # Auto-prune oldest own insight instead of rejecting
+        oldest = min(own_insights, key=lambda s: s.created_at)
+        state.insights.remove(oldest)
 
     from darkmatter.insight_resolver import resolve_region, hash_content
     from pathlib import Path
@@ -1003,7 +1006,7 @@ async def view_insights(params: ViewInsightsInput, ctx: Context) -> str:
 )
 async def wait_for_message(
     from_agents: Optional[list[str]] = None,
-    timeout_seconds: float = 900,
+    timeout_seconds: float = 3600,
     ctx: Context = None,
 ) -> str:
     """Block until a new inbox message arrives. Consumes and returns all matching messages.

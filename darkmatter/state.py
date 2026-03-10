@@ -19,7 +19,8 @@ from darkmatter.config import (
     DEFAULT_PORT,
     ANTIMATTER_LOG_MAX,
     CONVERSATION_LOG_MAX,
-    SHARED_INSIGHT_MAX,
+    OWN_INSIGHT_MAX,
+    PEER_INSIGHT_CACHE_MAX,
     REPLAY_WINDOW,
     REPLAY_MAX_SIZE,
 )
@@ -346,9 +347,14 @@ def _save_single_state(state: AgentState) -> None:
     if len(state.conversation_log) > CONVERSATION_LOG_MAX:
         state.conversation_log = state.conversation_log[-CONVERSATION_LOG_MAX:]
 
-    # Cap insights
-    if len(state.insights) > SHARED_INSIGHT_MAX:
-        state.insights = state.insights[-SHARED_INSIGHT_MAX:]
+    # Cap insights — own and peer separately
+    own = [s for s in state.insights if s.author_agent_id == state.agent_id]
+    peer = [s for s in state.insights if s.author_agent_id != state.agent_id]
+    if len(own) > OWN_INSIGHT_MAX:
+        own = own[-OWN_INSIGHT_MAX:]
+    if len(peer) > PEER_INSIGHT_CACHE_MAX:
+        peer = peer[-PEER_INSIGHT_CACHE_MAX:]
+    state.insights = own + peer
 
     seen = _seen_message_ids.get(state.agent_id, {})
 
@@ -427,7 +433,7 @@ def _save_single_state(state: AgentState) -> None:
                 "original_hash": s.original_hash,
                 "stale_views": s.stale_views,
             }
-            for s in state.insights[-SHARED_INSIGHT_MAX:]
+            for s in state.insights
         ],
         "security_settings": state.security_settings,
         "seen_message_ids": {
