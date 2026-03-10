@@ -843,7 +843,9 @@ def dm_status():
 @app.route("/__darkmatter__/network_info", methods=["GET"])
 def dm_network_info():
     peers = [
-        {"agent_id": c.agent_id, "agent_url": c.agent_url, "agent_bio": c.agent_bio}
+        {"agent_id": c.agent_id, "agent_url": c.agent_url, "agent_bio": c.agent_bio,
+         "display_name": getattr(c, "agent_display_name", None) or "",
+         "bio": c.agent_bio}
         for c in state.connections.values()
     ]
     return jsonify({
@@ -855,6 +857,7 @@ def dm_network_info():
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "wallets": state.wallets,
         "peers": peers,
+        "connections": peers,
     })
 
 
@@ -1676,6 +1679,18 @@ def mesh_connect():
     to_url = _resolve_base_url(to_conn)
     if not from_url or not to_url:
         return jsonify({"success": False, "error": "Could not resolve URLs for agents"})
+
+    # If the target is on localhost but the source isn't, the source agent can't
+    # reach "localhost" (it would hit its own machine). Replace with our LAN IP.
+    from urllib.parse import urlparse
+    from_host = urlparse(from_url).hostname or ""
+    to_host = urlparse(to_url).hostname or ""
+    from_is_localhost = from_host in ("localhost", "127.0.0.1", "::1")
+    to_is_localhost = to_host in ("localhost", "127.0.0.1", "::1")
+    if to_is_localhost and not from_is_localhost:
+        parsed = urlparse(to_url)
+        lan_ip = _get_lan_ip()
+        to_url = f"http://{lan_ip}:{parsed.port}"
 
     # Tell the source agent to connect to the target agent's URL
     try:

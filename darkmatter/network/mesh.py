@@ -1261,7 +1261,9 @@ async def handle_network_info(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
     peers = [
-        {"agent_id": c.agent_id, "agent_url": c.agent_url, "agent_bio": c.agent_bio}
+        {"agent_id": c.agent_id, "agent_url": c.agent_url, "agent_bio": c.agent_bio,
+         "display_name": getattr(c, "agent_display_name", None) or "",
+         "bio": c.agent_bio}
         for c in state.connections.values()
     ]
     return JSONResponse({
@@ -1273,6 +1275,7 @@ async def handle_network_info(request: Request) -> JSONResponse:
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
         "wallets": state.wallets,
         "peers": peers,
+        "connections": peers,
     })
 
 

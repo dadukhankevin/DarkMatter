@@ -736,12 +736,7 @@ function initQR(lanUrl) {
   if (!qrExpanded) toggleQR();
 }
 
-function onThemeChange() {
-  if (qrInitialized) {
-    qrInitialized = false;
-    initQR(document.getElementById('qr-url').textContent);
-  }
-}
+// onThemeChange is defined in the mesh section below (handles both QR + mesh)
 
 // =========================================================================
 // Security panel
@@ -2848,6 +2843,12 @@ async function _completeConnection(targetNode) {
 }
 
 function onThemeChange() {
+  // Re-render QR code with new theme colors
+  if (qrInitialized) {
+    qrInitialized = false;
+    initQR(document.getElementById('qr-url').textContent);
+  }
+  // Re-render mesh graph with new theme colors
   if (_meshVisible) fetchMeshTopology();
 }
 </script>
