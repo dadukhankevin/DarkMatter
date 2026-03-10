@@ -214,5 +214,109 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# =============================================================================
+# Keep-alive hook installation
+# =============================================================================
+
+# Map of client name → settings file path and hook format
+KEEPALIVE_TARGETS: dict[str, dict] = {
+    "claude-code": {
+        "settings_path": "~/.claude/settings.json",
+        "hook_event": "Stop",
+    },
+    # Future:
+    # "gemini": {"settings_path": "~/.gemini/settings.json", "hook_event": "AfterAgent"},
+    # "codex": {"settings_path": "~/.codex/config.toml", "hook_event": "agent-turn-complete"},
+    # "opencode": {"settings_path": "~/.config/opencode/opencode.json", "hook_event": "session.idle"},
+}
+
+
+def _keepalive_hook_command(python_cmd: str) -> str:
+    """Build the hook command string."""
+    return f"{python_cmd} -m darkmatter.hooks.keepalive"
+
+
+def install_keepalive(client: str = "claude-code", python_cmd: str = sys.executable) -> tuple[bool, str]:
+    """Install the keep-alive Stop hook for a supported client."""
+    target = KEEPALIVE_TARGETS.get(client)
+    if not target:
+        return False, f"Keep-alive hook not supported for {client}"
+
+    home = Path.home()
+    path = _expand(target["settings_path"], home)
+    command = _keepalive_hook_command(python_cmd)
+
+    if client == "claude-code":
+        def update(config: dict) -> None:
+            config.setdefault("hooks", {})
+            hooks = config["hooks"]
+            hook_entry = {
+                "type": "command",
+                "command": command,
+                "timeout": 10,
+            }
+
+            # Check if we already installed a DarkMatter keep-alive hook
+            stop_hooks = hooks.get("Stop", [])
+            for rule in stop_hooks:
+                for h in rule.get("hooks", []):
+                    if "darkmatter.hooks.keepalive" in h.get("command", ""):
+                        h["command"] = command  # Update command path
+                        return
+
+            # Add new hook rule
+            stop_hooks.append({"hooks": [hook_entry]})
+            hooks["Stop"] = stop_hooks
+
+        try:
+            _merge_json_config(path, update)
+        except (json.JSONDecodeError, OSError) as exc:
+            return False, f"Failed to install keep-alive hook: {exc}"
+
+        return True, f"Keep-alive hook installed to {path}"
+
+    return False, f"Keep-alive hook not yet implemented for {client}"
+
+
+def uninstall_keepalive(client: str = "claude-code") -> tuple[bool, str]:
+    """Remove the keep-alive Stop hook for a supported client."""
+    target = KEEPALIVE_TARGETS.get(client)
+    if not target:
+        return False, f"Keep-alive hook not supported for {client}"
+
+    home = Path.home()
+    path = _expand(target["settings_path"], home)
+
+    if not path.exists():
+        return True, "No settings file found — nothing to uninstall"
+
+    if client == "claude-code":
+        def update(config: dict) -> None:
+            hooks = config.get("hooks", {})
+            stop_hooks = hooks.get("Stop", [])
+            # Remove any rule containing a darkmatter keepalive hook
+            hooks["Stop"] = [
+                rule for rule in stop_hooks
+                if not any(
+                    "darkmatter.hooks.keepalive" in h.get("command", "")
+                    for h in rule.get("hooks", [])
+                )
+            ]
+            # Clean up empty lists
+            if not hooks["Stop"]:
+                del hooks["Stop"]
+            if not hooks:
+                del config["hooks"]
+
+        try:
+            _merge_json_config(path, update)
+        except (json.JSONDecodeError, OSError) as exc:
+            return False, f"Failed to uninstall keep-alive hook: {exc}"
+
+        return True, f"Keep-alive hook removed from {path}"
+
+    return False, f"Keep-alive hook not yet implemented for {client}"
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -239,7 +239,7 @@ class NetworkManager:
         (e.g. http://host:port/__darkmatter__/{agent_id}) so remote peers
         can route back to the correct local agent.
 
-        If agent_id is None, returns the base URL (backward compat).
+        If agent_id is None, returns the base URL.
         """
         state = self._get_state()
         base_url = None

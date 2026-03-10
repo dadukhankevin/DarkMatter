@@ -685,14 +685,6 @@ async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
 # Access these via: curl localhost:PORT/__darkmatter__/<endpoint>
 # See .claude/skills/darkmatter-ops/SKILL.md for documentation.
 
-_REMOVED_TOOL_MARKER = True  # noqa: F841 — placeholder for removed tools
-
-
-# REMOVED: set_status, get_identity, list_connections, list_pending_requests,
-# list_inbox, get_message, list_messages, get_sent_message, expire_message,
-# wait_for_response, network_info, discover_domain,
-# set_impression, get_impression, set_superagent, set_rate_limit,
-# get_balance, send_sol, send_token, wallet_balances, wallet_send
 
 # =============================================================================
 # Insight Tools

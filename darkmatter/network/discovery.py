@@ -97,7 +97,7 @@ async def handle_well_known(request) -> "JSONResponse":
     """Return /.well-known/darkmatter.json for global discovery.
 
     Multi-tenant: includes an `agents` array with all hosted agents.
-    Backward compat: top-level fields still reference the default/primary agent.
+    Top-level fields reference the default/primary agent.
     """
     from starlette.responses import JSONResponse
     from darkmatter.state import get_state, get_state_for, list_hosted_agents
@@ -131,7 +131,7 @@ async def handle_well_known(request) -> "JSONResponse":
     response = {
         "darkmatter": True,
         "protocol_version": PROTOCOL_VERSION,
-        # Backward compat: primary agent fields at top level
+        # Primary agent fields at top level
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
@@ -340,7 +340,7 @@ async def probe_port(client: httpx.AsyncClient, state: AgentState, port: int, ho
                 source=source,
             )
     else:
-        # Backward compat: single-agent response
+        # Single-agent response (no agents array)
         peer_id = info.get("agent_id", "")
         if not peer_id or peer_id == state.agent_id:
             return

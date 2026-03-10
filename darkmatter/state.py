@@ -2,7 +2,6 @@
 State persistence — save/load JSON, replay protection.
 
 Multi-tenant registry: supports multiple agents on a single daemon.
-Backward compatible — single-agent deployments work unchanged.
 
 Depends on: config, models, identity
 """
@@ -91,15 +90,11 @@ def list_hosted_agents() -> list[str]:
 
 
 # =============================================================================
-# Backward-compatible singleton API
+# Default Agent API
 # =============================================================================
 
 def get_state() -> Optional[AgentState]:
-    """Get the current agent state (backward compat).
-
-    Returns the default agent's state, or the only registered agent,
-    or None if no agents are registered.
-    """
+    """Get the default agent's state, or the only registered agent, or None."""
     if _default_agent_id and _default_agent_id in _agent_states:
         return _agent_states[_default_agent_id]
     if len(_agent_states) == 1:
@@ -108,10 +103,7 @@ def get_state() -> Optional[AgentState]:
 
 
 def set_state(state: AgentState) -> None:
-    """Set the current agent state (backward compat).
-
-    Registers the agent and sets it as default.
-    """
+    """Register an agent and set it as the default."""
     register_agent(state.agent_id, state)
     global _default_agent_id
     _default_agent_id = state.agent_id
@@ -259,7 +251,7 @@ def state_file_path(agent_id: Optional[str] = None) -> str:
         if state and state.public_key_hex:
             return os.path.join(_STATE_DIR, f"{state.public_key_hex}.json")
 
-    # Backward compat: use default agent
+    # Fall back to default agent
     state = get_state()
     if state is not None and state.public_key_hex:
         return os.path.join(_STATE_DIR, f"{state.public_key_hex}.json")
@@ -401,7 +393,7 @@ def _save_single_state(state: AgentState) -> None:
         # router_mode is NOT persisted — it's set from config.AGENT_ROUTER_MODE on startup.
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
         "superagent_url": state.superagent_url,
-        "gas_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
+        "antimatter_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
         "conversation_log": [
             {
                 "message_id": e.message_id,
@@ -454,6 +446,7 @@ def _save_single_state(state: AgentState) -> None:
             }
             for m in state.message_queue
         ],
+        "consumed_message_ids": list(_consumed_message_ids.get(state.agent_id, set())),
     }
 
     path = state_file_path(agent_id=state.agent_id)
@@ -480,8 +473,7 @@ def _save_single_state(state: AgentState) -> None:
 def save_state(agent_id: Optional[str] = None) -> None:
     """Persist durable state to disk.
 
-    If agent_id is given, save just that agent. Otherwise save the default agent
-    (backward compat for single-agent deployments).
+    If agent_id is given, save just that agent. Otherwise save the default agent.
     """
     if agent_id:
         state = _agent_states.get(agent_id)
@@ -489,7 +481,7 @@ def save_state(agent_id: Optional[str] = None) -> None:
             _save_single_state(state)
         return
 
-    # Backward compat: save default agent
+    # Save default agent
     state = get_state()
     if state is not None:
         _save_single_state(state)
@@ -531,8 +523,8 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
             last_activity=cd.get("last_activity"),
             agent_public_key_hex=cd.get("agent_public_key_hex"),
             agent_display_name=cd.get("agent_display_name"),
-            wallets=cd.get("wallets") or ({"solana": cd["wallet_address"]} if cd.get("wallet_address") else {}),
-            addresses=cd.get("addresses") or ({"http": cd["agent_url"]} if cd.get("agent_url") else {}),
+            wallets=cd.get("wallets", {}),
+            addresses=cd.get("addresses", {}),
             rate_limit=cd.get("rate_limit", 0),
             peer_created_at=cd.get("peer_created_at"),
             identity_verified=cd.get("identity_verified", False),
@@ -540,10 +532,21 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
             capabilities=cd.get("capabilities", {}),
         )
 
+    # Restore consumed message IDs first, so we can filter the queue
+    loaded_agent_id = agent_id or data.get("agent_id", "")
+    saved_consumed = set(data.get("consumed_message_ids", []))
+    if saved_consumed and loaded_agent_id:
+        if loaded_agent_id not in _consumed_message_ids:
+            _consumed_message_ids[loaded_agent_id] = set()
+        _consumed_message_ids[loaded_agent_id].update(saved_consumed)
+
     message_queue = []
     for qd in data.get("message_queue", []):
+        mid = qd.get("message_id", "")
+        if mid in saved_consumed:
+            continue  # Already consumed — don't re-load
         message_queue.append(QueuedMessage(
-            message_id=qd["message_id"],
+            message_id=mid,
             content=qd["content"],
             hops_remaining=qd.get("hops_remaining", 0),
             metadata=qd.get("metadata", {}),
@@ -553,7 +556,6 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         ))
 
     # Restore replay protection (per-agent)
-    loaded_agent_id = agent_id or data.get("agent_id", "")
     saved_replay = data.get("seen_message_ids", {})
     if isinstance(saved_replay, dict):
         restore_seen_message_ids(saved_replay, agent_id=loaded_agent_id)
@@ -573,12 +575,11 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
             metadata=ed.get("metadata", {}),
         ))
 
-    # Deserialize insights (backward compat: also check "shared_shards" key)
+    # Deserialize insights
     insights = []
-    insights_data = data.get("insights") or data.get("shared_shards", [])
-    for sd in insights_data:
+    for sd in data.get("insights", []):
         insights.append(Insight(
-            insight_id=sd.get("insight_id") or sd.get("shard_id", ""),
+            insight_id=sd.get("insight_id", ""),
             author_agent_id=sd.get("author_agent_id", ""),
             content=sd.get("content", ""),
             tags=sd.get("tags", []),
@@ -608,11 +609,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         connections=connections,
         message_queue=message_queue,
         impressions={
-            aid: (
-                Impression(score=v["score"], note=v.get("note", ""), negative_since=v.get("negative_since"))
-                if isinstance(v, dict) else
-                Impression(score=0.0, note=v)
-            )
+            aid: Impression(score=v["score"], note=v.get("note", ""), negative_since=v.get("negative_since"))
             for aid, v in data.get("impressions", {}).items()
         },
         rate_limit_global=data.get("rate_limit_global", 0),
@@ -621,7 +618,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         router_mode="spawn",  # default; overridden by init_state() immediately after load
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
         superagent_url=data.get("superagent_url"),
-        antimatter_log=data.get("gas_log", []),
+        antimatter_log=data.get("antimatter_log", []),
         conversation_log=conversation_log,
         insights=insights,
         security_settings=data.get("security_settings", {

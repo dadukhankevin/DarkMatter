@@ -24,5 +24,27 @@ def main() -> None:
         open_entrypoint()
         return
 
+    if cmd == "keepalive":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else None
+        client = "claude-code"
+        # Parse --client flag
+        for i, arg in enumerate(sys.argv[3:], 3):
+            if arg == "--client" and i + 1 < len(sys.argv):
+                client = sys.argv[i + 1]
+
+        if subcmd == "install":
+            from darkmatter.installer import install_keepalive
+            ok, msg = install_keepalive(client=client)
+            print(msg)
+            raise SystemExit(0 if ok else 1)
+        elif subcmd == "uninstall":
+            from darkmatter.installer import uninstall_keepalive
+            ok, msg = uninstall_keepalive(client=client)
+            print(msg)
+            raise SystemExit(0 if ok else 1)
+        else:
+            print("Usage: darkmatter keepalive [install|uninstall] [--client claude-code]")
+            raise SystemExit(1)
+
     from darkmatter.app import main as app_main
     app_main()

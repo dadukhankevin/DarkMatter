@@ -20,7 +20,7 @@ _LOG_BACKUP_COUNT = 3
 
 
 class _StderrFormatter(logging.Formatter):
-    """Stderr format: [DarkMatter] [source] message — backward compat with old print() style."""
+    """Stderr format: [DarkMatter] [source] message."""
 
     def format(self, record: logging.LogRecord) -> str:
         # Extract the child logger name (e.g. "darkmatter.mesh" → "mesh")

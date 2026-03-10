@@ -81,12 +81,12 @@ def verify_signed_payload(public_key_hex: str, signature_hex: str,
 
 
 # =============================================================================
-# Backward-Compatible Signing (matches existing wire format)
+# Message Signing
 # =============================================================================
 
 def sign_message(private_key_hex: str, from_agent_id: str, message_id: str,
                  timestamp: str, content: str) -> str:
-    """Sign a message payload (backward-compatible format). Returns signature hex."""
+    """Sign a message payload. Returns signature hex."""
     private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(private_key_hex))
     payload = f"{from_agent_id}\n{message_id}\n{timestamp}\n{content}".encode("utf-8")
     return private_key.sign(payload).hex()
@@ -94,7 +94,7 @@ def sign_message(private_key_hex: str, from_agent_id: str, message_id: str,
 
 def verify_message(public_key_hex: str, signature_hex: str, from_agent_id: str,
                    message_id: str, timestamp: str, content: str) -> bool:
-    """Verify a signed message payload (backward-compatible format)."""
+    """Verify a signed message payload."""
     try:
         public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
         signature = bytes.fromhex(signature_hex)
@@ -192,7 +192,7 @@ def verify_inbound(data: dict, connections: dict) -> VerifiedPayload:
             conn.agent_public_key_hex = from_public_key_hex
             return VerifiedPayload(verified=True, pinned_key=True)
         else:
-            # Connected but no key on either side — reject (no backward compat)
+            # Connected but no key on either side — reject
             return VerifiedPayload(
                 verified=False,
                 error="Signature required — unsigned messages are not accepted.",

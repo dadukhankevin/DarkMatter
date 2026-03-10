@@ -89,8 +89,7 @@ def resolve_state(request: "Request") -> Optional[AgentState]:
     """Resolve the target agent state from a request.
 
     If the URL contains a {target_agent_id} path param, look up that specific
-    agent. Otherwise fall back to the default agent (backward compat).
-    Returns None if the target agent is not found.
+    agent. Otherwise fall back to the default agent.
     """
     target = request.path_params.get("target_agent_id")
     if target:
@@ -228,10 +227,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     from_agent_bio = data.get("from_agent_bio", "")
     from_agent_public_key_hex = data.get("from_agent_public_key_hex")
     from_agent_display_name = data.get("from_agent_display_name")
-    _wallets_raw = data.get("wallets")
-    from_agent_wallets = _wallets_raw if _wallets_raw is not None else (
-        {"solana": data["from_agent_wallet_address"]} if data.get("from_agent_wallet_address") else {}
-    )
+    from_agent_wallets = data.get("wallets", {})
     from_agent_created_at = data.get("created_at")
     mutual = data.get("mutual", False)
     from_agent_capabilities = data.get("capabilities", {}) or {}
@@ -276,7 +272,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_display_name": state.display_name,
             "wallets": state.wallets,
             "capabilities": local_delivery_capabilities(state),
-            "wallet_address": state.wallets.get("solana"),
+
             "created_at": state.created_at,
             "message": "Already connected.",
         }, 200
@@ -317,7 +313,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_display_name": state.display_name,
             "wallets": state.wallets,
             "capabilities": local_delivery_capabilities(state),
-            "wallet_address": state.wallets.get("solana"),
+
             "created_at": state.created_at,
             "message": "Auto-accepted (local network).",
         }, 200
@@ -409,10 +405,7 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
     agent_bio = data.get("agent_bio", "")
     agent_public_key_hex = data.get("agent_public_key_hex")
     agent_display_name = data.get("agent_display_name")
-    _wallets_raw = data.get("wallets")
-    agent_wallets = _wallets_raw if _wallets_raw is not None else (
-        {"solana": data["wallet_address"]} if data.get("wallet_address") else {}
-    )
+    agent_wallets = data.get("wallets", {})
     agent_capabilities = data.get("capabilities", {}) or {}
 
     if not agent_id or not agent_url:
@@ -502,7 +495,7 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
         # Proof was submitted and verified in handle_connection_proof
         identity_verified = True
     elif not pending.challenge_id:
-        # Legacy: no challenge was issued (shouldn't happen with new code)
+        # No challenge was issued
         identity_verified = False
 
     from darkmatter.security import assess_url_security
@@ -532,7 +525,6 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
         "agent_display_name": state.display_name,
         "wallets": state.wallets,
         "capabilities": local_delivery_capabilities(state),
-        "wallet_address": state.wallets.get("solana"),
         "created_at": state.created_at,
     }
 
@@ -558,7 +550,6 @@ def build_outbound_request_payload(state: AgentState, public_url: str, mutual: b
         "from_agent_display_name": state.display_name,
         "wallets": state.wallets,
         "capabilities": local_delivery_capabilities(state),
-        "from_agent_wallet_address": state.wallets.get("solana"),
         "created_at": state.created_at,
     }
     if mutual:
@@ -568,17 +559,13 @@ def build_outbound_request_payload(state: AgentState, public_url: str, mutual: b
 
 def build_connection_from_accepted(result_data: dict) -> Connection:
     """Build a Connection from an auto-accepted or accepted response."""
-    _wallets_raw = result_data.get("wallets")
-    peer_wallets = _wallets_raw if _wallets_raw is not None else (
-        {"solana": result_data["wallet_address"]} if result_data.get("wallet_address") else {}
-    )
     return Connection(
         agent_id=result_data["agent_id"],
         agent_url=result_data.get("agent_url", ""),
         agent_bio=result_data.get("agent_bio", ""),
         agent_public_key_hex=result_data.get("agent_public_key_hex"),
         agent_display_name=result_data.get("agent_display_name"),
-        wallets=peer_wallets,
+        wallets=result_data.get("wallets", {}),
         peer_created_at=result_data.get("created_at"),
         capabilities=result_data.get("capabilities", {}) or {},
     )
@@ -600,23 +587,16 @@ def _gc_expired_sessions() -> None:
 
 
 def process_antimatter_match(data: dict) -> tuple[dict, int]:
-    """Commit-reveal match game endpoint with backward compatibility.
+    """Commit-reveal match game endpoint.
 
     Phase 1 (commit): peer generates pick/nonce/commitment, stores session, returns commitment.
     Phase 2 (reveal): peer verifies orchestrator commitment, returns its pick+nonce.
-    Legacy (no phase): stateless random pick for mixed-version networks.
     """
     _gc_expired_sessions()
 
     phase = data.get("phase")
-
-    # --- Legacy path (backward compatibility) ---
-    if phase is None:
-        n = data.get("n")
-        if not isinstance(n, int) or n < 1:
-            return {"error": "Invalid n"}, 400
-        pick = random.randint(0, n)
-        return {"pick": pick}, 200
+    if phase not in ("commit", "reveal"):
+        return {"error": "Missing or invalid phase (expected 'commit' or 'reveal')"}, 400
 
     # --- Phase 1: Commit ---
     if phase == "commit":
@@ -1287,7 +1267,7 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
 async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, int]:
     """Process an incoming insight push. Returns (response_dict, status_code)."""
     author_id = data.get("author_agent_id", "")
-    insight_id = data.get("insight_id") or data.get("shard_id", "")
+    insight_id = data.get("insight_id", "")
 
     if not author_id or not insight_id:
         missing = [f for f, v in [("author_agent_id", author_id), ("insight_id", insight_id)] if not v]
@@ -1423,7 +1403,7 @@ async def dispatch_webrtc_message(state: AgentState, conn, path: str, payload: d
             _log.warning("WebRTC peer_update rejected (%s): %s", status_code, result.get("error", "unknown"))
         return None
 
-    if clean_path in ("/__darkmatter__/insight_push", "/__darkmatter__/shard_push"):
+    if clean_path == "/__darkmatter__/insight_push":
         result, status_code = await _process_insight_push(state, payload)
         if status_code >= 400:
             _log.warning("WebRTC insight_push rejected (%s): %s", status_code, result.get("error", "unknown"))
@@ -2185,8 +2165,6 @@ async def handle_insight_push(request: Request) -> JSONResponse:
     result, status_code = await _process_insight_push(state, data)
     return JSONResponse(result, status_code=status_code)
 
-# Backward compat alias
-handle_shard_push = handle_insight_push
 
 
 # =============================================================================

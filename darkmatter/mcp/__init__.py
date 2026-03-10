@@ -35,6 +35,12 @@ BEHAVIOR:
 - MANDATORY: When your task is complete, call darkmatter_complete_and_summarize. Write a dense summary of what you did, \
 reference peers with @agent_id, list insights created. This is NOT optional — every task must end with a summary.
 
+KEEP-ALIVE:
+- A keep-alive hook automatically nudges you to listen for messages when you finish a task.
+- You do NOT need to manage this yourself — just do your work and the hook handles the rest.
+- When you truly need to exit (goodbye, signing off, no more work), include <dm:stop/> in your final message. \
+This tells the hook to let you stop.
+
 Advanced ops: see .claude/skills/darkmatter-ops/SKILL.md\
 """
 

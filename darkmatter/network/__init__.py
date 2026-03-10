@@ -18,16 +18,8 @@ __all__ = [
 ]
 
 
-# =============================================================================
-# Backward compatibility shim — delegates to NetworkManager
-# =============================================================================
-
 async def send_to_peer(conn, path: str, payload: dict, **kw) -> dict:
-    """Backward compat — delegates to NetworkManager.
-
-    Callers that still use send_to_peer(conn, path, payload) get transparent
-    transport selection via the manager. Remove once all callers are migrated.
-    """
+    """Send a message to a peer via the NetworkManager with automatic transport selection."""
     mgr = get_network_manager()
     result = await mgr.send(conn.agent_id, path, payload)
     if not result.success:

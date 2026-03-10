@@ -65,7 +65,6 @@ from darkmatter.network.mesh import (
     handle_antimatter_signal,
     handle_antimatter_result,
     handle_insight_push,
-    handle_shard_push,
     handle_sdp_relay,
     handle_sdp_relay_deliver,
     handle_connection_proof,
@@ -103,7 +102,7 @@ def init_state(port: int = None) -> None:
     if port is None:
         port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
-    display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", os.environ.get("DARKMATTER_AGENT_ID", ""))
+    display_name = os.environ.get("DARKMATTER_DISPLAY_NAME", "")
     bio = os.environ.get("DARKMATTER_BIO", "A DarkMatter mesh agent.")
 
     # Step 1: Load or create passport — this IS our identity
@@ -307,7 +306,6 @@ def create_app() -> Router:
         Route("/antimatter_signal", handle_antimatter_signal, methods=["POST"]),
         Route("/antimatter_result", handle_antimatter_result, methods=["POST"]),
         Route("/insight_push", handle_insight_push, methods=["POST"]),
-        Route("/shard_push", handle_shard_push, methods=["POST"]),  # backward compat
         Route("/sdp_relay", handle_sdp_relay, methods=["POST"]),
         Route("/sdp_relay_deliver", handle_sdp_relay_deliver, methods=["POST"]),
         Route("/admin_connect", handle_admin_connect, methods=["POST"]),
@@ -416,7 +414,7 @@ def create_app() -> Router:
 
     # Build the app. Use redirect_slashes=False so POST /mcp doesn't get
     # redirected to /mcp/ (which breaks MCP client connections).
-    # Dual-mount: agent-scoped routes first (more specific), then bare routes (backward compat)
+    # Dual-mount: agent-scoped routes first (more specific), then bare routes (default agent)
     app = Router(
         routes=[
             Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
