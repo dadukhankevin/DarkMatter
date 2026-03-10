@@ -97,9 +97,15 @@ def init_entrypoint(argv: list[str] = None) -> None:
     with open(claude_md_path, "w") as f:
         f.write(claude_md)
 
+    # Auto-install keep-alive hook for Claude Code
+    from darkmatter.installer import install_keepalive
+    ok, msg = install_keepalive(client="claude-code", python_cmd=command)
+
     print(f"Entrypoint initialized at {ep_dir}")
     print(f"  .mcp.json: port {args.port}, display_name={args.display_name}")
     print(f"  CLAUDE.md: connects to dev node on port {args.dev_port}")
+    if ok:
+        print(f"  Keep-alive hook: installed")
     print(f"\nRun 'darkmatter open-entrypoint' to launch Claude Code there.")
 
 

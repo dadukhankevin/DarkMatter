@@ -159,6 +159,10 @@ def install_target(target: InstallTarget, *, command: str, display_name: str, po
     except OSError as exc:
         return False, f"{target.label}: failed to write {path} ({exc})"
 
+    # Auto-install keep-alive hook if supported for this client
+    if target.client in KEEPALIVE_TARGETS:
+        install_keepalive(client=target.client, python_cmd=command)
+
     return True, f"{target.label}: installed to {path}"
 
 
