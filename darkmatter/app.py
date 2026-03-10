@@ -70,6 +70,7 @@ from darkmatter.network.mesh import (
     handle_pool_proxy,
     handle_pool_info,
     handle_admin_update,
+    handle_admin_connect,
     handle_genome,
     handle_local_inbox,
     handle_local_pending,
@@ -275,6 +276,7 @@ def create_app() -> Router:
         Route("/pool_proxy", handle_pool_proxy, methods=["POST"]),
         Route("/pool_info/{pool_id}", handle_pool_info, methods=["GET"]),
         Route("/admin_update", handle_admin_update, methods=["POST"]),
+        Route("/admin_connect", handle_admin_connect, methods=["POST"]),
         Route("/genome", handle_genome, methods=["GET"]),
         Route("/ping", handle_ping, methods=["POST"]),
         # Local API — for skill/curl access

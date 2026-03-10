@@ -2021,6 +2021,61 @@ async def handle_admin_update(request: Request) -> JSONResponse:
     })
 
 
+async def handle_admin_connect(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/admin_connect — Tell this agent to connect to a URL.
+
+    Only processes requests from connected peers.
+    """
+    state = get_state()
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    from_id = data.get("from_agent_id", "")
+    if from_id not in state.connections:
+        return JSONResponse({"error": "Not a connected peer"}, status_code=403)
+
+    target_url = data.get("url", "").strip().rstrip("/")
+    if not target_url:
+        return JSONResponse({"error": "Missing url"}, status_code=400)
+
+    # Build and send a connection request to the target
+    from darkmatter.network.manager import get_network_manager, is_local_url
+    import httpx
+
+    mgr = get_network_manager()
+    if is_local_url(target_url):
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            our_url = f"http://{s.getsockname()[0]}:{state.port}"
+            s.close()
+        except Exception:
+            our_url = f"http://127.0.0.1:{state.port}"
+    else:
+        our_url = mgr.get_public_url()
+
+    payload = build_outbound_request_payload(state, our_url, mutual=True)
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(f"{target_url}/__darkmatter__/connection_request", json=payload)
+            result = resp.json()
+            if result.get("auto_accepted"):
+                conn = build_connection_from_accepted(result)
+                state.connections[result["agent_id"]] = conn
+                save_state()
+                return JSONResponse({"success": True, "status": "connected", "agent_id": result["agent_id"]})
+            return JSONResponse({"success": True, "status": "pending", "request_id": result.get("request_id")})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 # =============================================================================
 # Genome — serve code as signed zip
 # =============================================================================

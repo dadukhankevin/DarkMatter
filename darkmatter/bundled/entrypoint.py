@@ -1618,6 +1618,81 @@ def scan():
     return jsonify({"success": True})
 
 
+@app.route("/api/check-update", methods=["GET"])
+def check_update():
+    """Check PyPI for a newer version of dmagent."""
+    try:
+        from darkmatter import __version__ as current_version
+    except ImportError:
+        current_version = "0.0.0"
+    try:
+        resp = httpx.get("https://pypi.org/pypi/dmagent/json", timeout=10.0)
+        if resp.status_code == 200:
+            latest_version = resp.json()["info"]["version"]
+            update_available = latest_version != current_version
+            return jsonify({
+                "success": True,
+                "current_version": current_version,
+                "latest_version": latest_version,
+                "update_available": update_available,
+            })
+        return jsonify({"success": False, "error": f"PyPI returned {resp.status_code}", "current_version": current_version})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "current_version": current_version})
+
+
+@app.route("/api/disconnect-agent", methods=["POST"])
+def disconnect_agent():
+    """Disconnect from an agent."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("agent_id", "")
+    if not agent_id:
+        return jsonify({"success": False, "error": "Missing agent_id"})
+    if agent_id not in state.connections:
+        return jsonify({"success": False, "error": "Not connected to that agent"})
+    del state.connections[agent_id]
+    save_state()
+    return jsonify({"success": True})
+
+
+@app.route("/api/mesh-connect", methods=["POST"])
+def mesh_connect():
+    """Tell one LAN agent to connect to another by proxying the connection request."""
+    data = request.get_json(silent=True) or {}
+    from_id = data.get("from_agent_id", "")
+    to_id = data.get("to_agent_id", "")
+    if not from_id or not to_id:
+        return jsonify({"success": False, "error": "Missing from_agent_id or to_agent_id"})
+
+    # Find URLs for both agents
+    from_conn = state.connections.get(from_id)
+    to_conn = state.connections.get(to_id)
+    if not from_conn:
+        return jsonify({"success": False, "error": f"Not connected to source agent {from_id[:12]}"})
+    if not to_conn:
+        return jsonify({"success": False, "error": f"Not connected to target agent {to_id[:12]}"})
+
+    from_url = _resolve_base_url(from_conn)
+    to_url = _resolve_base_url(to_conn)
+    if not from_url or not to_url:
+        return jsonify({"success": False, "error": "Could not resolve URLs for agents"})
+
+    # Tell the source agent to connect to the target agent's URL
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(f"{from_url}/__darkmatter__/admin_connect", json={
+                "url": to_url,
+                "from_agent_id": state.agent_id,
+            })
+            if resp.status_code == 200:
+                result = resp.json()
+                return jsonify({"success": result.get("success", False), "detail": result})
+            else:
+                return jsonify({"success": False, "error": f"Agent returned HTTP {resp.status_code}"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
 @app.route("/api/update-agents", methods=["POST"])
 def update_agents():
     """Send pip upgrade command to all local connected agents."""
