@@ -446,22 +446,59 @@ def _save_single_state(state: AgentState) -> None:
             mid: ts for mid, ts in seen.items()
             if time.time() - ts < REPLAY_WINDOW
         },
-        "message_queue": [
-            {
-                "message_id": m.message_id,
-                "content": m.content,
-                "hops_remaining": m.hops_remaining,
-                "metadata": m.metadata,
-                "received_at": m.received_at,
-                "from_agent_id": m.from_agent_id,
-                "verified": m.verified,
-            }
-            for m in state.message_queue
-        ],
-        "consumed_message_ids": list(_consumed_message_ids.get(state.agent_id, set())),
+        "message_queue": [],  # filled below after disk merge
+        "consumed_message_ids": [],  # filled below after disk merge
     }
 
     path = state_file_path(agent_id=state.agent_id)
+
+    # --- Cross-process state merge ---
+    # The HTTP daemon and MCP stdio session share this state file but run in
+    # separate processes with separate in-memory state. Before writing, merge
+    # on-disk data so we never clobber state added by the other process.
+    consumed = _consumed_message_ids.get(state.agent_id, set())
+    in_memory_ids = {m.message_id for m in state.message_queue}
+    disk_extras: list[dict] = []
+    disk_consumed: set[str] = set()
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as df:
+                disk_data = json.load(df)
+            # Merge messages from disk that we don't have in memory
+            for qd in disk_data.get("message_queue", []):
+                mid = qd.get("message_id", "")
+                if mid and mid not in in_memory_ids and mid not in consumed:
+                    disk_extras.append(qd)
+            # Merge consumed IDs from disk (other process may have consumed)
+            disk_consumed = set(disk_data.get("consumed_message_ids", []))
+            # Merge connections from disk that we don't have in memory
+            # (daemon may have established bootstrap/incoming connections)
+            disk_conns = disk_data.get("connections", {})
+            for aid, cdata in disk_conns.items():
+                if aid not in data["connections"]:
+                    data["connections"][aid] = cdata
+            # Merge impressions for disk-only connections
+            disk_imps = disk_data.get("impressions", {})
+            for aid, idata in disk_imps.items():
+                if aid not in data["impressions"]:
+                    data["impressions"][aid] = idata
+    except (json.JSONDecodeError, OSError):
+        pass  # Disk unreadable — proceed with in-memory only
+
+    data["consumed_message_ids"] = list(consumed | disk_consumed)
+
+    data["message_queue"] = [
+        {
+            "message_id": m.message_id,
+            "content": m.content,
+            "hops_remaining": m.hops_remaining,
+            "metadata": m.metadata,
+            "received_at": m.received_at,
+            "from_agent_id": m.from_agent_id,
+            "verified": m.verified,
+        }
+        for m in state.message_queue
+    ] + disk_extras
     tmp = path + ".tmp"
     try:
         with _state_write_lock:
