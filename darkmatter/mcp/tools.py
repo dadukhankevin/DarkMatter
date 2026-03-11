@@ -659,8 +659,8 @@ async def list_connections(ctx: Context) -> str:
         imp = state.impressions.get(aid)
         conns.append({
             "agent_id": aid,
-            "display_name": conn.display_name or aid[:12] + "...",
-            "bio": (conn.bio or "")[:200],
+            "display_name": conn.agent_display_name or aid[:12] + "...",
+            "bio": (conn.agent_bio or "")[:200],
             "agent_url": conn.agent_url,
             "trust_score": round(imp.score, 4) if imp else 0.0,
             "infrastructure": imp.infrastructure if imp else False,
