@@ -388,10 +388,16 @@ async def get_latest_signature(address: str) -> Optional[str]:
     return None
 
 
-async def get_inbound_sol_transfers(address: str, sender: Optional[str] = None,
-                                     after_signature: Optional[str] = None,
-                                     limit: int = 20) -> list[dict]:
-    """Get recent inbound SOL transfers to address, optionally filtered by sender."""
+async def get_inbound_transfers(address: str, sender: Optional[str] = None,
+                                 token: Optional[str] = None,
+                                 after_signature: Optional[str] = None,
+                                 limit: int = 20) -> list[dict]:
+    """Get recent inbound transfers to address (SOL or SPL token).
+
+    For SOL: uses pre/post lamport balances to detect received SOL.
+    For SPL tokens: uses pre/post token balances from tx metadata, matching by mint.
+    Both modes support sender filtering and after_signature pagination.
+    """
     pubkey = SolanaPubkey.from_string(address)
     transfers = []
     try:
@@ -420,42 +426,120 @@ async def get_inbound_sol_transfers(address: str, sender: Optional[str] = None,
                     continue
 
                 account_keys = list(msg.account_keys)
-                pre_balances = list(meta.pre_balances)
-                post_balances = list(meta.post_balances)
 
-                # Find which account is our target
-                target_idx = None
-                for i, key in enumerate(account_keys):
-                    if str(key) == address:
-                        target_idx = i
-                        break
-                if target_idx is None:
-                    continue
+                if token is None:
+                    # === SOL transfer detection ===
+                    pre_balances = list(meta.pre_balances)
+                    post_balances = list(meta.post_balances)
 
-                # Check if target received SOL
-                diff = post_balances[target_idx] - pre_balances[target_idx]
-                if diff <= 0:
-                    continue
-
-                # Identify the sender (account that lost SOL, excluding fee payer overhead)
-                tx_sender = None
-                for i, key in enumerate(account_keys):
-                    if i == target_idx:
+                    target_idx = None
+                    for i, key in enumerate(account_keys):
+                        if str(key) == address:
+                            target_idx = i
+                            break
+                    if target_idx is None:
                         continue
-                    loss = pre_balances[i] - post_balances[i]
-                    if loss > 0:
-                        tx_sender = str(key)
-                        break
 
-                if sender and tx_sender != sender:
-                    continue
+                    diff = post_balances[target_idx] - pre_balances[target_idx]
+                    if diff <= 0:
+                        continue
 
-                transfers.append({
-                    "sender": tx_sender,
-                    "amount": diff / LAMPORTS_PER_SOL,
-                    "signature": str(sig),
-                    "timestamp": sig_info.block_time,
-                })
+                    tx_sender = None
+                    for i, key in enumerate(account_keys):
+                        if i == target_idx:
+                            continue
+                        loss = pre_balances[i] - post_balances[i]
+                        if loss > 0:
+                            tx_sender = str(key)
+                            break
+
+                    if sender and tx_sender != sender:
+                        continue
+
+                    transfers.append({
+                        "sender": tx_sender,
+                        "amount": diff / LAMPORTS_PER_SOL,
+                        "signature": str(sig),
+                        "timestamp": sig_info.block_time,
+                    })
+                else:
+                    # === SPL token transfer detection ===
+                    # Use pre_token_balances / post_token_balances from tx metadata
+                    pre_token = getattr(meta, "pre_token_balances", None) or []
+                    post_token = getattr(meta, "post_token_balances", None) or []
+
+                    # Build maps: account_index → token amount for our mint
+                    def _token_map(balances):
+                        result = {}
+                        for tb in balances:
+                            if str(getattr(tb, "mint", "")) != token:
+                                continue
+                            idx = getattr(tb, "account_index", None)
+                            amt = getattr(tb, "ui_token_amount", None)
+                            if idx is not None and amt is not None:
+                                ui = getattr(amt, "ui_amount", None)
+                                if ui is not None:
+                                    result[idx] = float(ui)
+                                else:
+                                    raw = getattr(amt, "amount", "0")
+                                    dec = getattr(amt, "decimals", 0)
+                                    result[idx] = int(raw) / (10 ** dec) if dec else float(raw)
+                            # Also store owner for sender identification
+                            owner = getattr(tb, "owner", None)
+                            if owner and idx is not None:
+                                result[f"owner_{idx}"] = str(owner)
+                        return result
+
+                    pre_map = _token_map(pre_token)
+                    post_map = _token_map(post_token)
+
+                    # Find which account index belongs to our target address
+                    # The owner field in token_balances is the wallet owner, not the ATA
+                    target_indices = [
+                        idx for idx in set(
+                            k for k in list(pre_map.keys()) + list(post_map.keys())
+                            if isinstance(k, int)
+                        )
+                        if post_map.get(f"owner_{idx}") == address
+                        or pre_map.get(f"owner_{idx}") == address
+                    ]
+
+                    if not target_indices:
+                        continue
+
+                    for target_idx in target_indices:
+                        pre_amt = pre_map.get(target_idx, 0.0)
+                        post_amt = post_map.get(target_idx, 0.0)
+                        diff = post_amt - pre_amt
+                        if diff <= 0:
+                            continue
+
+                        # Identify sender: account whose token balance decreased
+                        tx_sender = None
+                        all_indices = set(
+                            k for k in list(pre_map.keys()) + list(post_map.keys())
+                            if isinstance(k, int) and k != target_idx
+                        )
+                        for src_idx in all_indices:
+                            src_pre = pre_map.get(src_idx, 0.0)
+                            src_post = post_map.get(src_idx, 0.0)
+                            if src_pre - src_post > 0:
+                                # This account lost tokens — its owner is the sender
+                                tx_sender = (
+                                    pre_map.get(f"owner_{src_idx}")
+                                    or post_map.get(f"owner_{src_idx}")
+                                )
+                                break
+
+                        if sender and tx_sender != sender:
+                            continue
+
+                        transfers.append({
+                            "sender": tx_sender,
+                            "amount": diff,
+                            "signature": str(sig),
+                            "timestamp": sig_info.block_time,
+                        })
     except Exception:
         pass
     return transfers
@@ -530,10 +614,9 @@ class SolanaWalletProvider(WalletProvider):
                                      token: Optional[str] = None,
                                      after_signature: Optional[str] = None,
                                      limit: int = 20) -> list[dict]:
-        # TODO: SPL token transfer tracking (requires parsing token program instructions)
-        # For now, SOL transfers are fully tracked; SPL falls back to balance diff
-        return await get_inbound_sol_transfers(
-            address, sender=sender, after_signature=after_signature, limit=limit,
+        return await get_inbound_transfers(
+            address, sender=sender, token=token,
+            after_signature=after_signature, limit=limit,
         )
 
     async def attest_identity(self, private_key_hex: str, wallets: dict,
