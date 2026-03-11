@@ -845,10 +845,13 @@ class NetworkManager:
             return
 
         backoff = {url: BOOTSTRAP_RECONNECT_INTERVAL for url in BOOTSTRAP_PEERS}
+        first_run = True
 
         while True:
             try:
-                await asyncio.sleep(min(backoff.values()))
+                # Connect quickly on first boot, then use normal backoff interval
+                await asyncio.sleep(5 if first_run else min(backoff.values()))
+                first_run = False
 
                 state = self._get_state()
                 if state is None:
