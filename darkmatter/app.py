@@ -492,13 +492,20 @@ def create_app() -> Router:
     # Build the app. Use redirect_slashes=False so POST /mcp doesn't get
     # redirected to /mcp/ (which breaks MCP client connections).
     # Dual-mount: agent-scoped routes first (more specific), then bare routes (default agent)
+    # Build route list. When behind a reverse proxy that strips path prefixes
+    # (e.g. DO App Platform), also mount routes at root so they're reachable.
+    route_list = [
+        Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
+        Mount("/__darkmatter__/{target_agent_id}", routes=darkmatter_routes),
+        Mount("/__darkmatter__", routes=darkmatter_routes),
+        Route("/mcp", mcp_handler),
+    ]
+    if os.environ.get("DARKMATTER_BOOTSTRAP_MODE", "").lower() == "true":
+        # Duplicate routes at root for prefix-stripping reverse proxies
+        route_list.extend(darkmatter_routes)
+
     app = Router(
-        routes=[
-            Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
-            Mount("/__darkmatter__/{target_agent_id}", routes=darkmatter_routes),
-            Mount("/__darkmatter__", routes=darkmatter_routes),
-            Route("/mcp", mcp_handler),
-        ],
+        routes=route_list,
         redirect_slashes=False,
         lifespan=lifespan,
     )
