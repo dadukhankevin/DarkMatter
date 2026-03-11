@@ -150,6 +150,7 @@ def init_state(port: int = None) -> None:
     state = get_state()
     if state.private_key_hex:
         from darkmatter.wallet import get_all_providers
+        import darkmatter.wallet.solana  # noqa: F401 — registers SolanaWalletProvider
         for chain, provider in get_all_providers().items():
             state.wallets[chain] = provider.derive_address(state.private_key_hex)
             _log.info("%s wallet: %s", chain.capitalize(), state.wallets[chain])
