@@ -47,18 +47,20 @@ def _resolve_spl_token(token_or_mint: str) -> Optional[tuple[str, int]]:
     return None
 
 
-def _get_associated_token_address(owner: SolanaPubkey, mint: SolanaPubkey) -> SolanaPubkey:
+def _get_associated_token_address(owner: SolanaPubkey, mint: SolanaPubkey,
+                                   token_program_id: SolanaPubkey = TOKEN_PROGRAM_ID) -> SolanaPubkey:
     """Derive the associated token account address for an owner + mint."""
     return SolanaPubkey.find_program_address(
-        [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
+        [bytes(owner), bytes(token_program_id), bytes(mint)],
         ASSOCIATED_TOKEN_PROGRAM_ID,
     )[0]
 
 
 def _create_associated_token_account_ix(payer: SolanaPubkey, owner: SolanaPubkey,
-                                         mint: SolanaPubkey) -> SolInstruction:
+                                         mint: SolanaPubkey,
+                                         token_program_id: SolanaPubkey = TOKEN_PROGRAM_ID) -> SolInstruction:
     """Build a CreateAssociatedTokenAccount instruction using raw solders."""
-    ata = _get_associated_token_address(owner, mint)
+    ata = _get_associated_token_address(owner, mint, token_program_id)
     return SolInstruction(
         program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
         accounts=[
@@ -67,7 +69,7 @@ def _create_associated_token_account_ix(payer: SolanaPubkey, owner: SolanaPubkey
             AccountMeta(pubkey=owner, is_signer=False, is_writable=False),
             AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
             AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=token_program_id, is_signer=False, is_writable=False),
             AccountMeta(pubkey=SYSVAR_RENT_ID, is_signer=False, is_writable=False),
         ],
         data=b"",
@@ -76,11 +78,12 @@ def _create_associated_token_account_ix(payer: SolanaPubkey, owner: SolanaPubkey
 
 def _transfer_checked_ix(source: SolanaPubkey, mint: SolanaPubkey,
                           dest: SolanaPubkey, owner: SolanaPubkey,
-                          amount: int, decimals: int) -> SolInstruction:
+                          amount: int, decimals: int,
+                          token_program_id: SolanaPubkey = TOKEN_PROGRAM_ID) -> SolInstruction:
     """Build a TransferChecked instruction (SPL Token instruction #12)."""
     data = _struct.pack("<BQB", 12, amount, decimals)
     return SolInstruction(
-        program_id=TOKEN_PROGRAM_ID,
+        program_id=token_program_id,
         accounts=[
             AccountMeta(pubkey=source, is_signer=False, is_writable=True),
             AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
@@ -89,6 +92,14 @@ def _transfer_checked_ix(source: SolanaPubkey, mint: SolanaPubkey,
         ],
         data=data,
     )
+
+
+async def _detect_token_program(client: SolanaClient, mint: SolanaPubkey) -> SolanaPubkey:
+    """Detect whether a mint uses Token or Token-2022 by checking its owner program."""
+    resp = await client.get_account_info(mint)
+    if resp.value and resp.value.owner == TOKEN_2022_PROGRAM_ID:
+        return TOKEN_2022_PROGRAM_ID
+    return TOKEN_PROGRAM_ID
 
 
 def _derive_solana_keypair(private_key_hex: str) -> SolanaKeypair:
@@ -124,7 +135,8 @@ async def get_solana_balance(wallets: dict, mint: str = None) -> dict:
                 }
             else:
                 mint_pubkey = SolanaPubkey.from_string(mint)
-                ata = _get_associated_token_address(pubkey, mint_pubkey)
+                token_prog = await _detect_token_program(client, mint_pubkey)
+                ata = _get_associated_token_address(pubkey, mint_pubkey, token_prog)
                 resp = await client.get_token_account_balance(ata)
                 if resp.value is None:
                     return {
@@ -199,7 +211,7 @@ async def send_solana_sol(private_key_hex: str, wallets: dict,
 async def send_solana_token(private_key_hex: str, wallets: dict,
                             recipient_wallet: str, mint: str,
                             amount: float, decimals: int) -> dict:
-    """Send SPL tokens to a recipient wallet."""
+    """Send SPL tokens (legacy Token or Token-2022) to a recipient wallet."""
     sol_addr = wallets.get("solana")
     if not sol_addr:
         return {"success": False, "error": "Solana wallet not available"}
@@ -209,13 +221,16 @@ async def send_solana_token(private_key_hex: str, wallets: dict,
     recipient_pubkey = SolanaPubkey.from_string(recipient_wallet)
     mint_pubkey = SolanaPubkey.from_string(mint)
 
-    sender_ata = _get_associated_token_address(sender_pubkey, mint_pubkey)
-    recipient_ata = _get_associated_token_address(recipient_pubkey, mint_pubkey)
-
     raw_amount = int(amount * (10 ** decimals))
 
     try:
         async with SolanaClient(SOLANA_RPC_URL) as client:
+            # Detect which token program this mint uses
+            token_program_id = await _detect_token_program(client, mint_pubkey)
+
+            sender_ata = _get_associated_token_address(sender_pubkey, mint_pubkey, token_program_id)
+            recipient_ata = _get_associated_token_address(recipient_pubkey, mint_pubkey, token_program_id)
+
             instructions = []
             created_ata = False
 
@@ -225,6 +240,7 @@ async def send_solana_token(private_key_hex: str, wallets: dict,
                     payer=sender_pubkey,
                     owner=recipient_pubkey,
                     mint=mint_pubkey,
+                    token_program_id=token_program_id,
                 ))
                 created_ata = True
 
@@ -235,6 +251,7 @@ async def send_solana_token(private_key_hex: str, wallets: dict,
                 owner=sender_pubkey,
                 amount=raw_amount,
                 decimals=decimals,
+                token_program_id=token_program_id,
             ))
 
             bh_resp = await client.get_latest_blockhash()
