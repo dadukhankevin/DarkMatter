@@ -47,6 +47,39 @@ Advanced ops: see .claude/skills/darkmatter-ops/SKILL.md\
 # Create the FastMCP instance
 mcp = FastMCP("darkmatter_mcp", instructions=MCP_INSTRUCTIONS)
 
+
+def refresh_mcp_instructions() -> None:
+    """Update MCP instructions with the 10 most recently updated insight tags."""
+    try:
+        from darkmatter.state import get_state
+        state = get_state()
+        if state is None:
+            return
+
+        # Collect insights sorted by updated_at descending
+        sorted_insights = sorted(
+            state.insights,
+            key=lambda s: s.updated_at or s.created_at or "",
+            reverse=True,
+        )[:10]
+
+        # Collect unique tags preserving order of first appearance
+        seen = set()
+        recent_tags = []
+        for insight in sorted_insights:
+            for tag in (insight.tags or []):
+                if tag not in seen:
+                    seen.add(tag)
+                    recent_tags.append(tag)
+
+        if recent_tags:
+            tag_line = f"\n\nRECENT INSIGHT TAGS (view_insights with these): {', '.join(recent_tags)}"
+            mcp._mcp_server.instructions = MCP_INSTRUCTIONS + tag_line
+        else:
+            mcp._mcp_server.instructions = MCP_INSTRUCTIONS
+    except Exception:
+        pass  # Best-effort, never crash
+
 # Session tracking for notifications
 _active_sessions: set = set()
 _all_tools: dict = {}

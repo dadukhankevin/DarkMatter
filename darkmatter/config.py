@@ -124,8 +124,7 @@ SPL_TOKENS = {
 # =============================================================================
 
 ANTIMATTER_RATE = 0.01          # 1% default antimatter fee
-ANTIMATTER_MAX_HOPS = 10        # TTL for antimatter signal
-ANTIMATTER_MAX_AGE_S = 300.0    # 5 minute timeout
+ANTIMATTER_TIMEOUT = 300        # seconds for B to pay delegate D
 ANTIMATTER_LOG_MAX = 100        # cap antimatter_log entries
 
 # =============================================================================
@@ -145,12 +144,15 @@ INSIGHT_CACHE_TTL = 86400           # 24h
 # =============================================================================
 
 TRUST_MESSAGE_SENT = 0.001              # micro-gain per message sent/replied
-TRUST_ANTIMATTER_SUCCESS = 0.02         # gain on successful antimatter tx
-TRUST_RATE_DISAGREEMENT = -0.02         # penalty when peer uses different antimatter rate
-TRUST_COMMITMENT_FRAUD = -0.1           # penalty when peer fails commitment verification
+TRUST_ANTIMATTER_GENEROUS = 0.08        # B paid more than expected
+TRUST_ANTIMATTER_HONEST = 0.05          # B paid exact amount
+TRUST_ANTIMATTER_CHEAP = -0.03          # B paid less than expected
+TRUST_ANTIMATTER_STIFF = -0.1           # B paid nothing (timeout)
+TRUST_ANTIMATTER_LEGIT_DELEGATE = 0.03  # A chose elder delegate (older than A)
+TRUST_ANTIMATTER_GAMING = -0.05         # A chose younger-than-self delegate
 TRUST_NEGATIVE_TIMEOUT = 3600           # seconds of sustained negative trust before auto-disconnect
-TRUST_RATE_TOLERANCE = 0.001            # float comparison tolerance for rate disagreement
-SUPERAGENT_DEFAULT_URL = os.environ.get("DARKMATTER_SUPERAGENT", "")
+RECIPROCITY_GRACE_THRESHOLD = 5         # first N messages use full trust gain (ratio=1.0)
+TRUST_SEED_CAP = 0.5                    # max initial trust from peer recommendations
 
 # =============================================================================
 # Mesh Route Spam Prevention
@@ -177,3 +179,15 @@ REPLAY_WINDOW = 300  # seconds
 REPLAY_MAX_SIZE = 10000
 
 
+# =============================================================================
+# Bootstrap Peers
+# =============================================================================
+
+BOOTSTRAP_PEERS = [
+    p.strip() for p in
+    os.environ.get("DARKMATTER_BOOTSTRAP_PEERS", "https://loseylabs.ai").split(",")
+    if p.strip()
+]
+BOOTSTRAP_MODE = os.environ.get("DARKMATTER_BOOTSTRAP_MODE", "false").lower() == "true"
+BOOTSTRAP_RECONNECT_INTERVAL = 60   # initial retry interval (seconds)
+BOOTSTRAP_RECONNECT_MAX = 300       # max backoff (5 min)

@@ -32,6 +32,10 @@ from darkmatter.config import (
     PING_INTERVAL,
     PING_IP_WINDOW,
     PING_SILENCE_THRESHOLD,
+    BOOTSTRAP_PEERS,
+    BOOTSTRAP_MODE,
+    BOOTSTRAP_RECONNECT_INTERVAL,
+    BOOTSTRAP_RECONNECT_MAX,
 )
 from darkmatter.security import sign_peer_update
 from darkmatter.network.transport import Transport, SendResult
@@ -429,9 +433,14 @@ class NetworkManager:
         self._tasks.append(asyncio.create_task(self._health_loop()))
         self._tasks.append(asyncio.create_task(self._connectivity_upgrade_loop()))
         self._tasks.append(asyncio.create_task(self._ping_loop()))
+        self._tasks.append(asyncio.create_task(self._bootstrap_loop()))
         _log.info("Network health loop: ENABLED (%ss interval)", HEALTH_CHECK_INTERVAL)
         _log.info("Connectivity upgrade loop: ENABLED (%ss interval)", CONNECTIVITY_UPGRADE_INTERVAL)
         _log.info("Peer ping loop: ENABLED (%ss interval)", PING_INTERVAL)
+        if not BOOTSTRAP_MODE and BOOTSTRAP_PEERS:
+            _log.info("Bootstrap loop: ENABLED (peers: %s)", ", ".join(BOOTSTRAP_PEERS))
+        elif BOOTSTRAP_MODE:
+            _log.info("Bootstrap mode: ACTIVE (this node is a bootstrap peer)")
         _log.info("UPnP: AVAILABLE")
 
     async def stop(self) -> None:
@@ -468,6 +477,9 @@ class NetworkManager:
 
                 # Connection health checks
                 await self._check_connection_health()
+
+                # WebRTC dead channel cleanup
+                await self._cleanup_dead_webrtc()
 
                 # Trust-based auto-disconnect
                 await self._check_trust_disconnects()
@@ -533,6 +545,31 @@ class NetworkManager:
                         "Connection %s... unhealthy (%s failures, url=%s)",
                         conn.agent_id[:12], conn.health_failures, conn.agent_url,
                     )
+
+    async def _cleanup_dead_webrtc(self) -> None:
+        """Detect dead WebRTC channels, clean up, and downgrade to HTTP.
+
+        The connectivity upgrade loop will re-attempt WebRTC later.
+        """
+        from darkmatter.state import list_hosted_agents, get_state_for
+
+        webrtc = self.get_transport("webrtc")
+        if not webrtc:
+            return
+
+        for aid in list_hosted_agents():
+            s = get_state_for(aid)
+            if s is None:
+                continue
+            for conn in list(s.connections.values()):
+                if conn.webrtc_pc is None:
+                    continue
+                pc_state = getattr(conn.webrtc_pc, "connectionState", "unknown")
+                if pc_state in ("failed", "closed", "disconnected"):
+                    peer = conn.agent_display_name or conn.agent_id[:12]
+                    _log.info("WebRTC dead channel (%s) for %s, downgrading to HTTP",
+                              pc_state, peer)
+                    await webrtc.cleanup(conn)
 
     async def _check_trust_disconnects(self) -> None:
         """Auto-disconnect peers with sustained negative trust scores across all hosted agents."""
@@ -795,3 +832,97 @@ class NetworkManager:
         if counts[best_ip] > len(self._observed_ips) / 2:
             return best_ip
         return None
+
+    # -- Bootstrap loop --
+
+    async def _bootstrap_loop(self) -> None:
+        """Maintain connections to bootstrap peers with exponential backoff.
+
+        Skips if this node is in bootstrap mode (to avoid connecting to itself)
+        or if no bootstrap peers are configured.
+        """
+        if BOOTSTRAP_MODE or not BOOTSTRAP_PEERS:
+            return
+
+        backoff = {url: BOOTSTRAP_RECONNECT_INTERVAL for url in BOOTSTRAP_PEERS}
+
+        while True:
+            try:
+                await asyncio.sleep(min(backoff.values()))
+
+                state = self._get_state()
+                if state is None:
+                    continue
+
+                # Collect all connected peer URLs across all hosted agents
+                from darkmatter.state import list_hosted_agents, get_state_for
+                connected_urls = set()
+                for aid in list_hosted_agents():
+                    s = get_state_for(aid)
+                    if s:
+                        for conn in s.connections.values():
+                            connected_urls.add(strip_base_url(conn.agent_url))
+                # Fallback for single-agent
+                for conn in state.connections.values():
+                    connected_urls.add(strip_base_url(conn.agent_url))
+
+                for bootstrap_url in BOOTSTRAP_PEERS:
+                    base = bootstrap_url.rstrip("/")
+
+                    # Skip if already connected to this bootstrap peer
+                    if base in connected_urls:
+                        backoff[bootstrap_url] = BOOTSTRAP_RECONNECT_INTERVAL
+                        continue
+
+                    try:
+                        from darkmatter.network.mesh import (
+                            build_outbound_request_payload,
+                            build_connection_from_accepted,
+                        )
+
+                        public_url = self.get_public_url(agent_id=state.agent_id)
+                        payload = build_outbound_request_payload(state, public_url)
+
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            resp = await client.post(
+                                f"{base}/__darkmatter__/connection_request",
+                                json=payload,
+                            )
+
+                        if resp.status_code == 200:
+                            result_data = resp.json()
+                            if result_data.get("auto_accepted"):
+                                peer_id = result_data["agent_id"]
+                                if peer_id not in state.connections:
+                                    conn = build_connection_from_accepted(result_data)
+                                    state.connections[peer_id] = conn
+                                    self._save_state()
+                                    _log.info(
+                                        "Bootstrap: connected to %s (%s)",
+                                        result_data.get("agent_display_name", peer_id[:12]),
+                                        bootstrap_url,
+                                    )
+                                backoff[bootstrap_url] = BOOTSTRAP_RECONNECT_INTERVAL
+                            else:
+                                _log.info("Bootstrap: connection request pending at %s", bootstrap_url)
+                                backoff[bootstrap_url] = min(
+                                    backoff[bootstrap_url] * 2, BOOTSTRAP_RECONNECT_MAX
+                                )
+                        else:
+                            _log.warning(
+                                "Bootstrap: %s returned %d", bootstrap_url, resp.status_code
+                            )
+                            backoff[bootstrap_url] = min(
+                                backoff[bootstrap_url] * 2, BOOTSTRAP_RECONNECT_MAX
+                            )
+
+                    except Exception as e:
+                        _log.warning("Bootstrap: failed to connect to %s: %s", bootstrap_url, e)
+                        backoff[bootstrap_url] = min(
+                            backoff[bootstrap_url] * 2, BOOTSTRAP_RECONNECT_MAX
+                        )
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                _log.error("Bootstrap loop error: %s", e)

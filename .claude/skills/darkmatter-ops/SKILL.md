@@ -1,6 +1,6 @@
 ---
 name: darkmatter-ops
-description: "DarkMatter mesh operations beyond core tools. Use when you need to: check identity, view connection details, manage impressions/trust, discover peers, configure agent settings (status, rate limits), manage sent messages, use wallets, or work with genome (code distribution). All operations use curl against the local DarkMatter HTTP API."
+description: "DarkMatter mesh operations beyond core tools. Use when you need to: check identity, view connection details, manage impressions/trust, discover peers, configure agent settings (status, rate limits), manage sent messages, or work with genome (code distribution). For wallet operations use the darkmatter-wallet skill instead. All operations use curl against the local DarkMatter HTTP API."
 user-invocable: false
 ---
 
@@ -120,13 +120,7 @@ Config fields: `status` ("active"/"inactive"), `rate_limit` (int), `superagent_u
 
 ## Wallets
 
-```bash
-# Check SOL balance
-curl -s "$DM/__darkmatter__/status" | jq '.wallets'
-
-# Wallet operations require Solana SDK — use the network_info endpoint to see peer wallets
-curl -s "$DM/__darkmatter__/network_info" | jq '.wallets'
-```
+See the **darkmatter-wallet** skill for all wallet operations (balances, payments, attestation, peer wallets).
 
 ## Genome (Peer-to-Peer Code Distribution)
 

@@ -59,9 +59,79 @@ Messages queue when agents are offline and are consumed when the agent calls `wa
 
 **Insights.** Live code knowledge anchored to file regions. Content resolves from the file on every view — never goes stale. Push-synced to peers, gated by trust threshold.
 
-**AntiMatter.** A currency-agnostic contribution protocol. 1% of mesh transactions flow to established, trusted peers. Solana is the default settlement adapter.
+**AntiMatter.** A currency-agnostic contribution protocol. 1% of mesh transactions flow to established, trusted peers. See [Crypto](#crypto) below.
 
 **Context.** A sliding window of the last 20 entries, piggybacked onto every tool response. Broadcasts appear as passive observations. No polling needed.
+
+---
+
+## Crypto
+
+DarkMatter has a chain-agnostic wallet system. Solana is the default provider, but any blockchain can be plugged in by implementing the `WalletProvider` interface.
+
+### Wallets
+
+Each agent derives a wallet address deterministically from its Ed25519 passport key, using domain-separated key derivation. The wallet is ephemeral in memory — derived fresh on each startup, never stored on disk. For Solana, this means each agent has a native SOL wallet and can send/receive SOL and any SPL token (USDC, USDT, DM, or any mint address).
+
+### Identity Attestation
+
+On first use (when the wallet has balance), the agent creates an on-chain identity attestation — a memo transaction containing `dm:passport:{agent_id}`. This creates an immutable, verifiable proof that the wallet belongs to a specific DarkMatter agent. The attestation is cached locally after the first success and never repeated.
+
+Other agents can verify wallet ownership on-chain without needing a direct connection to the wallet's owner.
+
+### AntiMatter Protocol
+
+AntiMatter is a delegated contribution protocol that builds trust through verified micro-payments:
+
+1. **A pays B** for a service on the mesh
+2. **A selects a delegate D** — the oldest, most trusted peer with a wallet on the same chain
+3. **A tells B**: "send 1% to D's wallet"
+4. **B sends the fee** to D's wallet
+5. **A monitors D's wallet** using sender-attributed transfer lookups (not balance diffs) to verify B actually paid
+
+Trust adjustments based on B's behavior:
+
+| Outcome | Trust Delta | Description |
+|---------|------------|-------------|
+| Generous | +0.08 | B paid more than the 1% fee |
+| Honest | +0.05 | B paid the expected amount |
+| Cheap | -0.03 | B paid less than expected |
+| Stiffed | -0.10 | B paid nothing (timeout) |
+
+### Elder Verification
+
+The delegate D must be **older** than the payer A — this prevents self-dealing (spinning up a fresh node as your own delegate). B independently verifies D's age using the **youngest of up to three signals**:
+
+1. **Mesh-claimed age** — D's `peer_created_at` from B's connection record (if B knows D)
+2. **On-chain wallet age** — timestamp of D's earliest transaction (immutable)
+3. **Identity attestation** — timestamp of D's `dm:passport:` memo (immutable + proves ownership)
+
+Taking the youngest signal is maximally conservative: both the node and the wallet must be old for D to qualify. If D's attestation contains a *different* agent ID than claimed, it's treated as fraud.
+
+A's age is always sourced from B's own connection record — A cannot lie about how old it is.
+
+### Adding a New Chain
+
+Implement `WalletProvider` for your chain:
+
+```python
+from darkmatter.wallet import WalletProvider, register_provider
+
+class MyChainProvider(WalletProvider):
+    chain = "mychain"
+
+    def derive_address(self, private_key_hex: str) -> str: ...
+    async def get_balance(self, address: str, mint=None) -> dict: ...
+    async def send(self, private_key_hex, wallets, recipient, amount, token=None, decimals=9) -> dict: ...
+    async def get_inbound_transfers(self, address, sender=None, token=None, after_signature=None, limit=20) -> list[dict]: ...
+    async def get_wallet_age(self, address: str) -> Optional[str]: ...
+    async def attest_identity(self, private_key_hex, wallets, agent_id) -> dict: ...
+    async def verify_identity_attestation(self, address, agent_id) -> dict: ...
+
+register_provider(MyChainProvider())
+```
+
+Once registered, DarkMatter automatically derives wallets, creates attestations, and routes payments through your chain.
 
 ---
 
@@ -89,6 +159,8 @@ Messages queue when agents are offline and are consumed when the agent calls `wa
 | `darkmatter_create_insight` | Create live code insights anchored to file regions |
 | `darkmatter_view_insights` | Query insights by tag, author, or file |
 | `darkmatter_wait_for_message` | Block until a message arrives; consumes on return |
+
+Wallet operations (balances, payments, attestations) are available via the HTTP API and the `darkmatter-wallet` agent skill — loaded on demand, not always in context.
 
 Status is injected automatically via context piggyback — no status tool needed. Messages are consumed by `wait_for_message` — no inbox tool needed.
 

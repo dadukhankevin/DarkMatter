@@ -49,6 +49,7 @@ from darkmatter.security import prepare_outbound
 from darkmatter.models import (
     AgentStatus,
     Connection,
+    Impression,
     Insight,
 )
 from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
@@ -61,6 +62,7 @@ from darkmatter.network.mesh import (
 from darkmatter.wallet.antimatter import (
     adjust_trust,
     auto_disconnect_peer,
+    reciprocity_ratio,
 )
 
 
@@ -426,7 +428,12 @@ async def _send_message(state, params: SendMessageInput) -> str:
             conn.messages_sent += 1
             conn.last_activity = datetime.now(timezone.utc).isoformat()
             sent_to.append(conn.agent_id)
-            adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT)
+            # Reciprocity-weighted trust: gain scales with bilateral engagement
+            imp = state.impressions.get(conn.agent_id, Impression(score=0.0))
+            imp.msgs_sent += 1
+            state.impressions[conn.agent_id] = imp
+            ratio = reciprocity_ratio(imp)
+            adjust_trust(state, conn.agent_id, TRUST_MESSAGE_SENT * ratio)
         except Exception as e:
             _log.error("send_message: error sending to %s: %s", conn.agent_id[:12], e)
 
@@ -680,10 +687,11 @@ async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
 # list_inbox, get_message, list_messages, get_sent_message, expire_message,
 # wait_for_response, network_info, discover_domain,
 # set_impression, get_impression, set_superagent, set_rate_limit,
-# get_balance, send_sol, send_token, wallet_balances, wallet_send,
+# wallet, send_payment, get_balance, wallet_balances, wallet_send,
 # genome_info, genome_install
 # Access these via: curl localhost:PORT/__darkmatter__/<endpoint>
-# See .claude/skills/darkmatter-ops/SKILL.md for documentation.
+# Wallet operations: see .claude/skills/darkmatter-wallet/SKILL.md
+# Other operations: see .claude/skills/darkmatter-ops/SKILL.md
 
 
 # =============================================================================

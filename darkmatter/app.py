@@ -61,9 +61,7 @@ from darkmatter.network.mesh import (
     handle_peer_lookup,
     handle_get_peers,
     handle_mesh_route,
-    handle_antimatter_match,
-    handle_antimatter_signal,
-    handle_antimatter_result,
+    handle_antimatter_request,
     handle_insight_push,
     handle_sdp_relay,
     handle_sdp_relay_deliver,
@@ -75,6 +73,8 @@ from darkmatter.network.mesh import (
     handle_local_connections,
     handle_local_set_impression,
     handle_local_config,
+    handle_local_wallet,
+    handle_local_send_payment,
     handle_ping,
 )
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
@@ -146,15 +146,75 @@ def init_state(port: int = None) -> None:
 
     _log.info("Identity: %s...%s", agent_id[:16], agent_id[-8:])
 
-    # Derive Solana wallet (ephemeral — not persisted, derived from passport each startup)
+    # Derive wallets for all registered providers (ephemeral — derived from passport each startup)
     state = get_state()
     if state.private_key_hex:
-        from darkmatter.wallet.solana import _get_solana_wallet_address
-        state.wallets["solana"] = _get_solana_wallet_address(state.private_key_hex)
-        _log.info("Solana wallet: %s", state.wallets["solana"])
+        from darkmatter.wallet import get_all_providers
+        for chain, provider in get_all_providers().items():
+            state.wallets[chain] = provider.derive_address(state.private_key_hex)
+            _log.info("%s wallet: %s", chain.capitalize(), state.wallets[chain])
+
+    # Bootstrap mode: auto-accept all incoming connections
+    from darkmatter.config import BOOTSTRAP_MODE
+    if BOOTSTRAP_MODE:
+        state = get_state()
+        state.security_settings["auto_accept_all"] = True
+        _log.info("Bootstrap mode: ENABLED (auto-accept all connections)")
 
     save_state()
     clear_waiting_signal()
+
+
+# =============================================================================
+# Identity attestation (on-chain passport proof)
+# =============================================================================
+
+async def _ensure_identity_attestations(state: AgentState) -> None:
+    """Ensure each wallet has an on-chain identity attestation.
+
+    Skips chains already attested (cached in state.wallet_attestations).
+    Only attempts attestation when the wallet has sufficient balance for tx fees.
+    This is a one-time operation per chain — once attested, never retried.
+    Runs as a background task so it doesn't block startup.
+    """
+    from darkmatter.wallet import get_all_providers
+
+    for chain, provider in get_all_providers().items():
+        address = state.wallets.get(chain)
+        if not address:
+            continue
+
+        # Skip if already attested (cached locally)
+        if chain in state.wallet_attestations:
+            continue
+
+        try:
+            # Verify on-chain (one-time fallback if cache was lost)
+            existing = await provider.verify_identity_attestation(address, state.agent_id)
+            if existing["status"] == "match":
+                state.wallet_attestations[chain] = existing.get("timestamp", "verified")
+                save_state()
+                _log.info("Identity attestation exists on %s (since %s)", chain, existing.get("timestamp"))
+                continue
+
+            # Check balance before attempting — don't waste an RPC call if wallet is empty
+            balance = await provider.get_balance(address)
+            if not balance.get("success") or balance.get("balance", 0) <= 0:
+                _log.debug("Skipping %s attestation — wallet has no balance", chain)
+                continue
+
+            _log.info("Creating identity attestation on %s...", chain)
+            result = await provider.attest_identity(
+                state.private_key_hex, state.wallets, state.agent_id,
+            )
+            if result.get("success"):
+                state.wallet_attestations[chain] = result["tx_signature"]
+                save_state()
+                _log.info("Identity attested on %s: tx %s", chain, result["tx_signature"])
+            else:
+                _log.warning("Identity attestation failed on %s: %s", chain, result.get("error"))
+        except Exception as e:
+            _log.warning("Identity attestation check failed on %s: %s", chain, e)
 
 
 # =============================================================================
@@ -214,6 +274,10 @@ def create_app() -> Router:
     """
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     init_state(port)
+
+    # Populate MCP instructions with recent insight tags
+    from darkmatter.mcp import refresh_mcp_instructions
+    refresh_mcp_instructions()
 
     # Create and register NetworkManager with transport plugins
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
@@ -282,6 +346,10 @@ def create_app() -> Router:
         asyncio.create_task(_agent_scan_loop(port))
         _log.info("Multi-agent scanner: ENABLED (10s interval)")
 
+        # Background: ensure identity attestation exists on-chain for each wallet
+        if state.private_key_hex and state.agent_id:
+            asyncio.create_task(_ensure_identity_attestations(state))
+
         # Start NetworkManager (discovers public URL, starts health loop + ping loop)
         await manager.start()
 
@@ -302,9 +370,7 @@ def create_app() -> Router:
         Route("/peer_lookup/{agent_id}", handle_peer_lookup, methods=["GET"]),
         Route("/get_peers", handle_get_peers, methods=["GET", "POST"]),
         Route("/mesh_route", handle_mesh_route, methods=["POST"]),
-        Route("/antimatter_match", handle_antimatter_match, methods=["POST"]),
-        Route("/antimatter_signal", handle_antimatter_signal, methods=["POST"]),
-        Route("/antimatter_result", handle_antimatter_result, methods=["POST"]),
+        Route("/antimatter_request", handle_antimatter_request, methods=["POST"]),
         Route("/insight_push", handle_insight_push, methods=["POST"]),
         Route("/sdp_relay", handle_sdp_relay, methods=["POST"]),
         Route("/sdp_relay_deliver", handle_sdp_relay_deliver, methods=["POST"]),
@@ -317,6 +383,8 @@ def create_app() -> Router:
         Route("/connections", handle_local_connections, methods=["GET"]),
         Route("/set_impression", handle_local_set_impression, methods=["POST"]),
         Route("/config", handle_local_config, methods=["POST"]),
+        Route("/wallet", handle_local_wallet, methods=["GET"]),
+        Route("/send_payment", handle_local_send_payment, methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
@@ -500,6 +568,8 @@ def find_free_port(host: str, start: int) -> int:
 def _init_shared_stdio_session(port: int) -> None:
     """Initialize state + networking for a stdio MCP session that shares an HTTP mesh node."""
     init_state(port)
+    from darkmatter.mcp import refresh_mcp_instructions
+    refresh_mcp_instructions()
 
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
     manager.register_transport(HttpTransport())

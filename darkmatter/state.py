@@ -391,15 +391,20 @@ def _save_single_state(state: AgentState) -> None:
             for aid, c in state.connections.items()
         },
         "impressions": {
-            aid: {"score": imp.score, "note": imp.note, "negative_since": imp.negative_since}
+            aid: {
+                "score": imp.score, "note": imp.note, "negative_since": imp.negative_since,
+                "msgs_sent": imp.msgs_sent, "msgs_received": imp.msgs_received,
+            }
             for aid, imp in state.impressions.items()
         },
         "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
         # router_mode is NOT persisted — it's set from config.AGENT_ROUTER_MODE on startup.
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
-        "superagent_url": state.superagent_url,
         "antimatter_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
+        "delegated_antimatter_agent": state.delegated_antimatter_agent,
+        "delegated_antimatter_wallet": state.delegated_antimatter_wallet,
+        "wallet_attestations": state.wallet_attestations,
         "conversation_log": [
             {
                 "message_id": e.message_id,
@@ -615,7 +620,10 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         connections=connections,
         message_queue=message_queue,
         impressions={
-            aid: Impression(score=v["score"], note=v.get("note", ""), negative_since=v.get("negative_since"))
+            aid: Impression(
+                score=v["score"], note=v.get("note", ""), negative_since=v.get("negative_since"),
+                msgs_sent=v.get("msgs_sent", 0), msgs_received=v.get("msgs_received", 0),
+            )
             for aid, v in data.get("impressions", {}).items()
         },
         rate_limit_global=data.get("rate_limit_global", 0),
@@ -623,8 +631,10 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         # router_mode not loaded from disk — set by config.AGENT_ROUTER_MODE in app.py init_state()
         router_mode="spawn",  # default; overridden by init_state() immediately after load
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
-        superagent_url=data.get("superagent_url"),
         antimatter_log=data.get("antimatter_log", []),
+        delegated_antimatter_agent=data.get("delegated_antimatter_agent"),
+        delegated_antimatter_wallet=data.get("delegated_antimatter_wallet"),
+        wallet_attestations=data.get("wallet_attestations", {}),
         conversation_log=conversation_log,
         insights=insights,
         security_settings=data.get("security_settings", {

@@ -17,7 +17,7 @@ from darkmatter.config import (
     CORE_TOOLS,
 )
 from darkmatter.models import AgentState, AgentStatus
-from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional
+from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional, refresh_mcp_instructions
 from darkmatter.state import get_state, save_state
 from darkmatter.context import build_activity_hint
 from darkmatter.logging import get_logger
@@ -48,7 +48,12 @@ def build_status_line() -> str:
 
     agent_label = state.display_name or state.agent_id[:12]
     wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in state.wallets.items()]
-    wallet_suffix = f" | Wallets: {', '.join(wallet_parts)}" if wallet_parts else ""
+    attested_chains = [c for c in state.wallets if c in state.wallet_attestations]
+    wallet_suffix = (
+        f" | Wallets: {', '.join(wallet_parts)}"
+        f" (attested: {', '.join(attested_chains) or 'none'}"
+        f" — use darkmatter-wallet skill to check balances and send payments)"
+    ) if wallet_parts else ""
     # Conversation memory stats
     conv_total = len(state.conversation_log)
     broadcast_count = sum(1 for e in state.conversation_log if e.entry_type == "broadcast")
@@ -305,5 +310,6 @@ async def status_updater() -> None:
                 purge_stale_inbox(state)
             await update_status_tool()
             _write_status_file(state)
+            refresh_mcp_instructions()
         except Exception as e:
             _log.error("Status updater error: %s", e)

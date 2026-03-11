@@ -9,7 +9,6 @@ import asyncio
 import json
 import os
 import random
-import secrets
 import sys
 import time
 import uuid
@@ -29,8 +28,7 @@ from darkmatter.config import (
     MESSAGE_QUEUE_MAX,
     PROTOCOL_VERSION,
     REQUEST_EXPIRY_S,
-    ANTIMATTER_MAX_AGE_S,
-    TRUST_ANTIMATTER_SUCCESS,
+    ANTIMATTER_TIMEOUT,
     WEBRTC_ICE_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
     MIN_CHAIN_TRUST,
@@ -41,7 +39,7 @@ from darkmatter.models import (
     AgentState,
     AgentStatus,
     Connection,
-    AntiMatterSignal,
+    Impression,
 
     PendingConnectionRequest,
     QueuedMessage,
@@ -66,17 +64,10 @@ from darkmatter.state import (
 )
 from darkmatter.context import log_conversation
 from darkmatter.wallet.antimatter import (
-    antimatter_signal_from_dict,
     log_antimatter_event,
     adjust_trust,
-    run_antimatter_match,
-    make_commitment,
-    verify_commitment,
-    initiate_antimatter_from_payment,
-)
-from darkmatter.wallet.solana import (
-    send_solana_sol,
-    send_solana_token,
+    compute_seeded_trust,
+    handle_antimatter_request as _handle_antimatter_request,
 )
 from darkmatter.network.manager import get_network_manager
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
@@ -165,6 +156,7 @@ async def _gather_peer_trust(state: AgentState, about_agent_id: str) -> dict:
         "peers_with_opinion": len(opinions),
         "avg_score": avg_score,
         "most_trusted_recommender": most_trusted,
+        "opinions": opinions,
     }
 
 
@@ -296,6 +288,15 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             capabilities=from_agent_capabilities,
         )
         state.connections[from_agent_id] = conn
+
+        # Seed initial trust from peer recommendations
+        peer_trust = await _gather_peer_trust(state, from_agent_id)
+        seeded = compute_seeded_trust(state, peer_trust.get("opinions", []))
+        if seeded > 0 and from_agent_id not in state.impressions:
+            state.impressions[from_agent_id] = Impression(score=round(seeded, 4))
+            _log.info("Seeded trust for %s... at %.4f from %d peer opinions",
+                       from_agent_id[:12], seeded, peer_trust.get("peers_with_opinion", 0))
+
         save_state()
         _log.info("Auto-accepted local agent %s... (%s)", from_agent_display_name or from_agent_id[:12], from_agent_url)
 
@@ -316,6 +317,50 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
 
             "created_at": state.created_at,
             "message": "Auto-accepted (local network).",
+        }, 200
+
+    # Auto-accept ALL when in bootstrap mode (auto_accept_all setting)
+    auto_accept_all = state.security_settings.get("auto_accept_all", False)
+    if auto_accept_all and len(state.connections) < MAX_CONNECTIONS:
+        from darkmatter.security import assess_url_security
+        tls_info = assess_url_security(from_agent_url)
+        conn = Connection(
+            agent_id=from_agent_id,
+            agent_url=from_agent_url,
+            agent_bio=from_agent_bio,
+            agent_public_key_hex=from_agent_public_key_hex,
+            agent_display_name=from_agent_display_name,
+            wallets=from_agent_wallets,
+            peer_created_at=from_agent_created_at,
+            tls_secure=tls_info["secure"],
+            identity_verified=bool(from_agent_public_key_hex),
+            capabilities=from_agent_capabilities,
+        )
+        state.connections[from_agent_id] = conn
+
+        peer_trust = await _gather_peer_trust(state, from_agent_id)
+        seeded = compute_seeded_trust(state, peer_trust.get("opinions", []))
+        if seeded > 0 and from_agent_id not in state.impressions:
+            state.impressions[from_agent_id] = Impression(score=round(seeded, 4))
+
+        save_state()
+        _log.info("Auto-accepted agent %s... (bootstrap mode)", from_agent_display_name or from_agent_id[:12])
+
+        _queue_connection_request(
+            state, from_agent_id, from_agent_display_name, from_agent_bio, "auto-accepted"
+        )
+
+        return {
+            "auto_accepted": True,
+            "agent_id": state.agent_id,
+            "agent_url": public_url,
+            "agent_bio": state.bio,
+            "agent_public_key_hex": state.public_key_hex,
+            "agent_display_name": state.display_name,
+            "wallets": state.wallets,
+            "capabilities": local_delivery_capabilities(state),
+            "created_at": state.created_at,
+            "message": "Auto-accepted (bootstrap mode).",
         }, 200
 
     # Prune expired pending requests
@@ -514,6 +559,13 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
     )
     state.connections[pending.from_agent_id] = conn
 
+    # Seed initial trust from peer recommendations (stored during request)
+    peer_opinions = (pending.peer_trust or {}).get("opinions", [])
+    seeded = compute_seeded_trust(state, peer_opinions)
+    if seeded > 0 and pending.from_agent_id not in state.impressions:
+        state.impressions[pending.from_agent_id] = Impression(score=round(seeded, 4))
+        _log.info("Seeded trust for %s... at %.4f", pending.from_agent_id[:12], seeded)
+
     if not tls_info["secure"] and not tls_info["is_local"]:
         _log.warning("Connection to %s... uses insecure HTTP", pending.from_agent_id[:12])
 
@@ -570,205 +622,6 @@ def build_connection_from_accepted(result_data: dict) -> Connection:
         capabilities=result_data.get("capabilities", {}) or {},
     )
 
-
-# ---------------------------------------------------------------------------
-# Commit-Reveal Session Store
-# ---------------------------------------------------------------------------
-_pending_match_sessions: dict[str, dict] = {}
-_MATCH_SESSION_TTL = 10.0  # seconds
-
-
-def _gc_expired_sessions() -> None:
-    """Remove expired commit-reveal sessions."""
-    now = time.monotonic()
-    expired = [k for k, v in _pending_match_sessions.items() if now - v["created"] > _MATCH_SESSION_TTL]
-    for k in expired:
-        del _pending_match_sessions[k]
-
-
-def process_antimatter_match(data: dict) -> tuple[dict, int]:
-    """Commit-reveal match game endpoint.
-
-    Phase 1 (commit): peer generates pick/nonce/commitment, stores session, returns commitment.
-    Phase 2 (reveal): peer verifies orchestrator commitment, returns its pick+nonce.
-    """
-    _gc_expired_sessions()
-
-    phase = data.get("phase")
-    if phase not in ("commit", "reveal"):
-        return {"error": "Missing or invalid phase (expected 'commit' or 'reveal')"}, 400
-
-    # --- Phase 1: Commit ---
-    if phase == "commit":
-        n = data.get("n")
-        if not isinstance(n, int) or n < 1:
-            return {"error": "Invalid n"}, 400
-        orchestrator_commitment = data.get("orchestrator_commitment")
-        if not orchestrator_commitment:
-            return {"error": "Missing orchestrator_commitment"}, 400
-
-        pick, nonce, commitment = make_commitment(n)
-        session_token = secrets.token_hex(16)
-        _pending_match_sessions[session_token] = {
-            "pick": pick,
-            "nonce": nonce,
-            "commitment": commitment,
-            "orchestrator_commitment": orchestrator_commitment,
-            "n": n,
-            "created": time.monotonic(),
-        }
-        return {"peer_commitment": commitment, "session_token": session_token}, 200
-
-    # --- Phase 2: Reveal ---
-    if phase == "reveal":
-        session_token = data.get("session_token")
-        if not session_token or session_token not in _pending_match_sessions:
-            return {"error": "Unknown or expired session"}, 400
-
-        session = _pending_match_sessions.pop(session_token)
-
-        # Verify orchestrator's commitment
-        orch_pick = data.get("orchestrator_pick")
-        orch_nonce = data.get("orchestrator_nonce")
-        if orch_pick is None or not orch_nonce:
-            return {"error": "Missing orchestrator reveal data"}, 400
-
-        if not verify_commitment(session["orchestrator_commitment"], orch_pick, orch_nonce):
-            return {"error": "Orchestrator commitment verification failed"}, 400
-
-        return {
-            "peer_pick": session["pick"],
-            "peer_nonce": session["nonce"].hex(),
-        }, 200
-
-    return {"error": f"Unknown phase: {phase}"}, 400
-
-
-async def process_antimatter_signal(state: AgentState, data: dict) -> tuple[dict, int]:
-    """Process a forwarded antimatter signal and start the match game. Returns (response_dict, status_code)."""
-    try:
-        sig = antimatter_signal_from_dict(data)
-    except (KeyError, TypeError) as e:
-        return {"error": f"Invalid antimatter signal: {e}"}, 400
-
-    if sig.hops >= sig.max_hops:
-        return {"error": "Signal expired (max hops)"}, 400
-
-    if sig.created_at:
-        try:
-            created = datetime.fromisoformat(sig.created_at)
-            age = (datetime.now(timezone.utc) - created).total_seconds()
-            if age > ANTIMATTER_MAX_AGE_S:
-                return {"error": "Signal expired (age)"}, 400
-        except (ValueError, TypeError):
-            _log.warning("Malformed antimatter signal timestamp: %r, skipping age check", sig.created_at)
-
-    if state.agent_id in sig.path:
-        return {"error": "Loop detected"}, 400
-
-    log_antimatter_event(state, {
-        "type": "gas_signal_received",
-        "signal_id": sig.signal_id,
-        "hops": sig.hops,
-        "from": sig.path[-1] if sig.path else sig.sender_agent_id,
-    })
-
-    # Start match game as background task
-    asyncio.create_task(run_antimatter_match(state, sig, is_originator=False))
-
-    return {"accepted": True}, 200
-
-
-async def process_antimatter_result(state: AgentState, data: dict) -> tuple[dict, int]:
-    """Process an antimatter resolution callback. B sends fee to destination. Returns (response_dict, status_code)."""
-    signal_id = data.get("signal_id", "")
-    dest_wallet = data.get("destination_wallet", "")
-    resolved_by = data.get("resolved_by", "")
-    resolution = data.get("resolution", "resolved")
-
-    if not signal_id:
-        return {"error": "Missing signal_id"}, 400
-
-    original_entry = None
-    for entry in state.antimatter_log:
-        if entry.get("signal_id") == signal_id and entry.get("type") == "antimatter_initiated":
-            original_entry = entry
-            break
-
-    if not original_entry:
-        return {"error": "Unknown signal_id"}, 404
-
-    for entry in state.antimatter_log:
-        if entry.get("signal_id") == signal_id and entry.get("type") in ("antimatter_sent", "antimatter_kept"):
-            return {"status": "already_resolved"}, 200
-
-    amount = original_entry.get("amount", 0)
-    token = original_entry.get("token", "SOL")
-    token_decimals = original_entry.get("token_decimals", 9)
-
-    if dest_wallet and state.private_key_hex and amount > 0:
-        try:
-            if token == "SOL":
-                result = await send_solana_sol(
-                    state.private_key_hex, state.wallets, dest_wallet, amount
-                )
-            else:
-                result = await send_solana_token(
-                    state.private_key_hex, state.wallets, dest_wallet,
-                    token, amount, token_decimals
-                )
-
-            log_antimatter_event(state, {
-                "type": "antimatter_sent",
-                "signal_id": signal_id,
-                "resolution": resolution,
-                "destination": dest_wallet,
-                "amount": amount,
-                "token": token,
-                "tx_success": result.get("success", False),
-                "tx_signature": result.get("tx_signature"),
-                "resolved_by": resolved_by,
-            })
-
-            if result.get("success") and resolved_by:
-                adjust_trust(state, resolved_by, TRUST_ANTIMATTER_SUCCESS)
-
-        except Exception as e:
-            log_antimatter_event(state, {
-                "type": "antimatter_send_failed",
-                "signal_id": signal_id,
-                "error": str(e),
-            })
-    elif resolution == "timeout" and original_entry.get("sender_superagent_wallet"):
-        sa_wallet = original_entry["sender_superagent_wallet"]
-        if state.private_key_hex and amount > 0:
-            try:
-                if token == "SOL":
-                    await send_solana_sol(state.private_key_hex, state.wallets, sa_wallet, amount)
-                else:
-                    await send_solana_token(
-                        state.private_key_hex, state.wallets, sa_wallet,
-                        token, amount, token_decimals
-                    )
-                log_antimatter_event(state, {
-                    "type": "antimatter_sent",
-                    "signal_id": signal_id,
-                    "resolution": "timeout",
-                    "destination": sa_wallet,
-                    "amount": amount,
-                })
-            except Exception as e:
-                _log.error("Antimatter timeout send to %s... failed: %s", sa_wallet[:12], e)
-    else:
-        log_antimatter_event(state, {
-            "type": "antimatter_kept",
-            "signal_id": signal_id,
-            "reason": "no_destination",
-            "amount": amount,
-        })
-
-    save_state()
-    return {"status": "resolved"}, 200
 
 
 async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decision: RouterDecision) -> None:
@@ -827,19 +680,12 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
         conn = state.connections[msg.from_agent_id]
         conn.messages_received += 1
         conn.last_activity = datetime.now(timezone.utc).isoformat()
+        # Track inbound count for reciprocity-weighted trust
+        imp = state.impressions.get(msg.from_agent_id, Impression(score=0.0))
+        imp.msgs_received += 1
+        state.impressions[msg.from_agent_id] = imp
 
     save_state()
-
-    msg_meta = msg.metadata or {}
-    if (msg_meta.get("type") == "solana_payment"
-            and msg_meta.get("antimatter_eligible")
-            and msg_meta.get("amount")
-            and msg_meta.get("tx_signature")):
-        asyncio.create_task(initiate_antimatter_from_payment(
-            state, msg,
-            get_public_url_fn=lambda port: get_network_manager().get_public_url(),
-            save_state_fn=save_state,
-        ))
 
     # queue_only — no routing, just queue for the MCP session.
     if state.router_mode == "queue_only":
@@ -1984,18 +1830,8 @@ async def handle_get_peers(request: Request) -> JSONResponse:
 # =============================================================================
 
 
-async def handle_antimatter_match(request: Request) -> JSONResponse:
-    """Stateless match game endpoint. Peer picks a random number and returns it."""
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    result, status = process_antimatter_match(data)
-    return JSONResponse(result, status_code=status)
-
-
-async def handle_antimatter_signal(request: Request) -> JSONResponse:
-    """Receive a forwarded antimatter signal and run the match game."""
+async def handle_antimatter_request(request: Request) -> JSONResponse:
+    """B receives antimatter request from A: send fee to A's delegate D."""
     state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -2003,20 +1839,8 @@ async def handle_antimatter_signal(request: Request) -> JSONResponse:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    result, status = await process_antimatter_signal(state, data)
-    return JSONResponse(result, status_code=status)
-
-
-async def handle_antimatter_result(request: Request) -> JSONResponse:
-    """B receives this when a downstream node resolves the antimatter signal."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    result, status = await process_antimatter_result(state, data)
+    result = await _handle_antimatter_request(state, data, save_state_fn=save_state)
+    status = 200 if result.get("success") else 400
     return JSONResponse(result, status_code=status)
 
 
@@ -2472,6 +2296,69 @@ async def handle_local_set_impression(request: Request) -> JSONResponse:
     return JSONResponse({"success": True, "agent_id": agent_id, "score": score})
 
 
+async def handle_local_wallet(request: Request) -> JSONResponse:
+    """GET /__darkmatter__/wallet — wallet balances across all chains."""
+    state = resolve_state(request)
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    from darkmatter.wallet import get_all_providers
+
+    chain_filter = request.query_params.get("chain")
+    results = {}
+
+    for chain, provider in get_all_providers().items():
+        if chain_filter and chain != chain_filter:
+            continue
+        address = state.wallets.get(chain)
+        if not address:
+            continue
+        try:
+            all_bal = await provider.get_all_balances(address)
+            native = all_bal.get("native", {})
+            results[chain] = {
+                "address": address,
+                "balance": native.get("balance", 0) if native.get("success", all_bal.get("success")) else None,
+                "tokens": all_bal.get("tokens", []),
+                "error": native.get("error") if not all_bal.get("success") else None,
+                "attested": chain in state.wallet_attestations,
+            }
+        except Exception as e:
+            results[chain] = {"address": address, "error": str(e)}
+
+    return JSONResponse({"wallets": results})
+
+
+async def handle_local_send_payment(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/send_payment — send payment to a connected peer."""
+    state = resolve_state(request)
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    agent_id = data.get("agent_id", "")
+    amount = data.get("amount", 0)
+    currency = data.get("currency", "SOL")
+    token_decimals = data.get("token_decimals", 9)
+    chain = data.get("chain", "solana")
+
+    if not agent_id or amount <= 0:
+        return JSONResponse({"error": "agent_id and amount > 0 required"}, status_code=400)
+
+    from darkmatter.wallet.antimatter import initiate_payment
+    result = await initiate_payment(
+        state, agent_id, amount, currency=currency,
+        token_decimals=token_decimals, chain=chain,
+        save_state_fn=save_state,
+    )
+    status = 200 if result.get("success") else 400
+    return JSONResponse(result, status_code=status)
+
+
 async def handle_local_config(request: Request) -> JSONResponse:
     """POST /__darkmatter__/config — set agent configuration."""
     state = resolve_state(request)
@@ -2495,10 +2382,6 @@ async def handle_local_config(request: Request) -> JSONResponse:
     if "rate_limit" in data:
         state.rate_limit_per_connection = int(data["rate_limit"])
         changes["rate_limit"] = state.rate_limit_per_connection
-
-    if "superagent_url" in data:
-        state.superagent_url = data["superagent_url"]
-        changes["superagent_url"] = state.superagent_url
 
     if "display_name" in data:
         state.display_name = str(data["display_name"])[:100]

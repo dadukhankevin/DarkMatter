@@ -94,28 +94,13 @@ class GetImpressionInput(BaseModel):
     agent_id: str = Field(..., description="The agent ID to look up")
 
 
-class SetSuperagentInput(BaseModel):
-    """Set the default superagent URL for antimatter routing."""
+class SendPaymentInput(BaseModel):
+    """Send a payment to a connected agent with automatic antimatter delegation."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    url: Optional[str] = Field(default=None, description="Superagent URL. Set to null to reset to default.", max_length=MAX_URL_LENGTH)
-
-
-class SendSolInput(BaseModel):
-    """Send SOL to a connected agent's wallet."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The connected agent to send SOL to")
-    amount: float = Field(..., gt=0, description="Amount of SOL to send")
-    notify: bool = Field(default=True, description="Send a message notifying the recipient")
-
-
-class SendTokenInput(BaseModel):
-    """Send SPL tokens to a connected agent's wallet."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The connected agent to send tokens to")
-    mint: str = Field(..., description="Token mint address")
-    amount: float = Field(..., gt=0, description="Amount in human-readable units")
-    decimals: int = Field(..., ge=0, le=18, description="Token decimals (e.g. 6 for USDC)")
-    notify: bool = Field(default=True, description="Send a message notifying the recipient")
+    agent_id: str = Field(..., description="The connected agent to pay")
+    amount: float = Field(..., gt=0, description="Amount to send")
+    currency: str = Field(default="SOL", description="Currency: SOL, or SPL token mint address")
+    token_decimals: int = Field(default=9, ge=0, le=18, description="Token decimals (9 for SOL, 6 for USDC)")
 
 
 class GetBalanceInput(BaseModel):

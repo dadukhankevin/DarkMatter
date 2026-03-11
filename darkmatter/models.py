@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from darkmatter.config import ANTIMATTER_MAX_HOPS, ANTIMATTER_LOG_MAX, CONVERSATION_LOG_MAX
+from darkmatter.config import ANTIMATTER_LOG_MAX, CONVERSATION_LOG_MAX
 
 
 # =============================================================================
@@ -91,27 +91,8 @@ class Impression:
     score: float       # -1.0 (avoid) to 1.0 (fully trusted)
     note: str = ""
     negative_since: Optional[str] = None  # ISO timestamp when score crossed below 0
-
-
-# =============================================================================
-# AntiMatter Economy
-# =============================================================================
-
-@dataclass
-class AntiMatterSignal:
-    """A antimatter fee signal routed through the network via the match game."""
-    signal_id: str
-    original_tx: str            # tx_signature that generated this signal
-    sender_agent_id: str        # A (who sent the payment)
-    amount: float               # antimatter fee amount (1% of original)
-    token: str                  # "SOL" or mint address
-    token_decimals: int         # 9 for SOL, 6 for USDC, etc.
-    sender_superagent_wallet: str  # where fee goes on timeout
-    callback_url: str           # B's /__darkmatter__/antimatter_result endpoint
-    hops: int = 0
-    max_hops: int = ANTIMATTER_MAX_HOPS
-    created_at: str = ""
-    path: list[str] = field(default_factory=list)  # agent_ids visited (loop prevention)
+    msgs_sent: int = 0       # messages sent TO this peer (for reciprocity tracking)
+    msgs_received: int = 0   # messages received FROM this peer
 
 
 # =============================================================================
@@ -274,8 +255,11 @@ class AgentState:
     routing_rules: list = field(default_factory=list)
     router_mode: str = "spawn"
     # AntiMatter economy
-    superagent_url: Optional[str] = None
     antimatter_log: list[dict] = field(default_factory=list)
+    delegated_antimatter_agent: Optional[str] = None   # agent_id of chosen delegate
+    delegated_antimatter_wallet: Optional[str] = None   # cached wallet address of delegate
+    # Identity attestations: chain -> tx_signature (persisted, one-time per chain)
+    wallet_attestations: dict[str, str] = field(default_factory=dict)
     # Conversation memory
     conversation_log: list[ConversationEntry] = field(default_factory=list)
     # Insights (live code knowledge)
