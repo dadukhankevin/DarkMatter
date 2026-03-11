@@ -236,8 +236,6 @@ def _register_discovered_agents(daemon_port: int) -> None:
     Only registers agents whose state file indicates the same port as this daemon
     (to avoid claiming agents from other daemons).
     """
-    from darkmatter.config import AGENT_ROUTER_MODE
-
     current_agents = set(list_hosted_agents())
     for info in scan_state_files():
         agent_id = info["agent_id"]
@@ -253,7 +251,7 @@ def _register_discovered_agents(daemon_port: int) -> None:
 
         state.port = daemon_port
         state.status = AgentStatus.ACTIVE
-        state.router_mode = AGENT_ROUTER_MODE
+        # router_mode is loaded from the persisted state file — don't override it.
         register_agent(agent_id, state)
         _log.info("Discovered and registered agent %s... (%s)",
                   agent_id[:12], state.display_name or "unnamed")

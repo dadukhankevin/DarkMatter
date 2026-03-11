@@ -400,7 +400,7 @@ def _save_single_state(state: AgentState) -> None:
         },
         "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
-        # router_mode is NOT persisted — it's set from config.AGENT_ROUTER_MODE on startup.
+        "router_mode": state.router_mode,
         "routing_rules": [_routing_rule_to_dict(r) for r in state.routing_rules],
         "antimatter_log": state.antimatter_log[-ANTIMATTER_LOG_MAX:],
         "delegated_antimatter_agent": state.delegated_antimatter_agent,
@@ -630,8 +630,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         },
         rate_limit_global=data.get("rate_limit_global", 0),
         inactive_until=data.get("inactive_until"),
-        # router_mode not loaded from disk — set by config.AGENT_ROUTER_MODE in app.py init_state()
-        router_mode="spawn",  # default; overridden by init_state() immediately after load
+        router_mode=data.get("router_mode", "spawn"),
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
         antimatter_log=data.get("antimatter_log", []),
         delegated_antimatter_agent=data.get("delegated_antimatter_agent"),

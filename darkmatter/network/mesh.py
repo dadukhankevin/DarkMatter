@@ -658,11 +658,9 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
     """Commit a verified inbound message into state and route it."""
     state.messages_handled += 1
 
-    # queue_only (entrypoint) skips the queue entirely — messages go straight
-    # to conversation_log for the human to see.  Agents use the queue so
-    # wait_for_message can drain it.
-    if state.router_mode != "queue_only":
-        state.message_queue.append(msg)
+    # Always queue so wait_for_message can drain it (including queue_only
+    # entrypoint agents that are MCP sessions).
+    state.message_queue.append(msg)
 
     _agents_waiting_at_receive = len(state._inbox_events) > 0
     for evt in state._inbox_events:
@@ -735,9 +733,7 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if state.status == AgentStatus.INACTIVE:
         return {"error": "Agent is currently inactive"}, 503
 
-    # queue_only (entrypoint) doesn't use the queue — messages go straight to
-    # conversation_log.  Skip the queue-full check for it.
-    if state.router_mode != "queue_only" and len(state.message_queue) >= MESSAGE_QUEUE_MAX:
+    if len(state.message_queue) >= MESSAGE_QUEUE_MAX:
         return {"error": "Message queue full"}, 429
 
     message_id = data.get("message_id", "")
