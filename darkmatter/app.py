@@ -47,6 +47,8 @@ from darkmatter.network.discovery import (
 )
 from darkmatter.network.mesh import (
     dispatch_webrtc_message,
+    check_access,
+    resolve_state as _resolve_state,
     handle_connection_request,
     handle_connection_accepted,
     handle_accept_pending,
@@ -81,6 +83,18 @@ from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_netwo
 from darkmatter.logging import get_logger
 
 _log = get_logger("app")
+
+
+def _guarded(route_name: str, handler):
+    """Wrap a route handler with access control."""
+    async def wrapper(request):
+        state = _resolve_state(request)
+        denied = check_access(request, route_name, state)
+        if denied is not None:
+            return denied
+        return await handler(request)
+    wrapper.__name__ = handler.__name__
+    return wrapper
 
 
 # =============================================================================
@@ -360,38 +374,41 @@ def create_app() -> Router:
         # Start NetworkManager (discovers public URL, starts health loop + ping loop)
         await manager.start()
 
-    # DarkMatter mesh protocol routes
+    # DarkMatter mesh protocol routes (wrapped with access control)
     darkmatter_routes = [
-        Route("/connection_request", handle_connection_request, methods=["POST"]),
-        Route("/connection_accepted", handle_connection_accepted, methods=["POST"]),
-        Route("/connection_proof", handle_connection_proof, methods=["POST"]),
-        Route("/accept_pending", handle_accept_pending, methods=["POST"]),
-        Route("/message", handle_message, methods=["POST"]),
+        # Public — discovery + connection establishment
+        Route("/connection_request", _guarded("connection_request", handle_connection_request), methods=["POST"]),
+        Route("/connection_accepted", _guarded("connection_accepted", handle_connection_accepted), methods=["POST"]),
+        Route("/connection_proof", _guarded("connection_proof", handle_connection_proof), methods=["POST"]),
+        Route("/accept_pending", _guarded("accept_pending", handle_accept_pending), methods=["POST"]),
+        Route("/status", _guarded("status", handle_status), methods=["GET"]),
+        Route("/genome", _guarded("genome", handle_genome), methods=["GET"]),
 
-        Route("/status", handle_status, methods=["GET"]),
-        Route("/network_info", handle_network_info, methods=["GET"]),
-        Route("/status_broadcast", handle_status_broadcast, methods=["POST"]),
-        Route("/impression/{agent_id}", handle_impression_get, methods=["GET"]),
-        Route("/webrtc_offer", handle_webrtc_offer, methods=["POST"]),
-        Route("/peer_update", handle_peer_update, methods=["POST"]),
-        Route("/peer_lookup/{agent_id}", handle_peer_lookup, methods=["GET"]),
-        Route("/get_peers", handle_get_peers, methods=["GET", "POST"]),
-        Route("/mesh_route", handle_mesh_route, methods=["POST"]),
-        Route("/antimatter_request", handle_antimatter_request, methods=["POST"]),
-        Route("/insight_push", handle_insight_push, methods=["POST"]),
-        Route("/sdp_relay", handle_sdp_relay, methods=["POST"]),
-        Route("/sdp_relay_deliver", handle_sdp_relay_deliver, methods=["POST"]),
-        Route("/admin_connect", handle_admin_connect, methods=["POST"]),
-        Route("/genome", handle_genome, methods=["GET"]),
-        Route("/ping", handle_ping, methods=["POST"]),
-        # Local API — for skill/curl access
-        Route("/inbox", handle_local_inbox, methods=["GET"]),
-        Route("/pending_requests", handle_local_pending, methods=["GET"]),
-        Route("/connections", handle_local_connections, methods=["GET"]),
-        Route("/set_impression", handle_local_set_impression, methods=["POST"]),
-        Route("/config", handle_local_config, methods=["POST"]),
-        Route("/wallet", handle_local_wallet, methods=["GET"]),
-        Route("/send_payment", handle_local_send_payment, methods=["POST"]),
+        # Peer — mesh protocol (connected peers + localhost)
+        Route("/message", _guarded("message", handle_message), methods=["POST"]),
+        Route("/status_broadcast", _guarded("status_broadcast", handle_status_broadcast), methods=["POST"]),
+        Route("/peer_update", _guarded("peer_update", handle_peer_update), methods=["POST"]),
+        Route("/ping", _guarded("ping", handle_ping), methods=["POST"]),
+        Route("/webrtc_offer", _guarded("webrtc_offer", handle_webrtc_offer), methods=["POST"]),
+        Route("/sdp_relay", _guarded("sdp_relay", handle_sdp_relay), methods=["POST"]),
+        Route("/sdp_relay_deliver", _guarded("sdp_relay_deliver", handle_sdp_relay_deliver), methods=["POST"]),
+        Route("/insight_push", _guarded("insight_push", handle_insight_push), methods=["POST"]),
+        Route("/antimatter_request", _guarded("antimatter_request", handle_antimatter_request), methods=["POST"]),
+        Route("/mesh_route", _guarded("mesh_route", handle_mesh_route), methods=["POST"]),
+        Route("/network_info", _guarded("network_info", handle_network_info), methods=["GET"]),
+        Route("/impression/{agent_id}", _guarded("impression", handle_impression_get), methods=["GET"]),
+        Route("/peer_lookup/{agent_id}", _guarded("peer_lookup", handle_peer_lookup), methods=["GET"]),
+        Route("/get_peers", _guarded("get_peers", handle_get_peers), methods=["GET", "POST"]),
+        Route("/admin_connect", _guarded("admin_connect", handle_admin_connect), methods=["POST"]),
+
+        # Local — admin/read endpoints (localhost only)
+        Route("/inbox", _guarded("inbox", handle_local_inbox), methods=["GET"]),
+        Route("/pending_requests", _guarded("pending_requests", handle_local_pending), methods=["GET"]),
+        Route("/connections", _guarded("connections", handle_local_connections), methods=["GET"]),
+        Route("/set_impression", _guarded("set_impression", handle_local_set_impression), methods=["POST"]),
+        Route("/config", _guarded("config", handle_local_config), methods=["POST"]),
+        Route("/wallet", _guarded("wallet", handle_local_wallet), methods=["GET"]),
+        Route("/send_payment", _guarded("send_payment", handle_local_send_payment), methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.

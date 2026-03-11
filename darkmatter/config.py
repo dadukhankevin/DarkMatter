@@ -180,6 +180,55 @@ REPLAY_MAX_SIZE = 10000
 
 
 # =============================================================================
+# Route Access Control
+# =============================================================================
+# Three tiers: "public" (anyone), "peer" (connected peers), "local" (localhost only)
+# Override per-route via DARKMATTER_ACCESS_OVERRIDES env var (JSON: {"route": "level"})
+
+ROUTE_ACCESS_DEFAULTS = {
+    # Public — discovery + mesh protocol
+    "well_known": "public",
+    "status": "public",
+    "connection_request": "public",
+    "connection_accepted": "public",
+    "connection_proof": "public",
+    "accept_pending": "public",
+    "message": "peer",
+    "status_broadcast": "peer",
+    "peer_update": "peer",
+    "ping": "peer",
+    "webrtc_offer": "peer",
+    "sdp_relay": "peer",
+    "sdp_relay_deliver": "peer",
+    "insight_push": "peer",
+    "antimatter_request": "peer",
+    "mesh_route": "peer",
+    "genome": "public",
+    # Peer — requires known connection
+    "network_info": "peer",
+    "impression": "peer",
+    "peer_lookup": "peer",
+    "get_peers": "peer",
+    "admin_connect": "peer",
+    # Local — localhost only
+    "inbox": "local",
+    "pending_requests": "local",
+    "connections": "local",
+    "set_impression": "local",
+    "config": "local",
+    "wallet": "local",
+    "send_payment": "local",
+}
+
+# Allow overrides via env var: '{"inbox": "peer", "connections": "public"}'
+import json as _json
+_access_overrides = os.environ.get("DARKMATTER_ACCESS_OVERRIDES", "{}")
+try:
+    ROUTE_ACCESS = {**ROUTE_ACCESS_DEFAULTS, **_json.loads(_access_overrides)}
+except Exception:
+    ROUTE_ACCESS = ROUTE_ACCESS_DEFAULTS
+
+# =============================================================================
 # Bootstrap Peers
 # =============================================================================
 

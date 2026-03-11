@@ -34,6 +34,7 @@ from darkmatter.config import (
     MIN_CHAIN_TRUST,
     MESH_ROUTE_PER_SOURCE_LIMIT,
     MESH_ROUTE_PER_SOURCE_WINDOW,
+    ROUTE_ACCESS,
 )
 from darkmatter.models import (
     AgentState,
@@ -74,6 +75,65 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, R
 
 from darkmatter.logging import get_logger
 _log = get_logger("mesh")
+
+
+# =============================================================================
+# Route Access Control
+# =============================================================================
+
+def _client_ip(request: "Request") -> str:
+    """Extract client IP from request (respects X-Forwarded-For behind proxies)."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _is_local(request: "Request") -> bool:
+    """Check if request comes from localhost."""
+    ip = _client_ip(request)
+    return ip in ("127.0.0.1", "::1", "localhost", "unknown")
+
+
+def _is_connected_peer(request: "Request", state: Optional["AgentState"]) -> bool:
+    """Check if request comes from a known connected peer (by agent_id in body or IP)."""
+    if state is None:
+        return False
+    # Check by source IP — any connection with a matching URL host
+    client_ip = _client_ip(request)
+    for conn in state.connections.values():
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(conn.agent_url)
+            if parsed.hostname == client_ip:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def check_access(request: "Request", route_name: str,
+                 state: Optional["AgentState"] = None) -> Optional[JSONResponse]:
+    """Check if request is allowed for this route. Returns error response or None if allowed."""
+    level = ROUTE_ACCESS.get(route_name, "peer")
+
+    if level == "public":
+        return None
+    if level == "local":
+        if _is_local(request):
+            return None
+        return JSONResponse({"error": "This endpoint is only accessible from localhost"},
+                            status_code=403)
+    if level == "peer":
+        if _is_local(request):
+            return None  # Local always has peer access
+        if _is_connected_peer(request, state):
+            return None
+        return JSONResponse({"error": "This endpoint requires a peer connection"},
+                            status_code=403)
+    return None  # Unknown level — allow
 
 
 def resolve_state(request: "Request") -> Optional[AgentState]:
