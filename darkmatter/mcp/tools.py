@@ -636,6 +636,54 @@ async def discover_local(ctx: Context) -> str:
 
 
 @mcp.tool(
+    name="darkmatter_list_connections",
+    annotations={
+        "title": "List Connections",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def list_connections(ctx: Context) -> str:
+    """List all your connections with display names, bios, trust scores, wallets, and activity.
+
+    This is the first thing to check when you want to know who you're connected to.
+    Returns up to 100 connections sorted by most recent activity.
+    """
+    track_session(ctx)
+    state = get_state()
+
+    conns = []
+    for aid, conn in state.connections.items():
+        imp = state.impressions.get(aid)
+        conns.append({
+            "agent_id": aid,
+            "display_name": conn.display_name or aid[:12] + "...",
+            "bio": (conn.bio or "")[:200],
+            "agent_url": conn.agent_url,
+            "trust_score": round(imp.score, 4) if imp else 0.0,
+            "infrastructure": imp.infrastructure if imp else False,
+            "wallets": conn.wallets,
+            "connected_at": conn.connected_at,
+            "last_activity": conn.last_activity,
+            "messages_sent": conn.messages_sent,
+            "messages_received": conn.messages_received,
+            "connectivity_level": conn.connectivity_level,
+            "connectivity_method": conn.connectivity_method,
+        })
+
+    # Sort by last_activity descending (most recent first)
+    conns.sort(key=lambda c: c.get("last_activity") or "", reverse=True)
+    conns = conns[:100]
+
+    return json.dumps({
+        "count": len(conns),
+        "connections": conns,
+    })
+
+
+@mcp.tool(
     name="darkmatter_get_peers_from",
     annotations={
         "title": "Get Peers From Agent",

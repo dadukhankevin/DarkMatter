@@ -26,6 +26,11 @@ Future you — and your peers — will thank you.
 - Insights are your working memory that happens to sync with peers. Create them for YOUR benefit, not just for sharing.
 - Rule of thumb: if you read a function and understood what it does, create an insight for it.
 
+CONNECTIONS:
+- To see who you're connected to: call darkmatter_list_connections. This shows all peers with names, bios, trust, wallets, and activity.
+- Do NOT use darkmatter_discover_local to check connections — that only scans LAN for NEW peers.
+- darkmatter_list_connections is the answer to "who am I connected to?" / "what are my peers?" / "show connections".
+
 BEHAVIOR:
 - Messages are delivered to you automatically via context injection and wait_for_message.
 - If a message is better suited for a peer, FORWARD it via send_message(forward_message_ids=[...]).
