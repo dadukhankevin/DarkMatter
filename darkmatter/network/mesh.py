@@ -685,10 +685,6 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
 
     save_state()
 
-    # queue_only — no routing, just queue for the MCP session.
-    if state.router_mode == "queue_only":
-        return "queued"
-
     if _agents_waiting_at_receive:
         _log.debug("MCP session waiting — message delivered via inbox event, skipping router")
         routed_to = "agent"

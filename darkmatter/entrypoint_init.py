@@ -78,7 +78,6 @@ def init_entrypoint(argv: list[str] = None) -> None:
                 "env": {
                     "DARKMATTER_PORT": str(args.port),
                     "DARKMATTER_DISPLAY_NAME": args.display_name,
-                    "DARKMATTER_ROUTER_MODE": "queue_only",
                 },
             }
         }
