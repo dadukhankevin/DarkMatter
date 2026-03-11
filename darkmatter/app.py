@@ -152,8 +152,16 @@ def init_state(port: int = None) -> None:
         from darkmatter.wallet import get_all_providers
         import darkmatter.wallet.solana  # noqa: F401 — registers SolanaWalletProvider
         for chain, provider in get_all_providers().items():
-            state.wallets[chain] = provider.derive_address(state.private_key_hex)
-            _log.info("%s wallet: %s", chain.capitalize(), state.wallets[chain])
+            # Allow env var override (e.g. DARKMATTER_WALLET_SOLANA) so bootstrap
+            # operators can receive antimatter fees to their own wallet
+            env_key = f"DARKMATTER_WALLET_{chain.upper()}"
+            override = os.environ.get(env_key, "").strip()
+            if override:
+                state.wallets[chain] = override
+                _log.info("%s wallet (override): %s", chain.capitalize(), override)
+            else:
+                state.wallets[chain] = provider.derive_address(state.private_key_hex)
+                _log.info("%s wallet: %s", chain.capitalize(), state.wallets[chain])
 
     # Bootstrap mode: auto-accept all incoming connections
     from darkmatter.config import BOOTSTRAP_MODE

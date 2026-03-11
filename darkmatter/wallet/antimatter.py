@@ -177,12 +177,16 @@ async def auto_disconnect_peer(state: AgentState, agent_id: str) -> bool:
 # =============================================================================
 
 def select_delegate(state: AgentState) -> Optional[Connection]:
-    """Select the best delegate for antimatter fees: oldest peer by tenure * trust.
+    """Select a delegate for antimatter fees: random weighted by tenure * trust.
 
     The delegate must be older than this agent (created_at < state.created_at),
     have positive trust, and have at least one wallet with a registered provider.
+    Selection is random weighted by (age × trust_score) so older, more trusted
+    peers are more likely chosen, but not deterministically — this prevents
+    gaming by always targeting the same delegate.
     Returns the Connection, or None if no eligible peers.
     """
+    import random
     now = datetime.now(timezone.utc)
     candidates = []
 
@@ -209,9 +213,9 @@ def select_delegate(state: AgentState) -> Optional[Connection]:
     if not candidates:
         return None
 
-    # Deterministic: pick the highest weight (most trusted + oldest)
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates[0][0]
+    # Random weighted selection — older & more trusted peers are more likely
+    conns, weights = zip(*candidates)
+    return random.choices(conns, weights=weights, k=1)[0]
 
 
 # =============================================================================
