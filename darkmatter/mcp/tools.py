@@ -654,6 +654,29 @@ async def list_connections(ctx: Context) -> str:
     track_session(ctx)
     state = get_state()
 
+    # Fetch from the HTTP daemon for fresh state (daemon may have connections
+    # the MCP session's in-memory state doesn't know about yet, e.g. bootstrap)
+    import httpx
+    from darkmatter.config import DEFAULT_PORT
+    import os
+    port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/__darkmatter__/connections")
+            if resp.status_code == 200:
+                daemon_data = resp.json()
+                daemon_conns = daemon_data.get("connections", [])
+                # Extract trust scores from daemon's impression data
+                for c in daemon_conns:
+                    imp_data = c.pop("impression", None)
+                    c["trust_score"] = round(imp_data["score"], 4) if imp_data else 0.0
+                # Sort by last_activity descending
+                daemon_conns.sort(key=lambda c: c.get("last_activity") or "", reverse=True)
+                daemon_conns = daemon_conns[:100]
+                return json.dumps({"count": len(daemon_conns), "connections": daemon_conns})
+    except Exception:
+        pass  # Fall back to in-memory state
+
     conns = []
     for aid, conn in state.connections.items():
         imp = state.impressions.get(aid)
