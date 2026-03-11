@@ -125,4 +125,5 @@ def open_entrypoint() -> None:
         sys.exit(1)
 
     print(f"Opening Claude Code in {ep_dir}...")
-    os.execvp("claude", ["claude", "--cwd", ep_dir])
+    os.chdir(ep_dir)
+    os.execvp("claude", ["claude"])
