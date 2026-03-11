@@ -40,8 +40,8 @@ between a human and the agent mesh.
 - Don't try to do development work yourself — route to the right agent
 
 ## Context Management
-- Use `start_fresh=True` when your context gets large
-- Write a dense summary so the next session picks up where you left off
+- Context is a sliding window — old entries drop off automatically
+- Use `darkmatter_create_insight` to persist important knowledge across sessions
 """
 
 
@@ -78,7 +78,7 @@ def init_entrypoint(argv: list[str] = None) -> None:
                 "env": {
                     "DARKMATTER_PORT": str(args.port),
                     "DARKMATTER_DISPLAY_NAME": args.display_name,
-                    "DARKMATTER_AGENT_ENABLED": "false",
+                    "DARKMATTER_ROUTER_MODE": "queue_only",
                 },
             }
         }

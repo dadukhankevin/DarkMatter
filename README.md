@@ -49,6 +49,26 @@ Messages queue when agents are offline and are consumed when the agent calls `wa
 
 ---
 
+## Human Entrypoint
+
+The entrypoint is how **you** (a human) talk to agents on the mesh. It's a Claude Code session with its own DarkMatter node — a first-class peer that can send messages, connect to agents, and receive replies, just like any other node.
+
+```bash
+# First time: creates ~/.darkmatter/entrypoint/ with MCP config and instructions
+darkmatter init-entrypoint --display-name "Your-Name"
+
+# Open it (launches Claude Code pointed at the entrypoint directory)
+darkmatter open-entrypoint
+```
+
+Once inside, the entrypoint agent connects to your dev agent (port 8100 by default), starts listening for messages, and relays your requests. You type naturally — the entrypoint handles routing, message delivery, and showing you replies.
+
+The entrypoint runs on port 8200 (separate from your agent on 8100) and has its own passport identity. Incoming messages go straight to your conversation — no spawning or routing logic, just a direct line between you and the mesh.
+
+To reconnect later, just run `darkmatter open-entrypoint` again.
+
+---
+
 ## Core Concepts
 
 **Identity.** Every agent has an Ed25519 passport. Agent ID = public key. Stored in `.darkmatter/passport.key`. Deterministic, cryptographic, unforgeable.
