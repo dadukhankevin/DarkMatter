@@ -27,6 +27,7 @@ from solders.signature import Signature as SolSignature
 
 # Well-known program IDs
 TOKEN_PROGRAM_ID = SolanaPubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+TOKEN_2022_PROGRAM_ID = SolanaPubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 ASSOCIATED_TOKEN_PROGRAM_ID = SolanaPubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 SYSTEM_PROGRAM_ID = SolanaPubkey.from_string("11111111111111111111111111111111")
 SYSVAR_RENT_ID = SolanaPubkey.from_string("SysvarRent111111111111111111111111111111111")
@@ -463,29 +464,31 @@ class SolanaWalletProvider(WalletProvider):
         try:
             from solana.rpc.types import TokenAccountOpts
             async with SolanaClient(SOLANA_RPC_URL) as client:
-                resp = await client.get_token_accounts_by_owner_json_parsed(
-                    pubkey, TokenAccountOpts(program_id=TOKEN_PROGRAM_ID),
-                )
-                if resp.value:
-                    for acct in resp.value[:limit]:
-                        try:
-                            info = acct.account.data.parsed["info"]
-                            mint = info["mint"]
-                            amount = info["tokenAmount"]
-                            ui_amount = float(amount.get("uiAmountString", "0"))
-                            if ui_amount <= 0:
+                # Query both legacy Token and Token-2022 programs
+                for program_id in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+                    resp = await client.get_token_accounts_by_owner_json_parsed(
+                        pubkey, TokenAccountOpts(program_id=program_id),
+                    )
+                    if resp.value:
+                        for acct in resp.value[:limit]:
+                            try:
+                                info = acct.account.data.parsed["info"]
+                                mint = info["mint"]
+                                amount = info["tokenAmount"]
+                                ui_amount = float(amount.get("uiAmountString", "0"))
+                                if ui_amount <= 0:
+                                    continue
+                                entry = {
+                                    "mint": mint,
+                                    "balance": ui_amount,
+                                    "decimals": amount.get("decimals", 0),
+                                }
+                                symbol = mint_to_symbol.get(mint)
+                                if symbol:
+                                    entry["symbol"] = symbol
+                                tokens.append(entry)
+                            except (KeyError, TypeError, ValueError):
                                 continue
-                            entry = {
-                                "mint": mint,
-                                "balance": ui_amount,
-                                "decimals": amount.get("decimals", 0),
-                            }
-                            symbol = mint_to_symbol.get(mint)
-                            if symbol:
-                                entry["symbol"] = symbol
-                            tokens.append(entry)
-                        except (KeyError, TypeError, ValueError):
-                            continue
         except Exception:
             pass
         # Sort by balance descending
