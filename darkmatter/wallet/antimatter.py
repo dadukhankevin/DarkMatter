@@ -103,7 +103,10 @@ def reciprocity_ratio(imp: Impression) -> float:
 
     Grace period: if max(sent, received) < RECIPROCITY_GRACE_THRESHOLD,
     return 1.0 to allow cold-start trust building.
+    Infrastructure peers (bootstrap nodes) are exempt — always return 1.0.
     """
+    if imp.infrastructure:
+        return 1.0
     total = max(imp.msgs_sent, imp.msgs_received)
     if total < RECIPROCITY_GRACE_THRESHOLD:
         return 1.0

@@ -896,6 +896,11 @@ class NetworkManager:
                                 if peer_id not in state.connections:
                                     conn = build_connection_from_accepted(result_data)
                                     state.connections[peer_id] = conn
+                                    # Mark as infrastructure peer — exempt from reciprocity scaling
+                                    from darkmatter.models import Impression
+                                    imp = state.impressions.get(peer_id, Impression(score=0.0))
+                                    imp.infrastructure = True
+                                    state.impressions[peer_id] = imp
                                     self._save_state()
                                     _log.info(
                                         "Bootstrap: connected to %s (%s)",

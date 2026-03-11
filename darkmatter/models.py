@@ -93,6 +93,7 @@ class Impression:
     negative_since: Optional[str] = None  # ISO timestamp when score crossed below 0
     msgs_sent: int = 0       # messages sent TO this peer (for reciprocity tracking)
     msgs_received: int = 0   # messages received FROM this peer
+    infrastructure: bool = False  # exempt from reciprocity scaling (bootstrap peers)
 
 
 # =============================================================================

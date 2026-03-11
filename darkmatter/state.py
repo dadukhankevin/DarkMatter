@@ -394,6 +394,7 @@ def _save_single_state(state: AgentState) -> None:
             aid: {
                 "score": imp.score, "note": imp.note, "negative_since": imp.negative_since,
                 "msgs_sent": imp.msgs_sent, "msgs_received": imp.msgs_received,
+                "infrastructure": imp.infrastructure,
             }
             for aid, imp in state.impressions.items()
         },
@@ -623,6 +624,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
             aid: Impression(
                 score=v["score"], note=v.get("note", ""), negative_since=v.get("negative_since"),
                 msgs_sent=v.get("msgs_sent", 0), msgs_received=v.get("msgs_received", 0),
+                infrastructure=v.get("infrastructure", False),
             )
             for aid, v in data.get("impressions", {}).items()
         },
