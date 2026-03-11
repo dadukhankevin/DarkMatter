@@ -586,11 +586,18 @@ def _init_shared_stdio_session(port: int) -> None:
     refresh_mcp_instructions()
 
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
-    manager.register_transport(HttpTransport())
+    http_transport = HttpTransport()
+    manager.register_transport(http_transport)
     webrtc = WebRTCTransport()
     webrtc.set_message_dispatcher(dispatch_webrtc_message)
     manager.register_transport(webrtc)
     set_network_manager(manager)
+
+    # Wire up peer URL recovery on HTTP transport
+    # (normally done in manager.start(), but stdio sessions don't call start())
+    http_transport._lookup_peer_url = manager.lookup_peer_url
+    http_transport._save_state = save_state
+    http_transport._get_public_url = manager.get_public_url
     set_antimatter_network_fns(
         send_fn=manager.send,
         http_request_fn=manager.http_request,

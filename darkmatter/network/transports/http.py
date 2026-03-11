@@ -16,8 +16,17 @@ from darkmatter.network.transport import Transport, SendResult
 
 
 def strip_base_url(url: str) -> str:
-    """Strip /mcp or /__darkmatter__ suffix from a URL."""
+    """Strip /__darkmatter__/... or /mcp suffix to get the host base URL.
+
+    Handles agent-scoped URLs like:
+      https://host/__darkmatter__/{agent_id} → https://host
+    """
     base = url.rstrip("/")
+    # Agent-scoped: /__darkmatter__/{agent_id}
+    dm_prefix = "/__darkmatter__/"
+    idx = base.find(dm_prefix)
+    if idx != -1:
+        return base[:idx]
     for suffix in ("/mcp", "/__darkmatter__"):
         if base.endswith(suffix):
             return base[:-len(suffix)]

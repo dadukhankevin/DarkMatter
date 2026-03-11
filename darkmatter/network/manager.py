@@ -443,6 +443,9 @@ class NetworkManager:
             _log.info("Bootstrap mode: ACTIVE (this node is a bootstrap peer)")
         _log.info("UPnP: AVAILABLE")
 
+        # Broadcast our current URL to all peers on startup (non-blocking)
+        asyncio.create_task(self.broadcast_peer_update())
+
     async def stop(self) -> None:
         """Cancel background tasks, stop transports, cleanup UPnP."""
         for task in self._tasks:
@@ -539,7 +542,34 @@ class NetworkManager:
                     break
 
             if not reachable:
-                conn.health_failures += 1
+                # Try URL recovery via peer consensus before counting as failure
+                try:
+                    new_url = await self.lookup_peer_url(
+                        conn.agent_id, exclude_urls={conn.agent_url}
+                    )
+                    if new_url and new_url != conn.agent_url:
+                        old_url = conn.agent_url
+                        conn.agent_url = new_url
+                        if self._save_state:
+                            self._save_state()
+                        _log.info(
+                            "Health loop recovered URL for %s...: %s -> %s",
+                            conn.agent_id[:12], old_url, new_url,
+                        )
+                        # Re-check with recovered URL
+                        for transport in self._transports:
+                            if transport.available and await transport.is_reachable(conn):
+                                reachable = True
+                                conn.health_failures = 0
+                                # Broadcast our URL to the recovered peer
+                                await self.broadcast_peer_update()
+                                break
+                except Exception as e:
+                    _log.debug("URL recovery failed for %s...: %s", conn.agent_id[:12], e)
+
+                if not reachable:
+                    conn.health_failures += 1
+
                 if conn.health_failures >= HEALTH_FAILURE_THRESHOLD:
                     _log.warning(
                         "Connection %s... unhealthy (%s failures, url=%s)",
@@ -898,6 +928,9 @@ class NetworkManager:
                                 peer_id = result_data["agent_id"]
                                 if peer_id not in state.connections:
                                     conn = build_connection_from_accepted(result_data)
+                                    # Override URL with the bootstrap URL we actually connected to
+                                    # (the bootstrap may advertise localhost if PUBLIC_URL isn't set)
+                                    conn.agent_url = base
                                     state.connections[peer_id] = conn
                                     # Mark as infrastructure peer — exempt from reciprocity scaling
                                     from darkmatter.models import Impression
