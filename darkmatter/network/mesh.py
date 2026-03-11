@@ -2264,6 +2264,79 @@ async def handle_local_inbox(request: Request) -> JSONResponse:
     return JSONResponse({"count": len(messages), "messages": messages})
 
 
+async def handle_send_proxy(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/send_proxy — proxy a send through the daemon (local-only).
+
+    The MCP stdio session calls this so the daemon uses its own live connection
+    objects (fresh URLs, WebRTC channels) instead of stale in-memory copies.
+    """
+    state = resolve_state(request)
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    target_agent_id = body.get("target_agent_id")
+    path = body.get("path")
+    payload = body.get("payload")
+    if not target_agent_id or not path or payload is None:
+        return JSONResponse(
+            {"error": "Required: target_agent_id, path, payload"}, status_code=400
+        )
+
+    mgr = get_network_manager()
+    result = await mgr.send(target_agent_id, path, payload)
+    return JSONResponse({
+        "success": result.success,
+        "transport": result.transport_name,
+        "response": result.response,
+        "error": result.error,
+    })
+
+
+async def handle_inbox_consume(request: Request) -> JSONResponse:
+    """POST /__darkmatter__/inbox/consume — consume messages from the daemon queue (local-only).
+
+    Removes messages by ID and returns the consumed message details.
+    """
+    state = resolve_state(request)
+    if state is None:
+        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    message_ids = body.get("message_ids", [])
+    if not message_ids:
+        return JSONResponse({"error": "Required: message_ids"}, status_code=400)
+
+    consumed = []
+    remaining = []
+    id_set = set(message_ids)
+    for msg in state.message_queue:
+        if msg.message_id in id_set:
+            consumed.append({
+                "message_id": msg.message_id,
+                "content": msg.content,
+                "from_agent_id": msg.from_agent_id,
+                "hops_remaining": msg.hops_remaining,
+                "verified": msg.verified,
+                "received_at": msg.received_at,
+            })
+            state._consumed_message_ids.add(msg.message_id)
+        else:
+            remaining.append(msg)
+    state.message_queue = remaining
+    save_state()
+
+    return JSONResponse({"consumed": len(consumed), "messages": consumed})
+
+
 async def handle_local_pending(request: Request) -> JSONResponse:
     """GET /__darkmatter__/pending_requests — list pending connection requests."""
     state = resolve_state(request)

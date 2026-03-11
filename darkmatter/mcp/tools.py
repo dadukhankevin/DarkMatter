@@ -67,6 +67,55 @@ from darkmatter.wallet.antimatter import (
 
 
 # =============================================================================
+# Daemon inbox helpers — prefer HTTP API over disk polling
+# =============================================================================
+
+def _sync_inbox_from_daemon(state, daemon_port: int) -> None:
+    """Sync message queue from daemon's HTTP inbox API, falling back to disk."""
+    try:
+        import httpx as _httpx
+        with _httpx.Client(timeout=3.0) as client:
+            resp = client.get(f"http://127.0.0.1:{daemon_port}/__darkmatter__/inbox")
+            if resp.status_code == 200:
+                daemon_msgs = resp.json().get("messages", [])
+                # Merge: add any messages we don't already have in memory
+                existing_ids = {m.message_id for m in state.message_queue}
+                consumed_ids = getattr(state, "_consumed_message_ids", set())
+                from darkmatter.models import QueuedMessage
+                for dm in daemon_msgs:
+                    mid = dm.get("message_id", "")
+                    if mid and mid not in existing_ids and mid not in consumed_ids:
+                        state.message_queue.append(QueuedMessage(
+                            message_id=mid,
+                            content=dm.get("content", ""),
+                            from_agent_id=dm.get("from_agent_id", ""),
+                            hops_remaining=dm.get("hops_remaining", 10),
+                            verified=dm.get("verified", False),
+                            received_at=dm.get("received_at", ""),
+                        ))
+                return
+    except Exception:
+        pass
+    # Fallback to disk
+    sync_message_queue_from_disk()
+
+
+def _consume_via_daemon(daemon_port: int, message_ids: list[str]) -> None:
+    """Tell the daemon to consume messages by ID (best-effort)."""
+    if not message_ids:
+        return
+    try:
+        import httpx as _httpx
+        with _httpx.Client(timeout=3.0) as client:
+            client.post(
+                f"http://127.0.0.1:{daemon_port}/__darkmatter__/inbox/consume",
+                json={"message_ids": message_ids},
+            )
+    except Exception:
+        pass  # Best-effort — messages already consumed locally
+
+
+# =============================================================================
 # Helper functions used only by MCP tools
 # =============================================================================
 
@@ -340,6 +389,9 @@ async def _send_message(state, params: SendMessageInput) -> str:
             "success": False,
             "error": "No connections available to send to."
         })
+
+    # URL refresh is no longer needed here — send_to_peer proxies through
+    # the daemon which has live connection objects with fresh URLs.
 
     # Consume forwarded messages from the queue
     forwarded_msgs = []
@@ -1093,11 +1145,14 @@ async def wait_for_message(
     Use darkmatter_send_message(broadcast=True) for passive status updates to peers.
     """
     state = get_state()
+    from darkmatter.config import DEFAULT_PORT
+    daemon_port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
-    # Check if matching messages already exist in inbox
-    sync_message_queue_from_disk()
+    # Check if matching messages already exist — prefer daemon HTTP inbox
+    _sync_inbox_from_daemon(state, daemon_port)
     existing = _drain_inbox(state, from_agents)
     if existing:
+        _consume_via_daemon(daemon_port, [m["message_id"] for m in existing])
         return json.dumps({"success": True, "messages": existing, "waited": False})
 
     # Register event and wait for new message
@@ -1109,9 +1164,6 @@ async def wait_for_message(
     _log.info("wait_for_message: waiting (timeout=%ds, filter=%s)", int(timeout_seconds), from_agents or "any")
 
     try:
-        # Loop: wake on any inbox event OR poll disk every _WAIT_POLL_INTERVAL.
-        # Same-process events fire instantly; cross-process messages (from the
-        # HTTP daemon) are picked up via the disk poll.
         deadline = asyncio.get_event_loop().time() + timeout_seconds
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -1126,13 +1178,14 @@ async def wait_for_message(
                 if asyncio.get_event_loop().time() >= deadline:
                     raise
 
-            # Woke up (event or poll tick) — sync from disk and check for matches
-            sync_message_queue_from_disk()
+            # Woke up — sync from daemon (or disk fallback) and check for matches
+            _sync_inbox_from_daemon(state, daemon_port)
             matched = _drain_inbox(state, from_agents)
             if matched:
                 _log.info("wait_for_message: matched %d message(s)", len(matched))
                 if event in state._inbox_events:
                     state._inbox_events.remove(event)
+                _consume_via_daemon(daemon_port, [m["message_id"] for m in matched])
                 return json.dumps({"success": True, "messages": matched, "waited": True})
 
     except asyncio.TimeoutError:

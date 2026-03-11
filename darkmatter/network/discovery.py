@@ -366,6 +366,38 @@ def _get_lan_ip() -> str:
         return "127.0.0.1"
 
 
+def _dynamic_port_set(state: AgentState) -> set[int]:
+    """Build a dynamic set of ports to scan based on known connections and peers.
+
+    Includes: configured range defaults, ports from connection URLs,
+    ports from discovered_peers, and standard defaults (8100, 8200).
+    Capped at 20 ports per IP to avoid flooding.
+    """
+    ports = {8100, 8200}
+
+    # Add ports from connection URLs
+    from urllib.parse import urlparse
+    for conn in state.connections.values():
+        try:
+            parsed = urlparse(conn.agent_url)
+            if parsed.port:
+                ports.add(parsed.port)
+        except Exception:
+            pass
+
+    # Add ports from discovered peers
+    for peer_info in state.discovered_peers.values():
+        try:
+            parsed = urlparse(peer_info.get("url", ""))
+            if parsed.port:
+                ports.add(parsed.port)
+        except Exception:
+            pass
+
+    # Cap to avoid flooding
+    return set(sorted(ports)[:20])
+
+
 async def scan_local_ports(state: AgentState) -> None:
     """Scan localhost ports + LAN subnet for other DarkMatter nodes."""
     async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.25)) as client:
@@ -375,7 +407,10 @@ async def scan_local_ports(state: AgentState) -> None:
             if port != state.port
         ]
 
-        # Scan LAN /24 subnet on common DarkMatter ports
+        # Build dynamic port set for LAN scanning
+        lan_ports = _dynamic_port_set(state)
+
+        # Scan LAN /24 subnet on dynamic port set
         lan_ip = _get_lan_ip()
         if lan_ip != "127.0.0.1":
             subnet_prefix = lan_ip.rsplit(".", 1)[0]
@@ -383,7 +418,7 @@ async def scan_local_ports(state: AgentState) -> None:
                 ip = f"{subnet_prefix}.{host_octet}"
                 if ip == lan_ip:
                     continue
-                for p in (8100, 8101):
+                for p in lan_ports:
                     tasks.append(probe_port(client, state, p, host=ip))
 
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -398,11 +433,26 @@ async def discovery_loop(state: AgentState) -> None:
     global _mcast_sock
     loop = asyncio.get_event_loop()
 
-    mcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
-    mcast_sock.setblocking(False)
+    # Create multicast socket with retry (network interface may not be ready)
+    mcast_sock = None
+    for attempt in range(3):
+        try:
+            mcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+            mcast_sock.setblocking(False)
+            break
+        except OSError as e:
+            _log.warning("Multicast socket creation attempt %d/3 failed: %s", attempt + 1, e)
+            if mcast_sock:
+                mcast_sock.close()
+                mcast_sock = None
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+
     _mcast_sock = mcast_sock
+    if mcast_sock is None:
+        _log.warning("Multicast socket creation failed after 3 attempts, LAN beacons disabled")
 
     try:
         while True:
@@ -431,13 +481,15 @@ async def discovery_loop(state: AgentState) -> None:
                 "beacon_signature_hex": beacon_sig,
             }).encode("utf-8")
 
-            try:
-                await loop.run_in_executor(
-                    None, mcast_sock.sendto, packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT)
-                )
-            except OSError as e:
-                _log.error("Beacon multicast send failed: %s", e)
+            if mcast_sock is not None:
+                try:
+                    await loop.run_in_executor(
+                        None, mcast_sock.sendto, packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT)
+                    )
+                except OSError as e:
+                    _log.error("Beacon multicast send failed: %s", e)
 
             await asyncio.sleep(DISCOVERY_INTERVAL)
     finally:
-        mcast_sock.close()
+        if mcast_sock is not None:
+            mcast_sock.close()

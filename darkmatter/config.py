@@ -62,6 +62,8 @@ DISCOVERY_LOCAL_PORTS = range(int(_disc_lo), int(_disc_hi) + 1)
 
 HEALTH_CHECK_INTERVAL = 60          # seconds between health check cycles
 HEALTH_FAILURE_THRESHOLD = 3        # failures before logging warning
+HEALTH_DORMANT_THRESHOLD = 9        # failures before marking peer dormant
+HEALTH_DORMANT_RETRY_CYCLES = 10   # dormant peers retry every N health cycles (~10 min)
 STALE_CONNECTION_AGE = 300          # seconds of inactivity before health-checking
 UPNP_PORT_RANGE = (30000, 60000)    # external port range for UPnP mappings
 PEER_LOOKUP_TIMEOUT = 5.0           # seconds to wait for peer_lookup responses
@@ -218,6 +220,8 @@ ROUTE_ACCESS_DEFAULTS = {
     "config": "local",
     "wallet": "local",
     "send_payment": "local",
+    "send_proxy": "local",
+    "inbox_consume": "local",
 }
 
 # Allow overrides via env var: '{"inbox": "peer", "connections": "public"}'

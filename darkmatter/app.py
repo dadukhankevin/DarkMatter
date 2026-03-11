@@ -78,6 +78,8 @@ from darkmatter.network.mesh import (
     handle_local_wallet,
     handle_local_send_payment,
     handle_ping,
+    handle_send_proxy,
+    handle_inbox_consume,
 )
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
 from darkmatter.logging import get_logger
@@ -409,6 +411,8 @@ def create_app() -> Router:
         Route("/config", _guarded("config", handle_local_config), methods=["POST"]),
         Route("/wallet", _guarded("wallet", handle_local_wallet), methods=["GET"]),
         Route("/send_payment", _guarded("send_payment", handle_local_send_payment), methods=["POST"]),
+        Route("/send_proxy", _guarded("send_proxy", handle_send_proxy), methods=["POST"]),
+        Route("/inbox/consume", _guarded("inbox_consume", handle_inbox_consume), methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.

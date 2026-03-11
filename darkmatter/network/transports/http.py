@@ -9,10 +9,14 @@ Depends on: config, network/transport
 
 import sys
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import httpx
 
 from darkmatter.network.transport import Transport, SendResult
+from darkmatter.logging import get_logger
+
+_log = get_logger("http_transport")
 
 
 def strip_base_url(url: str) -> str:
@@ -58,7 +62,7 @@ class HttpTransport(Transport):
 
 
     async def send(self, conn, path: str, payload: dict) -> SendResult:
-        """Send via HTTP POST. On failure, attempt peer URL recovery and retry once."""
+        """Send via HTTP POST. On failure, attempt peer URL recovery and NAT hairpin fallback."""
         # Try direct HTTP
         try:
             result = await self._http_post(conn, path, payload)
@@ -75,17 +79,46 @@ class HttpTransport(Transport):
                     conn.agent_url = new_url
                     if self._save_state:
                         self._save_state()
-                    print(f"[DarkMatter] Recovered URL for {conn.agent_id[:12]}...: "
-                          f"{old_url} -> {new_url}", file=sys.stderr)
+                    _log.info("Recovered URL for %s...: %s -> %s",
+                              conn.agent_id[:12], old_url, new_url)
                     try:
                         result = await self._http_post(conn, path, payload)
                         return SendResult(success=True, transport_name="http", response=result)
                     except Exception as e2:
-                        print(f"[DarkMatter] HTTP retry after URL recovery also failed for "
-                              f"{conn.agent_id[:12]}...: {e2}", file=sys.stderr)
+                        _log.warning("HTTP retry after URL recovery also failed for %s...: %s",
+                                     conn.agent_id[:12], e2)
             except Exception as e3:
-                print(f"[DarkMatter] Peer URL lookup failed for {conn.agent_id[:12]}...: {e3}",
-                      file=sys.stderr)
+                _log.warning("Peer URL lookup failed for %s...: %s",
+                             conn.agent_id[:12], e3)
+
+        # NAT hairpinning fallback: if peer's public IP matches ours (same router),
+        # try their LAN URL from discovered_peers
+        try:
+            from darkmatter.state import get_state
+            state = get_state()
+            if state and self._get_public_url:
+                our_url = self._get_public_url()
+                our_host = urlparse(our_url).hostname or ""
+                peer_host = urlparse(conn.agent_url).hostname or ""
+                if our_host and peer_host and our_host == peer_host and our_host not in ("localhost", "127.0.0.1"):
+                    # Same public IP — likely behind the same NAT
+                    discovered = state.discovered_peers.get(conn.agent_id)
+                    if discovered:
+                        lan_url = discovered.get("url")
+                        if lan_url and lan_url != conn.agent_url:
+                            _log.info("NAT hairpin: trying LAN URL for %s...: %s",
+                                      conn.agent_id[:12], lan_url)
+                            old_url = conn.agent_url
+                            conn.agent_url = lan_url
+                            try:
+                                result = await self._http_post(conn, path, payload)
+                                if self._save_state:
+                                    self._save_state()
+                                return SendResult(success=True, transport_name="http", response=result)
+                            except Exception:
+                                conn.agent_url = old_url  # Restore on failure
+        except Exception as e:
+            _log.debug("NAT hairpin check failed: %s", e)
 
         return SendResult(success=False, transport_name="http", error=str(last_error))
 

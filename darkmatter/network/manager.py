@@ -25,6 +25,8 @@ from darkmatter.config import (
     PEER_LOOKUP_MAX_CONCURRENT,
     HEALTH_CHECK_INTERVAL,
     HEALTH_FAILURE_THRESHOLD,
+    HEALTH_DORMANT_THRESHOLD,
+    HEALTH_DORMANT_RETRY_CYCLES,
     STALE_CONNECTION_AGE,
     UPNP_PORT_RANGE,
     TRUST_NEGATIVE_TIMEOUT,
@@ -498,8 +500,85 @@ class NetworkManager:
             except Exception as e:
                 _log.error("Health loop error: %s", e)
 
+    async def _attempt_reconnect(self, state, conn) -> bool:
+        """Try to reconnect to a peer via URL recovery and LAN discovery.
+
+        Returns True if reconnection succeeded.
+        """
+        peer_name = conn.agent_display_name or conn.agent_id[:12]
+
+        # 1. Try peer consensus URL recovery
+        try:
+            new_url = await self.lookup_peer_url(
+                conn.agent_id, exclude_urls={conn.agent_url}
+            )
+            if new_url and new_url != conn.agent_url:
+                old_url = conn.agent_url
+                conn.agent_url = new_url
+                if self._save_state:
+                    self._save_state()
+                _log.info("Reconnect: recovered URL for %s: %s -> %s", peer_name, old_url, new_url)
+
+                # Verify the new URL is reachable
+                for transport in self._transports:
+                    if transport.available and await transport.is_reachable(conn):
+                        conn.health_failures = 0
+                        await self.broadcast_peer_update()
+                        _log.info("Reconnect: %s is reachable at %s", peer_name, new_url)
+                        return True
+        except Exception as e:
+            _log.debug("Reconnect URL recovery failed for %s: %s", peer_name, e)
+
+        # 2. Check discovered_peers for LAN URL
+        discovered = state.discovered_peers.get(conn.agent_id)
+        if discovered:
+            lan_url = discovered.get("url")
+            if lan_url and lan_url != conn.agent_url:
+                old_url = conn.agent_url
+                conn.agent_url = lan_url
+                if self._save_state:
+                    self._save_state()
+                _log.info("Reconnect: trying LAN URL for %s: %s -> %s", peer_name, old_url, lan_url)
+
+                for transport in self._transports:
+                    if transport.available and await transport.is_reachable(conn):
+                        conn.health_failures = 0
+                        await self.broadcast_peer_update()
+                        _log.info("Reconnect: %s reachable via LAN at %s", peer_name, lan_url)
+                        return True
+                # LAN URL didn't work either — restore original
+                conn.agent_url = old_url
+
+        # 3. Try sending a connection_request to re-establish (if we found any URL)
+        try:
+            from darkmatter.network.mesh import build_outbound_request_payload, build_connection_from_accepted
+            public_url = self.get_public_url(agent_id=state.agent_id)
+            payload = build_outbound_request_payload(state, public_url)
+            base = strip_base_url(conn.agent_url)
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{base}/__darkmatter__/connection_request",
+                    json=payload,
+                )
+            if resp.status_code == 200:
+                result_data = resp.json()
+                if result_data.get("auto_accepted") or result_data.get("already_connected"):
+                    conn.health_failures = 0
+                    conn.last_activity = datetime.now(timezone.utc).isoformat()
+                    _log.info("Reconnect: re-established connection to %s", peer_name)
+                    return True
+        except Exception as e:
+            _log.debug("Reconnect request failed for %s: %s", peer_name, e)
+
+        return False
+
     async def _check_connection_health(self) -> None:
-        """Check health of all stale connections across all hosted agents."""
+        """Check health of all stale connections across all hosted agents.
+
+        Includes active reconnection at HEALTH_FAILURE_THRESHOLD and
+        dormancy marking at HEALTH_DORMANT_THRESHOLD.
+        """
         from darkmatter.state import list_hosted_agents, get_state_for
 
         all_conns = []
@@ -516,8 +595,20 @@ class NetworkManager:
                 all_conns = [(state, c) for c in state.connections.values()]
 
         for state, conn in all_conns:
+            is_dormant = getattr(conn, "_dormant", False)
+
+            # Dormant peers: only retry every N health cycles
+            if is_dormant:
+                cycle = getattr(conn, "_dormant_cycle", 0) + 1
+                conn._dormant_cycle = cycle
+                if cycle % HEALTH_DORMANT_RETRY_CYCLES != 0:
+                    continue
+                # Time for a dormant retry
+                _log.info("Dormant retry for %s... (cycle %d)",
+                          conn.agent_id[:12], cycle)
+
             # Skip recently active connections
-            if conn.last_activity:
+            if conn.last_activity and not is_dormant:
                 try:
                     last = datetime.fromisoformat(conn.last_activity.replace("Z", "+00:00"))
                     age = (datetime.now(timezone.utc) - last).total_seconds()
@@ -534,6 +625,10 @@ class NetworkManager:
                 if await transport.is_reachable(conn):
                     reachable = True
                     conn.health_failures = 0
+                    if is_dormant:
+                        conn._dormant = False
+                        conn._dormant_cycle = 0
+                        _log.info("Peer %s... recovered from dormant state", conn.agent_id[:12])
                     # Try to upgrade to a better transport
                     if conn.transport == "http":
                         webrtc = self.get_transport("webrtc")
@@ -542,37 +637,32 @@ class NetworkManager:
                     break
 
             if not reachable:
-                # Try URL recovery via peer consensus before counting as failure
-                try:
-                    new_url = await self.lookup_peer_url(
-                        conn.agent_id, exclude_urls={conn.agent_url}
-                    )
-                    if new_url and new_url != conn.agent_url:
-                        old_url = conn.agent_url
-                        conn.agent_url = new_url
-                        if self._save_state:
-                            self._save_state()
-                        _log.info(
-                            "Health loop recovered URL for %s...: %s -> %s",
-                            conn.agent_id[:12], old_url, new_url,
-                        )
-                        # Re-check with recovered URL
-                        for transport in self._transports:
-                            if transport.available and await transport.is_reachable(conn):
-                                reachable = True
-                                conn.health_failures = 0
-                                # Broadcast our URL to the recovered peer
-                                await self.broadcast_peer_update()
-                                break
-                except Exception as e:
-                    _log.debug("URL recovery failed for %s...: %s", conn.agent_id[:12], e)
+                conn.health_failures += 1
 
-                if not reachable:
-                    conn.health_failures += 1
-
-                if conn.health_failures >= HEALTH_FAILURE_THRESHOLD:
+                # At threshold: attempt active reconnection
+                if conn.health_failures == HEALTH_FAILURE_THRESHOLD:
                     _log.warning(
-                        "Connection %s... unhealthy (%s failures, url=%s)",
+                        "Connection %s... unhealthy (%d failures), attempting reconnect...",
+                        conn.agent_id[:12], conn.health_failures,
+                    )
+                    reconnected = await self._attempt_reconnect(state, conn)
+                    if reconnected:
+                        if is_dormant:
+                            conn._dormant = False
+                            conn._dormant_cycle = 0
+                        continue
+
+                # At dormant threshold: mark as dormant
+                if conn.health_failures >= HEALTH_DORMANT_THRESHOLD and not is_dormant:
+                    conn._dormant = True
+                    conn._dormant_cycle = 0
+                    _log.warning(
+                        "Connection %s... marked dormant (%d failures, url=%s)",
+                        conn.agent_id[:12], conn.health_failures, conn.agent_url,
+                    )
+                elif conn.health_failures >= HEALTH_FAILURE_THRESHOLD and not is_dormant:
+                    _log.warning(
+                        "Connection %s... unhealthy (%d failures, url=%s)",
                         conn.agent_id[:12], conn.health_failures, conn.agent_url,
                     )
 
@@ -838,12 +928,29 @@ class NetworkManager:
                 except Exception:
                     pass  # Best-effort — don't spam errors for pings
 
-                # Check for inbound ping silence
+                # Check for inbound ping silence — no peers have pinged us
                 if (self._last_inbound_ping > 0 and
                         time.time() - self._last_inbound_ping > PING_SILENCE_THRESHOLD and
                         len(state.connections) > 0):
-                    # No peers have pinged us in a while — possible network issue
-                    pass  # Future: could trigger re-discovery
+                    _log.info("Ping silence detected (>%ds) — re-discovering public URL", PING_SILENCE_THRESHOLD)
+                    try:
+                        new_url = await self.discover_public_url()
+                        if new_url != state.public_url:
+                            _log.info("Public URL changed after ping silence: %s -> %s",
+                                      state.public_url, new_url)
+                            state.public_url = new_url
+                        await self.broadcast_peer_update()
+                        # Verify bootstrap peer reachability
+                        for bp_url in BOOTSTRAP_PEERS:
+                            try:
+                                async with httpx.AsyncClient(timeout=5.0) as bc:
+                                    await bc.get(f"{bp_url.rstrip('/')}/__darkmatter__/status")
+                            except Exception:
+                                _log.warning("Bootstrap peer %s unreachable during ping silence", bp_url)
+                    except Exception as e:
+                        _log.error("Ping silence recovery failed: %s", e)
+                    # Reset timer to avoid spamming recovery
+                    self._last_inbound_ping = time.time()
 
             except asyncio.CancelledError:
                 return
