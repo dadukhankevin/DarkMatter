@@ -742,7 +742,28 @@ class NetworkManager:
 
             for agent_id in to_disconnect:
                 try:
+                    imp = state.impressions.get(agent_id)
+                    conn = state.connections.get(agent_id)
+                    peer_name = (conn.agent_display_name if conn else None) or agent_id[:16]
+                    score = round(imp.score, 4) if imp else "?"
+                    neg_since = imp.negative_since if imp else "?"
                     if await auto_disconnect_peer(state, agent_id):
+                        # Queue self-notification so the agent knows what happened
+                        from darkmatter.models import QueuedMessage
+                        import uuid as _uuid
+                        note = QueuedMessage(
+                            message_id=f"trust-disconnect-{_uuid.uuid4().hex[:12]}",
+                            content=(
+                                f"Auto-disconnected {peer_name} ({agent_id[:16]}...) due to "
+                                f"sustained negative trust (score: {score}, negative since: {neg_since}). "
+                                f"The peer was notified. Reset their impression to reconnect."
+                            ),
+                            from_agent_id=state.agent_id,
+                            metadata={"type": "trust_disconnect_notice", "peer_id": agent_id},
+                            hops_remaining=0,
+                            verified=True,
+                        )
+                        state.message_queue.append(note)
                         save_state(agent_id=aid)
                 except Exception as e:
                     _log.error("Trust disconnect failed for %s...: %s", agent_id[:16], e)

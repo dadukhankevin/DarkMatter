@@ -154,13 +154,20 @@ async def auto_disconnect_peer(state: AgentState, agent_id: str) -> bool:
 
     if _network_send_fn:
         try:
+            imp = state.impressions.get(agent_id)
+            score = round(imp.score, 4) if imp else "?"
+            neg_since = imp.negative_since if imp else "?"
             await _network_send_fn(
                 agent_id,
                 "/__darkmatter__/message",
                 {
                     "message_id": f"disconnect-{uuid.uuid4().hex[:12]}",
-                    "content": "Auto-disconnecting due to sustained negative trust.",
-                    "metadata": {"type": "disconnect_announcement"},
+                    "content": (
+                        f"You have been auto-disconnected due to sustained negative trust "
+                        f"(score: {score}, negative since: {neg_since}). "
+                        f"Contact the agent directly to resolve and reconnect."
+                    ),
+                    "metadata": {"type": "trust_disconnect_notice", "peer_id": state.agent_id},
                     "from_agent_id": state.agent_id,
                 },
             )
@@ -176,7 +183,7 @@ async def auto_disconnect_peer(state: AgentState, agent_id: str) -> bool:
 # Delegate Selection
 # =============================================================================
 
-def select_delegate(state: AgentState) -> Optional[Connection]:
+def select_delegate(state: AgentState, exclude_agent_id: Optional[str] = None) -> Optional[Connection]:
     """Select a delegate for antimatter fees: random weighted by tenure * trust.
 
     The delegate must be older than this agent (created_at < state.created_at),
@@ -184,6 +191,7 @@ def select_delegate(state: AgentState) -> Optional[Connection]:
     Selection is random weighted by (age × trust_score) so older, more trusted
     peers are more likely chosen, but not deterministically — this prevents
     gaming by always targeting the same delegate.
+    exclude_agent_id: agent to exclude (e.g. the payment recipient — cannot be their own delegate).
     Returns the Connection, or None if no eligible peers.
     """
     import random
@@ -191,6 +199,8 @@ def select_delegate(state: AgentState) -> Optional[Connection]:
     candidates = []
 
     for aid, conn in state.connections.items():
+        if exclude_agent_id and aid == exclude_agent_id:
+            continue  # Recipient cannot be their own fee delegate
         if not conn.peer_created_at or not state.created_at:
             continue
         if conn.peer_created_at >= state.created_at:
@@ -213,6 +223,12 @@ def select_delegate(state: AgentState) -> Optional[Connection]:
         candidates.append((conn, weight))
 
     if not candidates:
+        # Fall back to configured delegate (e.g. bootstrap server)
+        from darkmatter.config import FALLBACK_DELEGATE_AGENT_ID
+        if FALLBACK_DELEGATE_AGENT_ID and FALLBACK_DELEGATE_AGENT_ID != exclude_agent_id:
+            fallback = state.connections.get(FALLBACK_DELEGATE_AGENT_ID)
+            if fallback and resolve_provider(fallback.wallets):
+                return fallback
         return None
 
     # Random weighted selection — older & more trusted peers are more likely
@@ -254,8 +270,8 @@ async def initiate_payment(state: AgentState, recipient_agent_id: str,
             return {"success": False, "error": "Recipient has no wallet with a supported chain"}
         chain, provider, recipient_wallet = resolved
 
-    # Select delegate — must have a wallet on the same chain
-    delegate = select_delegate(state)
+    # Select delegate — must have a wallet on the same chain (recipient excluded)
+    delegate = select_delegate(state, exclude_agent_id=recipient_agent_id)
     delegate_agent_id = delegate.agent_id if delegate else None
     delegate_wallet = delegate.wallets.get(chain) if delegate else None
 

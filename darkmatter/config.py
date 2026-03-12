@@ -152,6 +152,7 @@ TRUST_ANTIMATTER_STIFF = -0.1           # B paid nothing (timeout)
 TRUST_ANTIMATTER_LEGIT_DELEGATE = 0.03  # A chose elder delegate (older than A)
 TRUST_ANTIMATTER_GAMING = -0.05         # A chose younger-than-self delegate
 TRUST_NEGATIVE_TIMEOUT = 3600           # seconds of sustained negative trust before auto-disconnect
+FALLBACK_DELEGATE_AGENT_ID = os.environ.get("DARKMATTER_FALLBACK_DELEGATE_AGENT_ID", "")  # fallback fee delegate when no peer qualifies
 RECIPROCITY_GRACE_THRESHOLD = 5         # first N messages use full trust gain (ratio=1.0)
 TRUST_SEED_CAP = 0.5                    # max initial trust from peer recommendations
 
