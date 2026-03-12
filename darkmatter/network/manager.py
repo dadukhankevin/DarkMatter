@@ -157,31 +157,51 @@ class NetworkManager:
 
     # -- Core API --
 
+    # Paths that can be relayed through a mutual peer
+    RELAYABLE = frozenset((
+        "/__darkmatter__/message",
+        "/__darkmatter__/status_broadcast",
+        "/__darkmatter__/peer_update",
+        "/__darkmatter__/insight_push",
+    ))
+
     async def send(self, agent_id: str, path: str, payload: dict) -> SendResult:
-        """Send a message to a peer, trying transports in priority order.
+        """Send to a peer. Direct first, then relay. Fast — no recovery in hot path."""
+        conn = self._find_connection(agent_id)
+        if conn is None:
+            return SendResult(success=False, transport_name="none",
+                              error=f"No connection to {agent_id[:12]}...")
 
-        Searches across all hosted agents' connections to find the peer.
-        Tries each available transport. On first success, resets health_failures
-        and returns. On all failures, returns aggregate error.
-        """
+        # 1. Direct send — try each transport
+        result = await self._direct_send(conn, path, payload)
+        if result.success:
+            return result
+
+        # 2. Relay through a mutual peer
+        if path in self.RELAYABLE:
+            relay = await self._relay_send(agent_id, path, payload)
+            if relay.success:
+                return relay
+
+        return result  # Return the direct failure
+
+    def _find_connection(self, agent_id: str):
+        """Find a connection across all hosted agents."""
         from darkmatter.state import list_hosted_agents, get_state_for
-
-        # Search for connection across all hosted agents
-        conn = None
         state = self._get_state()
         if state:
             conn = state.connections.get(agent_id)
-        if conn is None:
-            for aid in list_hosted_agents():
-                s = get_state_for(aid)
-                if s and agent_id in s.connections:
-                    conn = s.connections[agent_id]
-                    break
-        if conn is None:
-            return SendResult(success=False, transport_name="none",
-                              error=f"No connection to agent {agent_id[:12]}...")
+            if conn:
+                return conn
+        for aid in list_hosted_agents():
+            s = get_state_for(aid)
+            if s and agent_id in s.connections:
+                return s.connections[agent_id]
+        return None
 
-        errors = []
+    async def _direct_send(self, conn, path: str, payload: dict) -> SendResult:
+        """Try each transport in priority order. Return first success or last failure."""
+        last = SendResult(success=False, transport_name="none", error="No transports")
         for transport in self._transports:
             if not transport.available:
                 continue
@@ -189,119 +209,55 @@ class NetworkManager:
             if result.success:
                 conn.health_failures = 0
                 return result
-            errors.append(f"{transport.name}: {result.error}")
+            last = result
+        return last
 
-        # Direct failed — relay through a mutual peer (fast, no reconnection attempt)
-        # Background reconnection happens in the ping loop, not in the send hot path
-        relay_result = await self._try_relay_send(state, agent_id, path, payload)
-        if relay_result is not None and relay_result.success:
-            return relay_result
-
-        return SendResult(
-            success=False,
-            transport_name="none",
-            error="; ".join(errors) if errors else "No transports available",
-        )
-
-    async def _try_relay_send(self, state, target_agent_id: str, path: str, payload: dict) -> Optional[SendResult]:
-        """Try to relay a message through a mutual peer when direct send fails.
-
-        Wraps the payload in a mesh_route envelope with route_type="message" and
-        sends it to the most trusted reachable peer, which will forward it to the target.
-        Only used for /__darkmatter__/message and /__darkmatter__/status_broadcast paths.
-        """
-        if state is None:
-            return None
-
-        # Only relay message-type paths — don't relay health checks, pings, etc.
-        relayable_paths = ("/__darkmatter__/message", "/__darkmatter__/status_broadcast",
-                           "/__darkmatter__/peer_update", "/__darkmatter__/insight_push")
-        if path not in relayable_paths:
-            return None
-
+    async def _relay_send(self, target_id: str, path: str, payload: dict) -> SendResult:
+        """Relay a message through the best reachable mutual peer."""
         import uuid
-        route_id = f"relay-{uuid.uuid4().hex[:12]}"
+        state = self._get_state()
+        if state is None:
+            return SendResult(success=False, transport_name="relay", error="No state")
 
-        # Build mesh_route envelope
-        imp = state.impressions.get(target_agent_id)
-        our_trust = imp.score if imp else 0.5
         envelope = {
-            "route_id": route_id,
+            "route_id": f"relay-{uuid.uuid4().hex[:12]}",
             "route_type": "message",
-            "target_agent_id": target_agent_id,
+            "target_agent_id": target_id,
             "source_agent_id": state.agent_id,
             "hops_remaining": 5,
             "visited": [state.agent_id],
-            "trust_chain": [{"agent_id": state.agent_id, "trust_to_next": round(our_trust, 3)}],
+            "trust_chain": [{"agent_id": state.agent_id, "trust_to_next": 0.5}],
             "payload": payload,
             "original_path": path,
         }
 
-        # Try each connected peer as a relay (most trusted first, skip the target itself)
-        candidates = [
-            (aid, conn) for aid, conn in state.connections.items()
-            if aid != target_agent_id
-        ]
-        candidates.sort(
-            key=lambda x: (state.impressions.get(x[0]).score if state.impressions.get(x[0]) else 0.0),
+        # Candidates: connected peers that aren't the target, sorted by trust
+        candidates = sorted(
+            [(aid, c) for aid, c in state.connections.items() if aid != target_id],
+            key=lambda x: getattr(state.impressions.get(x[0]), "score", 0),
             reverse=True,
         )
 
+        if not candidates:
+            return SendResult(success=False, transport_name="relay", error="No relay candidates")
+
+        _log.info("Relay: %d candidate(s) for %s...", len(candidates), target_id[:12])
+
         for relay_id, relay_conn in candidates:
-            try:
-                # Try direct HTTP to the relay (don't recurse through send() to avoid loops)
-                http_transport = self.get_transport("http")
-                if http_transport and http_transport.available:
-                    result = await http_transport.send(relay_conn, "/__darkmatter__/mesh_route", envelope)
-                    if result.success:
-                        resp = result.response or {}
-                        status = resp.get("status", "")
-                        if status in ("delivered", "forwarded_direct", "forwarded"):
-                            _log.info("Relay send to %s... via %s... succeeded (status=%s)",
-                                      target_agent_id[:12], relay_id[:12], status)
-                            return SendResult(
-                                success=True,
-                                transport_name=f"relay:{relay_id[:12]}",
-                                response=resp,
-                            )
-            except Exception as e:
-                _log.debug("Relay via %s... failed: %s", relay_id[:12], e)
+            name = relay_conn.agent_display_name or relay_id[:12]
+            result = await self._direct_send(relay_conn, "/__darkmatter__/mesh_route", envelope)
+            if not result.success:
+                _log.info("Relay via %s failed: %s", name, result.error)
                 continue
 
-        return None
+            status = (result.response or {}).get("status", "")
+            if status in ("delivered", "forwarded_direct", "forwarded"):
+                _log.info("Relay to %s... via %s succeeded (%s)", target_id[:12], name, status)
+                return SendResult(success=True, transport_name=f"relay:{name}", response=result.response)
 
-    async def _reestablish_p2p(self, state, conn) -> bool:
-        """Try to re-establish a direct P2P connection via a mutual peer.
+            _log.info("Relay via %s: unexpected status '%s'", name, status)
 
-        Uses WebRTC NAT punching through PeerRelaySignaling first (preferred),
-        then falls back to URL recovery + reconnect via mutual peer.
-        Returns True if a direct transport is now available.
-        """
-        if state is None or len(state.connections) < 2:
-            return False
-
-        peer_name = conn.agent_display_name or conn.agent_id[:12]
-
-        # 1. Try WebRTC NAT punch through a mutual peer
-        webrtc = self.get_transport("webrtc")
-        if webrtc and webrtc.available and conn.webrtc_channel is None:
-            from darkmatter.network.transports.webrtc import PeerRelaySignaling
-            _log.info("Attempting WebRTC NAT punch to %s via mutual peer...", peer_name)
-            success = await webrtc.upgrade(state, conn, PeerRelaySignaling())
-            if success:
-                conn._signaling_method = "peer_relay"
-                conn.connectivity_level, conn.connectivity_method = self.determine_connectivity_level(conn)
-                conn.health_failures = 0
-                _log.info("WebRTC NAT punch succeeded — direct P2P to %s re-established", peer_name)
-                return True
-
-        # 2. Try URL recovery via peer consensus + direct reconnect
-        reconnected = await self._attempt_reconnect(state, conn)
-        if reconnected:
-            _log.info("P2P reconnection to %s succeeded via URL recovery", peer_name)
-            return True
-
-        return False
+        return SendResult(success=False, transport_name="relay", error="All relay candidates failed")
 
     def preferred_transport_for(self, agent_id: str):
         """Return the first currently-usable transport for a peer, or None."""

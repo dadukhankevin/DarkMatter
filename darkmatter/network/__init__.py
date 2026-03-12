@@ -23,42 +23,35 @@ __all__ = [
 ]
 
 
-async def send_to_peer(conn, path: str, payload: dict, **kw) -> dict:
-    """Send a message to a peer, proxying through the daemon when possible.
+class SendError(Exception):
+    """Raised when a message cannot be delivered by any means."""
+    pass
 
-    The daemon has live connection objects with fresh URLs and WebRTC channels.
-    The MCP stdio session's in-memory copies can be stale, so we prefer the
-    daemon's send_proxy endpoint. Falls back to direct NetworkManager send
-    if the daemon is unreachable.
+
+async def send_to_peer(conn, path: str, payload: dict, **kw) -> dict:
+    """Send a message to a peer via the daemon.
+
+    The daemon has live connections (fresh URLs, WebRTC channels).
+    This is the only send path — no fallback to stale local state.
     """
     from darkmatter.config import DEFAULT_PORT
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
-    # Try daemon proxy first
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"http://127.0.0.1:{port}/__darkmatter__/send_proxy",
-                json={
-                    "target_agent_id": conn.agent_id,
-                    "path": path,
-                    "payload": payload,
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("success"):
-                    return data.get("response") or {"success": True, "transport": data.get("transport", "proxy")}
-                # Daemon processed but send failed — raise so caller sees the error
-                raise httpx.ConnectError(data.get("error", "Daemon send_proxy failed"))
-    except httpx.ConnectError:
-        raise  # Re-raise if daemon explicitly reported send failure
-    except Exception as e:
-        _log.debug("Daemon send_proxy unreachable, falling back to direct send: %s", e)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"http://127.0.0.1:{port}/__darkmatter__/send_proxy",
+            json={
+                "target_agent_id": conn.agent_id,
+                "path": path,
+                "payload": payload,
+            },
+        )
 
-    # Fallback: direct send via local NetworkManager
-    mgr = get_network_manager()
-    result = await mgr.send(conn.agent_id, path, payload)
-    if not result.success:
-        raise httpx.ConnectError(result.error)
-    return result.response or {"success": True, "transport": result.transport_name}
+    if resp.status_code != 200:
+        raise SendError(f"Daemon returned {resp.status_code}")
+
+    data = resp.json()
+    if data.get("success"):
+        return data.get("response") or {"success": True, "transport": data.get("transport", "proxy")}
+
+    raise SendError(data.get("error", "Send failed"))
