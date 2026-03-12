@@ -1431,7 +1431,7 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
     if not route_id or not target_agent_id or not source_agent_id:
         return {"error": "Missing required mesh_route fields"}, 400
 
-    if route_type != "connection_request":
+    if route_type not in ("connection_request", "message"):
         return {"error": f"Unknown route_type: {route_type}"}, 400
 
     # Dedup
@@ -1460,10 +1460,20 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
 
         # Chain trust floor — requests with insufficient transitive trust are dropped
         if chain_trust < MIN_CHAIN_TRUST:
-            _log.info("Mesh route: dropping connection_request from %s... — "
+            _log.info("Mesh route: dropping %s from %s... — "
                        "chain_trust %.6f < %.6f threshold",
-                       source_agent_id[:12], chain_trust, MIN_CHAIN_TRUST)
+                       route_type, source_agent_id[:12], chain_trust, MIN_CHAIN_TRUST)
             return {"status": "insufficient_trust", "route_id": route_id}, 200
+
+        if route_type == "message":
+            # Deliver the message locally — same as handle_message
+            _log.info("Mesh route: delivering message from %s... to local agent %s... "
+                       "(chain_trust=%.4f, hops=%d)",
+                       source_agent_id[:12], target_agent_id[:12],
+                       chain_trust, len(trust_chain))
+            enriched_payload = {**payload, "chain_trust": chain_trust, "mesh_routed": True}
+            result, status = await _process_incoming_message(target_state, enriched_payload)
+            return {"status": "delivered", "route_id": route_id, "delivery": result}, 200
 
         _log.info("Mesh route: delivering connection_request from %s... to local agent %s... "
                    "(chain_trust=%.4f, hops=%d)",
@@ -1505,28 +1515,42 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
     # --- Step 2: Am I connected to the target? Forward directly. ---
     target_conn = state.connections.get(target_agent_id)
     if target_conn:
-        # Add our trust for the target to the chain
-        imp = state.impressions.get(target_agent_id)
-        trust_score = imp.score if imp else 0.5
-        updated_chain = trust_chain + [{"agent_id": state.agent_id, "trust_to_next": round(trust_score, 3)}]
-
-        updated_visited = list(visited_set | {state.agent_id})
-        forwarded = {
-            **data,
-            "visited": updated_visited,
-            "trust_chain": updated_chain,
-            "hops_remaining": hops_remaining - 1,
-        }
-
-        _log.info("Mesh route: forwarding to connected target %s... (trust=%.2f)",
-                   target_agent_id[:12], trust_score)
         from darkmatter.network import send_to_peer
-        try:
-            await send_to_peer(target_conn, "/__darkmatter__/mesh_route", forwarded)
-            return {"status": "forwarded_direct", "route_id": route_id}, 200
-        except Exception as e:
-            _log.warning("Mesh route: direct forward to %s... failed: %s",
-                         target_agent_id[:12], e)
+
+        if route_type == "message":
+            # For messages, deliver directly to the target's original endpoint
+            # instead of wrapping in another mesh_route layer
+            original_path = data.get("original_path", "/__darkmatter__/message")
+            _log.info("Mesh route: delivering message to connected target %s... via %s",
+                       target_agent_id[:12], original_path)
+            try:
+                await send_to_peer(target_conn, original_path, payload)
+                return {"status": "delivered", "route_id": route_id}, 200
+            except Exception as e:
+                _log.warning("Mesh route: direct message delivery to %s... failed: %s",
+                             target_agent_id[:12], e)
+        else:
+            # For connection requests, forward the full mesh_route envelope
+            imp = state.impressions.get(target_agent_id)
+            trust_score = imp.score if imp else 0.5
+            updated_chain = trust_chain + [{"agent_id": state.agent_id, "trust_to_next": round(trust_score, 3)}]
+
+            updated_visited = list(visited_set | {state.agent_id})
+            forwarded = {
+                **data,
+                "visited": updated_visited,
+                "trust_chain": updated_chain,
+                "hops_remaining": hops_remaining - 1,
+            }
+
+            _log.info("Mesh route: forwarding to connected target %s... (trust=%.2f)",
+                       target_agent_id[:12], trust_score)
+            try:
+                await send_to_peer(target_conn, "/__darkmatter__/mesh_route", forwarded)
+                return {"status": "forwarded_direct", "route_id": route_id}, 200
+            except Exception as e:
+                _log.warning("Mesh route: direct forward to %s... failed: %s",
+                             target_agent_id[:12], e)
 
     # --- Step 3: Forward to most-trusted unvisited peer ---
     if hops_remaining <= 0:

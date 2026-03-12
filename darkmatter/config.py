@@ -60,11 +60,9 @@ DISCOVERY_LOCAL_PORTS = range(int(_disc_lo), int(_disc_hi) + 1)
 # Network Resilience
 # =============================================================================
 
-HEALTH_CHECK_INTERVAL = 60          # seconds between health check cycles
-HEALTH_FAILURE_THRESHOLD = 3        # failures before logging warning
-HEALTH_DORMANT_THRESHOLD = 9        # failures before marking peer dormant
-HEALTH_DORMANT_RETRY_CYCLES = 10   # dormant peers retry every N health cycles (~10 min)
-STALE_CONNECTION_AGE = 300          # seconds of inactivity before health-checking
+HEALTH_FAILURE_THRESHOLD = 3        # ping failures before attempting reconnect
+HEALTH_DORMANT_THRESHOLD = 9        # ping failures before marking peer dormant
+HEALTH_DORMANT_RETRY_CYCLES = 10   # dormant peers retry every N ping failures
 UPNP_PORT_RANGE = (30000, 60000)    # external port range for UPnP mappings
 PEER_LOOKUP_TIMEOUT = 5.0           # seconds to wait for peer_lookup responses
 PEER_LOOKUP_MAX_CONCURRENT = 50     # fan out peer_lookup to all connections
@@ -84,7 +82,7 @@ REQUEST_EXPIRY_S = int(os.environ.get("DARKMATTER_REQUEST_EXPIRY", "3600"))  # p
 # =============================================================================
 
 PEER_RELAY_SDP_TIMEOUT = 15         # seconds for peer-relayed SDP
-CONNECTIVITY_UPGRADE_INTERVAL = 120 # seconds between upgrade attempts
+MAINTENANCE_CYCLE_INTERVAL = 60    # run maintenance tasks every N ping cycles
 
 # =============================================================================
 # Rate Limiting

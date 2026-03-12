@@ -23,14 +23,12 @@ import httpx
 from darkmatter.config import (
     PEER_LOOKUP_TIMEOUT,
     PEER_LOOKUP_MAX_CONCURRENT,
-    HEALTH_CHECK_INTERVAL,
     HEALTH_FAILURE_THRESHOLD,
     HEALTH_DORMANT_THRESHOLD,
     HEALTH_DORMANT_RETRY_CYCLES,
-    STALE_CONNECTION_AGE,
     UPNP_PORT_RANGE,
     TRUST_NEGATIVE_TIMEOUT,
-    CONNECTIVITY_UPGRADE_INTERVAL,
+    MAINTENANCE_CYCLE_INTERVAL,
     PING_INTERVAL,
     PING_IP_WINDOW,
     PING_SILENCE_THRESHOLD,
@@ -193,11 +191,128 @@ class NetworkManager:
                 return result
             errors.append(f"{transport.name}: {result.error}")
 
+        # All direct transports failed — try to re-establish P2P via mutual peer
+        reestablished = await self._reestablish_p2p(state, conn)
+        if reestablished:
+            # Retry direct transports with the new connection
+            for transport in self._transports:
+                if not transport.available:
+                    continue
+                result = await transport.send(conn, path, payload)
+                if result.success:
+                    conn.health_failures = 0
+                    return result
+
+        # Last resort — relay message through a mutual peer
+        relay_result = await self._try_relay_send(state, agent_id, path, payload)
+        if relay_result is not None and relay_result.success:
+            return relay_result
+
         return SendResult(
             success=False,
             transport_name="none",
             error="; ".join(errors) if errors else "No transports available",
         )
+
+    async def _try_relay_send(self, state, target_agent_id: str, path: str, payload: dict) -> Optional[SendResult]:
+        """Try to relay a message through a mutual peer when direct send fails.
+
+        Wraps the payload in a mesh_route envelope with route_type="message" and
+        sends it to the most trusted reachable peer, which will forward it to the target.
+        Only used for /__darkmatter__/message and /__darkmatter__/status_broadcast paths.
+        """
+        if state is None:
+            return None
+
+        # Only relay message-type paths — don't relay health checks, pings, etc.
+        relayable_paths = ("/__darkmatter__/message", "/__darkmatter__/status_broadcast",
+                           "/__darkmatter__/peer_update", "/__darkmatter__/insight_push")
+        if path not in relayable_paths:
+            return None
+
+        import uuid
+        route_id = f"relay-{uuid.uuid4().hex[:12]}"
+
+        # Build mesh_route envelope
+        imp = state.impressions.get(target_agent_id)
+        our_trust = imp.score if imp else 0.5
+        envelope = {
+            "route_id": route_id,
+            "route_type": "message",
+            "target_agent_id": target_agent_id,
+            "source_agent_id": state.agent_id,
+            "hops_remaining": 5,
+            "visited": [state.agent_id],
+            "trust_chain": [{"agent_id": state.agent_id, "trust_to_next": round(our_trust, 3)}],
+            "payload": payload,
+            "original_path": path,
+        }
+
+        # Try each connected peer as a relay (most trusted first, skip the target itself)
+        candidates = [
+            (aid, conn) for aid, conn in state.connections.items()
+            if aid != target_agent_id
+        ]
+        candidates.sort(
+            key=lambda x: (state.impressions.get(x[0]).score if state.impressions.get(x[0]) else 0.0),
+            reverse=True,
+        )
+
+        for relay_id, relay_conn in candidates:
+            try:
+                # Try direct HTTP to the relay (don't recurse through send() to avoid loops)
+                http_transport = self.get_transport("http")
+                if http_transport and http_transport.available:
+                    result = await http_transport.send(relay_conn, "/__darkmatter__/mesh_route", envelope)
+                    if result.success:
+                        resp = result.response or {}
+                        status = resp.get("status", "")
+                        if status in ("delivered", "forwarded_direct", "forwarded"):
+                            _log.info("Relay send to %s... via %s... succeeded (status=%s)",
+                                      target_agent_id[:12], relay_id[:12], status)
+                            return SendResult(
+                                success=True,
+                                transport_name=f"relay:{relay_id[:12]}",
+                                response=resp,
+                            )
+            except Exception as e:
+                _log.debug("Relay via %s... failed: %s", relay_id[:12], e)
+                continue
+
+        return None
+
+    async def _reestablish_p2p(self, state, conn) -> bool:
+        """Try to re-establish a direct P2P connection via a mutual peer.
+
+        Uses WebRTC NAT punching through PeerRelaySignaling first (preferred),
+        then falls back to URL recovery + reconnect via mutual peer.
+        Returns True if a direct transport is now available.
+        """
+        if state is None or len(state.connections) < 2:
+            return False
+
+        peer_name = conn.agent_display_name or conn.agent_id[:12]
+
+        # 1. Try WebRTC NAT punch through a mutual peer
+        webrtc = self.get_transport("webrtc")
+        if webrtc and webrtc.available and conn.webrtc_channel is None:
+            from darkmatter.network.transports.webrtc import PeerRelaySignaling
+            _log.info("Attempting WebRTC NAT punch to %s via mutual peer...", peer_name)
+            success = await webrtc.upgrade(state, conn, PeerRelaySignaling())
+            if success:
+                conn._signaling_method = "peer_relay"
+                conn.connectivity_level, conn.connectivity_method = self.determine_connectivity_level(conn)
+                conn.health_failures = 0
+                _log.info("WebRTC NAT punch succeeded — direct P2P to %s re-established", peer_name)
+                return True
+
+        # 2. Try URL recovery via peer consensus + direct reconnect
+        reconnected = await self._attempt_reconnect(state, conn)
+        if reconnected:
+            _log.info("P2P reconnection to %s succeeded via URL recovery", peer_name)
+            return True
+
+        return False
 
     def preferred_transport_for(self, agent_id: str):
         """Return the first currently-usable transport for a peer, or None."""
@@ -431,14 +546,11 @@ class NetworkManager:
         # Discover public URL
         state.public_url = await self.discover_public_url()
 
-        # Start background tasks
-        self._tasks.append(asyncio.create_task(self._health_loop()))
-        self._tasks.append(asyncio.create_task(self._connectivity_upgrade_loop()))
+        # Start background tasks — ping loop is the single heartbeat that drives
+        # health detection, reconnection, IP tracking, and WebRTC upgrades
         self._tasks.append(asyncio.create_task(self._ping_loop()))
         self._tasks.append(asyncio.create_task(self._bootstrap_loop()))
-        _log.info("Network health loop: ENABLED (%ss interval)", HEALTH_CHECK_INTERVAL)
-        _log.info("Connectivity upgrade loop: ENABLED (%ss interval)", CONNECTIVITY_UPGRADE_INTERVAL)
-        _log.info("Peer ping loop: ENABLED (%ss interval)", PING_INTERVAL)
+        _log.info("Ping loop: ENABLED (%ss interval, drives health + upgrades)", PING_INTERVAL)
         if not BOOTSTRAP_MODE and BOOTSTRAP_PEERS:
             _log.info("Bootstrap loop: ENABLED (peers: %s)", ", ".join(BOOTSTRAP_PEERS))
         elif BOOTSTRAP_MODE:
@@ -473,32 +585,6 @@ class NetworkManager:
             state._upnp_mapping = None
 
     # -- Background loops (internal) --
-
-    async def _health_loop(self) -> None:
-        """Periodically check connection health."""
-        while True:
-            try:
-                await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-
-                # Connection health checks
-                await self._check_connection_health()
-
-                # WebRTC dead channel cleanup
-                await self._cleanup_dead_webrtc()
-
-                # Trust-based auto-disconnect
-                await self._check_trust_disconnects()
-
-                # Insight cache cleanup
-                self._prune_stale_insights()
-
-                # Update connectivity levels on all connections
-                self.update_connectivity_levels()
-
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                _log.error("Health loop error: %s", e)
 
     async def _attempt_reconnect(self, state, conn) -> bool:
         """Try to reconnect to a peer via URL recovery and LAN discovery.
@@ -573,12 +659,8 @@ class NetworkManager:
 
         return False
 
-    async def _check_connection_health(self) -> None:
-        """Check health of all stale connections across all hosted agents.
-
-        Includes active reconnection at HEALTH_FAILURE_THRESHOLD and
-        dormancy marking at HEALTH_DORMANT_THRESHOLD.
-        """
+    def _all_connections(self) -> list[tuple]:
+        """Collect (state, conn) pairs across all hosted agents."""
         from darkmatter.state import list_hosted_agents, get_state_for
 
         all_conns = []
@@ -588,83 +670,12 @@ class NetworkManager:
                 for conn in s.connections.values():
                     all_conns.append((s, conn))
 
-        # Fallback for single-agent mode
         if not all_conns:
             state = self._get_state()
             if state:
                 all_conns = [(state, c) for c in state.connections.values()]
 
-        for state, conn in all_conns:
-            is_dormant = getattr(conn, "_dormant", False)
-
-            # Dormant peers: only retry every N health cycles
-            if is_dormant:
-                cycle = getattr(conn, "_dormant_cycle", 0) + 1
-                conn._dormant_cycle = cycle
-                if cycle % HEALTH_DORMANT_RETRY_CYCLES != 0:
-                    continue
-                # Time for a dormant retry
-                _log.info("Dormant retry for %s... (cycle %d)",
-                          conn.agent_id[:12], cycle)
-
-            # Skip recently active connections
-            if conn.last_activity and not is_dormant:
-                try:
-                    last = datetime.fromisoformat(conn.last_activity.replace("Z", "+00:00"))
-                    age = (datetime.now(timezone.utc) - last).total_seconds()
-                    if age < STALE_CONNECTION_AGE:
-                        continue
-                except Exception:
-                    pass
-
-            # Check reachability via all transports
-            reachable = False
-            for transport in self._transports:
-                if not transport.available:
-                    continue
-                if await transport.is_reachable(conn):
-                    reachable = True
-                    conn.health_failures = 0
-                    if is_dormant:
-                        conn._dormant = False
-                        conn._dormant_cycle = 0
-                        _log.info("Peer %s... recovered from dormant state", conn.agent_id[:12])
-                    # Try to upgrade to a better transport
-                    if conn.transport == "http":
-                        webrtc = self.get_transport("webrtc")
-                        if webrtc and webrtc.available:
-                            asyncio.create_task(webrtc.upgrade(state, conn))
-                    break
-
-            if not reachable:
-                conn.health_failures += 1
-
-                # At threshold: attempt active reconnection
-                if conn.health_failures == HEALTH_FAILURE_THRESHOLD:
-                    _log.warning(
-                        "Connection %s... unhealthy (%d failures), attempting reconnect...",
-                        conn.agent_id[:12], conn.health_failures,
-                    )
-                    reconnected = await self._attempt_reconnect(state, conn)
-                    if reconnected:
-                        if is_dormant:
-                            conn._dormant = False
-                            conn._dormant_cycle = 0
-                        continue
-
-                # At dormant threshold: mark as dormant
-                if conn.health_failures >= HEALTH_DORMANT_THRESHOLD and not is_dormant:
-                    conn._dormant = True
-                    conn._dormant_cycle = 0
-                    _log.warning(
-                        "Connection %s... marked dormant (%d failures, url=%s)",
-                        conn.agent_id[:12], conn.health_failures, conn.agent_url,
-                    )
-                elif conn.health_failures >= HEALTH_FAILURE_THRESHOLD and not is_dormant:
-                    _log.warning(
-                        "Connection %s... unhealthy (%d failures, url=%s)",
-                        conn.agent_id[:12], conn.health_failures, conn.agent_url,
-                    )
+        return all_conns
 
     async def _cleanup_dead_webrtc(self) -> None:
         """Detect dead WebRTC channels, clean up, and downgrade to HTTP.
@@ -804,91 +815,45 @@ class NetworkManager:
 
     # -- Connectivity upgrade loop --
 
-    async def _connectivity_upgrade_loop(self) -> None:
-        """Periodically try to upgrade connections to better connectivity levels across all agents."""
-        while True:
-            try:
-                await asyncio.sleep(CONNECTIVITY_UPGRADE_INTERVAL)
-                from darkmatter.state import list_hosted_agents, get_state_for
-
-                webrtc = self.get_transport("webrtc")
-                if not webrtc or not webrtc.available:
-                    continue
-
-                for aid in list_hosted_agents():
-                    state = get_state_for(aid)
-                    if state is None:
-                        continue
-
-                    for conn in list(state.connections.values()):
-                        level, _ = self.determine_connectivity_level(conn)
-
-                        if level <= 2:
-                            continue
-
-                        if conn.agent_id in state.discovered_peers:
-                            from darkmatter.network.transports.webrtc import LANSignaling
-                            success = await webrtc.upgrade(state, conn, LANSignaling())
-                            if success:
-                                conn._signaling_method = "lan"
-                                lvl, meth = self.determine_connectivity_level(conn)
-                                conn.connectivity_level = lvl
-                                conn.connectivity_method = meth
-                                peer = conn.agent_display_name or conn.agent_id[:12]
-                                _log.info("Upgraded %s to L%s:%s", peer, lvl, meth)
-                                continue
-
-                        if level > 3 and len(state.connections) > 1:
-                            from darkmatter.network.transports.webrtc import PeerRelaySignaling
-                            success = await webrtc.upgrade(state, conn, PeerRelaySignaling())
-                            if success:
-                                conn._signaling_method = "peer_relay"
-                                lvl, meth = self.determine_connectivity_level(conn)
-                                conn.connectivity_level = lvl
-                                conn.connectivity_method = meth
-                                peer = conn.agent_display_name or conn.agent_id[:12]
-                                _log.info("Upgraded %s to L%s:%s", peer, lvl, meth)
-
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                _log.error("Connectivity upgrade loop error: %s", e)
-
-    # -- Relay polling (SDP + messages) --
-
-    # -- Peer Ping Loop --
+    # -- Consolidated Ping Loop --
+    #
+    # Single heartbeat that drives everything: health detection, IP tracking,
+    # reconnection, WebRTC upgrades, and periodic maintenance.
+    # Pings one random peer every PING_INTERVAL (~1s).
 
     async def _ping_loop(self) -> None:
-        """Periodically ping a random connected peer to detect IP changes.
+        """Ping a random peer every interval. This is the only background loop.
 
-        Each peer's ping response includes `your_ip` — the IP they see us on.
-        We track these observations in a sliding window and broadcast a peer
-        update if the majority IP changes.
+        On success: track IP, update last_activity, try WebRTC upgrade.
+        On failure: increment health_failures, trigger reconnection.
+        Periodically: cleanup dead WebRTC, trust disconnects, insight pruning.
         """
+        cycle = 0
+
         while True:
             try:
                 await asyncio.sleep(PING_INTERVAL)
+                cycle += 1
 
-                # Collect all connections across all hosted agents
-                from darkmatter.state import list_hosted_agents, get_state_for
-                all_conns = []
-                for aid in list_hosted_agents():
-                    s = get_state_for(aid)
-                    if s:
-                        all_conns.extend(s.connections.values())
-
-                # Fallback
-                if not all_conns:
-                    state = self._get_state()
-                    if state and state.connections:
-                        all_conns = list(state.connections.values())
-
+                all_conns = self._all_connections()
                 if not all_conns:
                     continue
 
-                conn = random.choice(all_conns)
-                state = self._get_state()
+                state, conn = random.choice(all_conns)
+                is_dormant = getattr(conn, "_dormant", False)
+
+                # Dormant peers: skip most pings, only retry periodically
+                if is_dormant:
+                    dormant_cycle = getattr(conn, "_dormant_cycle", 0) + 1
+                    conn._dormant_cycle = dormant_cycle
+                    if dormant_cycle % HEALTH_DORMANT_RETRY_CYCLES != 0:
+                        continue
+                    _log.info("Dormant retry for %s... (cycle %d)",
+                              conn.agent_id[:12], dormant_cycle)
+
+                # Ping the peer
                 base_url = strip_base_url(conn.agent_url)
+                ping_ok = False
 
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as client:
@@ -900,57 +865,96 @@ class NetworkManager:
                             },
                         )
                         if resp.status_code == 200:
+                            ping_ok = True
                             data = resp.json()
+
+                            # Track observed IP
                             observed_ip = data.get("your_ip")
                             if observed_ip and observed_ip != "unknown":
                                 now = time.time()
                                 self._observed_ips.append((now, observed_ip))
-
-                                # Prune old observations
                                 cutoff = now - PING_IP_WINDOW
                                 while self._observed_ips and self._observed_ips[0][0] < cutoff:
                                     self._observed_ips.popleft()
 
-                                # Check for majority IP
                                 majority_ip = self._get_majority_ip()
                                 if majority_ip and majority_ip != self._last_known_ip:
                                     old_ip = self._last_known_ip
                                     self._last_known_ip = majority_ip
                                     if old_ip is not None:
-                                        _log.info("Public IP changed (ping): %s -> %s", old_ip, majority_ip)
+                                        _log.info("Public IP changed: %s -> %s", old_ip, majority_ip)
                                         state.public_url = await self.discover_public_url()
                                         await self.broadcast_peer_update()
                                     else:
-                                        _log.info("Public IP detected (ping): %s", majority_ip)
+                                        _log.info("Public IP detected: %s", majority_ip)
 
-                            # Update last_activity on the connection
                             conn.last_activity = datetime.now(timezone.utc).isoformat()
                 except Exception:
-                    pass  # Best-effort — don't spam errors for pings
+                    pass
 
-                # Check for inbound ping silence — no peers have pinged us
+                if ping_ok:
+                    # --- Ping succeeded ---
+                    conn.health_failures = 0
+                    if is_dormant:
+                        conn._dormant = False
+                        conn._dormant_cycle = 0
+                        peer = conn.agent_display_name or conn.agent_id[:12]
+                        _log.info("Peer %s recovered from dormant", peer)
+
+                    # Try WebRTC upgrade if still on HTTP
+                    if conn.transport == "http" and conn.webrtc_channel is None:
+                        webrtc = self.get_transport("webrtc")
+                        if webrtc and webrtc.available:
+                            if conn.agent_id in state.discovered_peers:
+                                from darkmatter.network.transports.webrtc import LANSignaling
+                                asyncio.create_task(webrtc.upgrade(state, conn, LANSignaling()))
+                            else:
+                                asyncio.create_task(webrtc.upgrade(state, conn))
+                else:
+                    # --- Ping failed ---
+                    conn.health_failures = getattr(conn, "health_failures", 0) + 1
+                    peer = conn.agent_display_name or conn.agent_id[:12]
+
+                    if conn.health_failures == HEALTH_FAILURE_THRESHOLD:
+                        _log.warning("Peer %s unreachable (%d failures), reconnecting...",
+                                     peer, conn.health_failures)
+                        reconnected = await self._attempt_reconnect(state, conn)
+                        if reconnected:
+                            conn._dormant = False
+                            conn._dormant_cycle = 0
+
+                    elif conn.health_failures >= HEALTH_DORMANT_THRESHOLD and not is_dormant:
+                        conn._dormant = True
+                        conn._dormant_cycle = 0
+                        _log.warning("Peer %s marked dormant (%d failures)", peer, conn.health_failures)
+
+                # Inbound ping silence detection
                 if (self._last_inbound_ping > 0 and
                         time.time() - self._last_inbound_ping > PING_SILENCE_THRESHOLD and
                         len(state.connections) > 0):
-                    _log.info("Ping silence detected (>%ds) — re-discovering public URL", PING_SILENCE_THRESHOLD)
+                    _log.info("Ping silence (>%ds) — re-discovering URL", PING_SILENCE_THRESHOLD)
                     try:
                         new_url = await self.discover_public_url()
                         if new_url != state.public_url:
-                            _log.info("Public URL changed after ping silence: %s -> %s",
-                                      state.public_url, new_url)
+                            _log.info("URL changed: %s -> %s", state.public_url, new_url)
                             state.public_url = new_url
                         await self.broadcast_peer_update()
-                        # Verify bootstrap peer reachability
                         for bp_url in BOOTSTRAP_PEERS:
                             try:
                                 async with httpx.AsyncClient(timeout=5.0) as bc:
                                     await bc.get(f"{bp_url.rstrip('/')}/__darkmatter__/status")
                             except Exception:
-                                _log.warning("Bootstrap peer %s unreachable during ping silence", bp_url)
+                                _log.warning("Bootstrap %s unreachable", bp_url)
                     except Exception as e:
                         _log.error("Ping silence recovery failed: %s", e)
-                    # Reset timer to avoid spamming recovery
                     self._last_inbound_ping = time.time()
+
+                # Periodic maintenance (every ~60s)
+                if cycle % MAINTENANCE_CYCLE_INTERVAL == 0:
+                    await self._cleanup_dead_webrtc()
+                    await self._check_trust_disconnects()
+                    self._prune_stale_insights()
+                    self.update_connectivity_levels()
 
             except asyncio.CancelledError:
                 return
@@ -965,7 +969,6 @@ class NetworkManager:
         for _, ip in self._observed_ips:
             counts[ip] = counts.get(ip, 0) + 1
         best_ip = max(counts, key=counts.get)
-        # Require majority (>50% of observations)
         if counts[best_ip] > len(self._observed_ips) / 2:
             return best_ip
         return None
