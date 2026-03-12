@@ -343,7 +343,13 @@ class NetworkManager:
             _log.info("Public URL (env): %s", env_url)
             return env_url
 
-        result = await asyncio.to_thread(try_upnp_mapping, port)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(try_upnp_mapping, port), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            _log.warning("UPnP mapping timed out after 10s, skipping")
+            result = None
         if result is not None:
             url, upnp_obj, ext_port = result
             if state is not None:

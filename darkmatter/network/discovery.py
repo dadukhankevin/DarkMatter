@@ -399,16 +399,30 @@ def _dynamic_port_set(state: AgentState) -> set[int]:
 
 
 async def scan_local_ports(state: AgentState) -> None:
-    """Scan localhost ports + LAN subnet for other DarkMatter nodes."""
+    """Scan localhost ports + LAN subnet for other DarkMatter nodes.
+
+    Localhost: full port range (8100-8200), all concurrent (fast loopback).
+    LAN: only key ports (8100, 8101, 8200) with concurrency cap to avoid
+    flooding the event loop (~762 probes max vs 25k+ before).
+    """
+    # Concurrency limiter for LAN probes — prevent event loop starvation
+    lan_semaphore = asyncio.Semaphore(20)
+
+    async def _throttled_probe(client, state, port, host):
+        async with lan_semaphore:
+            await probe_port(client, state, port, host=host)
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(0.5, connect=0.25)) as client:
+        # Localhost: scan full range (loopback is fast, no throttle needed)
         tasks = [
             probe_port(client, state, port)
             for port in DISCOVERY_LOCAL_PORTS
             if port != state.port
         ]
 
-        # Scan LAN /24 subnet on the full discovery port range
-        # (agents listen on local ports like 8100-8200, NOT their UPnP external ports)
+        # LAN: scan /24 subnet but only key ports, throttled
+        # Agents listen on 8100 (default), 8101 (second agent), 8200 (entrypoint)
+        lan_ports = _dynamic_port_set(state) | {DEFAULT_PORT, DEFAULT_PORT + 1, 8200}
         lan_ip = _get_lan_ip()
         if lan_ip != "127.0.0.1":
             subnet_prefix = lan_ip.rsplit(".", 1)[0]
@@ -416,8 +430,9 @@ async def scan_local_ports(state: AgentState) -> None:
                 ip = f"{subnet_prefix}.{host_octet}"
                 if ip == lan_ip:
                     continue
-                for p in DISCOVERY_LOCAL_PORTS:
-                    tasks.append(probe_port(client, state, p, host=ip))
+                for p in lan_ports:
+                    if p != state.port or ip != lan_ip:
+                        tasks.append(_throttled_probe(client, state, p, host=ip))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
