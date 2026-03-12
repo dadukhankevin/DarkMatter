@@ -861,13 +861,18 @@ async def _push_insight_to_peers(state, insight) -> list[str]:
         )
         eligible = ranked[:insight.share_with_top_n]
 
-    for aid, conn in eligible:
+    import asyncio
+
+    async def _push_one(aid, conn):
         try:
             await send_to_peer(conn, "/__darkmatter__/insight_push", insight_payload)
-            pushed_to.append(aid)
+            return aid
         except Exception as e:
             _log.warning("Failed to push insight %s to peer %s: %s", insight.insight_id, aid, e)
-    return pushed_to
+            return None
+
+    results = await asyncio.gather(*[_push_one(aid, conn) for aid, conn in eligible])
+    return [aid for aid in results if aid is not None]
 
 
 @mcp.tool(
