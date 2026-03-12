@@ -77,6 +77,15 @@ from darkmatter.logging import get_logger
 _log = get_logger("mesh")
 
 
+def _extract_host(url: str) -> Optional[str]:
+    """Extract hostname from a URL, stripping port and path."""
+    from urllib.parse import urlparse
+    try:
+        return urlparse(url).hostname
+    except Exception:
+        return None
+
+
 # =============================================================================
 # Route Access Control
 # =============================================================================
@@ -1141,7 +1150,29 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
             return {"error": "Invalid signature"}, 403
 
     old_url = conn.agent_url
-    conn.agent_url = new_url
+
+    # Same-NAT detection: if peer shares our public IP, use their LAN address
+    # (hairpin NAT workaround — most consumer routers can't route to own external IP)
+    peer_lan_ip = data.get("lan_ip")
+    peer_local_port = data.get("local_port")
+    effective_url = new_url
+    if peer_lan_ip and peer_local_port:
+        from darkmatter.network.manager import is_local_url, get_network_manager
+        try:
+            mgr = get_network_manager()
+            our_public_ip = _extract_host(state.public_url) if state.public_url else None
+            peer_public_ip = _extract_host(new_url)
+            if (our_public_ip and peer_public_ip and
+                    our_public_ip == peer_public_ip and
+                    not is_local_url(new_url)):
+                lan_url = f"http://{peer_lan_ip}:{peer_local_port}"
+                _log.info("Same-NAT peer %s... — using LAN URL %s instead of %s",
+                          agent_id[:12], lan_url, new_url)
+                effective_url = lan_url
+        except Exception as e:
+            _log.debug("Same-NAT detection failed: %s", e)
+
+    conn.agent_url = effective_url
 
     addresses = data.get("addresses")
     if addresses and isinstance(addresses, dict):

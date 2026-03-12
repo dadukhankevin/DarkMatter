@@ -406,6 +406,9 @@ class NetworkManager:
                     "timestamp": timestamp,
                     "bio": _state.bio,
                     "display_name": _state.display_name,
+                    # LAN info for same-network peers (hairpin NAT workaround)
+                    "lan_ip": lan_ip,
+                    "local_port": _state.port,
                 }
                 if _state.public_key_hex:
                     p["public_key_hex"] = _state.public_key_hex

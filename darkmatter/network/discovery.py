@@ -407,10 +407,8 @@ async def scan_local_ports(state: AgentState) -> None:
             if port != state.port
         ]
 
-        # Build dynamic port set for LAN scanning
-        lan_ports = _dynamic_port_set(state)
-
-        # Scan LAN /24 subnet on dynamic port set
+        # Scan LAN /24 subnet on the full discovery port range
+        # (agents listen on local ports like 8100-8200, NOT their UPnP external ports)
         lan_ip = _get_lan_ip()
         if lan_ip != "127.0.0.1":
             subnet_prefix = lan_ip.rsplit(".", 1)[0]
@@ -418,7 +416,7 @@ async def scan_local_ports(state: AgentState) -> None:
                 ip = f"{subnet_prefix}.{host_octet}"
                 if ip == lan_ip:
                     continue
-                for p in lan_ports:
+                for p in DISCOVERY_LOCAL_PORTS:
                     tasks.append(probe_port(client, state, p, host=ip))
 
         await asyncio.gather(*tasks, return_exceptions=True)
