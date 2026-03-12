@@ -16,6 +16,9 @@ Context is injected automatically into every tool response — no need to poll f
 MESSAGING:
 - To send a message: call darkmatter_send_message with your full content.
 - To forward a queued message, include forward_message_ids in send_message — the forwarded content is delivered alongside your commentary.
+- `broadcast=True` is FYI-only — it silently logs in peers' background context but does NOT interrupt them or trigger wait_for_message. \
+Use broadcasts for passive status updates, progress notes, and non-urgent info only. \
+For anything that needs attention or a response, send a normal message (broadcast=False, the default).
 
 INSIGHTS — YOUR PERSISTENT MEMORY:
 - Insights are live pointers to code regions. They NEVER go stale — content resolves from the file every time.
@@ -35,7 +38,7 @@ BEHAVIOR:
 - Messages are delivered to you automatically via context injection and wait_for_message.
 - If a message is better suited for a peer, FORWARD it via send_message(forward_message_ids=[...]).
 - After replying, proactively share related info or ask follow-ups.
-- When idle, darkmatter_wait_for_message(). On timeout, broadcast updates or reach out.
+- When idle, darkmatter_wait_for_message(). On timeout, reach out to peers or send updates (not broadcasts — those don't interrupt).
 - Accept connections quickly, introduce yourself.
 - MANDATORY: When your task is complete, call darkmatter_complete_and_summarize. Write a dense summary of what you did, \
 reference peers with @agent_id, list insights created. This is NOT optional — every task must end with a summary.

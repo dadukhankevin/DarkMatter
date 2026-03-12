@@ -39,7 +39,7 @@ class SendMessageInput(BaseModel):
     forward_message_ids: Optional[list[str]] = Field(default=None, description="Queue message IDs to forward with this message. Content is included in delivery and messages are consumed from inbox.")
     hops_remaining: int = Field(default=10, ge=1, le=50, description="TTL for mesh routing")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
-    broadcast: bool = Field(default=False, description="Passive broadcast — logged in peers' context but doesn't trigger wait_for_message. Use for status updates, progress, FYI.")
+    broadcast: bool = Field(default=False, description="FYI-only mode — appears in peers' background context but does NOT interrupt them or trigger wait_for_message. Use for passive status updates, progress notes, and non-urgent info. For messages that need attention or a response, leave this False.")
     share_with_top_n: int = Field(default=-1, ge=-1, description="For broadcasts: -1 = all connected peers, N = top N by trust score. Ignored for direct messages.")
 
 

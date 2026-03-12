@@ -357,8 +357,10 @@ async def _connection_disconnect(state, agent_id: str) -> str:
 async def _send_message(state, params: SendMessageInput) -> str:
     """Send a message to one or more connected agents (single-shot delivery).
 
-    If broadcast=True, sends as a passive status_broadcast — logged in peers'
-    context but does NOT trigger wait_for_message or land in their inbox.
+    If broadcast=True, sends as an FYI-only status_broadcast — silently logged in
+    peers' background context. Does NOT interrupt them, trigger wait_for_message,
+    or land in their inbox. Peers see broadcasts next time they check context.
+    For messages that need attention, leave broadcast=False.
     """
     message_id = f"msg-{uuid.uuid4().hex[:12]}"
     metadata = params.metadata or {}
@@ -608,9 +610,11 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
     """Send a message to connected agents. Include your full message in content.
 
-    Set broadcast=True for passive updates (progress, FYI) — peers see it in their
-    context but it doesn't trigger wait_for_message. Use share_with_top_n to limit
-    broadcasts to your most trusted peers (-1 = all, N = top N by trust score).
+    Set broadcast=True for FYI-only updates (progress, status) — these appear in
+    peers' background context but do NOT interrupt them or trigger wait_for_message.
+    Broadcasts are silent — peers see them next time they check context, not immediately.
+    For messages that need attention or a response, leave broadcast=False (default).
+    Use share_with_top_n to limit broadcasts to your most trusted peers (-1 = all, N = top N by trust score).
     """
     track_session(ctx)
     state = get_state()
@@ -1167,7 +1171,8 @@ async def wait_for_message(
 ) -> str:
     """Block until a new inbox message arrives. Consumes and returns all matching messages.
 
-    Use darkmatter_send_message(broadcast=True) for passive status updates to peers.
+    Use darkmatter_send_message(broadcast=True) for FYI-only updates that don't need a response.
+    Broadcasts are silent — they won't trigger this function on the receiving end.
     """
     state = get_state()
     daemon_port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
@@ -1220,7 +1225,7 @@ async def wait_for_message(
             "success": False,
             "timed_out": True,
             "error": f"No message{filter_desc} received after {mins} minutes.",
-            "action": "Proactively reach out to peers, share updates, or broadcast. Then resume listening with darkmatter_wait_for_message.",
+            "action": "Proactively reach out to peers or share updates. Use broadcast=True only for FYI/passive info — it won't interrupt peers. Then resume listening with darkmatter_wait_for_message.",
         })
     finally:
         state._is_waiting = False
