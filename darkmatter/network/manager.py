@@ -76,7 +76,14 @@ def try_upnp_mapping(local_port: int) -> Optional[tuple]:
         import miniupnpc
         upnp = miniupnpc.UPnP()
         upnp.discoverdelay = 2000
-        devices = upnp.discover()
+        try:
+            devices = upnp.discover()
+        except Exception as disc_err:
+            # miniupnpc 2.3.x raises Exception("Success") on successful discovery
+            if "success" in str(disc_err).lower():
+                devices = 1
+            else:
+                raise
         if devices == 0:
             return None
         upnp.selectigd()
@@ -408,6 +415,7 @@ class NetworkManager:
                     )
                 return p
 
+            failed_peers = []
             for conn in list(state.connections.values()):
                 try:
                     # Local peers get our LAN URL; remote peers get the public URL
@@ -417,8 +425,57 @@ class NetworkManager:
                         conn.agent_id, "/__darkmatter__/peer_update", payload)
                     if not result.success:
                         _log.warning("Failed to notify %s... of URL change: %s", conn.agent_id[:12], result.error)
+                        failed_peers.append((state, conn, _build_payload))
                 except Exception as e:
                     _log.warning("Failed to notify %s... of URL change: %s", conn.agent_id[:12], e)
+                    failed_peers.append((state, conn, _build_payload))
+
+            if failed_peers:
+                asyncio.create_task(self._retry_peer_update(failed_peers))
+
+    async def _retry_peer_update(self, failed_peers: list) -> None:
+        """Background retry for peers that failed during broadcast_peer_update.
+
+        Attempts 3 retries with increasing backoff (5s, 15s, 30s).
+        Before each retry, tries URL recovery via peer consensus.
+        """
+        backoffs = [5, 15, 30]
+        remaining = list(failed_peers)
+
+        for attempt, delay in enumerate(backoffs, 1):
+            if not remaining:
+                break
+            await asyncio.sleep(delay)
+
+            still_failed = []
+            for state, conn, build_payload in remaining:
+                peer_name = conn.agent_display_name or conn.agent_id[:12]
+                try:
+                    # Try to recover URL via mutual peers first
+                    reconnected = await self._attempt_reconnect(state, conn)
+                    if reconnected:
+                        _log.info("Retry broadcast: recovered %s on attempt %d", peer_name, attempt)
+                        continue
+
+                    # Re-send peer_update with current URL
+                    peer_url = conn.agent_url
+                    payload = build_payload(peer_url, state)
+                    result = await self.send(
+                        conn.agent_id, "/__darkmatter__/peer_update", payload)
+                    if result.success:
+                        _log.info("Retry broadcast: notified %s on attempt %d", peer_name, attempt)
+                    else:
+                        _log.debug("Retry broadcast: %s still unreachable (attempt %d)", peer_name, attempt)
+                        still_failed.append((state, conn, build_payload))
+                except Exception as e:
+                    _log.debug("Retry broadcast: %s failed (attempt %d): %s", peer_name, attempt, e)
+                    still_failed.append((state, conn, build_payload))
+
+            remaining = still_failed
+
+        if remaining:
+            names = [c.agent_display_name or c.agent_id[:12] for _, c, _ in remaining]
+            _log.warning("Retry broadcast: gave up on %d peers: %s", len(remaining), ", ".join(names))
 
     async def lookup_peer_url(self, target_agent_id: str,
                               exclude_urls: Optional[set[str]] = None) -> Optional[str]:
@@ -857,12 +914,25 @@ class NetworkManager:
                                 asyncio.create_task(webrtc.upgrade(state, conn, LANSignaling()))
                             else:
                                 asyncio.create_task(webrtc.upgrade(state, conn))
+                elif is_dormant:
+                    # --- Dormant ping failed — try URL recovery ---
+                    peer = conn.agent_display_name or conn.agent_id[:12]
+                    _log.info("Dormant peer %s ping failed, attempting reconnect via consensus", peer)
+                    reconnected = await self._attempt_reconnect(state, conn)
+                    if reconnected:
+                        conn._dormant = False
+                        conn._dormant_cycle = 0
+                        conn.health_failures = 0
+                        _log.info("Dormant peer %s recovered via consensus lookup", peer)
+
                 else:
                     # --- Ping failed ---
                     conn.health_failures = getattr(conn, "health_failures", 0) + 1
                     peer = conn.agent_display_name or conn.agent_id[:12]
 
-                    if conn.health_failures == HEALTH_FAILURE_THRESHOLD:
+                    if (conn.health_failures >= HEALTH_FAILURE_THRESHOLD and
+                            conn.health_failures % HEALTH_FAILURE_THRESHOLD == 0 and
+                            conn.health_failures < HEALTH_DORMANT_THRESHOLD):
                         _log.warning("Peer %s unreachable (%d failures), reconnecting...",
                                      peer, conn.health_failures)
                         reconnected = await self._attempt_reconnect(state, conn)
