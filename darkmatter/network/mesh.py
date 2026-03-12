@@ -836,6 +836,10 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if not from_agent_id:
         return {"error": "Missing from_agent_id."}, 400
 
+    # Reject messages from self (prevents echo loops)
+    if from_agent_id == state.agent_id:
+        return {"error": "Rejecting message from self"}, 400
+
     # Rate limit check (only applied to connected agents)
     conn_for_rate = state.connections.get(from_agent_id)
     rate_err = check_rate_limit(state, conn_for_rate)
