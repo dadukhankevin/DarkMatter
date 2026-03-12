@@ -138,6 +138,7 @@ CONTEXT_PIGGYBACK_MAX = 5          # max entries injected into tool responses
 OWN_INSIGHT_MAX = 200               # max insights created by this agent (oldest pruned on overflow)
 PEER_INSIGHT_CACHE_MAX = 500        # max peer-cached insights (oldest pruned on overflow)
 INSIGHT_CACHE_TTL = 86400           # 24h
+ACCEPT_INSIGHTS = os.environ.get("DARKMATTER_ACCEPT_INSIGHTS", "true").lower() != "false"
 
 # =============================================================================
 # Trust Dynamics

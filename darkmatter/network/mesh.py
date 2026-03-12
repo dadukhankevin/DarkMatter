@@ -1199,6 +1199,10 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
 
 async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, int]:
     """Process an incoming insight push. Returns (response_dict, status_code)."""
+    from darkmatter.config import ACCEPT_INSIGHTS
+    if not ACCEPT_INSIGHTS:
+        return {"error": "This node does not accept incoming insights"}, 403
+
     author_id = data.get("author_agent_id", "")
     insight_id = data.get("insight_id", "")
 
