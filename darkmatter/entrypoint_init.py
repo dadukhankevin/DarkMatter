@@ -13,6 +13,8 @@ import os
 import shutil
 import sys
 
+from darkmatter.installer import install_keepalive
+
 
 ENTRYPOINT_DIR = os.path.join(os.path.expanduser("~"), ".darkmatter", "entrypoint")
 
@@ -97,7 +99,6 @@ def init_entrypoint(argv: list[str] = None) -> None:
         f.write(claude_md)
 
     # Auto-install keep-alive hook for Claude Code
-    from darkmatter.installer import install_keepalive
     ok, msg = install_keepalive(client="claude-code", python_cmd=command)
 
     print(f"Entrypoint initialized at {ep_dir}")

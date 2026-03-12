@@ -13,6 +13,7 @@ import os
 import random
 import sys
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -20,7 +21,13 @@ from urllib.parse import urlparse
 
 import httpx
 
+try:
+    import miniupnpc
+except ImportError:
+    miniupnpc = None
+
 from darkmatter.config import (
+    INSIGHT_CACHE_TTL,
     PEER_LOOKUP_TIMEOUT,
     PEER_LOOKUP_MAX_CONCURRENT,
     HEALTH_FAILURE_THRESHOLD,
@@ -37,10 +44,13 @@ from darkmatter.config import (
     BOOTSTRAP_RECONNECT_INTERVAL,
     BOOTSTRAP_RECONNECT_MAX,
 )
-from darkmatter.security import sign_peer_update
+from darkmatter.logging import get_logger
+from darkmatter.models import Impression, QueuedMessage
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
-from darkmatter.logging import get_logger
+from darkmatter.network.transports.webrtc import LANSignaling
+from darkmatter.security import sign_peer_update
+from darkmatter.wallet.antimatter import auto_disconnect_peer
 
 _log = get_logger("manager")
 
@@ -71,9 +81,9 @@ def set_network_manager(mgr: "NetworkManager") -> None:
 
 def try_upnp_mapping(local_port: int) -> Optional[tuple]:
     """Try to create a UPnP port mapping. Returns (url, upnp_obj, ext_port) or None."""
-    import random
+    if miniupnpc is None:
+        return None
     try:
-        import miniupnpc
         upnp = miniupnpc.UPnP()
         upnp.discoverdelay = 2000
         try:
@@ -221,7 +231,6 @@ class NetworkManager:
 
     async def _relay_send(self, target_id: str, path: str, payload: dict) -> SendResult:
         """Relay a message through the best reachable mutual peer."""
-        import uuid
         state = self._get_state()
         if state is None:
             return SendResult(success=False, transport_name="relay", error="No state")
@@ -716,7 +725,6 @@ class NetworkManager:
 
     async def _check_trust_disconnects(self) -> None:
         """Auto-disconnect peers with sustained negative trust scores across all hosted agents."""
-        from darkmatter.wallet.antimatter import auto_disconnect_peer
         from darkmatter.state import save_state, list_hosted_agents, get_state_for
 
         now = datetime.now(timezone.utc)
@@ -749,10 +757,8 @@ class NetworkManager:
                     neg_since = imp.negative_since if imp else "?"
                     if await auto_disconnect_peer(state, agent_id):
                         # Queue self-notification so the agent knows what happened
-                        from darkmatter.models import QueuedMessage
-                        import uuid as _uuid
                         note = QueuedMessage(
-                            message_id=f"trust-disconnect-{_uuid.uuid4().hex[:12]}",
+                            message_id=f"trust-disconnect-{uuid.uuid4().hex[:12]}",
                             content=(
                                 f"Auto-disconnected {peer_name} ({agent_id[:16]}...) due to "
                                 f"sustained negative trust (score: {score}, negative since: {neg_since}). "
@@ -770,7 +776,6 @@ class NetworkManager:
 
     def _prune_stale_insights(self) -> None:
         """Remove cached peer insights from disconnected peers or older than INSIGHT_CACHE_TTL."""
-        from darkmatter.config import INSIGHT_CACHE_TTL
         from darkmatter.state import save_state, list_hosted_agents, get_state_for
 
         now = datetime.now(timezone.utc)
@@ -941,7 +946,6 @@ class NetworkManager:
                         webrtc = self.get_transport("webrtc")
                         if webrtc and webrtc.available:
                             if conn.agent_id in state.discovered_peers:
-                                from darkmatter.network.transports.webrtc import LANSignaling
                                 asyncio.create_task(webrtc.upgrade(state, conn, LANSignaling()))
                             else:
                                 asyncio.create_task(webrtc.upgrade(state, conn))
@@ -1097,7 +1101,6 @@ class NetworkManager:
                                     conn.agent_url = base
                                     state.connections[peer_id] = conn
                                     # Mark as infrastructure peer — exempt from reciprocity scaling
-                                    from darkmatter.models import Impression
                                     imp = state.impressions.get(peer_id, Impression(score=0.0))
                                     imp.infrastructure = True
                                     state.impressions[peer_id] = imp

@@ -15,6 +15,7 @@ Uses callbacks for network operations to avoid circular imports.
 """
 
 import asyncio
+import random
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from darkmatter.config import (
     ANTIMATTER_RATE,
     ANTIMATTER_TIMEOUT,
     ANTIMATTER_LOG_MAX,
+    FALLBACK_DELEGATE_AGENT_ID,
     TRUST_ANTIMATTER_GENEROUS,
     TRUST_ANTIMATTER_HONEST,
     TRUST_ANTIMATTER_CHEAP,
@@ -194,7 +196,6 @@ def select_delegate(state: AgentState, exclude_agent_id: Optional[str] = None) -
     exclude_agent_id: agent to exclude (e.g. the payment recipient — cannot be their own delegate).
     Returns the Connection, or None if no eligible peers.
     """
-    import random
     now = datetime.now(timezone.utc)
     candidates = []
 
@@ -224,7 +225,6 @@ def select_delegate(state: AgentState, exclude_agent_id: Optional[str] = None) -
 
     if not candidates:
         # Fall back to configured delegate (e.g. bootstrap server)
-        from darkmatter.config import FALLBACK_DELEGATE_AGENT_ID
         if FALLBACK_DELEGATE_AGENT_ID and FALLBACK_DELEGATE_AGENT_ID != exclude_agent_id:
             fallback = state.connections.get(FALLBACK_DELEGATE_AGENT_ID)
             if fallback and resolve_provider(fallback.wallets):

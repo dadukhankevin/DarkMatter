@@ -9,17 +9,28 @@ import asyncio
 import contextlib
 import logging
 import os
+import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
 import traceback
 from typing import Optional
+from uuid import uuid4
 
 import anyio
+import httpx
 import uvicorn
+from anyio.abc import TaskStatus
+from mcp.server.streamable_http import MCP_SESSION_ID_HEADER, StreamableHTTPServerTransport
+from mcp.server.stdio import stdio_server
+from starlette.requests import Request
+from starlette.responses import Response
 from starlette.routing import Route, Mount, Router
 
 from darkmatter.config import (
+    BOOTSTRAP_MODE,
     DEFAULT_PORT,
     DISCOVERY_PORT,
     DISCOVERY_MCAST_GROUP,
@@ -81,7 +92,11 @@ from darkmatter.network.mesh import (
     handle_send_proxy,
     handle_inbox_consume,
 )
+from darkmatter.wallet import get_all_providers
+import darkmatter.wallet.solana  # noqa: F401 — registers SolanaWalletProvider
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
+from darkmatter.entrypoint_init import init_entrypoint, open_entrypoint
+from darkmatter.installer import main as installer_main
 from darkmatter.logging import get_logger
 
 _log = get_logger("app")
@@ -165,8 +180,6 @@ def init_state(port: int = None) -> None:
     # Derive wallets for all registered providers (ephemeral — derived from passport each startup)
     state = get_state()
     if state.private_key_hex:
-        from darkmatter.wallet import get_all_providers
-        import darkmatter.wallet.solana  # noqa: F401 — registers SolanaWalletProvider
         for chain, provider in get_all_providers().items():
             # Allow env var override (e.g. DARKMATTER_WALLET_SOLANA) so bootstrap
             # operators can receive antimatter fees to their own wallet
@@ -180,7 +193,6 @@ def init_state(port: int = None) -> None:
                 _log.info("%s wallet: %s", chain.capitalize(), state.wallets[chain])
 
     # Bootstrap mode: auto-accept all incoming connections
-    from darkmatter.config import BOOTSTRAP_MODE
     if BOOTSTRAP_MODE:
         state = get_state()
         state.security_settings["auto_accept_all"] = True
@@ -200,8 +212,6 @@ async def _attestation_loop(state: AgentState) -> None:
     Handles wallets funded after startup — keeps retrying until balance
     is available and attestation succeeds.
     """
-    from darkmatter.wallet import get_all_providers
-
     while True:
         all_attested = True
         for chain, provider in get_all_providers().items():
@@ -322,21 +332,19 @@ def create_app() -> Router:
         state = get_state()
 
         if discovery_enabled:
-            import struct as _struct
-            import socket as _socket
             loop = asyncio.get_event_loop()
 
             # Multicast listener for LAN discovery (best-effort)
             try:
-                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM, _socket.IPPROTO_UDP)
-                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-                if hasattr(_socket, "SO_REUSEPORT"):
-                    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.bind(("", DISCOVERY_PORT))
-                mreq = _struct.pack("4s4s",
-                    _socket.inet_aton(DISCOVERY_MCAST_GROUP),
-                    _socket.inet_aton("0.0.0.0"))
-                sock.setsockopt(_socket.IPPROTO_IP, _socket.IP_ADD_MEMBERSHIP, mreq)
+                mreq = struct.pack("4s4s",
+                    socket.inet_aton(DISCOVERY_MCAST_GROUP),
+                    socket.inet_aton("0.0.0.0"))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
                 transport, _ = await loop.create_datagram_endpoint(
                     lambda: DiscoveryProtocol(state),
                     sock=sock,
@@ -427,10 +435,7 @@ def create_app() -> Router:
     _original_handle_stateful = session_manager._handle_stateful_request
 
     async def _resilient_handle_stateful(scope, receive, send):
-        from starlette.requests import Request as _Request
-        from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
-
-        request = _Request(scope, receive)
+        request = Request(scope, receive)
         request_session_id = request.headers.get(MCP_SESSION_ID_HEADER)
 
         # For existing sessions, delegate directly (no new task spawned)
@@ -442,11 +447,7 @@ def create_app() -> Router:
         if request_session_id is None:
             # New session — wrap run_server to be fault-tolerant
             async with session_manager._session_creation_lock:
-                from uuid import uuid4 as _uuid4
-                from mcp.server.streamable_http import StreamableHTTPServerTransport
-                from anyio.abc import TaskStatus as _TaskStatus
-
-                new_session_id = _uuid4().hex
+                new_session_id = uuid4().hex
                 http_transport = StreamableHTTPServerTransport(
                     mcp_session_id=new_session_id,
                     is_json_response_enabled=session_manager.json_response,
@@ -458,7 +459,7 @@ def create_app() -> Router:
                 session_manager._server_instances[http_transport.mcp_session_id] = http_transport
                 _log.info("New MCP session: %s...", new_session_id[:16])
 
-                async def run_server_resilient(*, task_status: _TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
+                async def run_server_resilient(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
                     try:
                         async with http_transport.connect() as streams:
                             read_stream, write_stream = streams
@@ -489,8 +490,7 @@ def create_app() -> Router:
                 await http_transport.handle_request(scope, receive, send)
         else:
             # Unknown session ID
-            from starlette.responses import Response as _Response
-            response = _Response(
+            response = Response(
                 '{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}',
                 status_code=404,
                 media_type="application/json",
@@ -552,9 +552,8 @@ def check_port_owner(host: str, port: int, check_agent_id: str = None) -> Option
     well-known response for a multi-tenant match (returns that agent_id if
     the daemon hosts it, even if it's not the primary agent).
     """
-    import socket as _socket
     # First check if port is in use at all
-    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, port))
             return None  # Port is free
@@ -563,7 +562,6 @@ def check_port_owner(host: str, port: int, check_agent_id: str = None) -> Option
 
     # Port is taken — check if it's a DarkMatter node
     try:
-        import httpx
         resp = httpx.get(f"http://127.0.0.1:{port}/.well-known/darkmatter.json", timeout=1.0)
         if resp.status_code == 200:
             info = resp.json()
@@ -584,9 +582,8 @@ def check_port_owner(host: str, port: int, check_agent_id: str = None) -> Option
 
 def find_free_port(host: str, start: int) -> int:
     """Find a free port in the discovery range (start to start+10)."""
-    import socket as _socket
     for port in range(start, start + 11):
-        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind((host, port))
                 return port
@@ -602,8 +599,9 @@ def find_free_port(host: str, start: int) -> int:
 def _init_shared_stdio_session(port: int) -> None:
     """Initialize state + networking for a stdio MCP session that shares an HTTP mesh node."""
     init_state(port)
-    from darkmatter.mcp import refresh_mcp_instructions
-    refresh_mcp_instructions()
+    # Late import: circular — app ↔ mcp
+    from darkmatter.mcp import refresh_mcp_instructions as _refresh
+    _refresh()
 
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
     http_transport = HttpTransport()
@@ -671,7 +669,6 @@ async def run_stdio_with_http() -> None:
       already running the HTTP mesh. Run stdio-only and share state.
     - Port taken by SOMEONE ELSE -> find a new free port and start there.
     """
-    from mcp.server.stdio import stdio_server
 
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     host = os.environ.get("DARKMATTER_HOST", "0.0.0.0")
@@ -753,14 +750,11 @@ def main() -> None:
     """Entry point — detect transport mode and run."""
     cmd = sys.argv[1] if len(sys.argv) > 1 else None
     if cmd == "install-mcp":
-        from darkmatter.installer import main as installer_main
         raise SystemExit(installer_main(sys.argv[2:]))
     if cmd == "init-entrypoint":
-        from darkmatter.entrypoint_init import init_entrypoint
         init_entrypoint(sys.argv[2:])
         return
     if cmd == "open-entrypoint":
-        from darkmatter.entrypoint_init import open_entrypoint
         open_entrypoint()
         return
 
@@ -795,17 +789,16 @@ def main() -> None:
         asyncio.set_event_loop(loop)
 
         # Install signal trackers to log what triggers shutdown
-        import signal as _signal
-        for sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
-            old_handler = _signal.getsignal(sig)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            old_handler = signal.getsignal(sig)
             def _sig_handler(signum, frame, _old=old_handler, _name=sig.name):
                 _log.warning("RECEIVED SIGNAL %s (%d)", _name, signum)
                 traceback.print_stack(frame, file=sys.stderr)
-                if callable(_old) and _old not in (_signal.SIG_DFL, _signal.SIG_IGN):
+                if callable(_old) and _old not in (signal.SIG_DFL, signal.SIG_IGN):
                     _old(signum, frame)
-                elif _old == _signal.SIG_DFL:
+                elif _old == signal.SIG_DFL:
                     raise SystemExit(128 + signum)
-            _signal.signal(sig, _sig_handler)
+            signal.signal(sig, _sig_handler)
 
         app = create_app()
         discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"

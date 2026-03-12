@@ -6,6 +6,7 @@ Depends on: config, wallet/__init__
 
 import hashlib as _hashlib
 import struct as _struct
+from datetime import datetime, timezone
 from typing import Optional
 
 from solders.keypair import Keypair as SolanaKeypair
@@ -15,6 +16,7 @@ from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.instruction import Instruction as SolInstruction, AccountMeta
 from solana.rpc.async_api import AsyncClient as SolanaClient
+from solana.rpc.types import TokenAccountOpts
 
 from darkmatter.config import (
     SOLANA_RPC_URL,
@@ -349,7 +351,6 @@ async def verify_solana_identity_attestation(address: str, agent_id: str) -> dic
                     if sig_info.err is not None:
                         continue
                     if sig_info.memo and ATTESTATION_PREFIX in sig_info.memo:
-                        from datetime import datetime, timezone
                         ts = None
                         if sig_info.block_time is not None:
                             ts = datetime.fromtimestamp(
@@ -563,7 +564,6 @@ class SolanaWalletProvider(WalletProvider):
         # Reverse lookup: mint → symbol from SPL_TOKENS config
         mint_to_symbol = {mint: name for name, (mint, _dec) in SPL_TOKENS.items()}
         try:
-            from solana.rpc.types import TokenAccountOpts
             async with SolanaClient(SOLANA_RPC_URL) as client:
                 # Query both legacy Token and Token-2022 programs
                 for program_id in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
@@ -656,7 +656,6 @@ class SolanaWalletProvider(WalletProvider):
                     before = oldest_sig
 
                 if oldest_time is not None:
-                    from datetime import datetime, timezone
                     return datetime.fromtimestamp(oldest_time, tz=timezone.utc).isoformat()
         except Exception:
             pass

@@ -12,6 +12,7 @@ import httpx
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.manager import NetworkManager, get_network_manager, set_network_manager
 from darkmatter.network.transports.http import strip_base_url
+from darkmatter.config import DEFAULT_PORT
 from darkmatter.logging import get_logger
 
 _log = get_logger("network")
@@ -34,7 +35,6 @@ async def send_to_peer(conn, path: str, payload: dict, **kw) -> dict:
     The daemon has live connections (fresh URLs, WebRTC channels).
     This is the only send path — no fallback to stale local state.
     """
-    from darkmatter.config import DEFAULT_PORT
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
     async with httpx.AsyncClient(timeout=15.0) as client:

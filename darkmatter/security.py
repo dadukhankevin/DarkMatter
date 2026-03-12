@@ -5,6 +5,7 @@ challenge-response, and URL security assessment.
 Depends on: config
 """
 
+import json
 import os
 import secrets
 import sys
@@ -244,7 +245,6 @@ def prepare_outbound(payload: dict, private_key_hex: str, agent_id: str,
     signed_payload["signature_hex"] = signature_hex
 
     if recipient_public_key_hex:
-        import json
         plaintext = json.dumps(signed_payload).encode("utf-8")
         encrypted = encrypt_for_peer(plaintext, private_key_hex, recipient_public_key_hex)
         return SignedEnvelope(

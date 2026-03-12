@@ -13,6 +13,7 @@ import sys
 import uuid
 from typing import Callable, Optional
 
+import httpx
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 
 from darkmatter.config import (
@@ -24,6 +25,7 @@ from darkmatter.config import (
 )
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
+from darkmatter.security import sign_sdp
 from darkmatter.logging import get_logger
 
 _log = get_logger("webrtc")
@@ -65,7 +67,6 @@ class DirectSignaling(SignalingChannel):
     name = "direct"
 
     async def send_offer(self, state, conn, offer_data: dict) -> Optional[dict]:
-        import httpx
         base_url = strip_base_url(conn.agent_url)
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -104,7 +105,6 @@ class PeerRelaySignaling(SignalingChannel):
     name = "peer_relay"
 
     async def send_offer(self, state, conn, offer_data: dict) -> Optional[dict]:
-        import httpx
         # Find peers that are connected to both us and the target
         candidates = [
             c for c in state.connections.values()
@@ -339,7 +339,6 @@ class WebRTCTransport(Transport):
 
             await asyncio.sleep(WEBRTC_ICE_GATHER_TIMEOUT)
 
-            from darkmatter.security import sign_sdp
             offer_data = {
                 "sdp": pc.localDescription.sdp,
                 "type": pc.localDescription.type,

@@ -19,7 +19,7 @@ from darkmatter.config import (
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional, refresh_mcp_instructions
 from darkmatter.state import get_state, save_state
-from darkmatter.context import build_activity_hint
+from darkmatter.context import build_activity_hint, get_context
 from darkmatter.logging import get_logger
 
 _log = get_logger("visibility")
@@ -164,7 +164,6 @@ def _inject_activity_hint(result, session_id=None):
     # Deliver new conversation context piggyback on every tool response.
     new_context = None
     if session_id:
-        from darkmatter.context import get_context
         new_context = get_context(state, mode="piggyback", session_id=session_id)
 
     # result is a list of content objects from MCP

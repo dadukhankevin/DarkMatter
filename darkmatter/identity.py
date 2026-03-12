@@ -10,6 +10,7 @@ import sys
 import time
 import socket
 import ipaddress
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 from collections import deque
@@ -27,6 +28,7 @@ from cryptography.hazmat.primitives.serialization import (
 
 from darkmatter.config import (
     MAX_URL_LENGTH,
+    PEER_UPDATE_MAX_AGE,
     DEFAULT_RATE_LIMIT_PER_CONNECTION,
     DEFAULT_RATE_LIMIT_GLOBAL,
     RATE_LIMIT_WINDOW,
@@ -209,11 +211,9 @@ def check_rate_limit(state, conn=None) -> Optional[str]:
 
 def is_timestamp_fresh(timestamp: str, max_age: int = None) -> bool:
     """Check if a timestamp is within max_age seconds of now."""
-    from darkmatter.config import PEER_UPDATE_MAX_AGE
     if max_age is None:
         max_age = PEER_UPDATE_MAX_AGE
     try:
-        from datetime import datetime, timezone
         ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         age = abs((datetime.now(timezone.utc) - ts).total_seconds())
         return age <= max_age

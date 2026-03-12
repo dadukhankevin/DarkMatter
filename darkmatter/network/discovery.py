@@ -11,8 +11,10 @@ import socket
 import sys
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
+from starlette.responses import JSONResponse
 
 import darkmatter
 from darkmatter.logging import get_logger
@@ -28,6 +30,7 @@ from darkmatter.config import (
     PEER_RELAY_SDP_TIMEOUT,
 )
 from darkmatter.models import AgentState
+from darkmatter.security import verify_lan_beacon, sign_lan_beacon
 
 
 # =============================================================================
@@ -99,7 +102,6 @@ async def handle_well_known(request) -> "JSONResponse":
     Multi-tenant: includes an `agents` array with all hosted agents.
     Top-level fields reference the default/primary agent.
     """
-    from starlette.responses import JSONResponse
     from darkmatter.state import get_state, get_state_for, list_hosted_agents
 
     state = get_state()
@@ -213,7 +215,6 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         if not beacon_sig or not beacon_pub:
             _log.warning("Dropped unsigned beacon from %s…", peer_id[:12])
             return
-        from darkmatter.security import verify_lan_beacon
         beacon_ts = str(packet.get("ts", ""))
         beacon_port = str(packet.get("port", DEFAULT_PORT))
         if not verify_lan_beacon(beacon_pub, beacon_sig, peer_id, beacon_port, beacon_ts):
@@ -376,7 +377,6 @@ def _dynamic_port_set(state: AgentState) -> set[int]:
     ports = {8100, 8200}
 
     # Add ports from connection URLs
-    from urllib.parse import urlparse
     for conn in state.connections.values():
         try:
             parsed = urlparse(conn.agent_url)
@@ -474,7 +474,6 @@ async def discovery_loop(state: AgentState) -> None:
             except Exception as e:
                 _log.error("Local port scan failed: %s", e)
 
-            from darkmatter.security import sign_lan_beacon
             ts_val = int(time.time())
             beacon_sig = sign_lan_beacon(
                 state.private_key_hex, state.agent_id, str(state.port), str(ts_val)

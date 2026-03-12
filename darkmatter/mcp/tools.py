@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -30,29 +31,26 @@ from darkmatter.mcp.schemas import (
 from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, sync_peer_insights_from_disk, consume_message, set_waiting, _mcp_added_connections, _mcp_removed_connections
 from darkmatter.logging import get_logger
 from darkmatter.context import log_conversation
-
-_log = get_logger("tools")
-
-# Cross-process poll interval for wait_for_message (seconds).
-# The HTTP daemon runs in a separate process, so asyncio.Event.set() from the
-# daemon never wakes the MCP process's event.  This poll interval ensures we
-# check the on-disk message queue regularly.
-_WAIT_POLL_INTERVAL = 2.0
 from darkmatter.config import (
+    DEFAULT_PORT,
     MAX_CONNECTIONS,
+    OWN_INSIGHT_MAX,
     TRUST_MESSAGE_SENT,
 )
 from darkmatter.identity import (
     validate_url,
 )
-from darkmatter.security import prepare_outbound
+from darkmatter.security import prepare_outbound, prove_identity, sign_insight
 from darkmatter.models import (
     AgentStatus,
     Connection,
     Impression,
     Insight,
+    QueuedMessage,
 )
+from darkmatter.insight_resolver import resolve_region, assess_health, hash_content
 from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
+from darkmatter.network.discovery import scan_local_ports
 from darkmatter.network.mesh import (
     build_outbound_request_payload,
     build_connection_from_accepted,
@@ -65,6 +63,14 @@ from darkmatter.wallet.antimatter import (
     reciprocity_ratio,
 )
 
+_log = get_logger("tools")
+
+# Cross-process poll interval for wait_for_message (seconds).
+# The HTTP daemon runs in a separate process, so asyncio.Event.set() from the
+# daemon never wakes the MCP process's event.  This poll interval ensures we
+# check the on-disk message queue regularly.
+_WAIT_POLL_INTERVAL = 2.0
+
 
 # =============================================================================
 # Daemon inbox helpers — prefer HTTP API over disk polling
@@ -73,15 +79,13 @@ from darkmatter.wallet.antimatter import (
 def _sync_inbox_from_daemon(state, daemon_port: int) -> None:
     """Sync message queue from daemon's HTTP inbox API, falling back to disk."""
     try:
-        import httpx as _httpx
-        with _httpx.Client(timeout=3.0) as client:
+        with httpx.Client(timeout=3.0) as client:
             resp = client.get(f"http://127.0.0.1:{daemon_port}/__darkmatter__/inbox")
             if resp.status_code == 200:
                 daemon_msgs = resp.json().get("messages", [])
                 # Merge: add any messages we don't already have in memory
                 existing_ids = {m.message_id for m in state.message_queue}
                 consumed_ids = getattr(state, "_consumed_message_ids", set())
-                from darkmatter.models import QueuedMessage
                 for dm in daemon_msgs:
                     mid = dm.get("message_id", "")
                     if mid and mid not in existing_ids and mid not in consumed_ids:
@@ -105,8 +109,7 @@ def _consume_via_daemon(daemon_port: int, message_ids: list[str]) -> None:
     if not message_ids:
         return
     try:
-        import httpx as _httpx
-        with _httpx.Client(timeout=3.0) as client:
+        with httpx.Client(timeout=3.0) as client:
             client.post(
                 f"http://127.0.0.1:{daemon_port}/__darkmatter__/inbox/consume",
                 json={"message_ids": message_ids},
@@ -165,7 +168,6 @@ async def _connection_request(state, target_url: str) -> str:
             challenge_id = result.get("challenge_id")
             challenge_hex = result.get("challenge_hex")
             if challenge_id and challenge_hex and state.private_key_hex:
-                from darkmatter.security import prove_identity
                 proof_hex = prove_identity(challenge_hex, state.private_key_hex)
                 try:
                     await client.post(
@@ -669,7 +671,6 @@ async def discover_local(ctx: Context) -> str:
     track_session(ctx)
     state = get_state()
 
-    from darkmatter.network.discovery import scan_local_ports
     await scan_local_ports(state)
 
     # Filter out already-connected peers and self
@@ -718,9 +719,6 @@ async def list_connections(ctx: Context) -> str:
 
     # Fetch from the HTTP daemon for fresh state (daemon may have connections
     # the MCP session's in-memory state doesn't know about yet, e.g. bootstrap)
-    import httpx
-    from darkmatter.config import DEFAULT_PORT
-    import os
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -834,7 +832,6 @@ async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
 async def _push_insight_to_peers(state, insight) -> list[str]:
     """Push an insight to all qualifying connected peers. Returns list of agent IDs pushed to."""
     pushed_to = []
-    from darkmatter.security import sign_insight
     # Re-sign with current content
     tags_str = ",".join(sorted(insight.tags))
     insight.signature_hex = sign_insight(
@@ -871,8 +868,6 @@ async def _push_insight_to_peers(state, insight) -> list[str]:
         )
         eligible = ranked[:insight.share_with_top_n]
 
-    import asyncio
-
     async def _push_one(aid, conn):
         try:
             await send_to_peer(conn, "/__darkmatter__/insight_push", insight_payload)
@@ -907,15 +902,12 @@ async def create_insight(params: CreateInsightInput, ctx: Context) -> str:
     track_session(ctx)
     state = get_state()
 
-    from darkmatter.config import OWN_INSIGHT_MAX
     own_insights = [s for s in state.insights if s.author_agent_id == state.agent_id]
     if len(own_insights) >= OWN_INSIGHT_MAX:
         # Auto-prune oldest own insight instead of rejecting
         oldest = min(own_insights, key=lambda s: s.created_at)
         state.insights.remove(oldest)
 
-    from darkmatter.insight_resolver import resolve_region, hash_content
-    from pathlib import Path
     # Resolve file path
     p = Path(params.file)
     file_path = str(p) if p.is_absolute() else str(Path.cwd() / params.file)
@@ -936,7 +928,6 @@ async def create_insight(params: CreateInsightInput, ctx: Context) -> str:
     content = original_content  # stored content = resolved snapshot
 
     now = datetime.now(timezone.utc).isoformat()
-    from darkmatter.security import sign_insight
 
     # Upsert: if an insight exists for same file+from_text, replace it
     insight_id = f"insight-{uuid.uuid4().hex[:12]}"
@@ -1031,9 +1022,6 @@ async def view_insights(params: ViewInsightsInput, ctx: Context) -> str:
             "files": file_counts,
             "hint": "Pass tags=[], author=, or file= to view actual insight content.",
         })
-
-    from darkmatter.insight_resolver import resolve_region, assess_health, hash_content
-    from pathlib import Path
 
     results = []
     to_delete = []
@@ -1182,7 +1170,6 @@ async def wait_for_message(
     Use darkmatter_send_message(broadcast=True) for passive status updates to peers.
     """
     state = get_state()
-    from darkmatter.config import DEFAULT_PORT
     daemon_port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
 
     # Check if matching messages already exist — prefer daemon HTTP inbox

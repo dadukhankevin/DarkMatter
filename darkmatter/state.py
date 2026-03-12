@@ -216,8 +216,6 @@ def sync_peer_insights_from_disk(agent_id: Optional[str] = None) -> None:
         (s.insight_id, s.author_agent_id)
         for s in state.insights
     }
-
-    from darkmatter.models import Insight
     added = 0
     for di in disk_insights:
         author = di.get("author_agent_id", "")
@@ -302,7 +300,6 @@ def sync_connections_from_disk(agent_id: Optional[str] = None) -> None:
     added = 0
     for aid_peer, cd in disk_conns.items():
         if aid_peer not in state.connections:
-            from darkmatter.models import Connection
             state.connections[aid_peer] = Connection(
                 agent_id=cd["agent_id"],
                 agent_url=cd["agent_url"],
@@ -333,7 +330,6 @@ def sync_connections_from_disk(agent_id: Optional[str] = None) -> None:
             removed += 1
 
     # Merge impressions from disk (newer wins, fill gaps)
-    from darkmatter.models import Impression
     for aid_peer, idata in disk_imps.items():
         if aid_peer not in state.impressions:
             state.impressions[aid_peer] = Impression(
