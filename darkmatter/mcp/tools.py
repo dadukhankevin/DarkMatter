@@ -1004,6 +1004,24 @@ async def view_insights(params: ViewInsightsInput, ctx: Context) -> str:
     # insight_push from peers that this MCP session doesn't have in memory
     sync_peer_insights_from_disk()
 
+    # No filters → return lightweight index (tags + files) instead of full content
+    if not params.tags and not params.author and not params.file:
+        tag_counts: dict[str, int] = {}
+        file_counts: dict[str, int] = {}
+        for insight in state.insights:
+            for tag in (insight.tags or []):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            if insight.file:
+                file_counts[insight.file] = file_counts.get(insight.file, 0) + 1
+        return json.dumps({
+            "success": True,
+            "mode": "index",
+            "total_insights": len(state.insights),
+            "tags": tag_counts,
+            "files": file_counts,
+            "hint": "Pass tags=[], author=, or file= to view actual insight content.",
+        })
+
     from darkmatter.insight_resolver import resolve_region, assess_health, hash_content
     from pathlib import Path
 
@@ -1162,7 +1180,7 @@ async def wait_for_message(
     existing = _drain_inbox(state, from_agents)
     if existing:
         _consume_via_daemon(daemon_port, [m["message_id"] for m in existing])
-        return json.dumps({"success": True, "messages": existing, "waited": False})
+        return json.dumps({"success": True, "messages": existing, "waited": False, "_reminder": "insights"})
 
     # Register event and wait for new message
     event = asyncio.Event()
@@ -1195,7 +1213,7 @@ async def wait_for_message(
                 if event in state._inbox_events:
                     state._inbox_events.remove(event)
                 _consume_via_daemon(daemon_port, [m["message_id"] for m in matched])
-                return json.dumps({"success": True, "messages": matched, "waited": True})
+                return json.dumps({"success": True, "messages": matched, "waited": True, "_reminder": "insights"})
 
     except asyncio.TimeoutError:
         mins = int(timeout_seconds / 60)

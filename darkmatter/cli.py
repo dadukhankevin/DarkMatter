@@ -43,7 +43,7 @@ def main() -> None:
             print(msg)
             raise SystemExit(0 if ok else 1)
         else:
-            print("Usage: darkmatter keepalive [install|uninstall] [--client claude-code]")
+            print("Usage: darkmatter keepalive [install|uninstall] [--client claude-code|opencode]")
             raise SystemExit(1)
 
     # Auto-install MCP configs on first run

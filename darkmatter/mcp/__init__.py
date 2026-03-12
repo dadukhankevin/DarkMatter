@@ -19,12 +19,12 @@ MESSAGING:
 
 INSIGHTS — YOUR PERSISTENT MEMORY:
 - Insights are live pointers to code regions. They NEVER go stale — content resolves from the file every time.
-- BEFORE exploring code: call darkmatter_view_insights() to see what's already known. This saves you from re-reading files.
-- AFTER understanding code: create insights for key regions you explored (functions, classes, config blocks). \
-Future you — and your peers — will thank you.
-- Tag insights semantically: "auth", "routing", "config", "mesh", "trust", etc. Tags are how you find things later.
-- Insights are your working memory that happens to sync with peers. Create them for YOUR benefit, not just for sharing.
-- Rule of thumb: if you read a function and understood what it does, create an insight for it.
+- **MUST DO FIRST**: Before reading or exploring ANY code file, call darkmatter_view_insights(tags=[...]) with relevant tags. \
+Insights contain up-to-date understanding of code regions — use them instead of re-reading files from scratch. \
+Check the RECENT INSIGHT TAGS line at the bottom of these instructions to see what tags exist.
+- AFTER understanding NEW code (not already covered by insights): create insights for key regions. \
+Tag them semantically so others can find them.
+- Calling view_insights() with NO tags returns a lightweight index of all available tags and files — use this to orient yourself.
 
 CONNECTIONS:
 - To see who you're connected to: call darkmatter_list_connections. This shows all peers with names, bios, trust, wallets, and activity.

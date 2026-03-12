@@ -228,10 +228,13 @@ KEEPALIVE_TARGETS: dict[str, dict] = {
         "settings_path": "~/.claude/settings.json",
         "hook_event": "Stop",
     },
+    "opencode": {
+        "plugin_dir": "~/.config/opencode/plugins",
+        "plugin_filename": "darkmatter-keepalive.js",
+        "hook_event": "session.idle",
+    },
     # Future:
     # "gemini": {"settings_path": "~/.gemini/settings.json", "hook_event": "AfterAgent"},
-    # "codex": {"settings_path": "~/.codex/config.toml", "hook_event": "agent-turn-complete"},
-    # "opencode": {"settings_path": "~/.config/opencode/opencode.json", "hook_event": "session.idle"},
 }
 
 
@@ -279,6 +282,17 @@ def install_keepalive(client: str = "claude-code", python_cmd: str = sys.executa
 
         return True, f"Keep-alive hook installed to {path}"
 
+    if client == "opencode":
+        import shutil
+        plugin_dir = _expand(target["plugin_dir"], home)
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        dest = plugin_dir / target["plugin_filename"]
+        src = Path(__file__).parent / "hooks" / "opencode_plugin.js"
+        if not src.exists():
+            return False, f"Plugin source not found: {src}"
+        shutil.copy2(src, dest)
+        return True, f"Keep-alive plugin installed to {dest}"
+
     return False, f"Keep-alive hook not yet implemented for {client}"
 
 
@@ -289,6 +303,14 @@ def uninstall_keepalive(client: str = "claude-code") -> tuple[bool, str]:
         return False, f"Keep-alive hook not supported for {client}"
 
     home = Path.home()
+
+    if client == "opencode":
+        dest = _expand(target["plugin_dir"], home) / target["plugin_filename"]
+        if dest.exists():
+            dest.unlink()
+            return True, f"Keep-alive plugin removed from {dest}"
+        return True, "Plugin not found — nothing to uninstall"
+
     path = _expand(target["settings_path"], home)
 
     if not path.exists():
