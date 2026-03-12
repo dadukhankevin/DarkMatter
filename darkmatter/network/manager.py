@@ -835,8 +835,9 @@ class NetworkManager:
                                     await self.broadcast_peer_update()
 
                             conn.last_activity = datetime.now(timezone.utc).isoformat()
-                except Exception:
-                    pass
+                except Exception as e:
+                    peer = conn.agent_display_name or conn.agent_id[:12]
+                    _log.warning("Ping %s failed: %s", peer, e)
 
                 if ping_ok:
                     # --- Ping succeeded ---
