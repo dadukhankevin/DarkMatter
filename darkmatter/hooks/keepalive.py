@@ -8,8 +8,8 @@ invokes this module. We check whether the agent explicitly opted out
 If the hook fires twice within COOLDOWN_SECONDS, the agent is allowed
 to stop (it has nothing to do and the nudge isn't helping).
 
-Currently supports: Claude Code (Stop hook).
-Future: Gemini CLI (AfterAgent), Codex CLI (agent-turn-complete), OpenCode (session.idle).
+Currently supports: Claude Code (Stop hook), OpenCode (session.status / session.idle plugin).
+Future: Gemini CLI (AfterAgent), Codex CLI (agent-turn-complete).
 
 Usage (Claude Code):
     Hook command: python3 -m darkmatter.hooks.keepalive

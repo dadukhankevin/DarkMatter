@@ -49,6 +49,9 @@ def main() -> None:
     # Auto-install MCP configs on first run
     _auto_install_if_needed()
 
+    # Always re-install keepalive hooks (ensures upgrades propagate)
+    _install_keepalives()
+
     from darkmatter.app import main as app_main
     app_main()
 
@@ -67,3 +70,12 @@ def _auto_install_if_needed() -> None:
 
     sentinel.parent.mkdir(parents=True, exist_ok=True)
     sentinel.write_text("installed\n")
+
+
+def _install_keepalives() -> None:
+    """Re-install keepalive hooks for all supported CLIs on every start."""
+    try:
+        from darkmatter.installer import install_all_keepalives
+        install_all_keepalives()
+    except Exception:
+        pass

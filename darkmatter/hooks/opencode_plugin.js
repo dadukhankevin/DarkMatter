@@ -43,36 +43,42 @@ function checkCooldown(sessionId) {
   return firedRecently
 }
 
-export const DarkMatterKeepalive = async ({ client }) => {
+async function handleIdle(client, sessionId) {
+  // Check last assistant message for stop token
+  let lastMessage = ""
+  try {
+    const response = await client.session.messages({ path: { id: sessionId } })
+    const msgs = response?.data ?? response ?? []
+    const assistantMsgs = msgs.filter((m) => m.role === "assistant")
+    if (assistantMsgs.length > 0) {
+      const last = assistantMsgs[assistantMsgs.length - 1]
+      lastMessage = (last.parts ?? []).map((p) => p.text ?? "").join("")
+    }
+  } catch {}
+
+  if (lastMessage.includes(STOP_TOKEN)) return
+  if (checkCooldown(sessionId)) return
+
+  // Inject keepalive prompt into the session
+  try {
+    await client.session.prompt({
+      path: { id: sessionId },
+      body: {
+        parts: [{ type: "text", text: KEEPALIVE_PROMPT }],
+      },
+    })
+  } catch {}
+}
+
+export default async ({ client }) => {
   return {
-    "session.idle": async (input) => {
-      // Extract session ID from event input
-      const sessionId = input?.session?.id ?? input?.id ?? "default"
-
-      // Check last assistant message for stop token
-      let lastMessage = ""
-      try {
-        const response = await client.session.messages({ path: { id: sessionId } })
-        const msgs = response?.data ?? response ?? []
-        const assistantMsgs = msgs.filter((m) => m.role === "assistant")
-        if (assistantMsgs.length > 0) {
-          const last = assistantMsgs[assistantMsgs.length - 1]
-          lastMessage = (last.parts ?? []).map((p) => p.text ?? "").join("")
-        }
-      } catch {}
-
-      if (lastMessage.includes(STOP_TOKEN)) return
-      if (checkCooldown(sessionId)) return
-
-      // Inject keepalive prompt into the session
-      try {
-        await client.session.prompt({
-          path: { id: sessionId },
-          body: {
-            parts: [{ type: "text", text: KEEPALIVE_PROMPT }],
-          },
-        })
-      } catch {}
+    event: async ({ event }) => {
+      // Handle both the preferred session.status and deprecated session.idle
+      if (event.type === "session.status" && event.properties?.status?.type === "idle") {
+        await handleIdle(client, event.properties.sessionID)
+      } else if (event.type === "session.idle") {
+        await handleIdle(client, event.properties?.sessionID ?? "default")
+      }
     },
   }
 }

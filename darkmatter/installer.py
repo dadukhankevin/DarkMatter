@@ -297,6 +297,15 @@ def install_keepalive(client: str = "claude-code", python_cmd: str = sys.executa
     return False, f"Keep-alive hook not yet implemented for {client}"
 
 
+def install_all_keepalives(python_cmd: str = sys.executable) -> None:
+    """Install keep-alive hooks for all supported clients, silently skipping failures."""
+    for client in KEEPALIVE_TARGETS:
+        try:
+            install_keepalive(client=client, python_cmd=python_cmd)
+        except Exception:
+            pass
+
+
 def uninstall_keepalive(client: str = "claude-code") -> tuple[bool, str]:
     """Remove the keep-alive Stop hook for a supported client."""
     target = KEEPALIVE_TARGETS.get(client)
