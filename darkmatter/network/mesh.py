@@ -9,23 +9,29 @@ import asyncio
 import json
 import os
 import random
+import socket
 import sys
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
+import darkmatter as dm
 import httpx
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from darkmatter.config import (
+    ACCEPT_INSIGHTS,
     MAX_AGENT_ID_LENGTH,
     MAX_BIO_LENGTH,
     MAX_CONNECTIONS,
     MAX_CONTENT_LENGTH,
     MESSAGE_QUEUE_MAX,
+    PEER_INSIGHT_CACHE_MAX,
     PROTOCOL_VERSION,
     REQUEST_EXPIRY_S,
     ANTIMATTER_TIMEOUT,
@@ -41,7 +47,7 @@ from darkmatter.models import (
     AgentStatus,
     Connection,
     Impression,
-
+    Insight,
     PendingConnectionRequest,
     QueuedMessage,
     RouterAction,
@@ -55,7 +61,17 @@ from darkmatter.identity import (
     check_rate_limit,
     truncate_field,
 )
-from darkmatter.security import verify_inbound
+from darkmatter.security import (
+    assess_url_security,
+    create_challenge,
+    sign_payload,
+    sign_sdp,
+    verify_inbound,
+    verify_insight_signature,
+    verify_proof,
+    verify_sdp_signature,
+    verify_signed_payload,
+)
 from darkmatter.state import (
     get_state,
     get_state_for,
@@ -64,7 +80,11 @@ from darkmatter.state import (
     check_waiting,
 )
 from darkmatter.context import log_conversation
+from darkmatter.genome import get_genome_version, build_genome_zip, hash_bytes, sign_genome_zip
+from darkmatter.router import execute_routing
+from darkmatter.wallet import get_all_providers
 from darkmatter.wallet.antimatter import (
+    initiate_payment,
     log_antimatter_event,
     adjust_trust,
     compute_seeded_trust,
@@ -79,7 +99,6 @@ _log = get_logger("mesh")
 
 def _extract_host(url: str) -> Optional[str]:
     """Extract hostname from a URL, stripping port and path."""
-    from urllib.parse import urlparse
     try:
         return urlparse(url).hostname
     except Exception:
@@ -114,7 +133,6 @@ def _is_connected_peer(request: "Request", state: Optional["AgentState"]) -> boo
     client_ip = _client_ip(request)
     for conn in state.connections.values():
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(conn.agent_url)
             if parsed.hostname == client_ip:
                 return True
@@ -349,7 +367,6 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     from darkmatter.network.manager import is_local_url
     auto_accept = state.security_settings.get("auto_accept_local", True)
     if auto_accept and is_local_url(from_agent_url) and len(state.connections) < MAX_CONNECTIONS:
-        from darkmatter.security import assess_url_security
         tls_info = assess_url_security(from_agent_url)
         conn = Connection(
             agent_id=from_agent_id,
@@ -398,7 +415,6 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     # Auto-accept ALL when in bootstrap mode (auto_accept_all setting)
     auto_accept_all = state.security_settings.get("auto_accept_all", False)
     if auto_accept_all and len(state.connections) < MAX_CONNECTIONS:
-        from darkmatter.security import assess_url_security
         tls_info = assess_url_security(from_agent_url)
         conn = Connection(
             agent_id=from_agent_id,
@@ -502,7 +518,6 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     )
 
     # Generate challenge for proof-of-possession
-    from darkmatter.security import create_challenge
     challenge_id, challenge_hex = create_challenge(from_agent_id)
     pending_req = state.pending_requests.get(request_id)
     if pending_req:
@@ -558,7 +573,6 @@ def process_connection_accepted(state: AgentState, data: dict) -> tuple[dict, in
 
     del state.pending_outbound[matched]
 
-    from darkmatter.security import assess_url_security
     tls_info = assess_url_security(agent_url)
 
     conn = Connection(
@@ -619,7 +633,6 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
         # No challenge was issued
         identity_verified = False
 
-    from darkmatter.security import assess_url_security
     tls_info = assess_url_security(pending.from_agent_url)
 
     conn = Connection(
@@ -766,7 +779,6 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
         routed_to = "agent"
     else:
         routed_to = "queued"
-        from darkmatter.router import execute_routing
         try:
             decision = await execute_routing(state, msg, execute_decision_fn=_execute_router_decision)
             if decision.action == RouterAction.HANDLE:
@@ -776,7 +788,6 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
             elif decision.action == RouterAction.DROP:
                 routed_to = "dropped"
         except Exception as e:
-            import traceback
             _log.error("Routing FAILED for %s...: %s", msg.message_id[:12], e)
             traceback.print_exc(file=sys.stderr)
 
@@ -935,7 +946,6 @@ async def handle_ping(request: Request) -> JSONResponse:
         state.connections[from_agent_id].last_activity = datetime.now(timezone.utc).isoformat()
 
     # Track inbound ping time on the manager
-    from darkmatter.network.manager import get_network_manager
     try:
         mgr = get_network_manager()
         mgr._last_inbound_ping = time.time()
@@ -973,7 +983,6 @@ async def handle_connection_request(request: Request) -> JSONResponse:
     from_url = data.get("from_agent_url", "")
     mgr = get_network_manager()
     if from_url and is_local_url(from_url):
-        import socket
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -1037,8 +1046,6 @@ async def handle_connection_proof(request: Request) -> JSONResponse:
     # Enforce identity binding: public_key_hex must match agent_id (passport invariant)
     if public_key_hex != agent_id:
         return JSONResponse({"error": "Public key must match agent_id"}, status_code=400)
-
-    from darkmatter.security import verify_proof
 
     # Find the pending request with this challenge_id
     pending = None
@@ -1164,7 +1171,7 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
     peer_local_port = data.get("local_port")
     effective_url = new_url
     if peer_lan_ip and peer_local_port:
-        from darkmatter.network.manager import is_local_url, get_network_manager
+        from darkmatter.network.manager import is_local_url
         try:
             mgr = get_network_manager()
             our_public_ip = _extract_host(state.public_url) if state.public_url else None
@@ -1206,7 +1213,6 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
 
 async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, int]:
     """Process an incoming insight push. Returns (response_dict, status_code)."""
-    from darkmatter.config import ACCEPT_INSIGHTS
     if not ACCEPT_INSIGHTS:
         return {"error": "This node does not accept incoming insights"}, 403
 
@@ -1226,14 +1232,10 @@ async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, in
     if not author_pub_key:
         return {"error": "Unknown insight author — no public key on file"}, 403
 
-    from darkmatter.security import verify_insight_signature
     tags_str = ",".join(sorted(data.get("tags", [])))
     if not verify_insight_signature(author_pub_key, signature_hex, insight_id, author_id,
                                      data.get("content", ""), tags_str):
         return {"error": "Invalid insight signature"}, 403
-
-    from darkmatter.models import Insight
-    from darkmatter.config import PEER_INSIGHT_CACHE_MAX
 
     existing_idx = None
     for i, s in enumerate(state.insights):
@@ -1499,7 +1501,6 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
     visited_set = set(visited)
 
     # --- Step 1: Am I the target (or hosting it)? ---
-    from darkmatter.state import get_state_for
     target_state = get_state_for(target_agent_id)
     if target_state is not None:
         chain_trust = _compute_chain_trust(trust_chain)
@@ -1534,7 +1535,6 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
         result, status = await process_connection_request(target_state, enriched_payload, public_url)
 
         # Sign the response so the source can verify authenticity
-        from darkmatter.security import sign_payload
         sig_fields = [route_id, target_agent_id, source_agent_id, result.get("agent_id", "")]
         response_signature = ""
         if target_state.private_key_hex:
@@ -1655,7 +1655,6 @@ async def _process_mesh_route_response(state: AgentState, data: dict) -> tuple[d
     _seen_route_ids[route_id] = time.time()
 
     # Are we the target of this response (the original requester)?
-    from darkmatter.state import get_state_for
     target_state = get_state_for(target_agent_id)
     if target_state is not None:
         _log.info("Mesh route: connection_response arrived for local agent %s... from %s...",
@@ -1669,7 +1668,6 @@ async def _process_mesh_route_response(state: AgentState, data: dict) -> tuple[d
                          source_agent_id[:12])
             return {"error": "Missing response signature"}, 403
 
-        from darkmatter.security import verify_signed_payload
         sig_fields = [original_route_id, source_agent_id, target_agent_id,
                       payload.get("agent_id", "")]
         if not verify_signed_payload(source_agent_id, response_sig,
@@ -2026,7 +2024,6 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     verify_key = conn.agent_public_key_hex or sdp_pub
     if not sdp_sig or not verify_key:
         return JSONResponse({"error": "SDP signature required"}, status_code=403)
-    from darkmatter.security import verify_sdp_signature
     if not verify_sdp_signature(verify_key, sdp_sig, from_agent_id, sdp_offer):
         return JSONResponse({"error": "Invalid SDP signature"}, status_code=403)
 
@@ -2079,7 +2076,6 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
 
     _log.info("WebRTC: answered offer from %s", conn.agent_display_name or from_agent_id)
 
-    from darkmatter.security import sign_sdp
     answer_sdp = pc.localDescription.sdp
     answer_sig = sign_sdp(state.private_key_hex, state.agent_id, answer_sdp)
     return JSONResponse({
@@ -2192,7 +2188,6 @@ async def handle_sdp_relay_deliver(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Not connected to originating agent"}, status_code=403)
 
     # Process the offer via WebRTC transport
-    from darkmatter.network.manager import get_network_manager
     mgr = get_network_manager()
     webrtc = mgr.get_transport("webrtc")
     if not webrtc:
@@ -2233,12 +2228,10 @@ async def handle_admin_connect(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Missing url"}, status_code=400)
 
     # Build and send a connection request to the target
-    from darkmatter.network.manager import get_network_manager, is_local_url
-    import httpx
+    from darkmatter.network.manager import is_local_url
 
     mgr = get_network_manager()
     if is_local_url(target_url):
-        import socket
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -2275,14 +2268,10 @@ async def handle_genome(request: Request) -> Response:
     With ?info=true: returns JSON metadata (version, author, parent, agent_id).
     Without: returns signed zip bytes with signature headers.
     """
-    from starlette.responses import Response as StarletteResponse
-    from darkmatter.genome import get_genome_version, build_genome_zip, hash_bytes, sign_genome_zip
-
     state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
-    import darkmatter as dm
     version = get_genome_version()
 
     # Info-only mode
@@ -2299,7 +2288,7 @@ async def handle_genome(request: Request) -> Response:
     zip_hash = hash_bytes(zip_bytes)
     signature = sign_genome_zip(zip_bytes, state.private_key_hex, version)
 
-    return StarletteResponse(
+    return Response(
         content=zip_bytes,
         media_type="application/zip",
         headers={
@@ -2343,6 +2332,11 @@ async def handle_send_proxy(request: Request) -> JSONResponse:
     state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    # Sync connections from disk so MCP-added connections are visible immediately
+    # (without waiting for the 10s agent scan loop)
+    from darkmatter.state import sync_connections_from_disk
+    sync_connections_from_disk(agent_id=state.agent_id)
 
     try:
         body = await request.json()
@@ -2434,6 +2428,10 @@ async def handle_local_connections(request: Request) -> JSONResponse:
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
+    # Sync connections from disk so MCP-added connections are visible immediately
+    from darkmatter.state import sync_connections_from_disk
+    sync_connections_from_disk(agent_id=state.agent_id)
+
     conns = []
     for aid, conn in state.connections.items():
         entry = {
@@ -2457,8 +2455,6 @@ async def handle_local_connections(request: Request) -> JSONResponse:
 
 async def handle_local_set_impression(request: Request) -> JSONResponse:
     """POST /__darkmatter__/set_impression — set trust score for a peer."""
-    from darkmatter.models import Impression
-
     state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -2497,7 +2493,6 @@ async def handle_local_wallet(request: Request) -> JSONResponse:
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
-    from darkmatter.wallet import get_all_providers
 
     chain_filter = request.query_params.get("chain")
     results = {}
@@ -2544,7 +2539,6 @@ async def handle_local_send_payment(request: Request) -> JSONResponse:
     if not agent_id or amount <= 0:
         return JSONResponse({"error": "agent_id and amount > 0 required"}, status_code=400)
 
-    from darkmatter.wallet.antimatter import initiate_payment
     result = await initiate_payment(
         state, agent_id, amount, currency=currency,
         token_decimals=token_decimals, chain=chain,
@@ -2570,7 +2564,6 @@ async def handle_local_config(request: Request) -> JSONResponse:
     if "status" in data:
         val = data["status"]
         if val in ("active", "inactive"):
-            from darkmatter.models import AgentStatus
             state.status = AgentStatus(val)
             changes["status"] = val
 
