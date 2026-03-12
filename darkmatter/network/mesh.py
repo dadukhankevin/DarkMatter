@@ -2474,10 +2474,8 @@ async def handle_local_set_impression(request: Request) -> JSONResponse:
         return JSONResponse({"error": "score must be a number"}, status_code=400)
 
     state.impressions[agent_id] = Impression(
-        agent_id=agent_id,
         score=score,
         note=str(note)[:2000],
-        updated_at=datetime.now(timezone.utc).isoformat(),
     )
     save_state()
 
