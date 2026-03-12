@@ -1014,23 +1014,29 @@ class NetworkManager:
                 if state is None:
                     continue
 
-                # Collect all connected peer URLs across all hosted agents
+                # Collect all HEALTHY connected peer URLs across all hosted agents
                 from darkmatter.state import list_hosted_agents, get_state_for
-                connected_urls = set()
+                healthy_urls = set()
                 for aid in list_hosted_agents():
                     s = get_state_for(aid)
                     if s:
                         for conn in s.connections.values():
-                            connected_urls.add(strip_base_url(conn.agent_url))
+                            failures = getattr(conn, "health_failures", 0)
+                            dormant = getattr(conn, "_dormant", False)
+                            if failures < HEALTH_FAILURE_THRESHOLD and not dormant:
+                                healthy_urls.add(strip_base_url(conn.agent_url))
                 # Fallback for single-agent
                 for conn in state.connections.values():
-                    connected_urls.add(strip_base_url(conn.agent_url))
+                    failures = getattr(conn, "health_failures", 0)
+                    dormant = getattr(conn, "_dormant", False)
+                    if failures < HEALTH_FAILURE_THRESHOLD and not dormant:
+                        healthy_urls.add(strip_base_url(conn.agent_url))
 
                 for bootstrap_url in BOOTSTRAP_PEERS:
                     base = bootstrap_url.rstrip("/")
 
-                    # Skip if already connected to this bootstrap peer
-                    if base in connected_urls:
+                    # Skip if already connected AND healthy to this bootstrap peer
+                    if base in healthy_urls:
                         backoff[bootstrap_url] = BOOTSTRAP_RECONNECT_INTERVAL
                         continue
 
