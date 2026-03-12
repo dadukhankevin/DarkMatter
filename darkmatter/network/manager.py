@@ -191,19 +191,8 @@ class NetworkManager:
                 return result
             errors.append(f"{transport.name}: {result.error}")
 
-        # All direct transports failed — try to re-establish P2P via mutual peer
-        reestablished = await self._reestablish_p2p(state, conn)
-        if reestablished:
-            # Retry direct transports with the new connection
-            for transport in self._transports:
-                if not transport.available:
-                    continue
-                result = await transport.send(conn, path, payload)
-                if result.success:
-                    conn.health_failures = 0
-                    return result
-
-        # Last resort — relay message through a mutual peer
+        # Direct failed — relay through a mutual peer (fast, no reconnection attempt)
+        # Background reconnection happens in the ping loop, not in the send hot path
         relay_result = await self._try_relay_send(state, agent_id, path, payload)
         if relay_result is not None and relay_result.success:
             return relay_result
