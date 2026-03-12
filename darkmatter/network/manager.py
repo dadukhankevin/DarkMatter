@@ -883,10 +883,11 @@ class NetworkManager:
                                     self._last_known_ip = majority_ip
                                     if old_ip is not None:
                                         _log.info("Public IP changed: %s -> %s", old_ip, majority_ip)
-                                        state.public_url = await self.discover_public_url()
-                                        await self.broadcast_peer_update()
                                     else:
                                         _log.info("Public IP detected: %s", majority_ip)
+                                    # Always update URL and broadcast on IP change or first detection
+                                    state.public_url = await self.discover_public_url()
+                                    await self.broadcast_peer_update()
 
                             conn.last_activity = datetime.now(timezone.utc).isoformat()
                 except Exception:
