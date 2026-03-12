@@ -271,6 +271,84 @@ def sync_peer_insights_from_disk(agent_id: Optional[str] = None) -> None:
         _log.info("Synced %d peer insight(s) from disk", added)
 
 
+def sync_connections_from_disk(agent_id: Optional[str] = None) -> None:
+    """Reload connections and impressions from the on-disk state file into in-memory state.
+
+    Handles the case where the MCP session (a separate process) has added or
+    removed connections that the daemon doesn't see because its in-memory state
+    was loaded at startup. Merges new connections from disk and removes
+    connections that the MCP session disconnected.
+    """
+    aid = agent_id or _default_agent_id
+    state = _agent_states.get(aid) if aid else get_state()
+    if state is None:
+        return
+
+    path = state_file_path(agent_id=aid)
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        _log.warning("state file JSON corrupt during connection sync (%s): %s", path, e)
+        return
+
+    disk_conns = data.get("connections", {})
+    disk_imps = data.get("impressions", {})
+
+    # Add connections from disk that we don't have in memory
+    added = 0
+    for aid_peer, cd in disk_conns.items():
+        if aid_peer not in state.connections:
+            from darkmatter.models import Connection
+            state.connections[aid_peer] = Connection(
+                agent_id=cd["agent_id"],
+                agent_url=cd["agent_url"],
+                agent_bio=cd.get("agent_bio", ""),
+                connected_at=cd.get("connected_at", ""),
+                messages_sent=cd.get("messages_sent", 0),
+                messages_received=cd.get("messages_received", 0),
+                messages_declined=cd.get("messages_declined", 0),
+                total_response_time_ms=cd.get("total_response_time_ms", 0.0),
+                last_activity=cd.get("last_activity"),
+                agent_public_key_hex=cd.get("agent_public_key_hex"),
+                agent_display_name=cd.get("agent_display_name"),
+                wallets=cd.get("wallets", {}),
+                addresses=cd.get("addresses", {}),
+                rate_limit=cd.get("rate_limit", 0),
+                peer_created_at=cd.get("peer_created_at"),
+                identity_verified=cd.get("identity_verified", False),
+                tls_secure=cd.get("tls_secure", False),
+                capabilities=cd.get("capabilities", {}),
+            )
+            added += 1
+
+    # Remove connections from memory that are no longer on disk
+    removed = 0
+    for aid_peer in list(state.connections.keys()):
+        if aid_peer not in disk_conns:
+            del state.connections[aid_peer]
+            removed += 1
+
+    # Merge impressions from disk (newer wins, fill gaps)
+    from darkmatter.models import Impression
+    for aid_peer, idata in disk_imps.items():
+        if aid_peer not in state.impressions:
+            state.impressions[aid_peer] = Impression(
+                score=idata["score"],
+                note=idata.get("note", ""),
+                negative_since=idata.get("negative_since"),
+                msgs_sent=idata.get("msgs_sent", 0),
+                msgs_received=idata.get("msgs_received", 0),
+                infrastructure=idata.get("infrastructure", False),
+            )
+
+    if added or removed:
+        _log.info("Connection sync from disk: +%d added, -%d removed", added, removed)
+
+
 # =============================================================================
 # Replay Protection (per-agent)
 # =============================================================================

@@ -32,7 +32,7 @@ from darkmatter.identity import load_or_create_passport
 from darkmatter.state import (
     set_state, get_state, get_state_for, save_state, state_file_path,
     load_state_from_file, clear_waiting_signal, register_agent, list_hosted_agents,
-    scan_state_files,
+    scan_state_files, sync_connections_from_disk,
 )
 from darkmatter.mcp import mcp
 import darkmatter.mcp.tools  # noqa: F401 — registers @mcp.tool() decorators
@@ -269,11 +269,15 @@ def _register_discovered_agents(daemon_port: int) -> None:
 
 
 async def _agent_scan_loop(daemon_port: int) -> None:
-    """Periodically scan for new/removed agent state files."""
+    """Periodically scan for new/removed agent state files and sync connections."""
     while True:
         try:
             await asyncio.sleep(10)
             _register_discovered_agents(daemon_port)
+            # Sync connections/impressions from disk for all hosted agents
+            # (MCP sessions may have added/removed connections)
+            for agent_id in list(list_hosted_agents()):
+                sync_connections_from_disk(agent_id=agent_id)
         except asyncio.CancelledError:
             return
         except Exception as e:
