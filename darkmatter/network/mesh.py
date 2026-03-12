@@ -246,6 +246,13 @@ def _queue_connection_request(
     """Queue a connection request as a message for the active MCP session."""
     display = from_agent_display_name or from_agent_id[:16] + "..."
     msg_id = request_id or f"conn-{uuid.uuid4().hex[:8]}"
+
+    # Skip if already consumed or already in queue
+    if msg_id in getattr(state, "_consumed_message_ids", set()):
+        return
+    if any(m.message_id == msg_id for m in state.message_queue):
+        return
+
     content = (
         f"Connection request ({status}) from {display}. Bio: {from_agent_bio}"
         if from_agent_bio
@@ -2391,6 +2398,8 @@ async def handle_inbox_consume(request: Request) -> JSONResponse:
                 "verified": msg.verified,
                 "received_at": msg.received_at,
             })
+            if not hasattr(state, "_consumed_message_ids"):
+                state._consumed_message_ids = set()
             state._consumed_message_ids.add(msg.message_id)
         else:
             remaining.append(msg)
