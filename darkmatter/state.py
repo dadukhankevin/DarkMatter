@@ -52,6 +52,11 @@ _seen_message_ids: dict[str, dict[str, float]] = {}
 # Per-agent consumed message IDs: agent_id -> set of message_ids
 _consumed_message_ids: dict[str, set[str]] = {}
 
+# Track connection changes made by MCP session (this process).
+# These override the daemon's disk state when merging during save_state().
+_mcp_added_connections: set[str] = set()      # agent IDs added by MCP tools
+_mcp_removed_connections: set[str] = set()    # agent IDs removed by MCP tools
+
 
 # =============================================================================
 # Registry API
@@ -561,13 +566,19 @@ def _save_single_state(state: AgentState) -> None:
                     disk_extras.append(qd)
             # Merge consumed IDs from disk (other process may have consumed)
             disk_consumed = set(disk_data.get("consumed_message_ids", []))
-            # Merge connections from disk that we don't have in memory
-            # (daemon may have established bootstrap/incoming connections)
+            # Connections: daemon is authoritative for add/remove.
+            # Start from disk (daemon's version), then apply MCP-side changes.
             disk_conns = disk_data.get("connections", {})
-            for aid, cdata in disk_conns.items():
-                if aid not in data["connections"]:
-                    data["connections"][aid] = cdata
-            # Merge impressions for disk-only connections
+            merged_conns = dict(disk_conns)
+            # Add connections the MCP session explicitly created
+            for aid in _mcp_added_connections:
+                if aid in data["connections"] and aid not in merged_conns:
+                    merged_conns[aid] = data["connections"][aid]
+            # Remove connections the MCP session explicitly disconnected
+            for aid in _mcp_removed_connections:
+                merged_conns.pop(aid, None)
+            data["connections"] = merged_conns
+            # Merge impressions from disk that we don't have in memory
             disk_imps = disk_data.get("impressions", {})
             for aid, idata in disk_imps.items():
                 if aid not in data["impressions"]:

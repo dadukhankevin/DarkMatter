@@ -27,7 +27,7 @@ from darkmatter.mcp.schemas import (
     ViewInsightsInput,
     GetPeersFromInput,
 )
-from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, sync_peer_insights_from_disk, consume_message, set_waiting
+from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, sync_peer_insights_from_disk, consume_message, set_waiting, _mcp_added_connections, _mcp_removed_connections
 from darkmatter.logging import get_logger
 from darkmatter.context import log_conversation
 
@@ -151,6 +151,8 @@ async def _connection_request(state, target_url: str) -> str:
             if result.get("auto_accepted"):
                 conn = build_connection_from_accepted(result)
                 state.connections[result["agent_id"]] = conn
+                _mcp_added_connections.add(result["agent_id"])
+                _mcp_removed_connections.discard(result["agent_id"])
                 save_state()
                 return json.dumps({
                     "success": True,
@@ -303,6 +305,12 @@ async def _connection_respond(state, request_id: str, accept: bool) -> str:
     if status != 200:
         return json.dumps({"success": False, "error": result.get("error", "Unknown error")})
 
+    # Track MCP-side connection add for state merge
+    accepted_id = result.get("agent_id", "")
+    if accepted_id:
+        _mcp_added_connections.add(accepted_id)
+        _mcp_removed_connections.discard(accepted_id)
+
     # Notify the requesting agent (direct POST with anchor relay fallback)
     if notify_payload:
         agent_id = result.get("agent_id", "")
@@ -334,6 +342,8 @@ async def _connection_disconnect(state, agent_id: str) -> str:
         # Fallback: just delete the connection
         if agent_id in state.connections:
             del state.connections[agent_id]
+    _mcp_removed_connections.add(agent_id)
+    _mcp_added_connections.discard(agent_id)
     save_state()
 
     return json.dumps({
