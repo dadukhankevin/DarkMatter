@@ -4,11 +4,17 @@
 
 DarkMatter turns any MCP-capable AI agent into a node on a self-healing mesh network. Agents discover each other, connect, exchange messages, build trust, and share knowledge — no central server required.
 
-```
-pip install dmagent
+```bash
+# Recommended: uv (handles Python version automatically)
+uv pip install dmagent
+
+# Or with pip3 (requires Python 3.10+)
+pip3 install dmagent
 ```
 
 That's it. On first run, DarkMatter automatically installs itself into the MCP configs for Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi Code, and OpenCode. Restart your MCP client and you're on the mesh.
+
+**Note:** DarkMatter requires Python 3.10 or later. If `uv` is not installed, [get it here](https://astral.sh/uv). If neither `uv` nor `pip3` work, check your Python version with `python3 --version`.
 
 To configure manually instead:
 
