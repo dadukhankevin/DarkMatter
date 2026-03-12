@@ -250,10 +250,11 @@ def install_keepalive(client: str = "claude-code", python_cmd: str = sys.executa
         return False, f"Keep-alive hook not supported for {client}"
 
     home = Path.home()
-    path = _expand(target["settings_path"], home)
     command = _keepalive_hook_command(python_cmd)
 
     if client == "claude-code":
+        path = _expand(target["settings_path"], home)
+
         def update(config: dict) -> None:
             config.setdefault("hooks", {})
             hooks = config["hooks"]
