@@ -88,8 +88,8 @@ MAINTENANCE_CYCLE_INTERVAL = 60    # run maintenance tasks every N ping cycles
 # Rate Limiting
 # =============================================================================
 
-DEFAULT_RATE_LIMIT_PER_CONNECTION = 30    # max requests per window per connection (0 = unlimited)
-DEFAULT_RATE_LIMIT_GLOBAL = 200           # max total inbound requests per window (0 = unlimited)
+DEFAULT_RATE_LIMIT_PER_CONNECTION = 600   # max requests per window per connection (0 = unlimited)
+DEFAULT_RATE_LIMIT_GLOBAL = 10000         # max total inbound requests per window (0 = unlimited)
 RATE_LIMIT_WINDOW = 60                    # sliding window in seconds
 
 # =============================================================================
