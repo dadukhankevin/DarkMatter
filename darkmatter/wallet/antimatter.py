@@ -198,6 +198,8 @@ def select_delegate(state: AgentState) -> Optional[Connection]:
         imp = state.impressions.get(aid, Impression(score=0.0))
         if imp.score <= 0:
             continue
+        if imp.infrastructure:
+            continue  # Bootstrap/infrastructure peers cannot be delegates
         if not resolve_provider(conn.wallets):
             continue
 

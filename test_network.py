@@ -1179,133 +1179,6 @@ async def test_health_loop_increments_failures() -> None:
 
 
 # ==========================================================================
-# Tier 1: Anchor node tests
-# ==========================================================================
-
-async def test_anchor_priority() -> None:
-    """Anchor nodes are queried first; if they respond, peer fan-out is skipped."""
-    sf_a = make_state_file()
-    sf_b = make_state_file()
-
-    try:
-        app_a, state_a = create_agent(sf_a, port=9900)
-        app_b, state_b = create_agent(sf_b, port=9901)
-        await connect_agents(app_a, state_a, app_b, state_b)
-
-        # Build a mock anchor using Flask test app
-        from anchor import anchor_bp
-        from flask import Flask as _Flask
-        anchor_app = _Flask(__name__)
-        anchor_app.register_blueprint(anchor_bp)
-
-        # Register agent B's URL in the anchor (signed)
-        ts = datetime.now(timezone.utc).isoformat()
-        sig = sign_peer_update(
-            state_b.private_key_hex, state_b.agent_id,
-            f"http://localhost:{state_b.port}", ts
-        )
-        with anchor_app.test_client() as anchor_client:
-            resp = anchor_client.post("/__darkmatter__/peer_update", json={
-                "agent_id": state_b.agent_id,
-                "new_url": f"http://localhost:{state_b.port}",
-                "public_key_hex": state_b.public_key_hex,
-                "signature": sig,
-                "timestamp": ts,
-            })
-            report("anchor: peer_update accepted", resp.status_code == 200)
-
-        # Start anchor as a real HTTP server on a random port
-        import threading
-        import socket as _sock
-
-        # Find a free port
-        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        s.bind(("127.0.0.1", 0))
-        anchor_port = s.getsockname()[1]
-        s.close()
-
-        # Run anchor in a thread
-        anchor_server = None
-
-        def run_anchor():
-            nonlocal anchor_server
-            from werkzeug.serving import make_server
-            anchor_server = make_server("127.0.0.1", anchor_port, anchor_app, threaded=True)
-            anchor_server.serve_forever()
-
-        t = threading.Thread(target=run_anchor, daemon=True)
-        t.start()
-        import time as _time
-        _time.sleep(0.3)  # Let server start
-
-        # Set anchor nodes config (patch both config and manager module)
-        original_anchors_config = darkmatter.config.ANCHOR_NODES[:]
-        original_anchors_mgr = _mgr_module.ANCHOR_NODES[:]
-        darkmatter.config.ANCHOR_NODES = [f"http://127.0.0.1:{anchor_port}"]
-        _mgr_module.ANCHOR_NODES = [f"http://127.0.0.1:{anchor_port}"]
-
-        try:
-            use_agent(state_a)
-            mgr = get_network_manager()
-            result = await mgr.lookup_peer_url(state_b.agent_id)
-            report("anchor: lookup returned URL from anchor", result is not None and str(state_b.port) in result)
-        finally:
-            darkmatter.config.ANCHOR_NODES = original_anchors_config
-            _mgr_module.ANCHOR_NODES = original_anchors_mgr
-            if anchor_server:
-                anchor_server.shutdown()
-
-    finally:
-        for sf in [sf_a, sf_b]:
-            try:
-                os.unlink(sf)
-            except FileNotFoundError:
-                pass
-
-
-async def test_anchor_fallback() -> None:
-    """When anchor nodes are unreachable, peer fan-out still works."""
-    sf_a = make_state_file()
-    sf_b = make_state_file()
-    sf_c = make_state_file()
-
-    try:
-        app_a, state_a = create_agent(sf_a, port=9900)
-        app_b, state_b = create_agent(sf_b, port=9901)
-        app_c, state_c = create_agent(sf_c, port=9902)
-
-        # Connect A↔B and A↔C
-        await connect_agents(app_a, state_a, app_b, state_b)
-        await connect_agents(app_a, state_a, app_c, state_c)
-        # B knows C's URL via connection
-        await connect_agents(app_b, state_b, app_c, state_c)
-
-        # Point to unreachable anchor (patch both config and manager module)
-        original_anchors_config = darkmatter.config.ANCHOR_NODES[:]
-        original_anchors_mgr = _mgr_module.ANCHOR_NODES[:]
-        darkmatter.config.ANCHOR_NODES = ["http://127.0.0.1:19999"]
-        _mgr_module.ANCHOR_NODES = ["http://127.0.0.1:19999"]
-
-        try:
-            use_agent(state_a)
-            mgr = get_network_manager()
-            result = await mgr.lookup_peer_url(state_c.agent_id)
-            # Result is None because in-process peers can't be reached via real HTTP,
-            # but the important thing is the anchor failure didn't crash anything
-            report("anchor fallback: unreachable anchor didn't crash lookup", result is None or isinstance(result, str))
-            report("anchor fallback: returns None (no reachable peers)", result is None)
-        finally:
-            darkmatter.config.ANCHOR_NODES = original_anchors_config
-            _mgr_module.ANCHOR_NODES = original_anchors_mgr
-
-    finally:
-        for sf in [sf_a, sf_b, sf_c]:
-            try:
-                os.unlink(sf)
-            except FileNotFoundError:
-                pass
-
-
 # ==========================================================================
 # Tier 1: Impression system tests
 # ==========================================================================
@@ -1867,19 +1740,17 @@ async def run_tier1_tests() -> None:
         ("8. Webhook recovery: orphaned message", test_webhook_recovery_orphaned_message),
         ("9. Webhook recovery: gives up after max attempts", test_webhook_recovery_gives_up),
         ("10. Webhook recovery: timeout budget", test_webhook_recovery_timeout_budget),
-        ("11. Anchor priority: anchor queried first", test_anchor_priority),
-        ("12. Anchor fallback: unreachable anchor", test_anchor_fallback),
-        ("13. Health loop increments failures", test_health_loop_increments_failures),
-        ("14. Impression system", test_impression_system),
-        ("15. Rate limiting", test_rate_limiting),
-        ("16. WebRTC guards", test_webrtc_guards),
-        ("17. LAN discovery beacon", test_lan_discovery_beacon),
-        ("18. Peer update replay rejected", test_peer_update_replay_rejected),
-        ("19. Replay protection persistence", test_replay_persistence),
-        ("20. Agent spawn guards", test_agent_spawn_guards),
-        ("21. Agent prompt building", test_agent_prompt_building),
-        ("22. Agent cleanup finished", test_agent_cleanup_finished),
-        ("23. Agent spawn deduplication", test_agent_spawn_deduplication),
+        ("11. Health loop increments failures", test_health_loop_increments_failures),
+        ("12. Impression system", test_impression_system),
+        ("13. Rate limiting", test_rate_limiting),
+        ("14. WebRTC guards", test_webrtc_guards),
+        ("15. LAN discovery beacon", test_lan_discovery_beacon),
+        ("16. Peer update replay rejected", test_peer_update_replay_rejected),
+        ("17. Replay protection persistence", test_replay_persistence),
+        ("18. Agent spawn guards", test_agent_spawn_guards),
+        ("19. Agent prompt building", test_agent_prompt_building),
+        ("20. Agent cleanup finished", test_agent_cleanup_finished),
+        ("21. Agent spawn deduplication", test_agent_spawn_deduplication),
     ]
 
     for label, test_fn in tier1_tests:

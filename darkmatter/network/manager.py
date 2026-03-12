@@ -415,6 +415,7 @@ class NetworkManager:
                     # LAN info for same-network peers (hairpin NAT workaround)
                     "lan_ip": lan_ip,
                     "local_port": _state.port,
+                    "wallets": _state.wallets,
                 }
                 if _state.public_key_hex:
                     p["public_key_hex"] = _state.public_key_hex

@@ -194,52 +194,47 @@ def init_state(port: int = None) -> None:
 # Identity attestation (on-chain passport proof)
 # =============================================================================
 
-async def _ensure_identity_attestations(state: AgentState) -> None:
-    """Ensure each wallet has an on-chain identity attestation.
+async def _attestation_loop(state: AgentState) -> None:
+    """Retry identity attestation every 60s until all chains are attested.
 
-    Skips chains already attested (cached in state.wallet_attestations).
-    Only attempts attestation when the wallet has sufficient balance for tx fees.
-    This is a one-time operation per chain — once attested, never retried.
-    Runs as a background task so it doesn't block startup.
+    Handles wallets funded after startup — keeps retrying until balance
+    is available and attestation succeeds.
     """
     from darkmatter.wallet import get_all_providers
 
-    for chain, provider in get_all_providers().items():
-        address = state.wallets.get(chain)
-        if not address:
-            continue
-
-        # Skip if already attested (cached locally)
-        if chain in state.wallet_attestations:
-            continue
-
-        try:
-            # Verify on-chain (one-time fallback if cache was lost)
-            existing = await provider.verify_identity_attestation(address, state.agent_id)
-            if existing["status"] == "match":
-                state.wallet_attestations[chain] = existing.get("timestamp", "verified")
-                save_state()
-                _log.info("Identity attestation exists on %s (since %s)", chain, existing.get("timestamp"))
+    while True:
+        all_attested = True
+        for chain, provider in get_all_providers().items():
+            address = state.wallets.get(chain)
+            if not address:
                 continue
-
-            # Check balance before attempting — don't waste an RPC call if wallet is empty
-            balance = await provider.get_balance(address)
-            if not balance.get("success") or balance.get("balance", 0) <= 0:
-                _log.debug("Skipping %s attestation — wallet has no balance", chain)
+            if chain in state.wallet_attestations:
                 continue
-
-            _log.info("Creating identity attestation on %s...", chain)
-            result = await provider.attest_identity(
-                state.private_key_hex, state.wallets, state.agent_id,
-            )
-            if result.get("success"):
-                state.wallet_attestations[chain] = result["tx_signature"]
-                save_state()
-                _log.info("Identity attested on %s: tx %s", chain, result["tx_signature"])
-            else:
-                _log.warning("Identity attestation failed on %s: %s", chain, result.get("error"))
-        except Exception as e:
-            _log.warning("Identity attestation check failed on %s: %s", chain, e)
+            all_attested = False
+            try:
+                existing = await provider.verify_identity_attestation(address, state.agent_id)
+                if existing["status"] == "match":
+                    state.wallet_attestations[chain] = existing.get("timestamp", "verified")
+                    save_state()
+                    _log.info("Identity attestation exists on %s (since %s)", chain, existing.get("timestamp"))
+                    continue
+                balance = await provider.get_balance(address)
+                if not balance.get("success") or balance.get("balance", 0) <= 0:
+                    continue
+                _log.info("Creating identity attestation on %s...", chain)
+                result = await provider.attest_identity(
+                    state.private_key_hex, state.wallets, state.agent_id,
+                )
+                if result.get("success"):
+                    state.wallet_attestations[chain] = result["tx_signature"]
+                    save_state()
+                    _log.info("Identity attested on %s: tx %s", chain, result["tx_signature"])
+            except Exception as e:
+                _log.warning("Attestation check failed on %s: %s", chain, e)
+        if all_attested:
+            _log.info("All chains attested — stopping attestation loop")
+            return
+        await asyncio.sleep(60)
 
 
 # =============================================================================
@@ -369,9 +364,9 @@ def create_app() -> Router:
         asyncio.create_task(_agent_scan_loop(port))
         _log.info("Multi-agent scanner: ENABLED (10s interval)")
 
-        # Background: ensure identity attestation exists on-chain for each wallet
+        # Background: retry identity attestation until all chains attested
         if state.private_key_hex and state.agent_id:
-            asyncio.create_task(_ensure_identity_attestations(state))
+            asyncio.create_task(_attestation_loop(state))
 
         # Start NetworkManager (discovers public URL, starts health loop + ping loop)
         await manager.start()

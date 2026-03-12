@@ -25,7 +25,6 @@ services:
       DARKMATTER_HOST: "0.0.0.0"
       DARKMATTER_TRANSPORT: "http"
       DARKMATTER_DISCOVERY: "false"
-      DARKMATTER_ANCHOR_NODES: ""
       DARKMATTER_AGENT_ENABLED: "false"
 
   node-b:
@@ -43,7 +42,6 @@ services:
       DARKMATTER_HOST: "0.0.0.0"
       DARKMATTER_TRANSPORT: "http"
       DARKMATTER_DISCOVERY: "false"
-      DARKMATTER_ANCHOR_NODES: ""
       DARKMATTER_AGENT_ENABLED: "false"
       DARKMATTER_PUBLIC_URL: "http://node-b:8100"
 
@@ -61,5 +59,4 @@ services:
       DARKMATTER_HOST: "0.0.0.0"
       DARKMATTER_TRANSPORT: "http"
       DARKMATTER_DISCOVERY: "false"
-      DARKMATTER_ANCHOR_NODES: ""
       DARKMATTER_AGENT_ENABLED: "false"

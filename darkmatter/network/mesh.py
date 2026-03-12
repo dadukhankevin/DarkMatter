@@ -1187,6 +1187,10 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
     if new_display_name is not None and isinstance(new_display_name, str):
         conn.agent_display_name = new_display_name[:100]
 
+    new_wallets = data.get("wallets")
+    if new_wallets and isinstance(new_wallets, dict):
+        conn.wallets = new_wallets
+
     save_state()
 
     _log.info("Peer %s... updated URL: %s -> %s", agent_id[:12], old_url, new_url)
