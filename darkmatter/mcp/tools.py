@@ -27,7 +27,7 @@ from darkmatter.mcp.schemas import (
     ViewInsightsInput,
     GetPeersFromInput,
 )
-from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, consume_message, set_waiting
+from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, sync_peer_insights_from_disk, consume_message, set_waiting
 from darkmatter.logging import get_logger
 from darkmatter.context import log_conversation
 
@@ -994,6 +994,10 @@ async def view_insights(params: ViewInsightsInput, ctx: Context) -> str:
     """
     track_session(ctx)
     state = get_state()
+
+    # Sync peer insights from daemon (disk) — daemon may have received
+    # insight_push from peers that this MCP session doesn't have in memory
+    sync_peer_insights_from_disk()
 
     from darkmatter.insight_resolver import resolve_region, assess_health, hash_content
     from pathlib import Path

@@ -176,6 +176,96 @@ def sync_message_queue_from_disk(agent_id: Optional[str] = None) -> None:
             ))
 
 
+def sync_peer_insights_from_disk(agent_id: Optional[str] = None) -> None:
+    """Reload peer insights from the on-disk state file into in-memory state.
+
+    Same pattern as sync_message_queue_from_disk — merges peer insights that
+    the daemon received (via insight_push) but the MCP session doesn't have
+    because they're separate processes.
+
+    Only syncs insights authored by OTHER agents (peer cache). Own insights
+    are authoritative in-memory.
+    """
+    aid = agent_id or _default_agent_id
+    state = _agent_states.get(aid) if aid else get_state()
+    if state is None:
+        return
+
+    path = state_file_path(agent_id=aid)
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        _log.warning("state file JSON corrupt during insight sync (%s): %s", path, e)
+        return
+
+    disk_insights = data.get("insights", [])
+    if not disk_insights:
+        return
+
+    # Index existing in-memory insights by (insight_id, author)
+    existing = {
+        (s.insight_id, s.author_agent_id)
+        for s in state.insights
+    }
+
+    from darkmatter.models import Insight
+    added = 0
+    for di in disk_insights:
+        author = di.get("author_agent_id", "")
+        # Only sync peer insights (not our own)
+        if author == (state.agent_id if state else ""):
+            continue
+        iid = di.get("insight_id", "")
+        if not iid:
+            continue
+        key = (iid, author)
+        if key in existing:
+            # Update existing peer insight if disk version is newer
+            for s in state.insights:
+                if s.insight_id == iid and s.author_agent_id == author:
+                    disk_updated = di.get("updated_at", "")
+                    if disk_updated > (s.updated_at or ""):
+                        s.content = di.get("content", s.content)
+                        s.tags = di.get("tags", s.tags)
+                        s.updated_at = disk_updated
+                        s.summary = di.get("summary", s.summary)
+                        s.file = di.get("file", s.file)
+                        s.from_text = di.get("from_text", s.from_text)
+                        s.to_text = di.get("to_text", s.to_text)
+                        s.function_anchor = di.get("function_anchor", s.function_anchor)
+                        s.original_content = di.get("original_content", s.original_content)
+                        s.original_hash = di.get("original_hash", s.original_hash)
+                        s.signature_hex = di.get("signature_hex", s.signature_hex)
+                    break
+            continue
+        # New peer insight from disk
+        state.insights.append(Insight(
+            insight_id=iid,
+            author_agent_id=author,
+            content=di.get("content", ""),
+            tags=di.get("tags", []),
+            share_with_top_n=di.get("share_with_top_n", -1),
+            created_at=di.get("created_at", ""),
+            updated_at=di.get("updated_at", ""),
+            summary=di.get("summary"),
+            signature_hex=di.get("signature_hex"),
+            file=di.get("file"),
+            from_text=di.get("from_text"),
+            to_text=di.get("to_text"),
+            function_anchor=di.get("function_anchor"),
+            original_content=di.get("original_content"),
+            original_hash=di.get("original_hash"),
+        ))
+        added += 1
+
+    if added:
+        _log.info("Synced %d peer insight(s) from disk", added)
+
+
 # =============================================================================
 # Replay Protection (per-agent)
 # =============================================================================
