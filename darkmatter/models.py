@@ -265,6 +265,8 @@ class AgentState:
     conversation_log: list[ConversationEntry] = field(default_factory=list)
     # Insights (live code knowledge)
     insights: list[Insight] = field(default_factory=list)
+    # Network tier: "local", "lan", or "global" (default)
+    network_tier: str = "global"
     # Security settings (persisted)
     security_settings: dict = field(default_factory=lambda: {
         "pin_hash": "",

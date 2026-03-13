@@ -103,10 +103,17 @@ async def handle_well_known(request) -> "JSONResponse":
     Top-level fields reference the default/primary agent.
     """
     from darkmatter.state import get_state, get_state_for, list_hosted_agents
+    from darkmatter.network.tier import ip_allowed_by_tier
 
     state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    # Network tier enforcement — don't expose info to IPs outside the tier
+    xff = request.headers.get("x-forwarded-for")
+    client_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
+    if not ip_allowed_by_tier(client_ip, state.network_tier):
+        return JSONResponse({"error": "tier_restricted", "tier": state.network_tier}, status_code=403)
 
     public_url = os.environ.get("DARKMATTER_PUBLIC_URL", "").rstrip("/")
     if not public_url:
@@ -371,10 +378,10 @@ def _dynamic_port_set(state: AgentState) -> set[int]:
     """Build a dynamic set of ports to scan based on known connections and peers.
 
     Includes: configured range defaults, ports from connection URLs,
-    ports from discovered_peers, and standard defaults (8100, 8200).
+    ports from discovered_peers, and standard defaults.
     Capped at 20 ports per IP to avoid flooding.
     """
-    ports = {8100, 8200}
+    ports = {8100}
 
     # Add ports from connection URLs
     for conn in state.connections.values():
@@ -402,7 +409,7 @@ async def scan_local_ports(state: AgentState) -> None:
     """Scan localhost ports + LAN subnet for other DarkMatter nodes.
 
     Localhost: full port range (8100-8200), all concurrent (fast loopback).
-    LAN: only key ports (8100, 8101, 8200) with concurrency cap to avoid
+    LAN: only key ports with concurrency cap to avoid
     flooding the event loop (~762 probes max vs 25k+ before).
     """
     # Concurrency limiter for LAN probes — prevent event loop starvation
@@ -421,10 +428,11 @@ async def scan_local_ports(state: AgentState) -> None:
         ]
 
         # LAN: scan /24 subnet but only key ports, throttled
-        # Agents listen on 8100 (default), 8101 (second agent), 8200 (entrypoint)
-        lan_ports = _dynamic_port_set(state) | {DEFAULT_PORT, DEFAULT_PORT + 1, 8200}
+        # Agents listen on 8100 (default), 8101 (second agent), etc.
+        # Skip LAN scanning entirely when network tier is "local"
+        lan_ports = _dynamic_port_set(state) | {DEFAULT_PORT, DEFAULT_PORT + 1}
         lan_ip = _get_lan_ip()
-        if lan_ip != "127.0.0.1":
+        if lan_ip != "127.0.0.1" and state.network_tier != "local":
             subnet_prefix = lan_ip.rsplit(".", 1)[0]
             for host_octet in range(1, 255):
                 ip = f"{subnet_prefix}.{host_octet}"
@@ -493,7 +501,7 @@ async def discovery_loop(state: AgentState) -> None:
                 "beacon_signature_hex": beacon_sig,
             }).encode("utf-8")
 
-            if mcast_sock is not None:
+            if mcast_sock is not None and state.network_tier != "local":
                 try:
                     await loop.run_in_executor(
                         None, mcast_sock.sendto, packet, (DISCOVERY_MCAST_GROUP, DISCOVERY_PORT)

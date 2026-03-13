@@ -124,6 +124,14 @@ def _consume_via_daemon(daemon_port: int, message_ids: list[str]) -> None:
 
 async def _connection_request(state, target_url: str) -> str:
     """Send a connection request to a target agent."""
+    # Network tier enforcement — reject outbound to URLs outside our tier
+    from darkmatter.network.tier import url_allowed_by_tier
+    if not url_allowed_by_tier(target_url, state.network_tier):
+        return json.dumps({
+            "success": False,
+            "error": f"Target URL is outside network tier '{state.network_tier}'. Change tier with update_bio(network_tier=...) to connect."
+        })
+
     url_err = validate_url(target_url)
     if url_err:
         return json.dumps({"success": False, "error": url_err})
@@ -398,6 +406,9 @@ async def _send_message(state, params: SendMessageInput) -> str:
     else:
         targets = list(state.connections.values())
 
+    # Never send to self — prevents echo loops
+    targets = [c for c in targets if c.agent_id != state.agent_id]
+
     if not targets:
         return json.dumps({
             "success": False,
@@ -637,12 +648,17 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
     }
 )
 async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
-    """Update your bio and/or display name. Both fields are optional — omit either to keep its current value. Shared with peers for routing decisions."""
+    """Update your bio, display name, and/or network tier. All fields are optional — omit any to keep its current value. Shared with peers for routing decisions."""
+    from darkmatter.network.tier import VALID_TIERS
     state = get_state()
     if params.bio is not None:
         state.bio = params.bio
     if params.display_name is not None:
         state.display_name = params.display_name
+    if params.network_tier is not None:
+        if params.network_tier not in VALID_TIERS:
+            return json.dumps({"success": False, "error": f"Invalid network_tier: must be one of {VALID_TIERS}"})
+        state.network_tier = params.network_tier
     save_state()
 
     # Broadcast change to all connected peers
@@ -651,7 +667,7 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     except Exception as e:
         _log.error("Failed to broadcast update: %s", e)
 
-    return json.dumps({"success": True, "bio": state.bio, "display_name": state.display_name})
+    return json.dumps({"success": True, "bio": state.bio, "display_name": state.display_name, "network_tier": state.network_tier})
 
 
 
@@ -677,12 +693,15 @@ async def discover_local(ctx: Context) -> str:
 
     await scan_local_ports(state)
 
-    # Filter out already-connected peers and self
+    # Filter out already-connected peers, self, and peers outside our network tier
+    from darkmatter.network.tier import url_allowed_by_tier
     results = {}
     for peer_id, info in state.discovered_peers.items():
         if peer_id == state.agent_id:
             continue
         if peer_id in state.connections:
+            continue
+        if not url_allowed_by_tier(info.get("url", ""), state.network_tier):
             continue
         results[peer_id] = info
 

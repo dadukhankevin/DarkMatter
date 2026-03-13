@@ -610,6 +610,7 @@ def _save_single_state(state: AgentState) -> None:
             }
             for s in state.insights
         ],
+        "network_tier": state.network_tier,
         "security_settings": state.security_settings,
         "seen_message_ids": {
             mid: ts for mid, ts in seen.items()
@@ -850,6 +851,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         wallet_attestations=data.get("wallet_attestations", {}),
         conversation_log=conversation_log,
         insights=insights,
+        network_tier=data.get("network_tier", "global"),
         security_settings=data.get("security_settings", {
             "pin_hash": "",
             "auto_accept_local": True,

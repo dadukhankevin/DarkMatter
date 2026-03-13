@@ -14,16 +14,6 @@ def main() -> None:
         from darkmatter.installer import main as installer_main
         raise SystemExit(installer_main(sys.argv[2:]))
 
-    if cmd == "init-entrypoint":
-        from darkmatter.entrypoint_init import init_entrypoint
-        init_entrypoint(sys.argv[2:])
-        return
-
-    if cmd == "open-entrypoint":
-        from darkmatter.entrypoint_init import open_entrypoint
-        open_entrypoint()
-        return
-
     if cmd == "keepalive":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else None
         client = "claude-code"

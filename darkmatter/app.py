@@ -36,6 +36,7 @@ from darkmatter.config import (
     DISCOVERY_MCAST_GROUP,
     DISCOVERY_LOCAL_PORTS,
     AGENT_ROUTER_MODE,
+    NETWORK_TIER,
 )
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.names import generate_agent_name
@@ -95,7 +96,6 @@ from darkmatter.network.mesh import (
 from darkmatter.wallet import get_all_providers
 import darkmatter.wallet.solana  # noqa: F401 — registers SolanaWalletProvider
 from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
-from darkmatter.entrypoint_init import init_entrypoint, open_entrypoint
 from darkmatter.installer import main as installer_main
 from darkmatter.logging import get_logger
 
@@ -149,6 +149,7 @@ def init_state(port: int = None) -> None:
         private_key_hex=priv,
         public_key_hex=pub,
         display_name=display_name or generate_agent_name(),
+        network_tier=NETWORK_TIER,
     )
     set_state(state)
 
@@ -164,6 +165,7 @@ def init_state(port: int = None) -> None:
         restored.port = port
         restored.status = AgentStatus.ACTIVE
         restored.router_mode = AGENT_ROUTER_MODE  # From config — don't let stale state override
+        restored.network_tier = NETWORK_TIER       # Env var overrides persisted value on boot
         if display_name:
             restored.display_name = display_name
         elif not restored.display_name:
@@ -751,13 +753,6 @@ def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else None
     if cmd == "install-mcp":
         raise SystemExit(installer_main(sys.argv[2:]))
-    if cmd == "init-entrypoint":
-        init_entrypoint(sys.argv[2:])
-        return
-    if cmd == "open-entrypoint":
-        open_entrypoint()
-        return
-
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     transport = os.environ.get("DARKMATTER_TRANSPORT", "auto")
 

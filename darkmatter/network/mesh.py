@@ -262,6 +262,10 @@ def _queue_connection_request(
     request_id: str | None = None,
 ) -> None:
     """Queue a connection request as a message for the active MCP session."""
+    # Reject self-connection requests
+    if from_agent_id == state.agent_id:
+        return
+
     display = from_agent_display_name or from_agent_id[:16] + "..."
     msg_id = request_id or f"conn-{uuid.uuid4().hex[:8]}"
 
@@ -296,11 +300,19 @@ def _queue_connection_request(
     _log.info("Queued %s connection request from %s", status, display)
 
 
-async def process_connection_request(state: AgentState, data: dict, public_url: str) -> tuple[dict, int]:
+async def process_connection_request(state: AgentState, data: dict, public_url: str,
+                                     client_ip: str = "") -> tuple[dict, int]:
     """Process an incoming connection request. Returns (response_dict, status_code).
 
     public_url: the public URL of this agent (caller provides it since Flask/Starlette differ).
+    client_ip: the requester's IP address (for network tier enforcement).
     """
+    # Network tier enforcement — reject IPs outside our tier
+    if client_ip:
+        from darkmatter.network.tier import ip_allowed_by_tier
+        if not ip_allowed_by_tier(client_ip, state.network_tier):
+            return {"error": "tier_restricted", "tier": state.network_tier}, 403
+
     if state.status == AgentStatus.INACTIVE:
         return {"error": "Agent is currently inactive"}, 503
 
@@ -719,22 +731,24 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
         pass  # Message stays in queue; main agent picks it up via wait_for_message
 
     elif decision.action == RouterAction.FORWARD:
-        from darkmatter.network import send_to_peer
+        mgr = get_network_manager()
         for target_id in (decision.forward_to or []):
+            # Never forward back to the original sender
+            if target_id == msg.from_agent_id:
+                continue
             conn = state.connections.get(target_id)
             if conn:
-                try:
-                    fwd_metadata = dict(msg.metadata or {})
-                    fwd_metadata["forwarded"] = True
-                    fwd_metadata["forwarded_by"] = state.agent_id
-                    await send_to_peer(conn, "/__darkmatter__/message", {
-                        "from_agent_id": msg.from_agent_id,
-                        "content": msg.content,
-                        "metadata": fwd_metadata,
-                        "hops_remaining": (msg.hops_remaining or 10) - 1,
-                    })
-                except Exception as e:
-                    _log.error("Forward to %s... failed: %s", target_id[:12], e)
+                fwd_metadata = dict(msg.metadata or {})
+                fwd_metadata["forwarded"] = True
+                fwd_metadata["forwarded_by"] = state.agent_id
+                result = await mgr.send(target_id, "/__darkmatter__/message", {
+                    "from_agent_id": msg.from_agent_id,
+                    "content": msg.content,
+                    "metadata": fwd_metadata,
+                    "hops_remaining": (msg.hops_remaining or 10) - 1,
+                })
+                if not result.success:
+                    _log.error("Forward to %s... failed: %s", target_id[:12], result.error)
         # Remove from queue after forwarding
         state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
 
@@ -747,8 +761,7 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
     """Commit a verified inbound message into state and route it."""
     state.messages_handled += 1
 
-    # Always queue so wait_for_message can drain it (including queue_only
-    # entrypoint agents that are MCP sessions).
+    # Always queue so wait_for_message can drain it.
     state.message_queue.append(msg)
 
     _agents_waiting_at_receive = len(state._inbox_events) > 0
@@ -997,7 +1010,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
         public_url = f"http://{lan_ip}:{state.port}"
     else:
         public_url = mgr.get_public_url()
-    result, status = await process_connection_request(state, data, public_url)
+    result, status = await process_connection_request(state, data, public_url, client_ip=_client_ip(request))
     return JSONResponse(result, status_code=status)
 
 
@@ -1563,9 +1576,11 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
         return {"status": "delivered", "route_id": route_id}, 200
 
     # --- Step 2: Am I connected to the target? Forward directly. ---
+    # Use direct-only send (no relay fallback) to prevent relay echo loops.
+    # If direct fails, fall through to step 3 which properly maintains visited.
     target_conn = state.connections.get(target_agent_id)
     if target_conn:
-        from darkmatter.network import send_to_peer
+        mgr = get_network_manager()
 
         if route_type == "message":
             # For messages, deliver directly to the target's original endpoint
@@ -1573,12 +1588,11 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
             original_path = data.get("original_path", "/__darkmatter__/message")
             _log.info("Mesh route: delivering message to connected target %s... via %s",
                        target_agent_id[:12], original_path)
-            try:
-                await send_to_peer(target_conn, original_path, payload)
+            result = await mgr._direct_send(target_conn, original_path, payload)
+            if result.success:
                 return {"status": "delivered", "route_id": route_id}, 200
-            except Exception as e:
-                _log.warning("Mesh route: direct message delivery to %s... failed: %s",
-                             target_agent_id[:12], e)
+            _log.warning("Mesh route: direct message delivery to %s... failed: %s",
+                         target_agent_id[:12], result.error)
         else:
             # For connection requests, forward the full mesh_route envelope
             imp = state.impressions.get(target_agent_id)
@@ -1595,12 +1609,11 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
 
             _log.info("Mesh route: forwarding to connected target %s... (trust=%.2f)",
                        target_agent_id[:12], trust_score)
-            try:
-                await send_to_peer(target_conn, "/__darkmatter__/mesh_route", forwarded)
+            result = await mgr._direct_send(target_conn, "/__darkmatter__/mesh_route", forwarded)
+            if result.success:
                 return {"status": "forwarded_direct", "route_id": route_id}, 200
-            except Exception as e:
-                _log.warning("Mesh route: direct forward to %s... failed: %s",
-                             target_agent_id[:12], e)
+            _log.warning("Mesh route: direct forward to %s... failed: %s",
+                         target_agent_id[:12], result.error)
 
     # --- Step 3: Forward to most-trusted unvisited peer ---
     if hops_remaining <= 0:
@@ -1630,13 +1643,12 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
     _log.info("Mesh route: trust-guided forward to %s... (trust=%.2f)",
                next_peer_id[:12], trust_score)
 
-    from darkmatter.network import send_to_peer
-    try:
-        await send_to_peer(next_conn, "/__darkmatter__/mesh_route", forwarded)
+    mgr = get_network_manager()
+    result = await mgr._direct_send(next_conn, "/__darkmatter__/mesh_route", forwarded)
+    if result.success:
         return {"status": "forwarded", "route_id": route_id, "via": next_peer_id[:12]}, 200
-    except Exception as e:
-        _log.warning("Mesh route: forward to %s... failed: %s", next_peer_id[:12], e)
-        return {"status": "forward_failed", "route_id": route_id}, 200
+    _log.warning("Mesh route: forward to %s... failed: %s", next_peer_id[:12], result.error)
+    return {"status": "forward_failed", "route_id": route_id}, 200
 
 
 async def _process_mesh_route_response(state: AgentState, data: dict) -> tuple[dict, int]:
@@ -1708,8 +1720,11 @@ async def _process_mesh_route_response(state: AgentState, data: dict) -> tuple[d
 
 
 async def _forward_trust_guided(state: AgentState, envelope: dict) -> None:
-    """Forward a mesh route envelope to the most-trusted unvisited peer."""
-    from darkmatter.network import send_to_peer
+    """Forward a mesh route envelope to the most-trusted unvisited peer.
+
+    Uses direct-only send (no relay fallback) to prevent relay echo loops.
+    """
+    mgr = get_network_manager()
 
     visited = set(envelope.get("visited", []))
     visited.add(state.agent_id)
@@ -1724,12 +1739,11 @@ async def _forward_trust_guided(state: AgentState, envelope: dict) -> None:
             "hops_remaining": envelope.get("hops_remaining", 10) - 1,
             "visited": list(visited),
         }
-        try:
-            await send_to_peer(target_conn, "/__darkmatter__/mesh_route", forwarded)
+        result = await mgr._direct_send(target_conn, "/__darkmatter__/mesh_route", forwarded)
+        if result.success:
             return
-        except Exception as e:
-            _log.warning("Mesh route: direct forward to %s... failed: %s",
-                         target_agent_id[:12], e)
+        _log.warning("Mesh route: direct forward to %s... failed: %s",
+                     target_agent_id[:12], result.error)
 
     # Trust-guided: pick most trusted unvisited peer
     next_peer_id = _pick_most_trusted_peer(state, visited)
@@ -1744,11 +1758,10 @@ async def _forward_trust_guided(state: AgentState, envelope: dict) -> None:
         "visited": list(visited),
     }
 
-    try:
-        await send_to_peer(state.connections[next_peer_id],
-                           "/__darkmatter__/mesh_route", forwarded)
-    except Exception as e:
-        _log.warning("Mesh route: forward to %s... failed: %s", next_peer_id[:12], e)
+    result = await mgr._direct_send(state.connections[next_peer_id],
+                                     "/__darkmatter__/mesh_route", forwarded)
+    if not result.success:
+        _log.warning("Mesh route: forward to %s... failed: %s", next_peer_id[:12], result.error)
 
 
 async def handle_mesh_route(request: Request) -> JSONResponse:

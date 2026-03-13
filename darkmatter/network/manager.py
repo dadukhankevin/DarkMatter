@@ -1067,6 +1067,11 @@ class NetworkManager:
                     if failures < HEALTH_FAILURE_THRESHOLD and not dormant:
                         healthy_urls.add(strip_base_url(conn.agent_url))
 
+                # Network tier enforcement — only bootstrap when tier is "global"
+                if state.network_tier != "global":
+                    await asyncio.sleep(BOOTSTRAP_RECONNECT_INTERVAL)
+                    continue
+
                 for bootstrap_url in BOOTSTRAP_PEERS:
                     base = bootstrap_url.rstrip("/")
 

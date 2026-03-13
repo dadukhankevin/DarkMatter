@@ -78,6 +78,12 @@ PING_SILENCE_THRESHOLD = 30         # seconds of no inbound pings before alert
 REQUEST_EXPIRY_S = int(os.environ.get("DARKMATTER_REQUEST_EXPIRY", "3600"))  # pending request TTL
 
 # =============================================================================
+# Network Tier (visibility boundary)
+# =============================================================================
+
+NETWORK_TIER = os.environ.get("DARKMATTER_NETWORK_TIER", "global")
+
+# =============================================================================
 # NAT Traversal
 # =============================================================================
 

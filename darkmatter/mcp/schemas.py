@@ -45,10 +45,11 @@ class SendMessageInput(BaseModel):
 
 
 class UpdateBioInput(BaseModel):
-    """Update this agent's bio and/or display name."""
+    """Update this agent's bio, display name, and/or network tier."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     bio: Optional[str] = Field(default=None, description="New bio text describing this agent's specialty", min_length=1, max_length=1000)
     display_name: Optional[str] = Field(default=None, description="New display name for this agent", min_length=1, max_length=100)
+    network_tier: Optional[str] = Field(default=None, description="Network visibility tier: 'local' (localhost only), 'lan' (private networks), or 'global' (fully open, default)")
 
 
 class SetStatusInput(BaseModel):
