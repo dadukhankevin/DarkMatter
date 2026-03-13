@@ -28,6 +28,11 @@ from darkmatter.hooks import STOP_TOKEN
 # If the hook fires twice within this window, let the agent stop.
 COOLDOWN_SECONDS = 40
 
+# Delay before nudging — gives the human time to send another message.
+# If the user messages during this delay, Claude Code kills the hook process
+# and the nudge never fires. Only triggers when the user is truly idle.
+IDLE_DELAY_SECONDS = int(os.environ.get("DARKMATTER_KEEPALIVE_DELAY", "60"))
+
 # Timestamp file — records when the hook last fired and blocked.
 _STAMP_DIR = os.path.join(os.path.expanduser("~"), ".darkmatter", "keepalive")
 os.makedirs(_STAMP_DIR, exist_ok=True)
@@ -135,6 +140,10 @@ def main() -> None:
 
     if result is None:
         sys.exit(0)
+
+    # Wait before nudging — if the user sends a message during this delay,
+    # Claude Code kills this process and the nudge never reaches the agent.
+    time.sleep(IDLE_DELAY_SECONDS)
 
     json.dump(result, sys.stdout)
     sys.stdout.flush()

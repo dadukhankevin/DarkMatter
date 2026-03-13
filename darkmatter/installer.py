@@ -261,7 +261,7 @@ def install_keepalive(client: str = "claude-code", python_cmd: str = sys.executa
             hook_entry = {
                 "type": "command",
                 "command": command,
-                "timeout": 10,
+                "timeout": 120,
             }
 
             # Check if we already installed a DarkMatter keep-alive hook
@@ -270,6 +270,7 @@ def install_keepalive(client: str = "claude-code", python_cmd: str = sys.executa
                 for h in rule.get("hooks", []):
                     if "darkmatter.hooks.keepalive" in h.get("command", ""):
                         h["command"] = command  # Update command path
+                        h["timeout"] = 120      # Ensure delay-compatible timeout
                         return
 
             # Add new hook rule
