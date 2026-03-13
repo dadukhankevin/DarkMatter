@@ -53,13 +53,51 @@ def derive_public_key_hex(private_key_hex: str) -> str:
     return private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
 
 
-def load_or_create_passport() -> tuple[str, str]:
-    """Load or create the passport (Ed25519 keypair) from the working directory.
+def _find_passport_dir() -> str:
+    """Find the best directory for the passport file.
 
-    The passport file lives at .darkmatter/passport.key in the current working
-    directory. Returns (private_key_hex, public_key_hex).
+    Priority:
+    1. DARKMATTER_PROJECT_DIR env var
+    2. Walk up from cwd to find an existing .darkmatter/passport.key
+    3. Fall back to cwd (for new passport creation)
     """
-    passport_dir = os.path.join(os.getcwd(), ".darkmatter")
+    # 1. Explicit env var (set by .mcp.json or user)
+    project_dir = os.environ.get("DARKMATTER_PROJECT_DIR")
+    if project_dir and os.path.isdir(project_dir):
+        passport = os.path.join(project_dir, ".darkmatter", "passport.key")
+        if os.path.exists(passport):
+            return project_dir
+
+    # 2. Walk up from cwd to find nearest existing passport
+    cwd = os.getcwd()
+    current = cwd
+    while True:
+        passport = os.path.join(current, ".darkmatter", "passport.key")
+        if os.path.exists(passport):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break  # Hit filesystem root
+        current = parent
+
+    # 3. Fall back to project dir (if set) or cwd for new passport creation
+    if project_dir and os.path.isdir(project_dir):
+        return project_dir
+    return cwd
+
+
+def load_or_create_passport() -> tuple[str, str]:
+    """Load or create the passport (Ed25519 keypair) from the project directory.
+
+    Searches for .darkmatter/passport.key in this order:
+    1. DARKMATTER_PROJECT_DIR env var (set by .mcp.json)
+    2. Current working directory
+    3. Walk up parent directories from cwd to find an existing passport
+
+    Returns (private_key_hex, public_key_hex).
+    """
+    base_dir = _find_passport_dir()
+    passport_dir = os.path.join(base_dir, ".darkmatter")
     passport_path = os.path.join(passport_dir, "passport.key")
 
     if os.path.exists(passport_path):
