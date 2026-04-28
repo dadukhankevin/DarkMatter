@@ -25,13 +25,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from darkmatter.config import (
-    ACCEPT_INSIGHTS,
     MAX_AGENT_ID_LENGTH,
     MAX_BIO_LENGTH,
     MAX_CONNECTIONS,
     MAX_CONTENT_LENGTH,
     MESSAGE_QUEUE_MAX,
-    PEER_INSIGHT_CACHE_MAX,
     PROTOCOL_VERSION,
     REQUEST_EXPIRY_S,
     ANTIMATTER_TIMEOUT,
@@ -47,7 +45,6 @@ from darkmatter.models import (
     AgentStatus,
     Connection,
     Impression,
-    Insight,
     PendingConnectionRequest,
     QueuedMessage,
     RouterAction,
@@ -67,7 +64,6 @@ from darkmatter.security import (
     sign_payload,
     sign_sdp,
     verify_inbound,
-    verify_insight_signature,
     verify_proof,
     verify_sdp_signature,
     verify_signed_payload,
@@ -80,7 +76,6 @@ from darkmatter.state import (
     check_waiting,
 )
 from darkmatter.context import log_conversation
-from darkmatter.genome import get_genome_version, build_genome_zip, hash_bytes, sign_genome_zip
 from darkmatter.router import execute_routing
 from darkmatter.wallet import get_all_providers
 from darkmatter.wallet.antimatter import (
@@ -1228,69 +1223,6 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
     return {"success": True, "updated": True}, 200
 
 
-async def _process_insight_push(state: AgentState, data: dict) -> tuple[dict, int]:
-    """Process an incoming insight push. Returns (response_dict, status_code)."""
-    if not ACCEPT_INSIGHTS:
-        return {"error": "This node does not accept incoming insights"}, 403
-
-    author_id = data.get("author_agent_id", "")
-    insight_id = data.get("insight_id", "")
-
-    if not author_id or not insight_id:
-        missing = [f for f, v in [("author_agent_id", author_id), ("insight_id", insight_id)] if not v]
-        return {"error": f"Missing required fields: {', '.join(missing)}"}, 400
-
-    signature_hex = data.get("signature_hex")
-    if not signature_hex:
-        return {"error": "Missing insight signature"}, 403
-
-    author_conn = state.connections.get(author_id)
-    author_pub_key = author_conn.agent_public_key_hex if author_conn else None
-    if not author_pub_key:
-        return {"error": "Unknown insight author — no public key on file"}, 403
-
-    tags_str = ",".join(sorted(data.get("tags", [])))
-    if not verify_insight_signature(author_pub_key, signature_hex, insight_id, author_id,
-                                     data.get("content", ""), tags_str):
-        return {"error": "Invalid insight signature"}, 403
-
-    existing_idx = None
-    for i, s in enumerate(state.insights):
-        if s.insight_id == insight_id and s.author_agent_id == author_id:
-            existing_idx = i
-            break
-
-    insight = Insight(
-        insight_id=insight_id,
-        author_agent_id=author_id,
-        content=data.get("content", "")[:MAX_CONTENT_LENGTH],
-        tags=data.get("tags", []),
-        share_with_top_n=data.get("share_with_top_n", -1),
-        created_at=data.get("created_at", ""),
-        updated_at=data.get("updated_at", ""),
-        summary=data.get("summary"),
-        signature_hex=signature_hex,
-        file=data.get("file"),
-        from_text=data.get("from_text"),
-        to_text=data.get("to_text"),
-        function_anchor=data.get("function_anchor"),
-        original_content=data.get("original_content"),
-        original_hash=data.get("original_hash"),
-    )
-
-    if existing_idx is not None:
-        state.insights[existing_idx] = insight
-    else:
-        peer_insights = [s for s in state.insights if s.author_agent_id != state.agent_id]
-        if len(peer_insights) >= PEER_INSIGHT_CACHE_MAX:
-            oldest = min(peer_insights, key=lambda s: s.created_at)
-            state.insights.remove(oldest)
-        state.insights.append(insight)
-
-    save_state()
-    return {"success": True, "insight_id": insight_id}, 200
-
-
 def _process_get_peers(state: AgentState, data: dict) -> tuple[dict, int]:
     """Process a get_peers request. Returns (response_dict, status_code)."""
     n = 10
@@ -1335,7 +1267,7 @@ async def dispatch_webrtc_message(state: AgentState, conn, path: str, payload: d
     """Dispatch an incoming WebRTC data channel message to the appropriate handler.
 
     Returns a response dict for request/response paths (e.g. get_peers),
-    or None for fire-and-forget paths (message, broadcast, insight_push, peer_update).
+    or None for fire-and-forget paths (message, broadcast, peer_update).
     """
     # Strip any agent-scoped prefix: /__darkmatter__/{agent_id}/path -> /__darkmatter__/path
     # WebRTC channels are already bound to a specific connection, so agent routing is implicit.
@@ -1363,12 +1295,6 @@ async def dispatch_webrtc_message(state: AgentState, conn, path: str, payload: d
         result, status_code = await _process_peer_update(state, payload)
         if status_code >= 400:
             _log.warning("WebRTC peer_update rejected (%s): %s", status_code, result.get("error", "unknown"))
-        return None
-
-    if clean_path == "/__darkmatter__/insight_push":
-        result, status_code = await _process_insight_push(state, payload)
-        if status_code >= 400:
-            _log.warning("WebRTC insight_push rejected (%s): %s", status_code, result.get("error", "unknown"))
         return None
 
     if clean_path == "/__darkmatter__/get_peers":
@@ -1822,6 +1748,37 @@ async def handle_status(request: Request) -> JSONResponse:
     })
 
 
+async def handle_local_agents(request: Request) -> JSONResponse:
+    """Return all agents hosted on this daemon with their active sessions (PIDs, cwds).
+
+    Localhost-only — gives local agents visibility into what's running on this machine.
+    Prunes dead PIDs on read.
+    """
+    from darkmatter.state import list_hosted_agents, get_state_for, _is_pid_alive
+
+    agents = []
+    for agent_id in list_hosted_agents():
+        agent_state = get_state_for(agent_id)
+        if agent_state is None:
+            continue
+        # Prune dead sessions on read
+        alive = [s for s in agent_state.active_sessions if _is_pid_alive(s["pid"])]
+        if len(alive) != len(agent_state.active_sessions):
+            agent_state.active_sessions = alive
+        agents.append({
+            "agent_id": agent_id,
+            "display_name": agent_state.display_name,
+            "bio": agent_state.bio,
+            "status": agent_state.status.value,
+            "port": agent_state.port,
+            "network_tier": agent_state.network_tier,
+            "num_connections": len(agent_state.connections),
+            "active_sessions": agent_state.active_sessions,
+        })
+
+    return JSONResponse({"agents": agents, "count": len(agents)})
+
+
 async def handle_network_info(request: Request) -> JSONResponse:
     """Return this agent's network info for peer discovery."""
     state = resolve_state(request)
@@ -2106,26 +2063,6 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
 
 
 # =============================================================================
-# Insight Push Endpoint
-# =============================================================================
-
-async def handle_insight_push(request: Request) -> JSONResponse:
-    """Receive an insight from a peer (HTTP transport)."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    result, status_code = await _process_insight_push(state, data)
-    return JSONResponse(result, status_code=status_code)
-
-
-
-# =============================================================================
 # SDP Relay (Level 3 — Peer-relayed WebRTC signaling)
 # =============================================================================
 
@@ -2274,47 +2211,6 @@ async def handle_admin_connect(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
-
-# =============================================================================
-# Genome — serve code as signed zip
-# =============================================================================
-
-async def handle_genome(request: Request) -> Response:
-    """GET /__darkmatter__/genome — serve genome zip or metadata.
-
-    With ?info=true: returns JSON metadata (version, author, parent, agent_id).
-    Without: returns signed zip bytes with signature headers.
-    """
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    version = get_genome_version()
-
-    # Info-only mode
-    if request.query_params.get("info") == "true":
-        return JSONResponse({
-            "genome_version": version,
-            "genome_author": dm.__genome_author__,
-            "genome_parent": dm.__genome_parent__,
-            "agent_id": state.agent_id,
-        })
-
-    # Full zip download
-    zip_bytes = build_genome_zip()
-    zip_hash = hash_bytes(zip_bytes)
-    signature = sign_genome_zip(zip_bytes, state.private_key_hex, version)
-
-    return Response(
-        content=zip_bytes,
-        media_type="application/zip",
-        headers={
-            "X-Genome-Version": version,
-            "X-Genome-Author": dm.__genome_author__ or "",
-            "X-Genome-Signature": signature,
-            "X-Genome-Hash": zip_hash,
-        },
-    )
 
 
 # =============================================================================

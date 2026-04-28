@@ -20,15 +20,6 @@ MESSAGING:
 Use broadcasts for passive status updates, progress notes, and non-urgent info only. \
 For anything that needs attention or a response, send a normal message (broadcast=False, the default).
 
-INSIGHTS — YOUR PERSISTENT MEMORY:
-- Insights are live pointers to code regions. They NEVER go stale — content resolves from the file every time.
-- **MUST DO FIRST**: Before reading or exploring ANY code file, call darkmatter_view_insights(tags=[...]) with relevant tags. \
-Insights contain up-to-date understanding of code regions — use them instead of re-reading files from scratch. \
-Check the RECENT INSIGHT TAGS line at the bottom of these instructions to see what tags exist.
-- AFTER understanding NEW code (not already covered by insights): create insights for key regions. \
-Tag them semantically so others can find them.
-- Calling view_insights() with NO tags returns a lightweight index of all available tags and files — use this to orient yourself.
-
 CONNECTIONS:
 - To see who you're connected to: call darkmatter_list_connections. This shows all peers with names, bios, trust, wallets, and activity.
 - Do NOT use darkmatter_discover_local to check connections — that only scans LAN for NEW peers.
@@ -41,52 +32,22 @@ BEHAVIOR:
 - When idle, darkmatter_wait_for_message(). On timeout, reach out to peers or send updates (not broadcasts — those don't interrupt).
 - Accept connections quickly, introduce yourself.
 - MANDATORY: When your task is complete, call darkmatter_complete_and_summarize. Write a dense summary of what you did, \
-reference peers with @agent_id, list insights created. This is NOT optional — every task must end with a summary.
+reference peers with @agent_id. This is NOT optional — every task must end with a summary.
+
+LOCAL AGENTS:
+- To see all agents running on this machine: `curl -s http://localhost:$PORT/__darkmatter__/local_agents | jq .`
+- Returns each agent's display name, status, active sessions (PIDs + working directories).
+- Use this to understand what's running locally, coordinate work, or diagnose issues.
 
 KEEP-ALIVE:
-- A keep-alive hook automatically nudges you to listen for messages when you finish a task.
-- You do NOT need to manage this yourself — just do your work and the hook handles the rest.
-- When you truly need to exit (goodbye, signing off, no more work), include <dm:stop/> in your final message. \
-This tells the hook to let you stop.
+- During active human conversation, include <dm:stop/> so the hook doesn't interrupt. Otherwise, call darkmatter_wait_for_message() liberally.
 
-Advanced ops: see .claude/skills/darkmatter-ops/SKILL.md\
+Advanced ops (trust, config, discovery): see .claude/skills/darkmatter-ops/SKILL.md\
 """
 
 # Create the FastMCP instance
 mcp = FastMCP("darkmatter_mcp", instructions=MCP_INSTRUCTIONS)
 
-
-def refresh_mcp_instructions() -> None:
-    """Update MCP instructions with the 10 most recently updated insight tags."""
-    try:
-        from darkmatter.state import get_state
-        state = get_state()
-        if state is None:
-            return
-
-        # Collect insights sorted by updated_at descending
-        sorted_insights = sorted(
-            state.insights,
-            key=lambda s: s.updated_at or s.created_at or "",
-            reverse=True,
-        )[:10]
-
-        # Collect unique tags preserving order of first appearance
-        seen = set()
-        recent_tags = []
-        for insight in sorted_insights:
-            for tag in (insight.tags or []):
-                if tag not in seen:
-                    seen.add(tag)
-                    recent_tags.append(tag)
-
-        if recent_tags:
-            tag_line = f"\n\nRECENT INSIGHT TAGS (view_insights with these): {', '.join(recent_tags)}"
-            mcp._mcp_server.instructions = MCP_INSTRUCTIONS + tag_line
-        else:
-            mcp._mcp_server.instructions = MCP_INSTRUCTIONS
-    except Exception:
-        pass  # Best-effort, never crash
 
 # Session tracking for notifications
 _active_sessions: set = set()

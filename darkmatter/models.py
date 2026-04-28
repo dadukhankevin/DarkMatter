@@ -115,35 +115,6 @@ class ConversationEntry:
 
 
 # =============================================================================
-# Insights (Live Code Knowledge)
-# =============================================================================
-
-@dataclass
-class Insight:
-    """A live code insight, trust-gated and push-synced.
-
-    Anchored to a file region via from_text/to_text, resolved live on view.
-    When the code changes, updates are automatically pushed to peers.
-    """
-    insight_id: str
-    author_agent_id: str
-    content: str                # snapshot of resolved content
-    tags: list[str]
-    share_with_top_n: int       # -1 = all peers, N = top N by trust score
-    created_at: str
-    updated_at: str
-    summary: Optional[str] = None
-    signature_hex: Optional[str] = None
-    file: str = ""
-    from_text: str = ""
-    to_text: str = ""
-    function_anchor: Optional[str] = None
-    original_content: Optional[str] = None
-    original_hash: Optional[str] = None
-    stale_views: int = 0
-
-
-# =============================================================================
 # Connection Requests
 # =============================================================================
 
@@ -263,10 +234,10 @@ class AgentState:
     wallet_attestations: dict[str, str] = field(default_factory=dict)
     # Conversation memory
     conversation_log: list[ConversationEntry] = field(default_factory=list)
-    # Insights (live code knowledge)
-    insights: list[Insight] = field(default_factory=list)
     # Network tier: "local", "lan", or "global" (default)
     network_tier: str = "global"
+    # Active sessions: [{"pid": int, "cwd": str}] — MCP sessions using this agent
+    active_sessions: list[dict] = field(default_factory=list)
     # Security settings (persisted)
     security_settings: dict = field(default_factory=lambda: {
         "pin_hash": "",

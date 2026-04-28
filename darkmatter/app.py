@@ -44,7 +44,7 @@ from darkmatter.identity import load_or_create_passport
 from darkmatter.state import (
     set_state, get_state, get_state_for, save_state, state_file_path,
     load_state_from_file, clear_waiting_signal, register_agent, list_hosted_agents,
-    scan_state_files, sync_connections_from_disk,
+    scan_state_files, sync_connections_from_disk, _is_pid_alive,
 )
 from darkmatter.mcp import mcp
 import darkmatter.mcp.tools  # noqa: F401 — registers @mcp.tool() decorators
@@ -67,6 +67,7 @@ from darkmatter.network.mesh import (
     handle_message,
 
     handle_status,
+    handle_local_agents,
     handle_network_info,
     handle_status_broadcast,
     handle_impression_get,
@@ -76,12 +77,10 @@ from darkmatter.network.mesh import (
     handle_get_peers,
     handle_mesh_route,
     handle_antimatter_request,
-    handle_insight_push,
     handle_sdp_relay,
     handle_sdp_relay_deliver,
     handle_connection_proof,
     handle_admin_connect,
-    handle_genome,
     handle_local_inbox,
     handle_local_pending,
     handle_local_connections,
@@ -170,11 +169,18 @@ def init_state(port: int = None) -> None:
             restored.display_name = display_name
         elif not restored.display_name:
             restored.display_name = generate_agent_name()
+        # Register this process
+        my_pid = os.getpid()
+        if not any(s["pid"] == my_pid for s in restored.active_sessions):
+            restored.active_sessions.append({"pid": my_pid, "cwd": os.getcwd()})
         set_state(restored)
         _log.info("Restored state (display: %s, %d connections)",
                   restored.display_name or "none", len(restored.connections))
     else:
         # state already set to fresh state above
+        my_pid = os.getpid()
+        if not any(s["pid"] == my_pid for s in state.active_sessions):
+            state.active_sessions.append({"pid": my_pid, "cwd": os.getcwd()})
         _log.info("Starting fresh (display: %s) on port %d", display_name or "none", port)
 
     _log.info("Identity: %s...%s", agent_id[:16], agent_id[-8:])
@@ -287,9 +293,14 @@ async def _agent_scan_loop(daemon_port: int) -> None:
             await asyncio.sleep(10)
             _register_discovered_agents(daemon_port)
             # Sync connections/impressions from disk for all hosted agents
-            # (MCP sessions may have added/removed connections)
+            # and prune dead PIDs (MCP sessions may have exited)
             for agent_id in list(list_hosted_agents()):
                 sync_connections_from_disk(agent_id=agent_id)
+                agent_state = get_state_for(agent_id)
+                if agent_state and agent_state.active_sessions:
+                    alive = [s for s in agent_state.active_sessions if _is_pid_alive(s["pid"])]
+                    if len(alive) != len(agent_state.active_sessions):
+                        agent_state.active_sessions = alive
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -308,10 +319,6 @@ def create_app() -> Router:
     """
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     init_state(port)
-
-    # Populate MCP instructions with recent insight tags
-    from darkmatter.mcp import refresh_mcp_instructions
-    refresh_mcp_instructions()
 
     # Create and register NetworkManager with transport plugins
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
@@ -393,7 +400,7 @@ def create_app() -> Router:
         Route("/connection_proof", _guarded("connection_proof", handle_connection_proof), methods=["POST"]),
         Route("/accept_pending", _guarded("accept_pending", handle_accept_pending), methods=["POST"]),
         Route("/status", _guarded("status", handle_status), methods=["GET"]),
-        Route("/genome", _guarded("genome", handle_genome), methods=["GET"]),
+        Route("/local_agents", handle_local_agents, methods=["GET"]),
 
         # Peer — mesh protocol (connected peers + localhost)
         Route("/message", _guarded("message", handle_message), methods=["POST"]),
@@ -403,7 +410,6 @@ def create_app() -> Router:
         Route("/webrtc_offer", _guarded("webrtc_offer", handle_webrtc_offer), methods=["POST"]),
         Route("/sdp_relay", _guarded("sdp_relay", handle_sdp_relay), methods=["POST"]),
         Route("/sdp_relay_deliver", _guarded("sdp_relay_deliver", handle_sdp_relay_deliver), methods=["POST"]),
-        Route("/insight_push", _guarded("insight_push", handle_insight_push), methods=["POST"]),
         Route("/antimatter_request", _guarded("antimatter_request", handle_antimatter_request), methods=["POST"]),
         Route("/mesh_route", _guarded("mesh_route", handle_mesh_route), methods=["POST"]),
         Route("/network_info", _guarded("network_info", handle_network_info), methods=["GET"]),
@@ -601,9 +607,6 @@ def find_free_port(host: str, start: int) -> int:
 def _init_shared_stdio_session(port: int) -> None:
     """Initialize state + networking for a stdio MCP session that shares an HTTP mesh node."""
     init_state(port)
-    # Late import: circular — app ↔ mcp
-    from darkmatter.mcp import refresh_mcp_instructions as _refresh
-    _refresh()
 
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
     http_transport = HttpTransport()

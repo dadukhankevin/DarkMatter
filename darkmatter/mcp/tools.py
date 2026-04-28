@@ -24,31 +24,26 @@ from darkmatter.mcp.schemas import (
     ConnectionInput,
     SendMessageInput,
     UpdateBioInput,
-    CreateInsightInput,
-    ViewInsightsInput,
     GetPeersFromInput,
 )
-from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, sync_peer_insights_from_disk, consume_message, set_waiting, _mcp_added_connections, _mcp_removed_connections
+from darkmatter.state import get_state, save_state, sync_message_queue_from_disk, consume_message, set_waiting, _mcp_added_connections, _mcp_removed_connections
 from darkmatter.logging import get_logger
 from darkmatter.context import log_conversation
 from darkmatter.config import (
     DEFAULT_PORT,
     MAX_CONNECTIONS,
-    OWN_INSIGHT_MAX,
     TRUST_MESSAGE_SENT,
 )
 from darkmatter.identity import (
     validate_url,
 )
-from darkmatter.security import prepare_outbound, prove_identity, sign_insight
+from darkmatter.security import prepare_outbound, prove_identity
 from darkmatter.models import (
     AgentStatus,
     Connection,
     Impression,
-    Insight,
     QueuedMessage,
 )
-from darkmatter.insight_resolver import resolve_region, assess_health, hash_content
 from darkmatter.network import send_to_peer, strip_base_url, get_network_manager
 from darkmatter.network.discovery import scan_local_ports
 from darkmatter.network.mesh import (
@@ -842,331 +837,9 @@ async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
 # wait_for_response, network_info, discover_domain,
 # set_impression, get_impression, set_superagent, set_rate_limit,
 # wallet, send_payment, get_balance, wallet_balances, wallet_send,
-# genome_info, genome_install
 # Access these via: curl localhost:PORT/__darkmatter__/<endpoint>
 # Wallet operations: see .claude/skills/darkmatter-wallet/SKILL.md
 # Other operations: see .claude/skills/darkmatter-ops/SKILL.md
-
-
-# =============================================================================
-# Insight Tools
-# =============================================================================
-
-async def _push_insight_to_peers(state, insight) -> list[str]:
-    """Push an insight to all qualifying connected peers. Returns list of agent IDs pushed to."""
-    pushed_to = []
-    # Re-sign with current content
-    tags_str = ",".join(sorted(insight.tags))
-    insight.signature_hex = sign_insight(
-        state.private_key_hex, insight.insight_id, state.agent_id, insight.content, tags_str,
-    )
-    insight_payload = {
-        "insight_id": insight.insight_id,
-        "author_agent_id": insight.author_agent_id,
-        "content": insight.content,
-        "tags": insight.tags,
-        "share_with_top_n": insight.share_with_top_n,
-        "created_at": insight.created_at,
-        "updated_at": insight.updated_at,
-        "summary": insight.summary,
-        "signature_hex": insight.signature_hex,
-        "file": insight.file,
-        "from_text": insight.from_text,
-        "to_text": insight.to_text,
-        "function_anchor": insight.function_anchor,
-        "original_content": insight.original_content,
-        "original_hash": insight.original_hash,
-    }
-
-    # Determine which peers to push to based on share_with_top_n
-    if insight.share_with_top_n == -1:
-        # All peers
-        eligible = list(state.connections.items())
-    else:
-        # Rank peers by trust score descending, pick top N
-        ranked = sorted(
-            state.connections.items(),
-            key=lambda item: (state.impressions.get(item[0]).score if state.impressions.get(item[0]) else 0.0),
-            reverse=True,
-        )
-        eligible = ranked[:insight.share_with_top_n]
-
-    async def _push_one(aid, conn):
-        try:
-            await send_to_peer(conn, "/__darkmatter__/insight_push", insight_payload)
-            return aid
-        except Exception as e:
-            _log.warning("Failed to push insight %s to peer %s: %s", insight.insight_id, aid, e)
-            return None
-
-    results = await asyncio.gather(*[_push_one(aid, conn) for aid, conn in eligible])
-    return [aid for aid in results if aid is not None]
-
-
-@mcp.tool(
-    name="darkmatter_create_insight",
-    annotations={
-        "title": "Create Insight",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def create_insight(params: CreateInsightInput, ctx: Context) -> str:
-    """Create a live code insight anchored to a file region, and push to qualifying peers.
-
-    Content is resolved live from the file. When the code changes,
-    updates are automatically pushed to peers on next view.
-
-    Prefer raw code over summaries. Only add a summary for very long code regions
-    where the full content would waste context. For most insights, skip summary.
-    """
-    track_session(ctx)
-    state = get_state()
-
-    own_insights = [s for s in state.insights if s.author_agent_id == state.agent_id]
-    if len(own_insights) >= OWN_INSIGHT_MAX:
-        # Auto-prune oldest own insight instead of rejecting
-        oldest = min(own_insights, key=lambda s: s.created_at)
-        state.insights.remove(oldest)
-
-    # Resolve file path
-    p = Path(params.file)
-    file_path = str(p) if p.is_absolute() else str(Path.cwd() / params.file)
-
-    if not Path(file_path).exists():
-        return json.dumps({"success": False, "error": f"File not found: {params.file}"})
-
-    region = resolve_region(file_path, params.from_text, params.to_text)
-    if region is None:
-        return json.dumps({
-            "success": False,
-            "error": f"Could not find region in {params.file}. "
-                     f"Make sure from_text ('{params.from_text[:50]}') appears in the file."
-        })
-
-    original_content = region.content
-    original_hash = hash_content(original_content)
-    content = original_content  # stored content = resolved snapshot
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Upsert: if an insight exists for same file+from_text, replace it
-    insight_id = f"insight-{uuid.uuid4().hex[:12]}"
-    was_update = False
-    for i, existing in enumerate(state.insights):
-        if (existing.author_agent_id == state.agent_id
-                and existing.file == params.file
-                and existing.from_text == params.from_text):
-            insight_id = existing.insight_id
-            was_update = True
-            state.insights.pop(i)
-            break
-
-    tags_str = ",".join(sorted(params.tags))
-    sig = sign_insight(state.private_key_hex, insight_id, state.agent_id, content, tags_str)
-
-    insight = Insight(
-        insight_id=insight_id,
-        author_agent_id=state.agent_id,
-        content=content,
-        tags=params.tags,
-        share_with_top_n=params.share_with_top_n,
-        created_at=now,
-        updated_at=now,
-        summary=params.summary,
-        signature_hex=sig,
-        file=params.file,
-        from_text=params.from_text,
-        to_text=params.to_text,
-        function_anchor=region.function_anchor or "",
-        original_content=original_content,
-        original_hash=original_hash,
-    )
-    state.insights.append(insight)
-    save_state()
-
-    pushed_to = await _push_insight_to_peers(state, insight)
-
-    result = {
-        "success": True,
-        "insight_id": insight.insight_id,
-        "action": "updated" if was_update else "created",
-        "tags": insight.tags,
-        "share_with_top_n": insight.share_with_top_n,
-        "pushed_to": pushed_to,
-    }
-    result["file"] = params.file
-    result["lines"] = f"{region.start_line}-{region.end_line}"
-    if region.function_anchor:
-        result["function_anchor"] = region.function_anchor
-
-    return json.dumps(result)
-
-
-@mcp.tool(
-    name="darkmatter_view_insights",
-    annotations={
-        "title": "View Insights",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-async def view_insights(params: ViewInsightsInput, ctx: Context) -> str:
-    """Query insights by tags, author, and/or file. Returns local + cached peer insights.
-
-    Code insights resolve live content from files and include health status.
-    Remote code insights show the last-known snapshot.
-    """
-    track_session(ctx)
-    state = get_state()
-
-    # Sync peer insights from daemon (disk) — daemon may have received
-    # insight_push from peers that this MCP session doesn't have in memory
-    sync_peer_insights_from_disk()
-
-    # No filters → return lightweight index (tags + files) instead of full content
-    if not params.tags and not params.author and not params.file:
-        tag_counts: dict[str, int] = {}
-        file_counts: dict[str, int] = {}
-        for insight in state.insights:
-            for tag in (insight.tags or []):
-                tag_counts[tag] = tag_counts.get(tag, 0) + 1
-            if insight.file:
-                file_counts[insight.file] = file_counts.get(insight.file, 0) + 1
-        return json.dumps({
-            "success": True,
-            "mode": "index",
-            "total_insights": len(state.insights),
-            "tags": tag_counts,
-            "files": file_counts,
-            "hint": "Pass tags=[], author=, or file= to view actual insight content.",
-        })
-
-    results = []
-    to_delete = []
-    to_push = []  # insights whose content changed — push updates to peers
-
-    for insight in state.insights:
-        # Filter by tags
-        if params.tags:
-            if not any(
-                st == qt or st.startswith(qt + ":")
-                for qt in params.tags
-                for st in insight.tags
-            ):
-                continue
-        # Filter by author
-        if params.author and insight.author_agent_id != params.author:
-            continue
-        # Filter by file
-        if params.file and insight.file != params.file:
-            continue
-
-        is_local = insight.author_agent_id == state.agent_id
-
-        entry = {
-            "insight_id": insight.insight_id,
-            "author": insight.author_agent_id,
-            "tags": insight.tags,
-            "share_with_top_n": insight.share_with_top_n,
-            "created_at": insight.created_at,
-            "updated_at": insight.updated_at,
-            "file": insight.file,
-            "type": "code",
-        }
-
-        if is_local and insight.from_text and insight.to_text:
-            # Resolve live content from file
-            p = Path(insight.file)
-            file_path = str(p) if p.is_absolute() else str(Path.cwd() / insight.file)
-            region = resolve_region(
-                file_path, insight.from_text, insight.to_text,
-                function_anchor=insight.function_anchor,
-            )
-            current_content = region.content if region else None
-
-            if insight.original_content and insight.original_hash:
-                health = assess_health(
-                    insight.original_content, insight.original_hash,
-                    current_content, insight.stale_views,
-                )
-                entry["health"] = {"score": health.score, "status": health.status, "message": health.message}
-
-                if region:
-                    entry["lines"] = f"{region.start_line}-{region.end_line}"
-
-                # If content changed, update the insight and queue for push
-                if current_content and hash_content(current_content) != insight.original_hash:
-                    insight.content = current_content
-                    insight.original_content = current_content
-                    insight.original_hash = hash_content(current_content)
-                    insight.updated_at = datetime.now(timezone.utc).isoformat()
-                    insight.stale_views = 0
-                    if region:
-                        insight.function_anchor = region.function_anchor
-                    to_push.append(insight)
-
-                # Show content (raw code preferred)
-                if insight.summary and not params.raw:
-                    entry["summary"] = insight.summary
-                else:
-                    entry["content"] = current_content or "[Could not resolve]"
-
-                if health.should_delete():
-                    to_delete.append(insight.insight_id)
-                    entry["expired"] = True
-                elif health.status in ("stale", "degraded"):
-                    insight.stale_views += 1
-            else:
-                # Insight without original tracking — show content
-                entry["content"] = current_content or insight.content
-        else:
-            # Remote insight — show last-known snapshot
-            entry["cached"] = True
-            if insight.summary and not params.raw:
-                entry["summary"] = insight.summary
-            else:
-                entry["content"] = insight.content[:500]
-                if len(insight.content) > 500:
-                    entry["truncated"] = True
-
-        # Label if from peer
-        if not is_local:
-            conn = state.connections.get(insight.author_agent_id)
-            if conn:
-                entry["author_name"] = conn.agent_display_name or insight.author_agent_id[:12]
-            if "cached" not in entry:
-                entry["cached"] = True
-
-        results.append(entry)
-
-    # Delete expired insights
-    if to_delete:
-        state.insights = [s for s in state.insights if s.insight_id not in set(to_delete)]
-
-    # Push updated code insights to peers
-    pushed_updates = []
-    for insight in to_push:
-        if insight.insight_id not in set(to_delete):
-            peers = await _push_insight_to_peers(state, insight)
-            if peers:
-                pushed_updates.append({"insight_id": insight.insight_id, "pushed_to": peers})
-
-    if to_delete or to_push:
-        save_state()
-
-    response = {"success": True, "count": len(results), "insights": results}
-    if to_delete:
-        response["expired_deleted"] = to_delete
-    if pushed_updates:
-        response["pushed_updates"] = pushed_updates
-
-    return json.dumps(response)
-
 
 
 # =============================================================================
@@ -1201,7 +874,7 @@ async def wait_for_message(
     existing = _drain_inbox(state, from_agents)
     if existing:
         _consume_via_daemon(daemon_port, [m["message_id"] for m in existing])
-        return json.dumps({"success": True, "messages": existing, "waited": False, "_reminder": "insights"})
+        return json.dumps({"success": True, "messages": existing, "waited": False, "_reminder": "listen"})
 
     # Register event and wait for new message
     event = asyncio.Event()
@@ -1234,7 +907,7 @@ async def wait_for_message(
                 if event in state._inbox_events:
                     state._inbox_events.remove(event)
                 _consume_via_daemon(daemon_port, [m["message_id"] for m in matched])
-                return json.dumps({"success": True, "messages": matched, "waited": True, "_reminder": "insights"})
+                return json.dumps({"success": True, "messages": matched, "waited": True, "_reminder": "listen"})
 
     except asyncio.TimeoutError:
         mins = int(timeout_seconds / 60)
@@ -1264,5 +937,3 @@ def _drain_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
         return []
     return _consume_queue_messages(state, matched_ids)
 
-
-# Genome tools moved to HTTP API + skill (see /__darkmatter__/genome)

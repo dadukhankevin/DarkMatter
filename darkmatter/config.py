@@ -106,8 +106,6 @@ CORE_TOOLS = frozenset({
     "darkmatter_send_message",
     "darkmatter_connection",
     "darkmatter_update_bio",
-    "darkmatter_create_insight",
-    "darkmatter_view_insights",
     "darkmatter_wait_for_message",
     # complete_and_summarize merged into wait_for_message(start_fresh=True)
 })
@@ -141,11 +139,6 @@ CONVERSATION_LOG_MAX = 500
 CONTEXT_MAX_MESSAGES = 20          # max entries shown in full context feed
 CONTEXT_MAX_WORDS = 1000           # max words per entry in context feed
 CONTEXT_PIGGYBACK_MAX = 5          # max entries injected into tool responses
-OWN_INSIGHT_MAX = 200               # max insights created by this agent (oldest pruned on overflow)
-PEER_INSIGHT_CACHE_MAX = 500        # max peer-cached insights (oldest pruned on overflow)
-INSIGHT_CACHE_TTL = 86400           # 24h
-ACCEPT_INSIGHTS = os.environ.get("DARKMATTER_ACCEPT_INSIGHTS", "true").lower() != "false"
-
 # =============================================================================
 # Trust Dynamics
 # =============================================================================
@@ -207,14 +200,12 @@ ROUTE_ACCESS_DEFAULTS = {
     "status_broadcast": "public",
     "peer_update": "public",
     "mesh_route": "public",
-    "insight_push": "public",
     "ping": "public",
     # Peer — IP-based check (no body-level auth)
     "webrtc_offer": "peer",
     "sdp_relay": "peer",
     "sdp_relay_deliver": "peer",
     "antimatter_request": "peer",
-    "genome": "public",
     # Peer — requires known connection
     "network_info": "peer",
     "impression": "peer",

@@ -19,8 +19,6 @@ from darkmatter.config import (
     DEFAULT_PORT,
     ANTIMATTER_LOG_MAX,
     CONVERSATION_LOG_MAX,
-    OWN_INSIGHT_MAX,
-    PEER_INSIGHT_CACHE_MAX,
     REPLAY_WINDOW,
     REPLAY_MAX_SIZE,
 )
@@ -32,10 +30,28 @@ from darkmatter.models import (
     Impression,
     QueuedMessage,
     RoutingRule,
-    Insight,
 )
 
 _log = get_logger("state")
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process is still running. Cross-platform (Unix + Windows)."""
+    import sys as _sys
+    if _sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
 
 
 # =============================================================================
@@ -179,94 +195,6 @@ def sync_message_queue_from_disk(agent_id: Optional[str] = None) -> None:
                 from_agent_id=qd.get("from_agent_id"),
                 verified=qd.get("verified", False),
             ))
-
-
-def sync_peer_insights_from_disk(agent_id: Optional[str] = None) -> None:
-    """Reload peer insights from the on-disk state file into in-memory state.
-
-    Same pattern as sync_message_queue_from_disk — merges peer insights that
-    the daemon received (via insight_push) but the MCP session doesn't have
-    because they're separate processes.
-
-    Only syncs insights authored by OTHER agents (peer cache). Own insights
-    are authoritative in-memory.
-    """
-    aid = agent_id or _default_agent_id
-    state = _agent_states.get(aid) if aid else get_state()
-    if state is None:
-        return
-
-    path = state_file_path(agent_id=aid)
-    if not os.path.exists(path):
-        return
-
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        _log.warning("state file JSON corrupt during insight sync (%s): %s", path, e)
-        return
-
-    disk_insights = data.get("insights", [])
-    if not disk_insights:
-        return
-
-    # Index existing in-memory insights by (insight_id, author)
-    existing = {
-        (s.insight_id, s.author_agent_id)
-        for s in state.insights
-    }
-    added = 0
-    for di in disk_insights:
-        author = di.get("author_agent_id", "")
-        # Only sync peer insights (not our own)
-        if author == (state.agent_id if state else ""):
-            continue
-        iid = di.get("insight_id", "")
-        if not iid:
-            continue
-        key = (iid, author)
-        if key in existing:
-            # Update existing peer insight if disk version is newer
-            for s in state.insights:
-                if s.insight_id == iid and s.author_agent_id == author:
-                    disk_updated = di.get("updated_at", "")
-                    if disk_updated > (s.updated_at or ""):
-                        s.content = di.get("content", s.content)
-                        s.tags = di.get("tags", s.tags)
-                        s.updated_at = disk_updated
-                        s.summary = di.get("summary", s.summary)
-                        s.file = di.get("file", s.file)
-                        s.from_text = di.get("from_text", s.from_text)
-                        s.to_text = di.get("to_text", s.to_text)
-                        s.function_anchor = di.get("function_anchor", s.function_anchor)
-                        s.original_content = di.get("original_content", s.original_content)
-                        s.original_hash = di.get("original_hash", s.original_hash)
-                        s.signature_hex = di.get("signature_hex", s.signature_hex)
-                    break
-            continue
-        # New peer insight from disk
-        state.insights.append(Insight(
-            insight_id=iid,
-            author_agent_id=author,
-            content=di.get("content", ""),
-            tags=di.get("tags", []),
-            share_with_top_n=di.get("share_with_top_n", -1),
-            created_at=di.get("created_at", ""),
-            updated_at=di.get("updated_at", ""),
-            summary=di.get("summary"),
-            signature_hex=di.get("signature_hex"),
-            file=di.get("file"),
-            from_text=di.get("from_text"),
-            to_text=di.get("to_text"),
-            function_anchor=di.get("function_anchor"),
-            original_content=di.get("original_content"),
-            original_hash=di.get("original_hash"),
-        ))
-        added += 1
-
-    if added:
-        _log.info("Synced %d peer insight(s) from disk", added)
 
 
 def sync_connections_from_disk(agent_id: Optional[str] = None) -> None:
@@ -516,15 +444,6 @@ def _save_single_state(state: AgentState) -> None:
     if len(state.conversation_log) > CONVERSATION_LOG_MAX:
         state.conversation_log = state.conversation_log[-CONVERSATION_LOG_MAX:]
 
-    # Cap insights — own and peer separately
-    own = [s for s in state.insights if s.author_agent_id == state.agent_id]
-    peer = [s for s in state.insights if s.author_agent_id != state.agent_id]
-    if len(own) > OWN_INSIGHT_MAX:
-        own = own[-OWN_INSIGHT_MAX:]
-    if len(peer) > PEER_INSIGHT_CACHE_MAX:
-        peer = peer[-PEER_INSIGHT_CACHE_MAX:]
-    state.insights = own + peer
-
     seen = _seen_message_ids.get(state.agent_id, {})
 
     data = {
@@ -589,28 +508,8 @@ def _save_single_state(state: AgentState) -> None:
             }
             for e in state.conversation_log[-CONVERSATION_LOG_MAX:]
         ],
-        "insights": [
-            {
-                "insight_id": s.insight_id,
-                "author_agent_id": s.author_agent_id,
-                "content": s.content,
-                "tags": s.tags,
-                "share_with_top_n": s.share_with_top_n,
-                "created_at": s.created_at,
-                "updated_at": s.updated_at,
-                "summary": s.summary,
-                "signature_hex": s.signature_hex,
-                "file": s.file,
-                "from_text": s.from_text,
-                "to_text": s.to_text,
-                "function_anchor": s.function_anchor,
-                "original_content": s.original_content,
-                "original_hash": s.original_hash,
-                "stale_views": s.stale_views,
-            }
-            for s in state.insights
-        ],
         "network_tier": state.network_tier,
+        "active_sessions": state.active_sessions,
         "security_settings": state.security_settings,
         "seen_message_ids": {
             mid: ts for mid, ts in seen.items()
@@ -658,6 +557,14 @@ def _save_single_state(state: AgentState) -> None:
             for aid, idata in disk_imps.items():
                 if aid not in data["impressions"]:
                     data["impressions"][aid] = idata
+            # Merge sessions from disk and prune dead ones
+            disk_sessions = disk_data.get("active_sessions", [])
+            mem_pids = {s["pid"] for s in data["active_sessions"]}
+            merged = list(data["active_sessions"])
+            for ds in disk_sessions:
+                if ds["pid"] not in mem_pids:
+                    merged.append(ds)
+            data["active_sessions"] = [s for s in merged if _is_pid_alive(s["pid"])]
     except (json.JSONDecodeError, OSError):
         pass  # Disk unreadable — proceed with in-memory only
 
@@ -800,28 +707,6 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
             metadata=ed.get("metadata", {}),
         ))
 
-    # Deserialize insights
-    insights = []
-    for sd in data.get("insights", []):
-        insights.append(Insight(
-            insight_id=sd.get("insight_id", ""),
-            author_agent_id=sd.get("author_agent_id", ""),
-            content=sd.get("content", ""),
-            tags=sd.get("tags", []),
-            share_with_top_n=sd.get("share_with_top_n", -1),
-            created_at=sd.get("created_at", ""),
-            updated_at=sd.get("updated_at", ""),
-            summary=sd.get("summary"),
-            signature_hex=sd.get("signature_hex"),
-            file=sd.get("file"),
-            from_text=sd.get("from_text"),
-            to_text=sd.get("to_text"),
-            function_anchor=sd.get("function_anchor"),
-            original_content=sd.get("original_content"),
-            original_hash=sd.get("original_hash"),
-            stale_views=sd.get("stale_views", 0),
-        ))
-
     state = AgentState(
         agent_id=data["agent_id"],
         bio=data.get("bio", ""),
@@ -850,7 +735,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         delegated_antimatter_wallet=data.get("delegated_antimatter_wallet"),
         wallet_attestations=data.get("wallet_attestations", {}),
         conversation_log=conversation_log,
-        insights=insights,
+        active_sessions=data.get("active_sessions", []),
         network_tier=data.get("network_tier", "global"),
         security_settings=data.get("security_settings", {
             "pin_hash": "",
@@ -886,6 +771,7 @@ def scan_state_files() -> list[dict]:
                     "path": path,
                     "display_name": data.get("display_name"),
                     "port": data.get("port", DEFAULT_PORT),
+                    "active_sessions": data.get("active_sessions", []),
                 })
         except (json.JSONDecodeError, OSError):
             continue

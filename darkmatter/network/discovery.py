@@ -135,6 +135,7 @@ async def handle_well_known(request) -> "JSONResponse":
             "status": agent_state.status.value,
             "accepting_connections": len(agent_state.connections) < MAX_CONNECTIONS,
             "mesh_url": f"{public_url}/__darkmatter__/{agent_id}",
+            "active_sessions": agent_state.active_sessions,
         })
 
     response = {
@@ -150,8 +151,6 @@ async def handle_well_known(request) -> "JSONResponse":
         "mesh_url": f"{public_url}/__darkmatter__",
         "mcp_url": f"{public_url}/mcp",
         "webrtc_enabled": True,
-        "genome_version": darkmatter.__genome_version__ or f"stock:{darkmatter.__version__}",
-        "genome_author": darkmatter.__genome_author__,
         # Multi-tenant: all hosted agents
         "agents": agents,
     }

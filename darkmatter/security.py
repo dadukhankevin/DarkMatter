@@ -39,11 +39,8 @@ DOMAIN_MESSAGE = "darkmatter.message.v1"
 DOMAIN_PEER_UPDATE = "peer_update"  # matches existing wire format
 DOMAIN_RELAY_POLL = "relay_poll"    # matches existing wire format
 DOMAIN_SDP = "darkmatter.sdp.v1"
-DOMAIN_INSIGHT = "darkmatter.insight.v1"
 DOMAIN_LAN_BEACON = "darkmatter.lan_beacon.v1"
 DOMAIN_CHALLENGE_RESPONSE = "darkmatter.challenge_response.v1"
-DOMAIN_GENOME = "darkmatter.genome.v1"
-
 E2E_HKDF_INFO = b"darkmatter-e2e-v1"
 
 # Challenge TTL in seconds
@@ -439,22 +436,8 @@ def _prune_expired_challenges():
 
 
 # =============================================================================
-# Insight / SDP / LAN Beacon Signing Helpers
+# SDP / LAN Beacon Signing Helpers
 # =============================================================================
-
-def sign_insight(private_key_hex: str, insight_id: str, author_agent_id: str,
-                 content: str, tags_str: str) -> str:
-    """Sign an insight. Returns signature hex."""
-    return sign_payload(private_key_hex, DOMAIN_INSIGHT, insight_id, author_agent_id, content, tags_str)
-
-
-def verify_insight_signature(public_key_hex: str, signature_hex: str,
-                             insight_id: str, author_agent_id: str,
-                             content: str, tags_str: str) -> bool:
-    """Verify an insight's signature."""
-    return verify_signed_payload(public_key_hex, signature_hex,
-                                 DOMAIN_INSIGHT, insight_id, author_agent_id, content, tags_str)
-
 
 def sign_sdp(private_key_hex: str, agent_id: str, sdp: str) -> str:
     """Sign an SDP offer/answer. Returns signature hex."""
@@ -478,17 +461,6 @@ def verify_lan_beacon(public_key_hex: str, signature_hex: str,
     return verify_signed_payload(public_key_hex, signature_hex,
                                  DOMAIN_LAN_BEACON, agent_id, port, timestamp)
 
-
-def sign_genome(private_key_hex: str, genome_version: str, genome_hash: str) -> str:
-    """Sign a genome zip. Returns signature hex."""
-    return sign_payload(private_key_hex, DOMAIN_GENOME, genome_version, genome_hash)
-
-
-def verify_genome_signature(public_key_hex: str, signature_hex: str,
-                            genome_version: str, genome_hash: str) -> bool:
-    """Verify a genome zip's signature."""
-    return verify_signed_payload(public_key_hex, signature_hex,
-                                 DOMAIN_GENOME, genome_version, genome_hash)
 
 
 # =============================================================================

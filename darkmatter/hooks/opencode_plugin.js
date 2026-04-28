@@ -18,7 +18,6 @@ const COOLDOWN_SECONDS = 40
 const STAMP_DIR = join(homedir(), ".darkmatter", "keepalive")
 
 const KEEPALIVE_PROMPT =
-  "[reminder: consider creating insights for code you just explored]\n\n" +
   "Call darkmatter_wait_for_message() to listen for incoming messages. " +
   "Do not pass a short timeout — the default (1 hour) is intentional. " +
   "When you truly need to exit, include <dm:stop/> in your final message."

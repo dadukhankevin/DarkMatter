@@ -31,7 +31,7 @@ _session_context_hwm: dict[str, int] = {}
 def _get_session_counters(session_id: str) -> dict[str, int]:
     """Get or create per-session last-seen counters."""
     if session_id not in _session_last_seen:
-        _session_last_seen[session_id] = {"msgs": 0, "network": 0, "insights": 0}
+        _session_last_seen[session_id] = {"msgs": 0, "network": 0}
     return _session_last_seen[session_id]
 
 
@@ -240,30 +240,23 @@ def build_activity_hint(state: AgentState, session_id: Optional[str] = None) -> 
             else:
                 direct_count += 1
 
-    insight_count = sum(1 for s in state.insights if s.author_agent_id != state.agent_id)
-
     # If we have a session, compute deltas
     if session_id:
         counters = _get_session_counters(session_id)
         new_msgs = max(0, inbox_count - counters.get("msgs", 0))
         new_network = max(0, broadcast_count - counters.get("network", 0))
-        new_insights = max(0, insight_count - counters.get("insights", 0))
         # Update counters
         counters["msgs"] = inbox_count
         counters["network"] = broadcast_count
-        counters["insights"] = insight_count
     else:
         new_msgs = inbox_count
         new_network = broadcast_count
-        new_insights = insight_count
 
     parts = []
     if new_msgs > 0:
         parts.append(f"{new_msgs} unread message{'s' if new_msgs != 1 else ''}")
     if new_network > 0:
         parts.append(f"{new_network} network update{'s' if new_network != 1 else ''}")
-    if new_insights > 0:
-        parts.append(f"{new_insights} peer insight{'s' if new_insights != 1 else ''}")
 
     if not parts:
         return "No new activity"

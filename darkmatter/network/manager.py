@@ -27,7 +27,6 @@ except ImportError:
     miniupnpc = None
 
 from darkmatter.config import (
-    INSIGHT_CACHE_TTL,
     PEER_LOOKUP_TIMEOUT,
     PEER_LOOKUP_MAX_CONCURRENT,
     HEALTH_FAILURE_THRESHOLD,
@@ -179,7 +178,6 @@ class NetworkManager:
         "/__darkmatter__/message",
         "/__darkmatter__/status_broadcast",
         "/__darkmatter__/peer_update",
-        "/__darkmatter__/insight_push",
     ))
 
     async def send(self, agent_id: str, path: str, payload: dict) -> SendResult:
@@ -774,42 +772,6 @@ class NetworkManager:
                 except Exception as e:
                     _log.error("Trust disconnect failed for %s...: %s", agent_id[:16], e)
 
-    def _prune_stale_insights(self) -> None:
-        """Remove cached peer insights from disconnected peers or older than INSIGHT_CACHE_TTL."""
-        from darkmatter.state import save_state, list_hosted_agents, get_state_for
-
-        now = datetime.now(timezone.utc)
-
-        for aid in list_hosted_agents():
-            state = get_state_for(aid)
-            if state is None:
-                continue
-
-            keep = []
-            pruned = 0
-
-            for insight in state.insights:
-                if insight.author_agent_id == state.agent_id:
-                    keep.append(insight)
-                    continue
-                if insight.author_agent_id not in state.connections:
-                    pruned += 1
-                    continue
-                try:
-                    updated = datetime.fromisoformat(insight.updated_at.replace("Z", "+00:00"))
-                    age = (now - updated).total_seconds()
-                    if age > INSIGHT_CACHE_TTL:
-                        pruned += 1
-                        continue
-                except Exception:
-                    pass
-                keep.append(insight)
-
-            if pruned:
-                state.insights = keep
-                save_state(agent_id=aid)
-                _log.info("Pruned %s stale peer insight(s) for agent %s...", pruned, aid[:12])
-
     # -- Connectivity level --
 
     def determine_connectivity_level(self, conn) -> tuple[int, str]:
@@ -864,7 +826,7 @@ class NetworkManager:
 
         On success: track IP, update last_activity, try WebRTC upgrade.
         On failure: increment health_failures, trigger reconnection.
-        Periodically: cleanup dead WebRTC, trust disconnects, insight pruning.
+        Periodically: cleanup dead WebRTC, trust disconnects.
         """
         cycle = 0
 
@@ -1005,7 +967,6 @@ class NetworkManager:
                 if cycle % MAINTENANCE_CYCLE_INTERVAL == 0:
                     await self._cleanup_dead_webrtc()
                     await self._check_trust_disconnects()
-                    self._prune_stale_insights()
                     self.update_connectivity_levels()
 
             except asyncio.CancelledError:

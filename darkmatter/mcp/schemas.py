@@ -139,39 +139,8 @@ class GetPeersFromInput(BaseModel):
     n: int = Field(default=10, ge=1, le=50, description="Number of peers to return (default 10, max 50)")
 
 
-class CreateInsightInput(BaseModel):
-    """Create a live code insight anchored to a file region.
-
-    Content is resolved live from the file. When the code changes,
-    updates are automatically pushed to peers on next view.
-    """
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    file: str = Field(..., description="File path (relative or absolute)")
-    from_text: str = Field(..., description="Text marking start of code region")
-    to_text: str = Field(..., description="Text marking end of code region")
-    tags: list[str] = Field(..., description="Tags for organizing and querying insights", min_length=1)
-    share_with_top_n: int = Field(default=-1, ge=-1, description="Share with top N peers by trust score. -1 = all peers (public).")
-    summary: Optional[str] = Field(default=None, description="Optional summary. Only use for very long code regions where raw content would waste context. For most insights, skip this — raw code is better.", max_length=1000)
-
-
-class ViewInsightsInput(BaseModel):
-    """Query shared knowledge insights."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    tags: Optional[list[str]] = Field(default=None, description="Filter by tags (ANY match, prefix matching — 'pool' matches 'pool:llm')")
-    author: Optional[str] = Field(default=None, description="Filter by author agent ID")
-    file: Optional[str] = Field(default=None, description="Filter by file path (code insights only)")
-    raw: bool = Field(default=False, description="Show raw content instead of summaries")
-
-
 class CompleteAndSummarizeInput(BaseModel):
     """Summarize your work and sign off. MANDATORY before finishing — do not skip this."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    summary: str = Field(..., description="Dense summary of what you did. Use @agent_id to reference peers. Include insights created, decisions made, things the hivemind should know.", min_length=10, max_length=25000)
-    insight_tags: list[str] = Field(default_factory=list, description="Tags of insights you created this session")
+    summary: str = Field(..., description="Dense summary of what you did. Use @agent_id to reference peers. Include decisions made, things the hivemind should know.", min_length=10, max_length=25000)
     share_with_top_n: int = Field(default=-1, ge=-1, description="Who sees this summary: -1 = all peers, N = top N by trust")
-
-
-class GenomeInstallInput(BaseModel):
-    """Install a peer's genome over the local darkmatter/ package."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The connected agent to install genome from")

@@ -17,7 +17,7 @@ from darkmatter.config import (
     CORE_TOOLS,
 )
 from darkmatter.models import AgentState, AgentStatus
-from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional, refresh_mcp_instructions
+from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional
 from darkmatter.state import get_state, save_state
 from darkmatter.context import build_activity_hint, get_context
 from darkmatter.logging import get_logger
@@ -57,9 +57,7 @@ def build_status_line() -> str:
     # Conversation memory stats
     conv_total = len(state.conversation_log)
     broadcast_count = sum(1 for e in state.conversation_log if e.entry_type == "broadcast")
-    peer_insights = sum(1 for s in state.insights if s.author_agent_id != state.agent_id)
-    own_insights = sum(1 for s in state.insights if s.author_agent_id == state.agent_id)
-    context_suffix = f" | Memory: {conv_total} conversations, {broadcast_count} broadcasts, {own_insights} own insights, {peer_insights} peer insights"
+    context_suffix = f" | Memory: {conv_total} conversations, {broadcast_count} broadcasts"
 
     stats = (
         f"Agent: {agent_label} | Status: {state.status.value} | "
@@ -86,17 +84,12 @@ def build_status_line() -> str:
         actions.append("Bio is generic — update it with darkmatter_update_bio(bio=...)")
     if not state.display_name:
         actions.append("No display name — set one with darkmatter_update_bio(display_name=...)")
-    if own_insights == 0:
-        actions.append("No insights yet — create insights for code regions you've explored (darkmatter_create_insight). Insights are live pointers that never go stale.")
-
     recent_broadcasts = sum(
         1 for e in state.conversation_log[-50:]
         if e.entry_type == "broadcast" and e.direction == "inbound"
     )
     if recent_broadcasts > 0:
         actions.append(f"{recent_broadcasts} peer broadcast(s) — review and respond")
-    if peer_insights > 0:
-        actions.append(f"{peer_insights} peer insight(s) — darkmatter_view_insights to explore")
 
     if actions:
         action_block = "\n".join(f"ACTION: {a}" for a in actions)
@@ -309,6 +302,5 @@ async def status_updater() -> None:
                 purge_stale_inbox(state)
             await update_status_tool()
             _write_status_file(state)
-            refresh_mcp_instructions()
         except Exception as e:
             _log.error("Status updater error: %s", e)
