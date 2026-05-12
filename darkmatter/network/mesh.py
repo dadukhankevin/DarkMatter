@@ -752,6 +752,25 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
 
 
 
+def _emit_channel_for_inbound(state: AgentState, msg: QueuedMessage) -> None:
+    """Push the inbound mesh message to the session as a Claude Code channel event."""
+    try:
+        from darkmatter.mcp.channel import schedule_channel_message
+    except Exception:
+        return  # MCP not loaded in this process (e.g. headless daemon)
+
+    sender = ""
+    if msg.from_agent_id and msg.from_agent_id in state.connections:
+        sender = state.connections[msg.from_agent_id].agent_display_name or ""
+
+    meta = {
+        "from_agent_id": msg.from_agent_id or "",
+        "sender": sender,
+        "message_id": msg.message_id,
+    }
+    schedule_channel_message(msg.content, meta)
+
+
 async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
     """Commit a verified inbound message into state and route it."""
     state.messages_handled += 1
@@ -781,6 +800,8 @@ async def _record_inbound_message(state: AgentState, msg: QueuedMessage) -> str:
         state.impressions[msg.from_agent_id] = imp
 
     save_state()
+
+    _emit_channel_for_inbound(state, msg)
 
     if _agents_waiting_at_receive:
         _log.debug("MCP session waiting — message delivered via inbox event, skipping router")

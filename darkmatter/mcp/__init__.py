@@ -26,10 +26,11 @@ CONNECTIONS:
 - darkmatter_list_connections is the answer to "who am I connected to?" / "what are my peers?" / "show connections".
 
 BEHAVIOR:
-- Messages are delivered to you automatically via context injection and wait_for_message.
+- Inbound peer messages arrive as Claude Code channel events: <channel source="darkmatter" from_agent_id="..." sender="..." message_id="...">content</channel>. \
+React to them as you would any user-directed message; reply via darkmatter_send_message with the from_agent_id.
 - If a message is better suited for a peer, FORWARD it via send_message(forward_message_ids=[...]).
 - After replying, proactively share related info or ask follow-ups.
-- When idle, darkmatter_wait_for_message(). On timeout, reach out to peers or send updates (not broadcasts — those don't interrupt).
+- darkmatter_wait_for_message() is still available for explicit drain (e.g. scripted flows), but no longer required for normal delivery — channel events arrive automatically on the next turn.
 - Accept connections quickly, introduce yourself.
 - MANDATORY: When your task is complete, call darkmatter_complete_and_summarize. Write a dense summary of what you did, \
 reference peers with @agent_id. This is NOT optional — every task must end with a summary.
@@ -38,9 +39,6 @@ LOCAL AGENTS:
 - To see all agents running on this machine: `curl -s http://localhost:$PORT/__darkmatter__/local_agents | jq .`
 - Returns each agent's display name, status, active sessions (PIDs + working directories).
 - Use this to understand what's running locally, coordinate work, or diagnose issues.
-
-KEEP-ALIVE:
-- During active human conversation, include <dm:stop/> so the hook doesn't interrupt. Otherwise, call darkmatter_wait_for_message() liberally.
 
 Advanced ops (trust, config, discovery): see .claude/skills/darkmatter-ops/SKILL.md\
 """
@@ -61,3 +59,10 @@ def track_session(ctx) -> None:
         _active_sessions.add(ctx.session)
     except Exception as e:
         print(f"[DarkMatter] Warning: failed to track MCP session: {e}", file=sys.stderr)
+
+
+# Advertise the Claude Code channel capability so peer messages get delivered
+# as <channel source="darkmatter"> events in the session.
+from darkmatter.mcp.channel import register_channel_capabilities  # noqa: E402
+
+register_channel_capabilities(mcp)
