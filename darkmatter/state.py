@@ -131,6 +131,17 @@ def set_state(state: AgentState) -> None:
     _default_agent_id = state.agent_id
 
 
+def _reset_for_tests() -> None:
+    """Clear module-level runtime state for isolated tests."""
+    global _default_agent_id
+    _agent_states.clear()
+    _default_agent_id = None
+    _seen_message_ids.clear()
+    _consumed_message_ids.clear()
+    _mcp_added_connections.clear()
+    _mcp_removed_connections.clear()
+
+
 # =============================================================================
 # Per-agent consumed message tracking
 # =============================================================================
@@ -540,17 +551,29 @@ def _save_single_state(state: AgentState) -> None:
                     disk_extras.append(qd)
             # Merge consumed IDs from disk (other process may have consumed)
             disk_consumed = set(disk_data.get("consumed_message_ids", []))
-            # Connections: daemon is authoritative for add/remove.
-            # Start from disk (daemon's version), then apply MCP-side changes.
+            # Connections:
+            # - HTTP daemon saves are authoritative for live peer state.
+            # - stdio/MCP saves start from disk and apply only explicit MCP changes,
+            #   so stale session memory does not erase daemon-side changes.
             disk_conns = disk_data.get("connections", {})
             merged_conns = dict(disk_conns)
-            # Add connections the MCP session explicitly created
-            for aid in _mcp_added_connections:
-                if aid in data["connections"] and aid not in merged_conns:
-                    merged_conns[aid] = data["connections"][aid]
-            # Remove connections the MCP session explicitly disconnected
+
+            if os.environ.get("DARKMATTER_TRANSPORT") == "http":
+                merged_conns.update(data["connections"])
+            else:
+                for aid in _mcp_added_connections:
+                    if aid in data["connections"]:
+                        merged_conns[aid] = data["connections"][aid]
+
+            # Apply explicit local disconnects in either role.
             for aid in _mcp_removed_connections:
                 merged_conns.pop(aid, None)
+
+            # If there was no disk state yet, persist current in-memory state.
+            if not disk_conns and not merged_conns:
+                for aid in data["connections"]:
+                    merged_conns[aid] = data["connections"][aid]
+
             data["connections"] = merged_conns
             # Merge impressions from disk that we don't have in memory
             disk_imps = disk_data.get("impressions", {})
@@ -728,7 +751,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         },
         rate_limit_global=data.get("rate_limit_global", 0),
         inactive_until=data.get("inactive_until"),
-        router_mode=data.get("router_mode", "spawn"),
+        router_mode=data.get("router_mode") or "spawn",
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
         antimatter_log=data.get("antimatter_log", []),
         delegated_antimatter_agent=data.get("delegated_antimatter_agent"),

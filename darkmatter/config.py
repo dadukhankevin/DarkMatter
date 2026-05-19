@@ -107,13 +107,13 @@ CORE_TOOLS = frozenset({
     "darkmatter_connection",
     "darkmatter_update_bio",
     "darkmatter_wait_for_message",
-    # complete_and_summarize merged into wait_for_message(start_fresh=True)
 })
 
 # =============================================================================
 # Solana / Wallet
 # =============================================================================
 
+DARKMATTER_ENABLE_CRYPTO = os.environ.get("DARKMATTER_ENABLE_CRYPTO", "false")
 SOLANA_RPC_URL = os.environ.get("DARKMATTER_SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 LAMPORTS_PER_SOL = 1_000_000_000
 

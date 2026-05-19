@@ -33,10 +33,14 @@ dependencies = [
     "cryptography>=42.0.0",
     "anyio>=4.0.0",
     "pydantic>=2.0.0",
-    "solana>=0.34.0",
-    "solders>=0.21.0",
     "aiortc>=1.9.0",
     "miniupnpc>=2.2.0",
+]
+
+[project.optional-dependencies]
+crypto = [
+    "solana>=0.34.0",
+    "solders>=0.21.0",
 ]
 
 [project.scripts]

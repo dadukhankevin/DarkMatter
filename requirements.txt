@@ -5,4 +5,9 @@ starlette>=0.37.0
 cryptography>=42.0.0
 anyio>=4.0.0
 pydantic>=2.0.0
-flask>=3.0.0
+aiortc>=1.9.0
+miniupnpc>=2.2.0
+
+# Optional crypto addon:
+# solana>=0.34.0
+# solders>=0.21.0

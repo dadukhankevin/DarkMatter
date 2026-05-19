@@ -52,7 +52,7 @@ from darkmatter.network.mesh import (
     notify_connection_accepted,
     process_accept_pending,
 )
-from darkmatter.wallet.antimatter import (
+from darkmatter.trust import (
     adjust_trust,
     auto_disconnect_peer,
     reciprocity_ratio,
@@ -838,7 +838,7 @@ async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
 # set_impression, get_impression, set_superagent, set_rate_limit,
 # wallet, send_payment, get_balance, wallet_balances, wallet_send,
 # Access these via: curl localhost:PORT/__darkmatter__/<endpoint>
-# Wallet operations: see .claude/skills/darkmatter-wallet/SKILL.md
+# Wallet operations require dmagent[crypto] and DARKMATTER_ENABLE_CRYPTO=true.
 # Other operations: see .claude/skills/darkmatter-ops/SKILL.md
 
 
@@ -936,4 +936,3 @@ def _drain_inbox(state, from_agents: Optional[list[str]] = None) -> list[dict]:
     if not matched_ids:
         return []
     return _consume_queue_messages(state, matched_ids)
-

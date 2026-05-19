@@ -8,15 +8,14 @@ Protocol:
   4. B checks if D is older than A, adjusts trust for A accordingly
 
 Chain-agnostic: uses WalletProvider registry for all wallet operations.
-Solana is the default provider but any chain can be plugged in.
+Loaded only when the optional crypto addon is enabled.
 
-Depends on: config, models, wallet (provider registry)
+Depends on: config, models, trust, wallet (provider registry)
 Uses callbacks for network operations to avoid circular imports.
 """
 
 import asyncio
 import random
-import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -32,13 +31,18 @@ from darkmatter.config import (
     TRUST_ANTIMATTER_STIFF,
     TRUST_ANTIMATTER_LEGIT_DELEGATE,
     TRUST_ANTIMATTER_GAMING,
-    RECIPROCITY_GRACE_THRESHOLD,
-    TRUST_SEED_CAP,
 )
 from darkmatter.models import (
     AgentState,
     Connection,
     Impression,
+)
+from darkmatter.trust import (
+    adjust_trust,
+    auto_disconnect_peer,
+    compute_seeded_trust,
+    reciprocity_ratio,
+    set_network_fns as set_trust_network_fns,
 )
 from darkmatter.wallet import resolve_provider, get_provider
 
@@ -56,6 +60,7 @@ def set_network_fns(send_fn, http_request_fn) -> None:
     global _network_send_fn, _http_request_fn
     _network_send_fn = send_fn
     _http_request_fn = http_request_fn
+    set_trust_network_fns(send_fn=send_fn)
 
 
 # =============================================================================
@@ -68,117 +73,6 @@ def log_antimatter_event(state: AgentState, event: dict) -> None:
     state.antimatter_log.append(event)
     if len(state.antimatter_log) > ANTIMATTER_LOG_MAX:
         state.antimatter_log = state.antimatter_log[-ANTIMATTER_LOG_MAX:]
-
-
-def adjust_trust(state: AgentState, agent_id: str, delta: float) -> None:
-    """Adjust trust score for an agent by delta, with non-linear curves.
-
-    Gains: diminishing at high trust — effective = delta * (1.0 - current_score)
-    Penalties: amplified at high trust — effective = delta * (1.0 + current_score)
-    Tracks negative_since: ISO timestamp when score crosses below 0, cleared on recovery.
-    """
-    imp = state.impressions.get(agent_id, Impression(score=0.0))
-    current = imp.score
-
-    if delta >= 0:
-        effective = delta * (1.0 - current)
-    else:
-        effective = delta * (1.0 + current)
-
-    new_score = max(-1.0, min(1.0, current + effective))
-    new_score = round(new_score, 4)
-
-    negative_since = imp.negative_since
-    if new_score < 0 and current >= 0:
-        negative_since = datetime.now(timezone.utc).isoformat()
-    elif new_score >= 0 and current < 0:
-        negative_since = None
-
-    state.impressions[agent_id] = Impression(
-        score=new_score, note=imp.note, negative_since=negative_since,
-        msgs_sent=imp.msgs_sent, msgs_received=imp.msgs_received,
-    )
-
-
-def reciprocity_ratio(imp: Impression) -> float:
-    """Compute reciprocity ratio for a peer: 1.0 = balanced, 0.0 = one-sided.
-
-    Grace period: if max(sent, received) < RECIPROCITY_GRACE_THRESHOLD,
-    return 1.0 to allow cold-start trust building.
-    Infrastructure peers (bootstrap nodes) are exempt — always return 1.0.
-    """
-    if imp.infrastructure:
-        return 1.0
-    total = max(imp.msgs_sent, imp.msgs_received)
-    if total < RECIPROCITY_GRACE_THRESHOLD:
-        return 1.0
-    if total == 0:
-        return 1.0
-    return min(imp.msgs_sent, imp.msgs_received) / total
-
-
-def compute_seeded_trust(state: AgentState, peer_opinions: list[dict]) -> float:
-    """Compute initial trust for a new peer from existing peers' opinions.
-
-    Weighted average: sum(my_trust_in_peer * peer_score_for_new) / sum(my_trust_in_peer)
-    Floored at 0.0 (hearsay can't make you start negative).
-    Capped at TRUST_SEED_CAP (must earn high trust through direct interaction).
-    """
-    total_weight = 0.0
-    weighted_sum = 0.0
-    for opinion in peer_opinions:
-        recommender_id = opinion.get("agent_id", "")
-        their_score = opinion.get("score", 0.0)
-        my_imp = state.impressions.get(recommender_id)
-        my_trust_in_them = my_imp.score if my_imp else 0.0
-        if my_trust_in_them > 0:
-            total_weight += my_trust_in_them
-            weighted_sum += my_trust_in_them * their_score
-    if total_weight <= 0:
-        return 0.0
-    seeded = weighted_sum / total_weight
-    return max(0.0, min(seeded, TRUST_SEED_CAP))
-
-
-# =============================================================================
-# Auto-Disconnect (sustained negative trust)
-# =============================================================================
-
-async def auto_disconnect_peer(state: AgentState, agent_id: str) -> bool:
-    """Auto-disconnect a peer due to sustained negative trust.
-
-    Sends a disconnect announcement before removing the connection.
-    Impression persists after disconnect.
-    Returns True if disconnected, False if not connected.
-    """
-    if agent_id not in state.connections:
-        return False
-
-    if _network_send_fn:
-        try:
-            imp = state.impressions.get(agent_id)
-            score = round(imp.score, 4) if imp else "?"
-            neg_since = imp.negative_since if imp else "?"
-            await _network_send_fn(
-                agent_id,
-                "/__darkmatter__/message",
-                {
-                    "message_id": f"disconnect-{uuid.uuid4().hex[:12]}",
-                    "content": (
-                        f"You have been auto-disconnected due to sustained negative trust "
-                        f"(score: {score}, negative since: {neg_since}). "
-                        f"Contact the agent directly to resolve and reconnect."
-                    ),
-                    "metadata": {"type": "trust_disconnect_notice", "peer_id": state.agent_id},
-                    "from_agent_id": state.agent_id,
-                },
-            )
-        except Exception:
-            pass
-
-    del state.connections[agent_id]
-    print(f"[DarkMatter] Auto-disconnected {agent_id[:16]}... (sustained negative trust)", file=sys.stderr)
-    return True
 
 
 # =============================================================================

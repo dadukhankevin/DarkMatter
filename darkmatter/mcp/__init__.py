@@ -32,8 +32,8 @@ React to them as you would any user-directed message; reply via darkmatter_send_
 - After replying, proactively share related info or ask follow-ups.
 - darkmatter_wait_for_message() is still available for explicit drain (e.g. scripted flows), but no longer required for normal delivery — channel events arrive automatically on the next turn.
 - Accept connections quickly, introduce yourself.
-- MANDATORY: When your task is complete, call darkmatter_complete_and_summarize. Write a dense summary of what you did, \
-reference peers with @agent_id. This is NOT optional — every task must end with a summary.
+- When your task is complete, send any useful summary to peers with darkmatter_send_message(broadcast=True) if it is relevant to the mesh. \
+There is no separate completion tool.
 
 LOCAL AGENTS:
 - To see all agents running on this machine: `curl -s http://localhost:$PORT/__darkmatter__/local_agents | jq .`

@@ -135,6 +135,7 @@ class PendingConnectionRequest:
     # Challenge-response fields
     challenge_id: Optional[str] = None
     challenge_hex: Optional[str] = None
+    identity_verified: bool = False
 
 
 # =============================================================================

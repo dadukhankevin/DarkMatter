@@ -13,7 +13,6 @@ from darkmatter.security import (
     DOMAIN_PEER_UPDATE,
     DOMAIN_RELAY_POLL,
     DOMAIN_SDP,
-    DOMAIN_INSIGHT,
     DOMAIN_LAN_BEACON,
     DOMAIN_CHALLENGE_RESPONSE,
     # Core signing
@@ -39,9 +38,7 @@ from darkmatter.security import (
     verify_proof,
     _pending_challenges,
     CHALLENGE_TTL,
-    # Insight/SDP/LAN helpers
-    sign_insight,
-    verify_insight_signature,
+    # SDP/LAN helpers
     sign_sdp,
     verify_sdp_signature,
     sign_lan_beacon,
@@ -80,7 +77,8 @@ class TestSignPayload:
     def test_multiple_domains(self, keypair):
         priv, pub = keypair
         for domain in [DOMAIN_MESSAGE, DOMAIN_PEER_UPDATE, DOMAIN_SDP,
-                       DOMAIN_INSIGHT, DOMAIN_LAN_BEACON]:
+                       DOMAIN_RELAY_POLL, DOMAIN_CHALLENGE_RESPONSE,
+                       DOMAIN_LAN_BEACON]:
             sig = sign_payload(priv, domain, "a", "b")
             assert verify_signed_payload(pub, sig, domain, "a", "b")
 
@@ -395,19 +393,8 @@ class TestVerifyInbound:
 
 
 # =============================================================================
-# Insight / SDP / LAN Beacon Signing
+# SDP / LAN Beacon Signing
 # =============================================================================
-
-class TestInsightSigning:
-    def test_roundtrip(self, keypair):
-        priv, pub = keypair
-        sig = sign_insight(priv, "insight-1", "author-1", "content", "tag1,tag2")
-        assert verify_insight_signature(pub, sig, "insight-1", "author-1", "content", "tag1,tag2")
-
-    def test_tampered_content_fails(self, keypair):
-        priv, pub = keypair
-        sig = sign_insight(priv, "insight-1", "author-1", "original", "tag1")
-        assert not verify_insight_signature(pub, sig, "insight-1", "author-1", "tampered", "tag1")
 
 
 class TestSdpSigning:

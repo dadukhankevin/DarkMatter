@@ -93,8 +93,8 @@ from darkmatter.network.mesh import (
     handle_inbox_consume,
 )
 from darkmatter.wallet import get_all_providers
-import darkmatter.wallet.solana  # noqa: F401 — registers SolanaWalletProvider
-from darkmatter.wallet.antimatter import set_network_fns as set_antimatter_network_fns
+from darkmatter.extensions import crypto_enabled, load_crypto_extensions
+from darkmatter.trust import set_network_fns as set_trust_network_fns
 from darkmatter.installer import main as installer_main
 from darkmatter.logging import get_logger
 
@@ -111,6 +111,17 @@ def _guarded(route_name: str, handler):
         return await handler(request)
     wrapper.__name__ = handler.__name__
     return wrapper
+
+
+def _wire_network_fns(manager: NetworkManager) -> None:
+    """Wire optional subsystems to the active NetworkManager."""
+    set_trust_network_fns(send_fn=manager.send)
+    if load_crypto_extensions():
+        from darkmatter.wallet.antimatter import set_network_fns as set_crypto_network_fns
+        set_crypto_network_fns(
+            send_fn=manager.send,
+            http_request_fn=manager.http_request,
+        )
 
 
 # =============================================================================
@@ -185,9 +196,10 @@ def init_state(port: int = None) -> None:
 
     _log.info("Identity: %s...%s", agent_id[:16], agent_id[-8:])
 
-    # Derive wallets for all registered providers (ephemeral — derived from passport each startup)
+    # Derive wallets only when the optional crypto addon is enabled.
     state = get_state()
-    if state.private_key_hex:
+    crypto_loaded = load_crypto_extensions()
+    if crypto_loaded and state.private_key_hex:
         for chain, provider in get_all_providers().items():
             # Allow env var override (e.g. DARKMATTER_WALLET_SOLANA) so bootstrap
             # operators can receive antimatter fees to their own wallet
@@ -328,11 +340,7 @@ def create_app() -> Router:
     manager.register_transport(webrtc)
     set_network_manager(manager)
 
-    # Wire antimatter economy into NetworkManager for transport-agnostic sends
-    set_antimatter_network_fns(
-        send_fn=manager.send,
-        http_request_fn=manager.http_request,
-    )
+    _wire_network_fns(manager)
 
     # LAN discovery setup
     discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
@@ -385,8 +393,8 @@ def create_app() -> Router:
         asyncio.create_task(_agent_scan_loop(port))
         _log.info("Multi-agent scanner: ENABLED (10s interval)")
 
-        # Background: retry identity attestation until all chains attested
-        if state.private_key_hex and state.agent_id:
+        # Background: retry identity attestation until all crypto chains attested.
+        if crypto_enabled() and state.private_key_hex and state.agent_id and get_all_providers():
             asyncio.create_task(_attestation_loop(state))
 
         # Start NetworkManager (discovers public URL, starts health loop + ping loop)
@@ -621,10 +629,7 @@ def _init_shared_stdio_session(port: int) -> None:
     http_transport._lookup_peer_url = manager.lookup_peer_url
     http_transport._save_state = save_state
     http_transport._get_public_url = manager.get_public_url
-    set_antimatter_network_fns(
-        send_fn=manager.send,
-        http_request_fn=manager.http_request,
-    )
+    _wire_network_fns(manager)
 
 
 def _spawn_http_daemon(port: int) -> subprocess.Popen:

@@ -49,7 +49,8 @@ from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
 from darkmatter.network.transports.webrtc import LANSignaling
 from darkmatter.security import sign_peer_update
-from darkmatter.wallet.antimatter import auto_disconnect_peer
+from darkmatter.extensions import crypto_wallets
+from darkmatter.trust import auto_disconnect_peer
 
 _log = get_logger("manager")
 
@@ -422,7 +423,7 @@ class NetworkManager:
                     # LAN info for same-network peers (hairpin NAT workaround)
                     "lan_ip": lan_ip,
                     "local_port": _state.port,
-                    "wallets": _state.wallets,
+                    "wallets": crypto_wallets(_state),
                 }
                 if _state.public_key_hex:
                     p["public_key_hex"] = _state.public_key_hex

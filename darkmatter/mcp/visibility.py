@@ -20,6 +20,7 @@ from darkmatter.models import AgentState, AgentStatus
 from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional
 from darkmatter.state import get_state, save_state
 from darkmatter.context import build_activity_hint, get_context
+from darkmatter.extensions import crypto_wallets
 from darkmatter.logging import get_logger
 
 _log = get_logger("visibility")
@@ -47,8 +48,9 @@ def build_status_line() -> str:
     peers = ", ".join(peer_labels) if peer_labels else "none"
 
     agent_label = state.display_name or state.agent_id[:12]
-    wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in state.wallets.items()]
-    attested_chains = [c for c in state.wallets if c in state.wallet_attestations]
+    wallets = crypto_wallets(state)
+    wallet_parts = [f"{chain}: {addr[:6]}...{addr[-4:]}" for chain, addr in wallets.items()]
+    attested_chains = [c for c in wallets if c in state.wallet_attestations]
     wallet_suffix = (
         f" | Wallets: {', '.join(wallet_parts)}"
         f" (attested: {', '.join(attested_chains) or 'none'}"
@@ -304,3 +306,4 @@ async def status_updater() -> None:
             _write_status_file(state)
         except Exception as e:
             _log.error("Status updater error: %s", e)
+from darkmatter.extensions import crypto_wallets

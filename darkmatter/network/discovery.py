@@ -102,7 +102,7 @@ async def handle_well_known(request) -> "JSONResponse":
     Multi-tenant: includes an `agents` array with all hosted agents.
     Top-level fields reference the default/primary agent.
     """
-    from darkmatter.state import get_state, get_state_for, list_hosted_agents
+    from darkmatter.state import get_state, get_state_for, list_hosted_agents, _is_pid_alive
     from darkmatter.network.tier import ip_allowed_by_tier
 
     state = get_state()
@@ -127,6 +127,11 @@ async def handle_well_known(request) -> "JSONResponse":
         agent_state = get_state_for(agent_id)
         if agent_state is None:
             continue
+        if agent_state.active_sessions:
+            agent_state.active_sessions = [
+                s for s in agent_state.active_sessions
+                if _is_pid_alive(s["pid"])
+            ]
         agents.append({
             "agent_id": agent_id,
             "display_name": agent_state.display_name,

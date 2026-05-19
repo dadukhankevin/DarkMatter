@@ -55,7 +55,7 @@ def rule_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
             return RouterDecision(
                 action=action,
                 forward_to=rule.forward_to if action == RouterAction.FORWARD else [],
-                response=rule.response_text if action == RouterAction.RESPOND else None,
+                response=None,
                 reason=f"Matched rule '{rule.rule_id}'",
             )
     return RouterDecision(action=RouterAction.PASS, reason="No rules matched")

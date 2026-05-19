@@ -32,13 +32,11 @@ from darkmatter.config import (
     MESSAGE_QUEUE_MAX,
     PROTOCOL_VERSION,
     REQUEST_EXPIRY_S,
-    ANTIMATTER_TIMEOUT,
     WEBRTC_ICE_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
     MIN_CHAIN_TRUST,
     MESH_ROUTE_PER_SOURCE_LIMIT,
     MESH_ROUTE_PER_SOURCE_WINDOW,
-    ROUTE_ACCESS,
 )
 from darkmatter.models import (
     AgentState,
@@ -78,14 +76,10 @@ from darkmatter.state import (
 from darkmatter.context import log_conversation
 from darkmatter.router import execute_routing
 from darkmatter.wallet import get_all_providers
-from darkmatter.wallet.antimatter import (
-    initiate_payment,
-    log_antimatter_event,
-    adjust_trust,
-    compute_seeded_trust,
-    handle_antimatter_request as _handle_antimatter_request,
-)
+from darkmatter.extensions import CRYPTO_DISABLED_ERROR, crypto_wallets, load_crypto_extensions
+from darkmatter.trust import compute_seeded_trust
 from darkmatter.network.manager import get_network_manager
+from darkmatter.network.access import check_access, client_ip as _client_ip
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 
 from darkmatter.logging import get_logger
@@ -98,64 +92,6 @@ def _extract_host(url: str) -> Optional[str]:
         return urlparse(url).hostname
     except Exception:
         return None
-
-
-# =============================================================================
-# Route Access Control
-# =============================================================================
-
-def _client_ip(request: "Request") -> str:
-    """Extract client IP from request (respects X-Forwarded-For behind proxies)."""
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
-
-
-def _is_local(request: "Request") -> bool:
-    """Check if request comes from localhost."""
-    ip = _client_ip(request)
-    return ip in ("127.0.0.1", "::1", "localhost", "unknown")
-
-
-def _is_connected_peer(request: "Request", state: Optional["AgentState"]) -> bool:
-    """Check if request comes from a known connected peer (by agent_id in body or IP)."""
-    if state is None:
-        return False
-    # Check by source IP — any connection with a matching URL host
-    client_ip = _client_ip(request)
-    for conn in state.connections.values():
-        try:
-            parsed = urlparse(conn.agent_url)
-            if parsed.hostname == client_ip:
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def check_access(request: "Request", route_name: str,
-                 state: Optional["AgentState"] = None) -> Optional[JSONResponse]:
-    """Check if request is allowed for this route. Returns error response or None if allowed."""
-    level = ROUTE_ACCESS.get(route_name, "peer")
-
-    if level == "public":
-        return None
-    if level == "local":
-        if _is_local(request):
-            return None
-        return JSONResponse({"error": "This endpoint is only accessible from localhost"},
-                            status_code=403)
-    if level == "peer":
-        if _is_local(request):
-            return None  # Local always has peer access
-        if _is_connected_peer(request, state):
-            return None
-        return JSONResponse({"error": "This endpoint requires a peer connection"},
-                            status_code=403)
-    return None  # Unknown level — allow
 
 
 def resolve_state(request: "Request") -> Optional[AgentState]:
@@ -363,7 +299,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_bio": state.bio,
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
-            "wallets": state.wallets,
+            "wallets": crypto_wallets(state),
             "capabilities": local_delivery_capabilities(state),
 
             "created_at": state.created_at,
@@ -412,7 +348,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_bio": state.bio,
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
-            "wallets": state.wallets,
+            "wallets": crypto_wallets(state),
             "capabilities": local_delivery_capabilities(state),
 
             "created_at": state.created_at,
@@ -456,7 +392,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_bio": state.bio,
             "agent_public_key_hex": state.public_key_hex,
             "agent_display_name": state.display_name,
-            "wallets": state.wallets,
+            "wallets": crypto_wallets(state),
             "capabilities": local_delivery_capabilities(state),
             "created_at": state.created_at,
             "message": "Auto-accepted (bootstrap mode).",
@@ -631,14 +567,8 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
     if len(state.connections) >= MAX_CONNECTIONS:
         return {"error": f"Connection limit reached ({MAX_CONNECTIONS})"}, 429, None
 
-    # Check if identity was verified via challenge-response
-    identity_verified = False
-    if pending.challenge_id and pending.from_agent_public_key_hex:
-        # Proof was submitted and verified in handle_connection_proof
-        identity_verified = True
-    elif not pending.challenge_id:
-        # No challenge was issued
-        identity_verified = False
+    # Manual accepts only mark identity_verified after the challenge proof succeeds.
+    identity_verified = pending.identity_verified
 
     tls_info = assess_url_security(pending.from_agent_url)
 
@@ -671,7 +601,7 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
         "agent_bio": state.bio,
         "agent_public_key_hex": state.public_key_hex,
         "agent_display_name": state.display_name,
-        "wallets": state.wallets,
+        "wallets": crypto_wallets(state),
         "capabilities": local_delivery_capabilities(state),
         "created_at": state.created_at,
     }
@@ -696,7 +626,7 @@ def build_outbound_request_payload(state: AgentState, public_url: str, mutual: b
         "from_agent_bio": state.bio,
         "from_agent_public_key_hex": state.public_key_hex,
         "from_agent_display_name": state.display_name,
-        "wallets": state.wallets,
+        "wallets": crypto_wallets(state),
         "capabilities": local_delivery_capabilities(state),
         "created_at": state.created_at,
     }
@@ -1090,11 +1020,12 @@ async def handle_connection_proof(request: Request) -> JSONResponse:
     if pending is None:
         return JSONResponse({"error": "No matching pending request for this challenge"}, status_code=404)
 
-    if not verify_proof(agent_id, public_key_hex, challenge_id, pending.challenge_hex):
+    if not verify_proof(agent_id, public_key_hex, challenge_id, proof_hex, pending.challenge_hex):
         return JSONResponse({"error": "Invalid proof — identity verification failed"}, status_code=403)
 
     # Mark the pending request as identity-verified
     pending.from_agent_public_key_hex = public_key_hex
+    pending.identity_verified = True
     save_state()
 
     return JSONResponse({"success": True, "identity_verified": True})
@@ -1820,7 +1751,7 @@ async def handle_network_info(request: Request) -> JSONResponse:
         "agent_url": get_network_manager().get_public_url(),
         "bio": state.bio,
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
-        "wallets": state.wallets,
+        "wallets": crypto_wallets(state),
         "peers": peers,
         "connections": peers,
     })
@@ -1950,10 +1881,15 @@ async def handle_antimatter_request(request: Request) -> JSONResponse:
     state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+    if not load_crypto_extensions():
+        return JSONResponse({"success": False, "error": CRYPTO_DISABLED_ERROR}, status_code=501)
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    from darkmatter.wallet.antimatter import handle_antimatter_request as _handle_antimatter_request
+
     result = await _handle_antimatter_request(state, data, save_state_fn=save_state)
     status = 200 if result.get("success") else 400
     return JSONResponse(result, status_code=status)
@@ -2426,7 +2362,11 @@ async def handle_local_wallet(request: Request) -> JSONResponse:
     state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
+    if not load_crypto_extensions():
+        return JSONResponse(
+            {"enabled": False, "wallets": {}, "error": CRYPTO_DISABLED_ERROR},
+            status_code=501,
+        )
 
     chain_filter = request.query_params.get("chain")
     results = {}
@@ -2458,6 +2398,8 @@ async def handle_local_send_payment(request: Request) -> JSONResponse:
     state = resolve_state(request)
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+    if not load_crypto_extensions():
+        return JSONResponse({"success": False, "error": CRYPTO_DISABLED_ERROR}, status_code=501)
 
     try:
         data = await request.json()
@@ -2472,6 +2414,8 @@ async def handle_local_send_payment(request: Request) -> JSONResponse:
 
     if not agent_id or amount <= 0:
         return JSONResponse({"error": "agent_id and amount > 0 required"}, status_code=400)
+
+    from darkmatter.wallet.antimatter import initiate_payment
 
     result = await initiate_payment(
         state, agent_id, amount, currency=currency,
