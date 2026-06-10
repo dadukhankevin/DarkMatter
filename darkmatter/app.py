@@ -85,7 +85,6 @@ from darkmatter.network.mesh import (
     handle_sdp_relay,
     handle_sdp_relay_deliver,
     handle_connection_proof,
-    handle_admin_connect,
     handle_ping,
 )
 from darkmatter.network.local_api import (
@@ -457,7 +456,6 @@ def create_app() -> Router:
         Route("/impression/{agent_id}", _guarded("impression", handle_impression_get), methods=["GET"]),
         Route("/peer_lookup/{agent_id}", _guarded("peer_lookup", handle_peer_lookup), methods=["GET"]),
         Route("/get_peers", _guarded("get_peers", handle_get_peers), methods=["GET", "POST"]),
-        Route("/admin_connect", _guarded("admin_connect", handle_admin_connect), methods=["POST"]),
 
         # Local — daemon API for MCP sessions and skills (localhost sockets only)
         Route("/inbox", _guarded("inbox", handle_local_inbox), methods=["GET"]),

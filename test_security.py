@@ -276,7 +276,7 @@ class TestVerifyInbound:
 
     def test_connected_with_stored_key_valid(self, keypair):
         priv, pub = keypair
-        agent_id = "sender1"
+        agent_id = pub  # identity binding: agent_id IS the public key
 
         sig = sign_message(priv, agent_id, "msg1", "ts1", "hello")
         data = {
@@ -295,7 +295,7 @@ class TestVerifyInbound:
     def test_connected_key_mismatch(self, keypair, keypair2):
         priv, pub = keypair
         _, pub2 = keypair2
-        agent_id = "sender"
+        agent_id = pub
 
         sig = sign_message(priv, agent_id, "msg1", "ts", "hi")
         data = {
@@ -310,7 +310,6 @@ class TestVerifyInbound:
         result = verify_inbound(data, connections)
         assert not result.verified
         assert result.status_code == 403
-        assert "mismatch" in result.error.lower()
 
     def test_connected_missing_signature_rejected(self, keypair):
         _, pub = keypair
@@ -329,7 +328,7 @@ class TestVerifyInbound:
 
     def test_connected_no_key_pins_new_key(self, keypair):
         priv, pub = keypair
-        agent_id = "sender"
+        agent_id = pub
 
         sig = sign_message(priv, agent_id, "msg1", "ts", "hello")
         data = {
@@ -349,7 +348,7 @@ class TestVerifyInbound:
 
     def test_not_connected_with_valid_signature(self, keypair):
         priv, pub = keypair
-        agent_id = "stranger"
+        agent_id = pub
 
         sig = sign_message(priv, agent_id, "msg1", "ts", "hello")
         data = {
@@ -362,6 +361,30 @@ class TestVerifyInbound:
         }
         result = verify_inbound(data, {})
         assert result.verified
+
+    def test_impersonation_with_own_key_rejected(self, keypair, keypair2):
+        """An attacker signing with their OWN key while claiming someone
+        else's agent_id must be rejected — identity binding regression."""
+        attacker_priv, attacker_pub = keypair
+        _, victim_id = keypair2  # victim's agent_id (their public key)
+
+        sig = sign_message(attacker_priv, victim_id, "msg1", "ts", "hello")
+        data = {
+            "from_agent_id": victim_id,
+            "message_id": "msg1",
+            "content": "hello",
+            "timestamp": "ts",
+            "from_public_key_hex": attacker_pub,  # attacker's key
+            "signature_hex": sig,
+        }
+        result = verify_inbound(data, {})
+        assert not result.verified
+        assert result.status_code == 403
+
+        # Even omitting the key field: signature can't verify against victim_id
+        data.pop("from_public_key_hex")
+        result = verify_inbound(data, {})
+        assert not result.verified
 
     def test_not_connected_no_signature_rejected(self):
         data = {

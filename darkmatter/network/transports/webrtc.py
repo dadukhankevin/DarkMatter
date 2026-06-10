@@ -25,7 +25,7 @@ from darkmatter.config import (
 )
 from darkmatter.network.transport import Transport, SendResult
 from darkmatter.network.transports.http import strip_base_url
-from darkmatter.security import sign_sdp
+from darkmatter.security import sign_sdp, verify_sdp_signature
 from darkmatter.logging import get_logger
 
 _log = get_logger("webrtc")
@@ -36,6 +36,23 @@ def _make_rtc_config():
     return RTCConfiguration(
         iceServers=[RTCIceServer(**s) for s in WEBRTC_ICE_SERVERS]
     )
+
+
+async def _wait_for_ice_gathering(pc, timeout: float = WEBRTC_ICE_GATHER_TIMEOUT) -> None:
+    """Wait for ICE gathering to complete (event-based, not a blind sleep)."""
+    if pc.iceGatheringState == "complete":
+        return
+    done = asyncio.Event()
+
+    @pc.on("icegatheringstatechange")
+    def on_ice_state():
+        if pc.iceGatheringState == "complete":
+            done.set()
+
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass  # proceed with whatever candidates we have
 
 
 # =============================================================================
@@ -237,14 +254,21 @@ class WebRTCTransport(Transport):
 
             conn.webrtc_channel.send(data)
 
-            # Wait for correlated response (with timeout)
+            # Wait for the correlated response. Every dispatched path replies
+            # with an `_status` code, so a timeout is a real failure (the
+            # manager will fall back to HTTP) — not a fake success.
             try:
                 response = await asyncio.wait_for(fut, timeout=_WEBRTC_REQUEST_TIMEOUT)
+                status = response.pop("_status", 200) if isinstance(response, dict) else 200
+                if status >= 400:
+                    return SendResult(
+                        success=False, transport_name="webrtc", response=response,
+                        error=(response or {}).get("error", f"Peer rejected ({status})"),
+                    )
                 return SendResult(success=True, transport_name="webrtc", response=response)
             except asyncio.TimeoutError:
-                # Fire-and-forget paths won't get a response — that's fine
-                return SendResult(success=True, transport_name="webrtc",
-                                  response={"success": True, "transport": "webrtc"})
+                return SendResult(success=False, transport_name="webrtc",
+                                  error="No response over WebRTC (timeout)")
             finally:
                 self._pending_requests.pop(request_id, None)
 
@@ -337,7 +361,7 @@ class WebRTCTransport(Transport):
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
 
-            await asyncio.sleep(WEBRTC_ICE_GATHER_TIMEOUT)
+            await _wait_for_ice_gathering(pc)
 
             offer_data = {
                 "sdp": pc.localDescription.sdp,
@@ -349,6 +373,18 @@ class WebRTCTransport(Transport):
 
             answer_data = await signaling.send_offer(state, conn, offer_data)
             if not answer_data or not answer_data.get("sdp"):
+                await pc.close()
+                return False
+
+            # The answer must be signed by the peer's identity key — an
+            # unsigned or forged answer would let a man-in-the-middle own
+            # the data channel.
+            answer_sig = answer_data.get("sdp_signature_hex")
+            if not answer_sig or not verify_sdp_signature(
+                conn.agent_id, answer_sig, conn.agent_id, answer_data["sdp"]
+            ):
+                _log.warning("WebRTC: rejecting unsigned/invalid SDP answer from %s...",
+                             conn.agent_id[:12])
                 await pc.close()
                 return False
 
@@ -399,14 +435,21 @@ class WebRTCTransport(Transport):
         conn.transport = "http"
 
     async def handle_offer(self, state, offer_data: dict) -> Optional[dict]:
-        """Handle an incoming WebRTC SDP offer. Returns answer dict or None.
+        """Handle an incoming WebRTC SDP offer (LAN + peer-relay signaling).
 
-        This is called by the mesh.py HTTP handler — it doesn't belong in the
-        Transport.send() path but is transport-specific protocol logic.
+        Verifies the offer's SDP signature against the sender's identity and
+        signs the answer — same security bar as the direct (Level 1) path.
+        Returns the answer dict or None.
         """
         agent_id = offer_data.get("agent_id", "")
         conn = state.connections.get(agent_id)
         if not conn:
+            return None
+
+        sdp = offer_data.get("sdp", "")
+        sdp_sig = offer_data.get("sdp_signature_hex")
+        if not sdp or not sdp_sig or not verify_sdp_signature(agent_id, sdp_sig, agent_id, sdp):
+            _log.warning("WebRTC: rejecting unsigned/invalid SDP offer from %s...", agent_id[:12])
             return None
 
         try:
@@ -424,22 +467,22 @@ class WebRTCTransport(Transport):
                 def on_message(msg):
                     transport_ref._handle_incoming(state, conn, msg)
 
-            offer = RTCSessionDescription(
-                sdp=offer_data["sdp"],
-                type=offer_data["type"],
-            )
+            offer = RTCSessionDescription(sdp=sdp, type=offer_data["type"])
             await pc.setRemoteDescription(offer)
 
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
 
-            await asyncio.sleep(WEBRTC_ICE_GATHER_TIMEOUT)
+            await _wait_for_ice_gathering(pc)
 
             conn.webrtc_pc = pc
 
+            answer_sdp = pc.localDescription.sdp
             return {
-                "sdp": pc.localDescription.sdp,
+                "sdp": answer_sdp,
                 "type": pc.localDescription.type,
+                "sdp_signature_hex": sign_sdp(state.private_key_hex, state.agent_id, answer_sdp),
+                "public_key_hex": state.public_key_hex,
             }
 
         except Exception as e:

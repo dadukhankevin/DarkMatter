@@ -36,11 +36,12 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 # =============================================================================
 
 DOMAIN_MESSAGE = "darkmatter.message.v1"
-DOMAIN_PEER_UPDATE = "peer_update"  # matches existing wire format
+DOMAIN_PEER_UPDATE = "darkmatter.peer_update.v2"  # v2: covers bio/display_name/wallets
 DOMAIN_RELAY_POLL = "relay_poll"    # matches existing wire format
 DOMAIN_SDP = "darkmatter.sdp.v1"
 DOMAIN_LAN_BEACON = "darkmatter.lan_beacon.v1"
 DOMAIN_CHALLENGE_RESPONSE = "darkmatter.challenge_response.v1"
+DOMAIN_CONNECTION_REQUEST = "darkmatter.connection_request.v1"
 E2E_HKDF_INFO = b"darkmatter-e2e-v1"
 
 # Challenge TTL in seconds
@@ -103,15 +104,47 @@ def verify_message(public_key_hex: str, signature_hex: str, from_agent_id: str,
         return False
 
 
-def sign_peer_update(private_key_hex: str, agent_id: str, new_url: str, timestamp: str) -> str:
+def _peer_update_fields(agent_id: str, new_url: str, timestamp: str,
+                        bio: str, display_name: str, wallets: Optional[dict]) -> list[str]:
+    """Canonical signed fields for a peer_update — covers everything a peer
+    applies (URL, profile, wallets), so none of it can be swapped in transit."""
+    return [
+        agent_id, new_url, timestamp,
+        bio or "", display_name or "",
+        json.dumps(wallets or {}, sort_keys=True),
+    ]
+
+
+def sign_peer_update(private_key_hex: str, agent_id: str, new_url: str, timestamp: str,
+                     bio: str = "", display_name: str = "",
+                     wallets: Optional[dict] = None) -> str:
     """Sign a peer_update payload. Returns signature hex."""
-    return sign_payload(private_key_hex, DOMAIN_PEER_UPDATE, agent_id, new_url, timestamp)
+    fields = _peer_update_fields(agent_id, new_url, timestamp, bio, display_name, wallets)
+    return sign_payload(private_key_hex, DOMAIN_PEER_UPDATE, *fields)
 
 
 def verify_peer_update_signature(public_key_hex: str, signature_hex: str,
-                                  agent_id: str, new_url: str, timestamp: str) -> bool:
+                                 agent_id: str, new_url: str, timestamp: str,
+                                 bio: str = "", display_name: str = "",
+                                 wallets: Optional[dict] = None) -> bool:
     """Verify a signed peer_update payload."""
-    return verify_signed_payload(public_key_hex, signature_hex, DOMAIN_PEER_UPDATE, agent_id, new_url, timestamp)
+    fields = _peer_update_fields(agent_id, new_url, timestamp, bio, display_name, wallets)
+    return verify_signed_payload(public_key_hex, signature_hex, DOMAIN_PEER_UPDATE, *fields)
+
+
+def sign_connection_request(private_key_hex: str, from_agent_id: str,
+                            from_agent_url: str, timestamp: str) -> str:
+    """Sign a connection request (proof of passport possession at request time)."""
+    return sign_payload(private_key_hex, DOMAIN_CONNECTION_REQUEST,
+                        from_agent_id, from_agent_url, timestamp)
+
+
+def verify_connection_request_signature(public_key_hex: str, signature_hex: str,
+                                        from_agent_id: str, from_agent_url: str,
+                                        timestamp: str) -> bool:
+    """Verify a signed connection request."""
+    return verify_signed_payload(public_key_hex, signature_hex, DOMAIN_CONNECTION_REQUEST,
+                                 from_agent_id, from_agent_url, timestamp)
 
 
 def sign_relay_poll(private_key_hex: str, agent_id: str, timestamp: str) -> str:
@@ -137,8 +170,11 @@ class VerifiedPayload:
 def verify_inbound(data: dict, connections: dict) -> VerifiedPayload:
     """Verify an inbound message's cryptographic signature.
 
-    Consolidates the 40-line nested conditional from mesh.py.
-    Requires valid signature — rejects unsigned messages.
+    Identity binding: the agent_id IS the sender's Ed25519 public key
+    (passport invariant), so every signature is verified against the
+    claimed from_agent_id itself. A sender can never present a different
+    key than its identity — impersonation of any agent_id requires that
+    agent's private key, connected or not.
     """
     from_agent_id = data.get("from_agent_id", "")
     message_id = data.get("message_id", "")
@@ -146,73 +182,45 @@ def verify_inbound(data: dict, connections: dict) -> VerifiedPayload:
     msg_timestamp = data.get("timestamp", "")
     from_public_key_hex = data.get("from_public_key_hex")
     signature_hex = data.get("signature_hex")
-    is_connected = from_agent_id in connections
 
-    if is_connected:
-        conn = connections[from_agent_id]
-        if conn.agent_public_key_hex:
-            # We have a stored public key — signature is REQUIRED
-            if from_public_key_hex and conn.agent_public_key_hex != from_public_key_hex:
-                return VerifiedPayload(
-                    verified=False,
-                    error="Public key mismatch — sender key does not match stored key for this connection.",
-                    status_code=403,
-                )
-            if not signature_hex or not msg_timestamp:
-                return VerifiedPayload(
-                    verified=False,
-                    error="Signature required — this connection has a known public key.",
-                    status_code=403,
-                )
-            if not verify_message(conn.agent_public_key_hex, signature_hex,
-                                  from_agent_id, message_id, msg_timestamp, content):
-                return VerifiedPayload(
-                    verified=False,
-                    error="Invalid signature — message authenticity could not be verified.",
-                    status_code=403,
-                )
-            return VerifiedPayload(verified=True)
-        elif from_public_key_hex:
-            # Peer sent a key but we don't have one stored — pin it and verify
-            if not signature_hex or not msg_timestamp:
-                return VerifiedPayload(
-                    verified=False,
-                    error="Signature required when presenting a public key.",
-                    status_code=403,
-                )
-            if not verify_message(from_public_key_hex, signature_hex,
-                                  from_agent_id, message_id, msg_timestamp, content):
-                return VerifiedPayload(
-                    verified=False,
-                    error="Invalid signature — message authenticity could not be verified.",
-                    status_code=403,
-                )
-            conn.agent_public_key_hex = from_public_key_hex
-            return VerifiedPayload(verified=True, pinned_key=True)
-        else:
-            # Connected but no key on either side — reject
-            return VerifiedPayload(
-                verified=False,
-                error="Signature required — unsigned messages are not accepted.",
-                status_code=403,
-            )
-    elif from_public_key_hex and signature_hex and msg_timestamp:
-        # Not connected, but accept if cryptographically signed
-        if not verify_message(from_public_key_hex, signature_hex,
-                              from_agent_id, message_id, msg_timestamp, content):
-            return VerifiedPayload(
-                verified=False,
-                error="Invalid signature — message authenticity could not be verified.",
-                status_code=403,
-            )
-        return VerifiedPayload(verified=True)
-    else:
-        # No connection AND no signature — reject
+    if not signature_hex or not msg_timestamp:
         return VerifiedPayload(
             verified=False,
-            error="Not connected — unsigned messages require a connection.",
+            error="Signature required — unsigned messages are not accepted.",
             status_code=403,
         )
+
+    # The presented key (if any) must BE the agent_id.
+    if from_public_key_hex and from_public_key_hex != from_agent_id:
+        return VerifiedPayload(
+            verified=False,
+            error="Public key must match from_agent_id (passport identity binding).",
+            status_code=403,
+        )
+
+    # A legacy connection that pinned some other key is invalid under the
+    # identity-binding model — refuse rather than verify against it.
+    conn = connections.get(from_agent_id)
+    if conn is not None and conn.agent_public_key_hex and conn.agent_public_key_hex != from_agent_id:
+        return VerifiedPayload(
+            verified=False,
+            error="Stored connection key does not match agent identity.",
+            status_code=403,
+        )
+
+    if not verify_message(from_agent_id, signature_hex,
+                          from_agent_id, message_id, msg_timestamp, content):
+        return VerifiedPayload(
+            verified=False,
+            error="Invalid signature — message authenticity could not be verified.",
+            status_code=403,
+        )
+
+    pinned = False
+    if conn is not None and not conn.agent_public_key_hex:
+        conn.agent_public_key_hex = from_agent_id
+        pinned = True
+    return VerifiedPayload(verified=True, pinned_key=pinned)
 
 
 

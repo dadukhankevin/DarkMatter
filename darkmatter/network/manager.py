@@ -360,6 +360,7 @@ class NetworkManager:
 
         def _build_payload(url_for_peer: str, _state=state) -> dict:
             timestamp = datetime.now(timezone.utc).isoformat()
+            wallets = crypto_wallets(_state)
             p = {
                 "agent_id": _state.agent_id,
                 "new_url": url_for_peer,
@@ -370,13 +371,16 @@ class NetworkManager:
                 # LAN info for same-network peers (hairpin NAT workaround)
                 "lan_ip": lan_ip,
                 "local_port": _state.port,
-                "wallets": crypto_wallets(_state),
+                "wallets": wallets,
             }
             if _state.public_key_hex:
                 p["public_key_hex"] = _state.public_key_hex
             if _state.private_key_hex and _state.public_key_hex:
+                # Signature covers URL + profile + wallets (peer_update v2)
                 p["signature"] = sign_peer_update(
-                    _state.private_key_hex, _state.agent_id, url_for_peer, timestamp
+                    _state.private_key_hex, _state.agent_id, url_for_peer, timestamp,
+                    bio=_state.bio or "", display_name=_state.display_name or "",
+                    wallets=wallets,
                 )
             return p
 

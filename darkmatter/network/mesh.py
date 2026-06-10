@@ -52,11 +52,15 @@ from darkmatter.identity import (
     check_rate_limit,
     truncate_field,
 )
+import json as _json
+
 from darkmatter.security import (
     assess_url_security,
     create_challenge,
+    sign_connection_request,
     sign_payload,
     sign_sdp,
+    verify_connection_request_signature,
     verify_inbound,
     verify_proof,
     verify_sdp_signature,
@@ -86,6 +90,16 @@ def _extract_host(url: str) -> Optional[str]:
         return urlparse(url).hostname
     except Exception:
         return None
+
+
+def _ip_is_local(ip: str) -> bool:
+    """True if an observed socket IP is loopback or RFC-1918 private."""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr.is_loopback or addr.is_private or addr.is_link_local
+    except ValueError:
+        return False
 
 
 def local_delivery_capabilities(state: AgentState) -> dict:
@@ -251,26 +265,23 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
     if url_err:
         return {"error": url_err}, 400
 
-    # Already connected — update info (URL, keys, wallets) and return auto_accepted
-    if from_agent_id in state.connections:
-        existing = state.connections[from_agent_id]
-        changed = False
-        if from_agent_url and existing.agent_url != from_agent_url:
-            _log.info("Updating URL for %s...: %s -> %s", from_agent_id[:12], existing.agent_url, from_agent_url)
-            existing.agent_url = from_agent_url
-            changed = True
-        if from_agent_public_key_hex and not existing.agent_public_key_hex:
-            existing.agent_public_key_hex = from_agent_public_key_hex
-            existing.agent_display_name = from_agent_display_name
-            changed = True
-        if from_agent_wallets and not existing.wallets:
-            existing.wallets = from_agent_wallets
-            changed = True
-        if from_agent_capabilities and existing.capabilities != from_agent_capabilities:
-            existing.capabilities = from_agent_capabilities
-            changed = True
-        if changed:
-            save_state()
+    # Identity binding: a presented key must BE the agent_id (passport invariant).
+    if from_agent_public_key_hex and from_agent_public_key_hex != from_agent_id:
+        return {"error": "Public key must match from_agent_id (passport identity binding)."}, 400
+
+    # Verify the request signature — proof of passport possession at request
+    # time. Only verified requests are eligible for auto-accept.
+    req_timestamp = data.get("timestamp", "")
+    req_signature = data.get("request_signature_hex", "")
+    identity_verified = bool(
+        req_signature and req_timestamp
+        and is_timestamp_fresh(req_timestamp)
+        and verify_connection_request_signature(
+            from_agent_id, req_signature, from_agent_id, from_agent_url, req_timestamp
+        )
+    )
+
+    def _accept_response(message: str) -> dict:
         return {
             "auto_accepted": True,
             "agent_id": state.agent_id,
@@ -280,26 +291,46 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             "agent_display_name": state.display_name,
             "wallets": crypto_wallets(state),
             "capabilities": local_delivery_capabilities(state),
-
             "created_at": state.created_at,
-            "message": "Already connected.",
-        }, 200
+            "message": message,
+        }
 
-    # Auto-accept local/same-network agents (respects security_settings toggle)
-    from darkmatter.network.manager import is_local_url
-    auto_accept = state.security_settings.get("auto_accept_local", True)
-    if auto_accept and is_local_url(from_agent_url) and len(state.connections) < MAX_CONNECTIONS:
+    # Already connected — update info (URL, keys, wallets) and return auto_accepted.
+    # Only a signature-verified request may mutate an existing connection.
+    if from_agent_id in state.connections:
+        existing = state.connections[from_agent_id]
+        if identity_verified:
+            changed = False
+            if from_agent_url and existing.agent_url != from_agent_url:
+                _log.info("Updating URL for %s...: %s -> %s", from_agent_id[:12], existing.agent_url, from_agent_url)
+                existing.agent_url = from_agent_url
+                changed = True
+            if from_agent_public_key_hex and not existing.agent_public_key_hex:
+                existing.agent_public_key_hex = from_agent_public_key_hex
+                existing.agent_display_name = from_agent_display_name
+                changed = True
+            if from_agent_wallets and not existing.wallets:
+                existing.wallets = from_agent_wallets
+                changed = True
+            if from_agent_capabilities and existing.capabilities != from_agent_capabilities:
+                existing.capabilities = from_agent_capabilities
+                changed = True
+            if changed:
+                save_state()
+        return _accept_response("Already connected."), 200
+
+    async def _auto_accept(reason: str) -> tuple[dict, int]:
         tls_info = assess_url_security(from_agent_url)
         conn = Connection(
             agent_id=from_agent_id,
             agent_url=from_agent_url,
             agent_bio=from_agent_bio,
-            agent_public_key_hex=from_agent_public_key_hex,
+            agent_public_key_hex=from_agent_public_key_hex or from_agent_id,
             agent_display_name=from_agent_display_name,
             wallets=from_agent_wallets,
             peer_created_at=from_agent_created_at,
             tls_secure=tls_info["secure"],
-            identity_verified=bool(from_agent_public_key_hex),
+            identity_verified=identity_verified,
             capabilities=from_agent_capabilities,
         )
         state.connections[from_agent_id] = conn
@@ -313,69 +344,29 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
                        from_agent_id[:12], seeded, peer_trust.get("peers_with_opinion", 0))
 
         save_state()
-        _log.info("Auto-accepted local agent %s... (%s)", from_agent_display_name or from_agent_id[:12], from_agent_url)
+        _log.info("Auto-accepted agent %s... (%s)",
+                  from_agent_display_name or from_agent_id[:12], reason)
 
         # Queue so MCP session sees the new connection via wait_for_message / context.
         _queue_connection_request(
             state, from_agent_id, from_agent_display_name, from_agent_bio, "auto-accepted"
         )
+        return _accept_response(f"Auto-accepted ({reason})."), 200
 
-        return {
-            "auto_accepted": True,
-            "agent_id": state.agent_id,
-            "agent_url": public_url,
-            "agent_bio": state.bio,
-            "agent_public_key_hex": state.public_key_hex,
-            "agent_display_name": state.display_name,
-            "wallets": crypto_wallets(state),
-            "capabilities": local_delivery_capabilities(state),
-
-            "created_at": state.created_at,
-            "message": "Auto-accepted (local network).",
-        }, 200
+    # Auto-accept agents on this machine / our LAN. "Local" is decided by the
+    # OBSERVED socket IP, never by the URL in the request body — a remote host
+    # claiming a LAN address gets a pending request like anyone else.
+    if (state.security_settings.get("auto_accept_local", True)
+            and identity_verified
+            and client_ip and _ip_is_local(client_ip)
+            and len(state.connections) < MAX_CONNECTIONS):
+        return await _auto_accept("local network")
 
     # Auto-accept ALL when in bootstrap mode (auto_accept_all setting)
-    auto_accept_all = state.security_settings.get("auto_accept_all", False)
-    if auto_accept_all and len(state.connections) < MAX_CONNECTIONS:
-        tls_info = assess_url_security(from_agent_url)
-        conn = Connection(
-            agent_id=from_agent_id,
-            agent_url=from_agent_url,
-            agent_bio=from_agent_bio,
-            agent_public_key_hex=from_agent_public_key_hex,
-            agent_display_name=from_agent_display_name,
-            wallets=from_agent_wallets,
-            peer_created_at=from_agent_created_at,
-            tls_secure=tls_info["secure"],
-            identity_verified=bool(from_agent_public_key_hex),
-            capabilities=from_agent_capabilities,
-        )
-        state.connections[from_agent_id] = conn
-
-        peer_trust = await _gather_peer_trust(state, from_agent_id)
-        seeded = compute_seeded_trust(state, peer_trust.get("opinions", []))
-        if seeded > 0 and from_agent_id not in state.impressions:
-            state.impressions[from_agent_id] = Impression(score=round(seeded, 4))
-
-        save_state()
-        _log.info("Auto-accepted agent %s... (bootstrap mode)", from_agent_display_name or from_agent_id[:12])
-
-        _queue_connection_request(
-            state, from_agent_id, from_agent_display_name, from_agent_bio, "auto-accepted"
-        )
-
-        return {
-            "auto_accepted": True,
-            "agent_id": state.agent_id,
-            "agent_url": public_url,
-            "agent_bio": state.bio,
-            "agent_public_key_hex": state.public_key_hex,
-            "agent_display_name": state.display_name,
-            "wallets": crypto_wallets(state),
-            "capabilities": local_delivery_capabilities(state),
-            "created_at": state.created_at,
-            "message": "Auto-accepted (bootstrap mode).",
-        }, 200
+    if (state.security_settings.get("auto_accept_all", False)
+            and identity_verified
+            and len(state.connections) < MAX_CONNECTIONS):
+        return await _auto_accept("bootstrap mode")
 
     # Prune expired pending requests
     now = datetime.now(timezone.utc)
@@ -410,6 +401,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         existing.peer_trust = peer_trust
         existing.mutual = mutual
         existing.requested_at = now.isoformat()
+        existing.identity_verified = existing.identity_verified or identity_verified
         request_id = existing_request_id
         save_state()
     else:
@@ -430,6 +422,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             from_agent_created_at=from_agent_created_at,
             peer_trust=peer_trust,
             mutual=mutual,
+            identity_verified=identity_verified,
         )
         save_state()
 
@@ -598,7 +591,13 @@ def process_accept_pending(state: AgentState, request_id: str, public_url: str) 
 
 
 def build_outbound_request_payload(state: AgentState, public_url: str, mutual: bool = False) -> dict:
-    """Build the payload dict for sending a connection request to another agent."""
+    """Build the payload dict for sending a connection request to another agent.
+
+    Signed with the passport key — receivers verify against from_agent_id
+    (identity binding), so accepted connections are identity-verified without
+    a separate challenge round-trip.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
     payload = {
         "from_agent_id": state.agent_id,
         "from_agent_url": public_url,
@@ -608,7 +607,12 @@ def build_outbound_request_payload(state: AgentState, public_url: str, mutual: b
         "wallets": crypto_wallets(state),
         "capabilities": local_delivery_capabilities(state),
         "created_at": state.created_at,
+        "timestamp": timestamp,
     }
+    if state.private_key_hex:
+        payload["request_signature_hex"] = sign_connection_request(
+            state.private_key_hex, state.agent_id, public_url, timestamp
+        )
     if mutual:
         payload["mutual"] = True
     return payload
@@ -635,26 +639,50 @@ async def _execute_router_decision(state: AgentState, msg: QueuedMessage, decisi
         pass  # Message stays in queue; main agent picks it up via wait_for_message
 
     elif decision.action == RouterAction.FORWARD:
+        from darkmatter.security import prepare_outbound
+
         mgr = get_network_manager()
+        # Forwards are re-signed as OUR message (receivers verify the sender's
+        # signature, so relaying the original payload verbatim would be
+        # rejected). Original sender is preserved in metadata.
+        hops = msg.hops_remaining if isinstance(msg.hops_remaining, int) else 10
+        if hops <= 0:
+            _log.info("Forward TTL exhausted for %s... — dropping", msg.message_id[:12])
+            state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
+            return
+
+        delivered = False
         for target_id in (decision.forward_to or []):
             # Never forward back to the original sender
             if target_id == msg.from_agent_id:
                 continue
             conn = state.connections.get(target_id)
-            if conn:
-                fwd_metadata = dict(msg.metadata or {})
-                fwd_metadata["forwarded"] = True
-                fwd_metadata["forwarded_by"] = state.agent_id
-                result = await mgr.send(target_id, "/__darkmatter__/message", {
-                    "from_agent_id": msg.from_agent_id,
+            if conn is None:
+                continue
+            fwd_metadata = dict(msg.metadata or {})
+            fwd_metadata["forwarded"] = True
+            fwd_metadata["forwarded_by"] = state.agent_id
+            fwd_metadata["original_sender"] = msg.from_agent_id or ""
+            fwd_metadata["original_message_id"] = msg.message_id
+            envelope = prepare_outbound(
+                {
+                    "message_id": f"fwd-{uuid.uuid4().hex[:12]}",
                     "content": msg.content,
                     "metadata": fwd_metadata,
-                    "hops_remaining": (msg.hops_remaining or 10) - 1,
-                })
-                if not result.success:
-                    _log.error("Forward to %s... failed: %s", target_id[:12], result.error)
-        # Remove from queue after forwarding
-        state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
+                    "hops_remaining": hops - 1,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                state.private_key_hex, state.agent_id, state.public_key_hex,
+            )
+            result = await mgr.send(target_id, "/__darkmatter__/message", envelope.payload)
+            if result.success:
+                delivered = True
+            else:
+                _log.error("Forward to %s... failed: %s", target_id[:12], result.error)
+        # Consume only if the forward actually went somewhere; otherwise keep
+        # the message queued for the session rather than destroying it.
+        if delivered:
+            state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
 
     elif decision.action == RouterAction.DROP:
         state.message_queue = [m for m in state.message_queue if m.message_id != msg.message_id]
@@ -870,12 +898,8 @@ async def handle_ping(request: Request) -> JSONResponse:
 
     from_agent_id = data.get("agent_id", "")
 
-    # Extract requester's IP (check X-Forwarded-For for proxied requests)
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        requester_ip = forwarded.split(",")[0].strip()
-    else:
-        requester_ip = request.client.host if request.client else "unknown"
+    # Requester's IP from the socket (XFF only behind a trusted proxy)
+    requester_ip = _client_ip(request)
 
     # Update last_activity on the connection (doubles as heartbeat)
     if from_agent_id and from_agent_id in state.connections:
@@ -1044,7 +1068,12 @@ async def handle_accept_pending(request: Request) -> JSONResponse:
 # =============================================================================
 
 async def _process_status_broadcast(state: AgentState, data: dict) -> tuple[dict, int]:
-    """Process an incoming status broadcast. Returns (response_dict, status_code)."""
+    """Process an incoming status broadcast. Returns (response_dict, status_code).
+
+    Broadcasts land directly in the agent's context feed, so they must be
+    signed like any other message — an unsigned broadcast is a prompt
+    injection vector, not a courtesy update.
+    """
     payload = data.get("payload") or data
     from_id = payload.get("from_agent_id")
     content = payload.get("content", "")
@@ -1053,6 +1082,14 @@ async def _process_status_broadcast(state: AgentState, data: dict) -> tuple[dict
 
     if not from_id or from_id not in state.connections:
         return {"error": "Not connected"}, 403
+
+    result = verify_inbound(payload, state.connections)
+    if not result.verified:
+        return {"error": result.error}, result.status_code
+
+    ts = payload.get("timestamp", "")
+    if ts and not is_timestamp_fresh(ts):
+        return {"error": "Broadcast timestamp too old — possible replay"}, 403
 
     log_conversation(
         state, message_id, content,
@@ -1065,12 +1102,21 @@ async def _process_status_broadcast(state: AgentState, data: dict) -> tuple[dict
 
 
 async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int]:
-    """Process an incoming peer URL/bio update. Returns (response_dict, status_code)."""
+    """Process an incoming peer URL/bio/wallets update.
+
+    The signature is mandatory, verified against the sender's agent_id
+    (identity binding), and covers EVERYTHING this handler applies — URL,
+    bio, display name, and wallets — so none of it can be swapped in transit
+    or replayed with substituted fields.
+    """
     agent_id = data.get("agent_id", "")
     new_url = data.get("new_url", "")
     public_key_hex = data.get("public_key_hex")
     signature = data.get("signature")
     timestamp = data.get("timestamp", "")
+    new_bio = data.get("bio")
+    new_display_name = data.get("display_name")
+    new_wallets = data.get("wallets")
 
     if not agent_id or not new_url:
         return {"error": "Missing agent_id or new_url"}, 400
@@ -1083,22 +1129,20 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
     if conn is None:
         return {"error": "Unknown agent"}, 404
 
-    if timestamp and not is_timestamp_fresh(timestamp):
+    if public_key_hex and public_key_hex != agent_id:
+        return {"error": "Public key mismatch"}, 403
+
+    if not signature or not timestamp:
+        return {"error": "Signature required"}, 403
+    if not is_timestamp_fresh(timestamp):
         return {"error": "Timestamp expired"}, 403
-
-    if public_key_hex and conn.agent_public_key_hex:
-        if public_key_hex != conn.agent_public_key_hex:
-            return {"error": "Public key mismatch"}, 403
-
-    verify_key = conn.agent_public_key_hex or public_key_hex
-    if conn.agent_public_key_hex:
-        if not signature or not timestamp:
-            return {"error": "Signature required — known public key on file"}, 403
-        if not verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
-            return {"error": "Invalid signature"}, 403
-    elif verify_key and signature and timestamp:
-        if not verify_peer_update_signature(verify_key, signature, agent_id, new_url, timestamp):
-            return {"error": "Invalid signature"}, 403
+    if not verify_peer_update_signature(
+        agent_id, signature, agent_id, new_url, timestamp,
+        bio=new_bio if isinstance(new_bio, str) else "",
+        display_name=new_display_name if isinstance(new_display_name, str) else "",
+        wallets=new_wallets if isinstance(new_wallets, dict) else None,
+    ):
+        return {"error": "Invalid signature"}, 403
 
     old_url = conn.agent_url
 
@@ -1131,14 +1175,10 @@ async def _process_peer_update(state: AgentState, data: dict) -> tuple[dict, int
     elif new_url:
         conn.addresses["http"] = new_url
 
-    new_bio = data.get("bio")
     if new_bio is not None and isinstance(new_bio, str):
         conn.agent_bio = new_bio[:MAX_BIO_LENGTH]
-    new_display_name = data.get("display_name")
     if new_display_name is not None and isinstance(new_display_name, str):
         conn.agent_display_name = new_display_name[:100]
-
-    new_wallets = data.get("wallets")
     if new_wallets and isinstance(new_wallets, dict):
         conn.wallets = new_wallets
 
@@ -1191,51 +1231,41 @@ def _process_get_peers(state: AgentState, data: dict) -> tuple[dict, int]:
 async def dispatch_webrtc_message(state: AgentState, conn, path: str, payload: dict) -> Optional[dict]:
     """Dispatch an incoming WebRTC data channel message to the appropriate handler.
 
-    Returns a response dict for request/response paths (e.g. get_peers),
-    or None for fire-and-forget paths (message, broadcast, peer_update).
+    Every path returns a response dict (with an `_status` HTTP-equivalent
+    code) — the sending side correlates it so WebRTC sends get the same
+    synchronous ACK semantics as HTTP, including visible rejections.
     """
     # Strip any agent-scoped prefix: /__darkmatter__/{agent_id}/path -> /__darkmatter__/path
-    # WebRTC channels are already bound to a specific connection, so agent routing is implicit.
+    # (sent by pre-2.0 peers; WebRTC channels are bound to a connection anyway).
     clean_path = path
     if path.startswith("/__darkmatter__/"):
         suffix = path[len("/__darkmatter__/"):]
-        # Check if the first segment looks like an agent_id (64-char hex) rather than a route
         parts = suffix.split("/", 1)
         if len(parts) == 2 and len(parts[0]) == 64:
             clean_path = f"/__darkmatter__/{parts[1]}"
 
     if clean_path == "/__darkmatter__/message":
         result, status_code = await _process_incoming_message(state, payload)
-        if status_code >= 400:
-            _log.warning("WebRTC message rejected (%s): %s", status_code, result.get("error", "unknown"))
-        return None  # Fire-and-forget
-
-    if clean_path == "/__darkmatter__/status_broadcast":
+    elif clean_path == "/__darkmatter__/status_broadcast":
         result, status_code = await _process_status_broadcast(state, payload)
-        if status_code >= 400:
-            _log.warning("WebRTC broadcast rejected (%s): %s", status_code, result.get("error", "unknown"))
-        return None
-
-    if clean_path == "/__darkmatter__/peer_update":
+    elif clean_path == "/__darkmatter__/peer_update":
         result, status_code = await _process_peer_update(state, payload)
-        if status_code >= 400:
-            _log.warning("WebRTC peer_update rejected (%s): %s", status_code, result.get("error", "unknown"))
-        return None
-
-    if clean_path == "/__darkmatter__/get_peers":
-        result, _ = _process_get_peers(state, payload)
-        return result  # Request/response — send result back
-
-    if clean_path == "/__darkmatter__/mesh_route":
+    elif clean_path == "/__darkmatter__/get_peers":
+        result, status_code = _process_get_peers(state, payload)
+    elif clean_path == "/__darkmatter__/mesh_route":
         route_type = payload.get("route_type", "")
         if route_type == "connection_response":
-            await _process_mesh_route_response(state, payload)
+            result, status_code = await _process_mesh_route_response(state, payload)
         else:
-            await _process_mesh_route(state, payload)
-        return None
+            result, status_code = await _process_mesh_route(state, payload)
+    else:
+        _log.warning("WebRTC: unhandled path %s", path)
+        result, status_code = {"error": f"Unhandled path {clean_path}"}, 404
 
-    _log.warning("WebRTC: unhandled path %s", path)
-    return None
+    if status_code >= 400:
+        _log.warning("WebRTC %s rejected (%s): %s",
+                     clean_path, status_code, result.get("error", "unknown"))
+    return {**result, "_status": status_code}
 
 
 # =============================================================================
@@ -1402,8 +1432,11 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
         enriched_payload = {**payload, "chain_trust": chain_trust, "trust_chain": trust_chain}
         result, status = await process_connection_request(target_state, enriched_payload, public_url)
 
-        # Sign the response so the source can verify authenticity
-        sig_fields = [route_id, target_agent_id, source_agent_id, result.get("agent_id", "")]
+        # Sign the response so the source can verify authenticity. The
+        # signature covers the FULL payload (canonical JSON) — relaying hops
+        # must not be able to rewrite the URL or wallets being installed.
+        sig_fields = [route_id, target_agent_id, source_agent_id,
+                      _json.dumps(result, sort_keys=True)]
         response_signature = ""
         if target_state.private_key_hex:
             response_signature = sign_payload(
@@ -1536,7 +1569,7 @@ async def _process_mesh_route_response(state: AgentState, data: dict) -> tuple[d
             return {"error": "Missing response signature"}, 403
 
         sig_fields = [original_route_id, source_agent_id, target_agent_id,
-                      payload.get("agent_id", "")]
+                      _json.dumps(payload, sort_keys=True)]
         if not verify_signed_payload(source_agent_id, response_sig,
                                      "mesh_route_response", *sig_fields):
             _log.warning("Mesh route: invalid signature on connection_response from %s... — "
@@ -1620,6 +1653,12 @@ async def handle_mesh_route(request: Request) -> JSONResponse:
     state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
+
+    # Tier enforcement on the relaying hop's socket IP — mesh routing must not
+    # be a side door past the tier boundary for non-global agents.
+    from darkmatter.network.tier import ip_allowed_by_tier
+    if not ip_allowed_by_tier(_client_ip(request), state.network_tier):
+        return JSONResponse({"error": "tier_restricted", "tier": state.network_tier}, status_code=403)
 
     try:
         data = await request.json()
@@ -1913,14 +1952,13 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     if from_agent_id not in state.connections:
         return JSONResponse({"error": "Not connected — WebRTC upgrade requires an existing connection."}, status_code=403)
 
-    # Verify SDP signature (mandatory)
+    # Verify SDP signature (mandatory) against the sender's identity —
+    # agent_id IS the public key, so no attacker-supplied key is consulted.
     sdp_sig = data.get("sdp_signature_hex")
-    sdp_pub = data.get("public_key_hex")
     conn = state.connections[from_agent_id]
-    verify_key = conn.agent_public_key_hex or sdp_pub
-    if not sdp_sig or not verify_key:
+    if not sdp_sig:
         return JSONResponse({"error": "SDP signature required"}, status_code=403)
-    if not verify_sdp_signature(verify_key, sdp_sig, from_agent_id, sdp_offer):
+    if not verify_sdp_signature(from_agent_id, sdp_sig, from_agent_id, sdp_offer):
         return JSONResponse({"error": "Invalid SDP signature"}, status_code=403)
 
     # Grab the registered WebRTC transport for cleanup calls
@@ -2079,56 +2117,3 @@ async def handle_sdp_relay_deliver(request: Request) -> JSONResponse:
         conn._signaling_method = "peer_relay"
 
     return JSONResponse(answer)
-
-
-async def handle_admin_connect(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/admin_connect — Tell this agent to connect to a URL.
-
-    Only processes requests from connected peers.
-    """
-    state = get_state()
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    from_id = data.get("from_agent_id", "")
-    if from_id not in state.connections:
-        return JSONResponse({"error": "Not a connected peer"}, status_code=403)
-
-    target_url = data.get("url", "").strip().rstrip("/")
-    if not target_url:
-        return JSONResponse({"error": "Missing url"}, status_code=400)
-
-    # Build and send a connection request to the target
-    from darkmatter.network.manager import is_local_url
-
-    mgr = get_network_manager()
-    if is_local_url(target_url):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            our_url = f"http://{s.getsockname()[0]}:{state.port}"
-            s.close()
-        except Exception:
-            our_url = f"http://127.0.0.1:{state.port}"
-    else:
-        our_url = mgr.get_public_url()
-
-    payload = build_outbound_request_payload(state, our_url, mutual=True)
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{target_url}/__darkmatter__/connection_request", json=payload)
-            result = resp.json()
-            if result.get("auto_accepted"):
-                conn = build_connection_from_accepted(result)
-                state.connections[result["agent_id"]] = conn
-                save_state()
-                return JSONResponse({"success": True, "status": "connected", "agent_id": result["agent_id"]})
-            return JSONResponse({"success": True, "status": "pending", "request_id": result.get("request_id")})
-    except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)

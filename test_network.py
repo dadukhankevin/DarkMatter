@@ -87,17 +87,17 @@ def test_access_policy_allows_local_and_connected_peer():
 def test_peer_update_requires_known_key_signature():
     state = make_state()
     peer_priv, peer_pub = generate_keypair()
-    state.connections["peer"] = Connection(
-        agent_id="peer",
+    state.connections[peer_pub] = Connection(
+        agent_id=peer_pub,
         agent_url="https://old.example",
         agent_bio="peer",
         agent_public_key_hex=peer_pub,
     )
     timestamp = datetime.now(timezone.utc).isoformat()
-    signature = sign_peer_update(peer_priv, "peer", "https://new.example", timestamp)
+    signature = sign_peer_update(peer_priv, peer_pub, "https://new.example", timestamp)
 
     result, status = asyncio.run(_process_peer_update(state, {
-        "agent_id": "peer",
+        "agent_id": peer_pub,
         "new_url": "https://new.example",
         "public_key_hex": peer_pub,
         "signature": signature,
@@ -106,7 +106,56 @@ def test_peer_update_requires_known_key_signature():
 
     assert status == 200
     assert result["updated"] is True
-    assert state.connections["peer"].agent_url == "https://new.example"
+    assert state.connections[peer_pub].agent_url == "https://new.example"
+
+
+def test_peer_update_signature_covers_wallets():
+    """A signed update with substituted wallets must be rejected — the
+    signature covers profile + wallets, not just the URL."""
+    state = make_state()
+    peer_priv, peer_pub = generate_keypair()
+    state.connections[peer_pub] = Connection(
+        agent_id=peer_pub,
+        agent_url="https://old.example",
+        agent_bio="peer",
+        agent_public_key_hex=peer_pub,
+    )
+    timestamp = datetime.now(timezone.utc).isoformat()
+    signature = sign_peer_update(
+        peer_priv, peer_pub, "https://new.example", timestamp,
+        wallets={"solana": "legit-wallet"},
+    )
+
+    result, status = asyncio.run(_process_peer_update(state, {
+        "agent_id": peer_pub,
+        "new_url": "https://new.example",
+        "public_key_hex": peer_pub,
+        "signature": signature,
+        "timestamp": timestamp,
+        "wallets": {"solana": "attacker-wallet"},
+    }))
+
+    assert status == 403
+    assert state.connections[peer_pub].wallets == {}
+
+
+def test_peer_update_unsigned_rejected():
+    """Updates without a signature are rejected even for key-less connections."""
+    state = make_state()
+    _, peer_pub = generate_keypair()
+    state.connections[peer_pub] = Connection(
+        agent_id=peer_pub,
+        agent_url="https://old.example",
+        agent_bio="peer",
+    )
+
+    result, status = asyncio.run(_process_peer_update(state, {
+        "agent_id": peer_pub,
+        "new_url": "https://hijack.example",
+    }))
+
+    assert status == 403
+    assert state.connections[peer_pub].agent_url == "https://old.example"
 
 
 def test_peer_update_rejects_wrong_public_key():
@@ -114,16 +163,16 @@ def test_peer_update_rejects_wrong_public_key():
     _, peer_pub = generate_keypair()
     fake_priv, fake_pub = generate_keypair()
     timestamp = datetime.now(timezone.utc).isoformat()
-    signature = sign_peer_update(fake_priv, "peer", "https://new.example", timestamp)
-    state.connections["peer"] = Connection(
-        agent_id="peer",
+    signature = sign_peer_update(fake_priv, peer_pub, "https://new.example", timestamp)
+    state.connections[peer_pub] = Connection(
+        agent_id=peer_pub,
         agent_url="https://old.example",
         agent_bio="peer",
         agent_public_key_hex=peer_pub,
     )
 
     result, status = asyncio.run(_process_peer_update(state, {
-        "agent_id": "peer",
+        "agent_id": peer_pub,
         "new_url": "https://new.example",
         "public_key_hex": fake_pub,
         "signature": signature,
@@ -131,7 +180,6 @@ def test_peer_update_rejects_wrong_public_key():
     }))
 
     assert status == 403
-    assert "mismatch" in result["error"].lower()
 
 
 def test_get_peers_sorts_by_trust():

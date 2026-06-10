@@ -84,7 +84,38 @@ def test_load_legacy_state_defaults_router_mode(tmp_path):
     assert state.router_mode == "queue"
 
 
+def _signed_request_payload(peer_priv, peer_pub, url="http://127.0.0.1:9901"):
+    from datetime import datetime, timezone
+    from darkmatter.security import sign_connection_request
+    timestamp = datetime.now(timezone.utc).isoformat()
+    return {
+        "from_agent_id": peer_pub,
+        "from_agent_url": url,
+        "from_agent_bio": "local peer",
+        "from_agent_public_key_hex": peer_pub,
+        "from_agent_display_name": "peer",
+        "timestamp": timestamp,
+        "request_signature_hex": sign_connection_request(peer_priv, peer_pub, url, timestamp),
+    }
+
+
 def test_local_connection_request_auto_accepts():
+    target = make_state(port=9900)
+    peer_priv, peer_pub = generate_keypair()
+
+    result, status = asyncio.run(process_connection_request(
+        target, _signed_request_payload(peer_priv, peer_pub),
+        "http://127.0.0.1:9900", client_ip="127.0.0.1"))
+
+    assert status == 200
+    assert result["auto_accepted"] is True
+    assert peer_pub in target.connections
+    assert target.connections[peer_pub].identity_verified is True
+
+
+def test_unsigned_local_request_goes_pending():
+    """Auto-accept requires a verified request signature — unsigned requests
+    queue as pending even from localhost."""
     target = make_state(port=9900)
     _, peer_pub = generate_keypair()
 
@@ -93,13 +124,26 @@ def test_local_connection_request_auto_accepts():
         "from_agent_url": "http://127.0.0.1:9901",
         "from_agent_bio": "local peer",
         "from_agent_public_key_hex": peer_pub,
-        "from_agent_display_name": "peer",
     }, "http://127.0.0.1:9900", client_ip="127.0.0.1"))
 
     assert status == 200
-    assert result["auto_accepted"] is True
-    assert peer_pub in target.connections
-    assert target.connections[peer_pub].identity_verified is True
+    assert result["auto_accepted"] is False
+    assert peer_pub not in target.connections
+
+
+def test_remote_ip_claiming_local_url_not_auto_accepted():
+    """"Local" is decided by the socket IP, not the URL in the body — a
+    remote host claiming a loopback URL must not be auto-accepted."""
+    target = make_state(port=9900)
+    peer_priv, peer_pub = generate_keypair()
+
+    result, status = asyncio.run(process_connection_request(
+        target, _signed_request_payload(peer_priv, peer_pub),
+        "http://127.0.0.1:9900", client_ip="93.184.216.34"))
+
+    assert status == 200
+    assert result["auto_accepted"] is False
+    assert peer_pub not in target.connections
 
 
 def test_connection_proof_marks_pending_request_verified():

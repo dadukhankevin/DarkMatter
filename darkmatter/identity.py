@@ -142,17 +142,19 @@ def verify_message(public_key_hex: str, signature_hex: str, from_agent_id: str,
     return _verify(public_key_hex, signature_hex, from_agent_id, message_id, timestamp, content)
 
 
-def sign_peer_update(private_key_hex: str, agent_id: str, new_url: str, timestamp: str) -> str:
+def sign_peer_update(private_key_hex: str, agent_id: str, new_url: str, timestamp: str,
+                     **kwargs) -> str:
     """Sign a peer_update payload. Returns signature as hex."""
     from darkmatter.security import sign_peer_update as _sign
-    return _sign(private_key_hex, agent_id, new_url, timestamp)
+    return _sign(private_key_hex, agent_id, new_url, timestamp, **kwargs)
 
 
 def verify_peer_update_signature(public_key_hex: str, signature_hex: str,
-                                  agent_id: str, new_url: str, timestamp: str) -> bool:
+                                 agent_id: str, new_url: str, timestamp: str,
+                                 **kwargs) -> bool:
     """Verify a signed peer_update payload. Returns True if valid."""
     from darkmatter.security import verify_peer_update_signature as _verify
-    return _verify(public_key_hex, signature_hex, agent_id, new_url, timestamp)
+    return _verify(public_key_hex, signature_hex, agent_id, new_url, timestamp, **kwargs)
 
 
 def sign_relay_poll(private_key_hex: str, agent_id: str, timestamp: str) -> str:

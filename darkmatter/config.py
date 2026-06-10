@@ -199,7 +199,6 @@ ROUTE_ACCESS_DEFAULTS = {
     "impression": "peer",
     "peer_lookup": "peer",
     "get_peers": "peer",
-    "admin_connect": "peer",
     # Local — daemon API, genuine localhost sockets only
     "accept_pending": "local",
     "local_agents": "local",
