@@ -25,7 +25,7 @@ class AgentStatus(str, Enum):
 
 class RouterAction(str, Enum):
     """Actions a router can take on an incoming message."""
-    HANDLE = "handle"      # Keep in queue; spawn agent if in spawn mode
+    HANDLE = "handle"      # Keep in queue for the active MCP session
     FORWARD = "forward"    # Auto-forward to specified peer(s)
     DROP = "drop"          # Remove from queue silently
     PASS = "pass"          # No opinion — try next router in chain
@@ -226,24 +226,24 @@ class AgentState:
     _is_waiting: bool = False
     # Extensible message routing
     routing_rules: list = field(default_factory=list)
-    router_mode: str = "spawn"
+    router_mode: str = "queue"
     # AntiMatter economy
     antimatter_log: list[dict] = field(default_factory=list)
     delegated_antimatter_agent: Optional[str] = None   # agent_id of chosen delegate
     delegated_antimatter_wallet: Optional[str] = None   # cached wallet address of delegate
     # Identity attestations: chain -> tx_signature (persisted, one-time per chain)
     wallet_attestations: dict[str, str] = field(default_factory=dict)
-    # Conversation memory
+    # Conversation memory. conversation_log_total counts every entry ever
+    # logged (monotonic) so per-session context high-water marks survive the
+    # log being trimmed to CONVERSATION_LOG_MAX.
     conversation_log: list[ConversationEntry] = field(default_factory=list)
+    conversation_log_total: int = 0
     # Network tier: "local", "lan", or "global" (default)
     network_tier: str = "global"
     # Active sessions: [{"pid": int, "cwd": str}] — MCP sessions using this agent
     active_sessions: list[dict] = field(default_factory=list)
     # Security settings (persisted)
     security_settings: dict = field(default_factory=lambda: {
-        "pin_hash": "",
         "auto_accept_local": True,
         "auto_peer_local": True,
-        "sandbox_enabled": False,
-        "sandbox_network": True,
     })

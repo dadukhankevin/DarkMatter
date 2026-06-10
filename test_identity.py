@@ -81,7 +81,7 @@ def test_load_legacy_state_defaults_router_mode(tmp_path):
     assert state is not None
     assert state.agent_id == pub
     assert state.messages_handled == 5
-    assert state.router_mode == "spawn"
+    assert state.router_mode == "queue"
 
 
 def test_local_connection_request_auto_accepts():

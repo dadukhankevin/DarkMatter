@@ -222,44 +222,76 @@ def test_well_known_prunes_dead_active_sessions():
     assert data["agents"][0]["active_sessions"] == [{"pid": os.getpid(), "cwd": "/live"}]
 
 
-def test_auto_peer_connects_same_daemon_agents_mutually(monkeypatch):
+def _discovered_local_peer(state, peer_id: str, url: str = "http://127.0.0.1:9901"):
+    import time
+    state.discovered_peers[peer_id] = {
+        "url": url, "bio": "b", "status": "active", "accepting": True,
+        "source": "local", "ts": time.time(),
+    }
+
+
+def test_auto_peer_connects_discovered_local_agents(monkeypatch):
     from darkmatter import app
-    from darkmatter import state as state_mod
 
-    # Don't touch disk during the test.
-    monkeypatch.setattr(state_mod, "_save_single_state", lambda st: None)
+    a = make_state()
+    _priv_b, pub_b = generate_keypair()
+    _discovered_local_peer(a, pub_b)
 
-    a = make_state()  # registers as default + in registry
-    priv_b, pub_b = generate_keypair()
-    b = AgentState(agent_id=pub_b, bio="b", status=AgentStatus.ACTIVE, port=9900,
-                   private_key_hex=priv_b, public_key_hex=pub_b)
-    state_mod.register_agent(b.agent_id, b)
+    attempted = []
 
-    asyncio.run(app._auto_peer_local_agents(9900))
+    async def fake_connect(state, peer_id, base_url):
+        attempted.append((peer_id, base_url))
+        state.connections[peer_id] = Connection(
+            agent_id=peer_id, agent_url=base_url, agent_bio="b",
+        )
 
-    assert b.agent_id in a.connections, "A should auto-peer with B"
-    assert a.agent_id in b.connections, "B should auto-peer with A"
+    monkeypatch.setattr(app, "_connect_local_peer", fake_connect)
+    app._auto_peer_attempts.clear()
 
-    # Idempotent — a second pass adds nothing.
-    asyncio.run(app._auto_peer_local_agents(9900))
-    assert len(a.connections) == 1 and len(b.connections) == 1
+    asyncio.run(app._auto_peer_local_agents(a))
+    assert attempted == [(pub_b, "http://127.0.0.1:9901")]
+    assert pub_b in a.connections
+
+    # Idempotent — already-connected peers are skipped.
+    asyncio.run(app._auto_peer_local_agents(a))
+    assert len(attempted) == 1
+
+
+def test_auto_peer_backs_off_declined_peers(monkeypatch):
+    """A local peer that declines must not be re-asked every tick."""
+    from darkmatter import app
+
+    a = make_state()
+    _priv_b, pub_b = generate_keypair()
+    _discovered_local_peer(a, pub_b)
+
+    attempts = []
+
+    async def fake_connect(state, peer_id, base_url):
+        attempts.append(peer_id)  # declines: never adds a connection
+
+    monkeypatch.setattr(app, "_connect_local_peer", fake_connect)
+    app._auto_peer_attempts.clear()
+
+    asyncio.run(app._auto_peer_local_agents(a))
+    asyncio.run(app._auto_peer_local_agents(a))  # within the retry window
+
+    assert attempts == [pub_b]
 
 
 def test_auto_peer_respects_opt_out(monkeypatch):
     from darkmatter import app
-    from darkmatter import state as state_mod
-
-    monkeypatch.setattr(state_mod, "_save_single_state", lambda st: None)
 
     a = make_state()
     a.security_settings["auto_peer_local"] = False
-    priv_b, pub_b = generate_keypair()
-    b = AgentState(agent_id=pub_b, bio="b", status=AgentStatus.ACTIVE, port=9900,
-                   private_key_hex=priv_b, public_key_hex=pub_b)
-    b.security_settings["auto_peer_local"] = False
-    state_mod.register_agent(b.agent_id, b)
+    _priv_b, pub_b = generate_keypair()
+    _discovered_local_peer(a, pub_b)
 
-    asyncio.run(app._auto_peer_local_agents(9900))
+    async def fail_connect(state, peer_id, base_url):
+        raise AssertionError("must not attempt to connect when opted out")
 
-    assert b.agent_id not in a.connections
-    assert a.agent_id not in b.connections
+    monkeypatch.setattr(app, "_connect_local_peer", fail_connect)
+    app._auto_peer_attempts.clear()
+
+    asyncio.run(app._auto_peer_local_agents(a))
+    assert pub_b not in a.connections

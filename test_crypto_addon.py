@@ -8,7 +8,7 @@ import json
 from darkmatter.extensions import CRYPTO_DISABLED_ERROR, crypto_enabled, load_crypto_extensions
 from darkmatter.identity import generate_keypair
 from darkmatter.models import AgentState, AgentStatus
-from darkmatter.network.mesh import handle_local_wallet
+from darkmatter.network.local_api import handle_local_wallet
 from darkmatter.state import _reset_for_tests, set_state
 
 

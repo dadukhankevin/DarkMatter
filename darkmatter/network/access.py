@@ -3,10 +3,15 @@ HTTP route access checks for mesh endpoints.
 
 Kept separate from mesh protocol handlers so access policy can be tested and
 changed without touching message or routing logic.
+
+The client IP is the SOCKET peer address. X-Forwarded-For is attacker-supplied
+unless this daemon is deliberately deployed behind a trusted reverse proxy —
+set DARKMATTER_TRUST_PROXY=true only in that case.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -16,21 +21,23 @@ from starlette.responses import JSONResponse
 from darkmatter.config import ROUTE_ACCESS
 from darkmatter.models import AgentState
 
+TRUST_PROXY = os.environ.get("DARKMATTER_TRUST_PROXY", "false").lower() == "true"
+
 
 def client_ip(request: Request) -> str:
-    """Extract client IP from request, respecting X-Forwarded-For."""
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
+    """Extract the client IP from the socket (or XFF when behind a trusted proxy)."""
+    if TRUST_PROXY:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
     if request.client:
         return request.client.host
     return "unknown"
 
 
 def is_local_request(request: Request) -> bool:
-    """Check if request comes from localhost."""
-    ip = client_ip(request)
-    return ip in ("127.0.0.1", "::1", "localhost", "unknown")
+    """Check if the request socket is genuinely loopback."""
+    return client_ip(request) in ("127.0.0.1", "::1")
 
 
 def is_connected_peer(request: Request, state: Optional[AgentState]) -> bool:
@@ -38,6 +45,8 @@ def is_connected_peer(request: Request, state: Optional[AgentState]) -> bool:
     if state is None:
         return False
     request_ip = client_ip(request)
+    if request_ip == "unknown":
+        return False
     for conn in state.connections.values():
         try:
             if urlparse(conn.agent_url).hostname == request_ip:

@@ -88,3 +88,29 @@ def register_channel_capabilities(fastmcp) -> None:
         return original(notification_options, merged)
 
     inner.create_initialization_options = patched
+
+
+def install_session_capture() -> None:
+    """Track MCP sessions from the moment they're created.
+
+    Channel events must reach sessions that haven't made a tool call yet
+    (track_session only fires inside tools). Wrapping ServerSession.__init__
+    registers every session — stdio and HTTP — at creation.
+    """
+    try:
+        from mcp.server.session import ServerSession
+    except Exception as e:
+        print(f"[DarkMatter] session capture unavailable: {e!r}", file=sys.stderr)
+        return
+
+    if getattr(ServerSession, "_darkmatter_capture", False):
+        return
+
+    original_init = ServerSession.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _active_sessions.add(self)
+
+    ServerSession.__init__ = patched_init
+    ServerSession._darkmatter_capture = True

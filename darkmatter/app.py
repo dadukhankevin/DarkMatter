@@ -1,6 +1,12 @@
 """
 Application composition root — create_app(), startup hooks, main entry point.
 
+Process model (one agent per project):
+- The HTTP daemon owns the agent: it loads the passport, owns all state,
+  and is the ONLY process that writes the state file.
+- MCP stdio sessions (spawned by Claude Code et al.) are thin clients that
+  proxy every tool call to the daemon's loopback API.
+
 This is the top-level module that wires everything together.
 Depends on: everything (by design — this IS the composition root)
 """
@@ -43,13 +49,13 @@ from darkmatter.models import AgentState, AgentStatus
 from darkmatter.names import generate_agent_name
 from darkmatter.identity import load_or_create_passport
 from darkmatter.state import (
-    set_state, get_state, get_state_for, save_state, state_file_path,
-    load_state_from_file, clear_waiting_signal, register_agent, list_hosted_agents,
-    scan_state_files, sync_connections_from_disk, _is_pid_alive,
+    set_state, get_state, save_state, state_file_path,
+    load_state_from_file, _is_pid_alive,
 )
 from darkmatter.mcp import mcp
 import darkmatter.mcp.tools  # noqa: F401 — registers @mcp.tool() decorators
-from darkmatter.mcp.visibility import initialize_tool_visibility, status_updater
+from darkmatter.mcp.client import set_daemon_port
+from darkmatter.mcp.visibility import status_updater
 from darkmatter.network.manager import NetworkManager, set_network_manager, get_network_manager
 from darkmatter.network.transports.http import HttpTransport
 from darkmatter.network.transports.webrtc import WebRTCTransport
@@ -58,15 +64,13 @@ from darkmatter.network.discovery import (
     discovery_loop,
     handle_well_known,
 )
+from darkmatter.network.access import check_access
 from darkmatter.network.mesh import (
     dispatch_webrtc_message,
-    check_access,
-    resolve_state as _resolve_state,
     handle_connection_request,
     handle_connection_accepted,
     handle_accept_pending,
     handle_message,
-
     handle_status,
     handle_local_agents,
     handle_network_info,
@@ -82,16 +86,26 @@ from darkmatter.network.mesh import (
     handle_sdp_relay_deliver,
     handle_connection_proof,
     handle_admin_connect,
+    handle_ping,
+)
+from darkmatter.network.local_api import (
     handle_local_inbox,
+    handle_inbox_consume,
+    handle_inbox_wait,
+    handle_local_send_message,
+    handle_local_connect,
+    handle_local_respond_pending,
+    handle_local_disconnect,
     handle_local_pending,
     handle_local_connections,
-    handle_local_set_impression,
+    handle_local_discover,
     handle_local_config,
+    handle_local_set_impression,
+    handle_register_session,
+    handle_local_context,
     handle_local_wallet,
     handle_local_send_payment,
-    handle_ping,
     handle_send_proxy,
-    handle_inbox_consume,
 )
 from darkmatter.wallet import get_all_providers
 from darkmatter.extensions import crypto_enabled, load_crypto_extensions
@@ -105,8 +119,7 @@ _log = get_logger("app")
 def _guarded(route_name: str, handler):
     """Wrap a route handler with access control."""
     async def wrapper(request):
-        state = _resolve_state(request)
-        denied = check_access(request, route_name, state)
+        denied = check_access(request, route_name, get_state())
         if denied is not None:
             return denied
         return await handler(request)
@@ -126,7 +139,7 @@ def _wire_network_fns(manager: NetworkManager) -> None:
 
 
 # =============================================================================
-# State initialization
+# State initialization (daemon only)
 # =============================================================================
 
 def init_state(port: int = None) -> None:
@@ -169,7 +182,7 @@ def init_state(port: int = None) -> None:
     restored = load_state_from_file(path)
 
     if restored:
-        # Restore state but enforce passport-derived identity and spawn mode
+        # Restore state but enforce passport-derived identity
         restored.agent_id = agent_id  # Always use passport-derived ID
         restored.private_key_hex = priv
         restored.public_key_hex = pub
@@ -181,18 +194,10 @@ def init_state(port: int = None) -> None:
             restored.display_name = display_name
         elif not restored.display_name:
             restored.display_name = generate_agent_name()
-        # Register this process
-        my_pid = os.getpid()
-        if not any(s["pid"] == my_pid for s in restored.active_sessions):
-            restored.active_sessions.append({"pid": my_pid, "cwd": os.getcwd()})
         set_state(restored)
         _log.info("Restored state (display: %s, %d connections)",
                   restored.display_name or "none", len(restored.connections))
     else:
-        # state already set to fresh state above
-        my_pid = os.getpid()
-        if not any(s["pid"] == my_pid for s in state.active_sessions):
-            state.active_sessions.append({"pid": my_pid, "cwd": os.getcwd()})
         _log.info("Starting fresh (display: %s) on port %d", display_name or "none", port)
 
     _log.info("Identity: %s...%s", agent_id[:16], agent_id[-8:])
@@ -220,7 +225,6 @@ def init_state(port: int = None) -> None:
         _log.info("Bootstrap mode: ENABLED (auto-accept all connections)")
 
     save_state()
-    clear_waiting_signal()
 
 
 # =============================================================================
@@ -269,151 +273,89 @@ async def _attestation_loop(state: AgentState) -> None:
 
 
 # =============================================================================
-# Multi-agent daemon scanning
+# Local auto-peering (one daemon per project, loopback connections)
 # =============================================================================
 
-def _register_discovered_agents(daemon_port: int) -> None:
-    """Scan state files and register any agents not yet in the registry.
-
-    Only registers agents whose state file indicates the same port as this daemon
-    (to avoid claiming agents from other daemons).
-    """
-    current_agents = set(list_hosted_agents())
-    for info in scan_state_files():
-        agent_id = info["agent_id"]
-        if agent_id in current_agents:
-            continue
-        # Only adopt agents on our port
-        if info.get("port", daemon_port) != daemon_port:
-            continue
-
-        state = load_state_from_file(info["path"], agent_id=agent_id)
-        if state is None:
-            continue
-
-        state.port = daemon_port
-        state.status = AgentStatus.ACTIVE
-        # router_mode is loaded from the persisted state file — don't override it.
-        register_agent(agent_id, state)
-        _log.info("Discovered and registered agent %s... (%s)",
-                  agent_id[:12], state.display_name or "unnamed")
+# peer_id -> monotonic time of last attempt; avoids hammering local peers that
+# decline or have auto-accept disabled.
+_auto_peer_attempts: dict[str, float] = {}
+_AUTO_PEER_RETRY_S = 300.0
 
 
-async def _connect_local_peer(state: AgentState, peer_id: str, base_url: str,
-                              daemon_port: int) -> None:
-    """Establish a connection from `state` to a local peer, auto-accepted.
-
-    Same-daemon peers are connected in-process; peers on other localhost
-    daemons are connected via an HTTP loopback connection_request. Both sides
-    persist so sync_connections_from_disk doesn't wipe the new connection.
-    """
+async def _connect_local_peer(state: AgentState, peer_id: str, base_url: str) -> None:
+    """Connect to a peer on another localhost daemon, auto-accepted over loopback."""
     from darkmatter.network.mesh import (
         build_outbound_request_payload,
         build_connection_from_accepted,
-        process_connection_request,
     )
 
-    our_url = f"http://127.0.0.1:{daemon_port}/__darkmatter__/{state.agent_id}"
+    our_url = f"http://127.0.0.1:{state.port}"
     payload = build_outbound_request_payload(state, our_url)
 
-    target_state = get_state_for(peer_id)
-    if target_state is not None:
-        # Same daemon — drive the acceptance in-process (no HTTP round trip).
-        peer_url = f"http://127.0.0.1:{daemon_port}/__darkmatter__/{peer_id}"
-        result, status = await process_connection_request(
-            target_state, payload, peer_url, client_ip="127.0.0.1"
-        )
-        if status == 200 and result.get("auto_accepted"):
-            state.connections[result["agent_id"]] = build_connection_from_accepted(result)
-            save_state(state.agent_id)   # our side
-            save_state(peer_id)          # peer's side (process_connection_request saved it too)
-            _log.info("Auto-peered %s... <-> %s... (local)", state.agent_id[:8], peer_id[:8])
-        return
-
-    # Peer lives on another localhost daemon — connect over HTTP loopback.
     target = base_url.rstrip("/")
     async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(
-            f"{target}/__darkmatter__/{peer_id}/connection_request", json=payload
-        )
+        resp = await client.post(f"{target}/__darkmatter__/connection_request", json=payload)
         result = resp.json()
     if result.get("auto_accepted"):
         state.connections[result["agent_id"]] = build_connection_from_accepted(result)
-        save_state(state.agent_id)
-        _log.info("Auto-peered %s... -> %s... (loopback %s)", state.agent_id[:8], peer_id[:8], target)
+        save_state()
+        _log.info("Auto-peered %s... -> %s... (loopback %s)",
+                  state.agent_id[:8], peer_id[:8], target)
 
 
-async def _auto_peer_local_agents(daemon_port: int) -> None:
-    """Ensure every local agent is connected to every other local agent.
+async def _auto_peer_local_agents(state: AgentState) -> None:
+    """Connect this agent to every other localhost agent discovered via port scan.
 
-    Covers two cases:
-    - Agents hosted on THIS daemon (multi-tenant single port) — connected in-process.
-    - Agents on other localhost daemons — discovered via port scan, connected over loopback.
-
-    Idempotent: peers already connected are skipped, so this is safe to call every tick.
-    Honors the per-agent `auto_peer_local` security setting (default on).
+    Idempotent and rate-limited: connected peers are skipped, declined peers
+    are retried at most every _AUTO_PEER_RETRY_S seconds. Honors the
+    `auto_peer_local` security setting (default on).
     """
-    hosted = list(list_hosted_agents())
-    if not hosted:
+    if not state.security_settings.get("auto_peer_local", True):
         return
 
-    # Build the set of local peer targets: every hosted agent, plus fresh
-    # locally-discovered peers from any hosted agent's scan results.
-    # peer_id -> base URL of the daemon hosting it.
-    local_targets: dict[str, str] = {
-        aid: f"http://127.0.0.1:{daemon_port}" for aid in hosted
-    }
-    now = time.time()
-    for aid in hosted:
-        st = get_state_for(aid)
-        if st is None:
+    now = time.monotonic()
+    wall_now = time.time()
+    for peer_id, info in list(state.discovered_peers.items()):
+        if peer_id == state.agent_id or peer_id in state.connections:
             continue
-        for peer_id, info in st.discovered_peers.items():
-            if peer_id in local_targets or info.get("source") != "local":
-                continue
-            # Only chase peers seen recently — avoids hammering dead daemons.
-            if now - info.get("ts", 0) > 60:
-                continue
-            base = info.get("url", "")
-            if base:
-                local_targets[peer_id] = base
-
-    for aid in hosted:
-        state = get_state_for(aid)
-        if state is None or not state.security_settings.get("auto_peer_local", True):
+        if info.get("source") != "local":
             continue
-        for peer_id, base_url in local_targets.items():
-            if peer_id == aid or peer_id in state.connections:
-                continue
-            if len(state.connections) >= MAX_CONNECTIONS:
-                break
-            try:
-                await _connect_local_peer(state, peer_id, base_url, daemon_port)
-            except Exception as e:
-                _log.debug("Auto-peer %s... -> %s... failed: %s", aid[:8], peer_id[:8], e)
+        # Only chase peers seen recently — avoids hammering dead daemons.
+        if wall_now - info.get("ts", 0) > 60:
+            continue
+        if now - _auto_peer_attempts.get(peer_id, -_AUTO_PEER_RETRY_S) < _AUTO_PEER_RETRY_S:
+            continue
+        if len(state.connections) >= MAX_CONNECTIONS:
+            break
+        base = info.get("url", "")
+        if not base:
+            continue
+        _auto_peer_attempts[peer_id] = now
+        try:
+            await _connect_local_peer(state, peer_id, base)
+        except Exception as e:
+            _log.debug("Auto-peer %s... -> %s... failed: %s",
+                       state.agent_id[:8], peer_id[:8], e)
 
 
-async def _agent_scan_loop(daemon_port: int) -> None:
-    """Periodically scan for new/removed agent state files and sync connections."""
+async def _maintenance_loop() -> None:
+    """Periodic daemon housekeeping: prune dead session PIDs, auto-peer locals."""
     while True:
         try:
             await asyncio.sleep(10)
-            _register_discovered_agents(daemon_port)
-            # Sync connections/impressions from disk for all hosted agents
-            # and prune dead PIDs (MCP sessions may have exited)
-            for agent_id in list(list_hosted_agents()):
-                sync_connections_from_disk(agent_id=agent_id)
-                agent_state = get_state_for(agent_id)
-                if agent_state and agent_state.active_sessions:
-                    alive = [s for s in agent_state.active_sessions if _is_pid_alive(s["pid"])]
-                    if len(alive) != len(agent_state.active_sessions):
-                        agent_state.active_sessions = alive
-            # Auto-peer local agents — every localhost agent becomes a peer.
-            await _auto_peer_local_agents(daemon_port)
+            state = get_state()
+            if state is None:
+                continue
+            if state.active_sessions:
+                alive = [s for s in state.active_sessions if _is_pid_alive(s["pid"])]
+                if len(alive) != len(state.active_sessions):
+                    state.active_sessions = alive
+                    save_state()
+            await _auto_peer_local_agents(state)
         except asyncio.CancelledError:
             return
         except Exception as e:
-            _log.error("Agent scan loop error: %s", e)
+            _log.error("Maintenance loop error: %s", e)
 
 
 # =============================================================================
@@ -428,6 +370,7 @@ def create_app() -> Router:
     """
     port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
     init_state(port)
+    set_daemon_port(port)  # In-daemon MCP sessions proxy to ourselves over loopback
 
     # Create and register NetworkManager with transport plugins
     manager = NetworkManager(state_getter=get_state, state_saver=save_state)
@@ -476,19 +419,12 @@ def create_app() -> Router:
                 DISCOVERY_PORT,
             )
 
-        # Start live status updater (updates tool description and notifies clients)
+        # Start live status updater (status file + inbox hygiene)
         asyncio.create_task(status_updater())
         _log.info("Live status updater: ENABLED (5s interval)")
 
-        # Initialize dynamic tool visibility (hide optional tools until needed)
-        initialize_tool_visibility()
-
-        # Scan for other agents on this machine and register them
-        _register_discovered_agents(port)
-
-        # Start periodic agent scanning task
-        asyncio.create_task(_agent_scan_loop(port))
-        _log.info("Multi-agent scanner: ENABLED (10s interval)")
+        # Periodic housekeeping: session PID pruning + local auto-peering
+        asyncio.create_task(_maintenance_loop())
 
         # Background: retry identity attestation until all crypto chains attested.
         if crypto_enabled() and state.private_key_hex and state.agent_id and get_all_providers():
@@ -505,7 +441,7 @@ def create_app() -> Router:
         Route("/connection_proof", _guarded("connection_proof", handle_connection_proof), methods=["POST"]),
         Route("/accept_pending", _guarded("accept_pending", handle_accept_pending), methods=["POST"]),
         Route("/status", _guarded("status", handle_status), methods=["GET"]),
-        Route("/local_agents", handle_local_agents, methods=["GET"]),
+        Route("/local_agents", _guarded("local_agents", handle_local_agents), methods=["GET"]),
 
         # Peer — mesh protocol (connected peers + localhost)
         Route("/message", _guarded("message", handle_message), methods=["POST"]),
@@ -523,16 +459,24 @@ def create_app() -> Router:
         Route("/get_peers", _guarded("get_peers", handle_get_peers), methods=["GET", "POST"]),
         Route("/admin_connect", _guarded("admin_connect", handle_admin_connect), methods=["POST"]),
 
-        # Local — admin/read endpoints (localhost only)
+        # Local — daemon API for MCP sessions and skills (localhost sockets only)
         Route("/inbox", _guarded("inbox", handle_local_inbox), methods=["GET"]),
+        Route("/inbox/consume", _guarded("inbox_consume", handle_inbox_consume), methods=["POST"]),
+        Route("/inbox/wait", _guarded("inbox_wait", handle_inbox_wait), methods=["POST"]),
+        Route("/send_message", _guarded("send_message", handle_local_send_message), methods=["POST"]),
+        Route("/connect", _guarded("connect", handle_local_connect), methods=["POST"]),
+        Route("/respond_pending", _guarded("respond_pending", handle_local_respond_pending), methods=["POST"]),
+        Route("/disconnect", _guarded("disconnect", handle_local_disconnect), methods=["POST"]),
         Route("/pending_requests", _guarded("pending_requests", handle_local_pending), methods=["GET"]),
         Route("/connections", _guarded("connections", handle_local_connections), methods=["GET"]),
-        Route("/set_impression", _guarded("set_impression", handle_local_set_impression), methods=["POST"]),
+        Route("/discover", _guarded("discover", handle_local_discover), methods=["POST"]),
         Route("/config", _guarded("config", handle_local_config), methods=["POST"]),
+        Route("/set_impression", _guarded("set_impression", handle_local_set_impression), methods=["POST"]),
+        Route("/register_session", _guarded("register_session", handle_register_session), methods=["POST"]),
+        Route("/context", _guarded("context", handle_local_context), methods=["GET"]),
         Route("/wallet", _guarded("wallet", handle_local_wallet), methods=["GET"]),
         Route("/send_payment", _guarded("send_payment", handle_local_send_payment), methods=["POST"]),
         Route("/send_proxy", _guarded("send_proxy", handle_send_proxy), methods=["POST"]),
-        Route("/inbox/consume", _guarded("inbox_consume", handle_inbox_consume), methods=["POST"]),
     ]
 
     # Extract the MCP ASGI handler and its session manager for lifecycle.
@@ -622,12 +566,10 @@ def create_app() -> Router:
 
     # Build the app. Use redirect_slashes=False so POST /mcp doesn't get
     # redirected to /mcp/ (which breaks MCP client connections).
-    # Dual-mount: agent-scoped routes first (more specific), then bare routes (default agent)
-    # Build route list. When behind a reverse proxy that strips path prefixes
-    # (e.g. DO App Platform), also mount routes at root so they're reachable.
+    # When behind a reverse proxy that strips path prefixes (e.g. DO App
+    # Platform), also mount routes at root so they're reachable.
     route_list = [
         Route("/.well-known/darkmatter.json", handle_well_known, methods=["GET"]),
-        Mount("/__darkmatter__/{target_agent_id}", routes=darkmatter_routes),
         Mount("/__darkmatter__", routes=darkmatter_routes),
         Route("/mcp", mcp_handler),
     ]
@@ -658,17 +600,12 @@ def print_startup_banner(port: int, transport: str, discovery_enabled: bool) -> 
     _log.info("Install: pip install dmagent | https://github.com/dadukhankevin/DarkMatter")
 
 
-def check_port_owner(host: str, port: int, check_agent_id: str = None) -> Optional[str]:
-    """Check if a port has a DarkMatter server and return its agent_id, or None if port is free.
-
-    If check_agent_id is provided, also checks the `agents` array in the
-    well-known response for a multi-tenant match (returns that agent_id if
-    the daemon hosts it, even if it's not the primary agent).
-    """
+def check_port_owner(host: str, port: int) -> Optional[str]:
+    """Check if a port has a DarkMatter server and return its agent_id, or None if port is free."""
     # First check if port is in use at all
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.bind((host, port))
+            s.bind(("127.0.0.1", port))
             return None  # Port is free
         except OSError:
             pass  # Port in use — probe it
@@ -677,60 +614,48 @@ def check_port_owner(host: str, port: int, check_agent_id: str = None) -> Option
     try:
         resp = httpx.get(f"http://127.0.0.1:{port}/.well-known/darkmatter.json", timeout=1.0)
         if resp.status_code == 200:
-            info = resp.json()
-            primary_id = info.get("agent_id")
-
-            # Multi-tenant: check if our agent is already hosted on this daemon
-            if check_agent_id and check_agent_id != primary_id:
-                agents = info.get("agents", [])
-                for agent in agents:
-                    if agent.get("agent_id") == check_agent_id:
-                        return check_agent_id
-
-            return primary_id
+            return resp.json().get("agent_id")
     except Exception:
         pass
     return "unknown"  # Port taken by non-DarkMatter process
 
 
 def find_free_port(host: str, start: int) -> int:
-    """Find a free port in the discovery range (start to start+10)."""
-    for port in range(start, start + 11):
+    """Find a free port in the discovery range (start to start+100)."""
+    for port in range(start, start + 101):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                s.bind((host, port))
+                s.bind(("127.0.0.1", port))
                 return port
             except OSError:
                 continue
-    raise RuntimeError(f"No free ports in range {start}-{start + 10}")
+    raise RuntimeError(f"No free ports in range {start}-{start + 100}")
+
+
+def bind_host_for_tier(tier: str) -> str:
+    """Derive the daemon's bind address from its network tier.
+
+    Tier enforcement starts at the socket: a localhost-tier agent is bound to
+    the loopback interface, so no LAN or internet packet can ever reach it —
+    no header or filter can change that. LAN/global tiers bind all interfaces
+    and rely on socket-IP checks in the access layer.
+
+    DARKMATTER_HOST overrides (explicit operator choice).
+    """
+    explicit = os.environ.get("DARKMATTER_HOST", "").strip()
+    if explicit:
+        return explicit
+    if tier == "local":
+        return "127.0.0.1"
+    return "0.0.0.0"
 
 
 # =============================================================================
-# Dual transport — stdio + HTTP
+# Stdio MCP session — thin client of the daemon
 # =============================================================================
-
-def _init_shared_stdio_session(port: int) -> None:
-    """Initialize state + networking for a stdio MCP session that shares an HTTP mesh node."""
-    init_state(port)
-
-    manager = NetworkManager(state_getter=get_state, state_saver=save_state)
-    http_transport = HttpTransport()
-    manager.register_transport(http_transport)
-    webrtc = WebRTCTransport()
-    webrtc.set_message_dispatcher(dispatch_webrtc_message)
-    manager.register_transport(webrtc)
-    set_network_manager(manager)
-
-    # Wire up peer URL recovery on HTTP transport
-    # (normally done in manager.start(), but stdio sessions don't call start())
-    http_transport._lookup_peer_url = manager.lookup_peer_url
-    http_transport._save_state = save_state
-    http_transport._get_public_url = manager.get_public_url
-    _wire_network_fns(manager)
-
 
 def _spawn_http_daemon(port: int) -> subprocess.Popen:
-    """Spawn a detached HTTP-mode DarkMatter daemon for persistent discovery."""
+    """Spawn a detached HTTP-mode DarkMatter daemon for this project."""
     spawn_env = dict(os.environ)
     spawn_env["DARKMATTER_TRANSPORT"] = "http"
     spawn_env["DARKMATTER_PORT"] = str(port)
@@ -753,100 +678,113 @@ def _spawn_http_daemon(port: int) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-m", "darkmatter"], **kwargs)
 
 
-def _wait_for_our_server(host: str, port: int, expected_agent_id: str, timeout_s: float = 15.0) -> bool:
+def _wait_for_our_server(port: int, expected_agent_id: str, timeout_s: float = 15.0) -> bool:
     """Wait until the HTTP mesh port is owned by our agent."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        owner = check_port_owner(host, port)
+        owner = check_port_owner("127.0.0.1", port)
         if owner == expected_agent_id:
             return True
         time.sleep(0.25)
     return False
 
-async def run_stdio_with_http() -> None:
-    """Run MCP over stdio while serving HTTP mesh endpoints in the background.
 
-    This is the preferred mode when launched by an MCP client (e.g. Claude Code).
-    The client talks MCP over stdin/stdout. The HTTP server runs alongside for
-    agent-to-agent mesh communication and discovery.
+def _persisted_port(public_key_hex: str) -> Optional[int]:
+    """Read the agent's last-used port from its state file (read-only peek)."""
+    import json
+    from darkmatter.state import get_state_dir
+    path = os.path.join(get_state_dir(), f"{public_key_hex}.json")
+    try:
+        with open(path, "r") as f:
+            return int(json.load(f).get("port"))
+    except Exception:
+        return None
 
-    Port conflict resolution:
-    - Port free -> start normally
-    - Port taken by OUR server (same agent_id) -> another session of us is
-      already running the HTTP mesh. Run stdio-only and share state.
-    - Port taken by SOMEONE ELSE -> find a new free port and start there.
+
+def _register_with_daemon(port: int) -> None:
+    """Announce this stdio session to the daemon (best-effort)."""
+    try:
+        httpx.post(
+            f"http://127.0.0.1:{port}/__darkmatter__/register_session",
+            json={"pid": os.getpid(), "cwd": os.getcwd()},
+            timeout=3.0,
+        )
+    except Exception as e:
+        _log.warning("Could not register session with daemon: %s", e)
+
+
+def _resolve_daemon_port(our_agent_id: str) -> int:
+    """Find (or start) this project's daemon and return its port.
+
+    Resolution order:
+    1. The port persisted in our state file, if our daemon still owns it.
+    2. DARKMATTER_PORT / the default port, if free or owned by us.
+    3. Any free port in the range — spawn a fresh daemon there.
     """
+    candidate_ports = []
+    persisted = _persisted_port(our_agent_id)
+    if persisted:
+        candidate_ports.append(persisted)
+    env_port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
+    if env_port not in candidate_ports:
+        candidate_ports.append(env_port)
 
-    port = int(os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT)))
-    host = os.environ.get("DARKMATTER_HOST", "0.0.0.0")
+    for port in candidate_ports:
+        owner = check_port_owner("127.0.0.1", port)
+        if owner == our_agent_id:
+            _log.info("Daemon already running on port %d.", port)
+            return port
+        if owner is None:
+            _log.info("Spawning daemon on port %d.", port)
+            os.environ["DARKMATTER_PORT"] = str(port)
+            proc = _spawn_http_daemon(port)
+            if proc.poll() is not None:
+                raise RuntimeError("Failed to spawn DarkMatter daemon")
+            if _wait_for_our_server(port, our_agent_id):
+                return port
+            raise RuntimeError(f"DarkMatter daemon did not become ready on port {port}")
 
-    # Load our passport to get our agent_id (if we have one)
+    # All candidates taken by other agents — pick a fresh port
+    port = find_free_port("127.0.0.1", DEFAULT_PORT)
+    _log.info("Ports taken by other agents; spawning daemon on port %d.", port)
+    os.environ["DARKMATTER_PORT"] = str(port)
+    proc = _spawn_http_daemon(port)
+    if proc.poll() is not None:
+        raise RuntimeError("Failed to spawn DarkMatter daemon")
+    if not _wait_for_our_server(port, our_agent_id):
+        raise RuntimeError(f"DarkMatter daemon did not become ready on port {port}")
+    return port
+
+
+async def run_stdio_with_http() -> None:
+    """Run MCP over stdio as a thin client of this project's daemon.
+
+    This is the mode used when launched by an MCP client (e.g. Claude Code).
+    The client talks MCP over stdin/stdout; every tool call proxies to the
+    daemon's loopback API. This process never touches the state file.
+    """
+    # Load our passport to get our agent_id (creates one on first run)
     _priv, _pub = load_or_create_passport()
     our_agent_id = _pub
 
-    # Check who owns the port (multi-tenant aware)
-    port_owner = check_port_owner(host, port, check_agent_id=our_agent_id)
+    port = _resolve_daemon_port(our_agent_id)
+    set_daemon_port(port)
+    _register_with_daemon(port)
 
-    if port_owner is None:
-        # Port is free — promote the HTTP mesh node to a detached daemon so
-        # discovery survives MCP client restarts, then attach this stdio
-        # session to the shared on-disk state.
-        _log.info("No HTTP mesh daemon detected on port %d; spawning a persistent daemon.", port)
-        proc = _spawn_http_daemon(port)
-        if proc.poll() is not None:
-            raise RuntimeError("Failed to spawn persistent DarkMatter HTTP daemon")
-        if not _wait_for_our_server(host, port, our_agent_id):
-            raise RuntimeError(f"Persistent DarkMatter HTTP daemon did not become ready on port {port}")
+    from darkmatter.mcp.pump import channel_pump
+    pump_task = None
 
-        _log.info("Persistent HTTP mesh daemon is online on port %d.", port)
-        _log.info("Running stdio-only MCP against shared state.")
-
-        _init_shared_stdio_session(port)
-
-        async with stdio_server() as (read_stream, write_stream):
+    async with stdio_server() as (read_stream, write_stream):
+        pump_task = asyncio.get_event_loop().create_task(channel_pump(port))
+        try:
             await mcp._mcp_server.run(
                 read_stream,
                 write_stream,
                 mcp._mcp_server.create_initialization_options(),
             )
-
-    elif port_owner == our_agent_id:
-        # Our server is already running — parallel session, share state
-        _log.info("Port %d is already running our server (agent %s...).", port, our_agent_id[:12])
-        _log.info("Running stdio-only MCP (parallel session, shared state).")
-        _init_shared_stdio_session(port)
-
-        async with stdio_server() as (read_stream, write_stream):
-            await mcp._mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp._mcp_server.create_initialization_options(),
-            )
-
-    else:
-        # Port taken by a different agent — find a new port
-        _log.info("Port %d is taken by another agent (%s...).", port,
-                  port_owner[:12] if port_owner != "unknown" else "unknown")
-        new_port = find_free_port(host, DEFAULT_PORT)
-        _log.info("Using port %d instead.", new_port)
-
-        # Override port for this session
-        os.environ["DARKMATTER_PORT"] = str(new_port)
-        _log.info("Spawning persistent daemon on alternate port %d.", new_port)
-        proc = _spawn_http_daemon(new_port)
-        if proc.poll() is not None:
-            raise RuntimeError(f"Failed to spawn persistent DarkMatter HTTP daemon on port {new_port}")
-        if not _wait_for_our_server(host, new_port, our_agent_id):
-            raise RuntimeError(f"Persistent DarkMatter HTTP daemon did not become ready on port {new_port}")
-
-        _init_shared_stdio_session(new_port)
-
-        async with stdio_server() as (read_stream, write_stream):
-            await mcp._mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp._mcp_server.create_initialization_options(),
-            )
+        finally:
+            if pump_task:
+                pump_task.cancel()
 
 
 # =============================================================================
@@ -867,7 +805,7 @@ def main() -> None:
     if use_stdio:
         anyio.run(run_stdio_with_http)
     else:
-        # Standalone HTTP mode (manual start, or DARKMATTER_TRANSPORT=http)
+        # Daemon mode (manual start, or DARKMATTER_TRANSPORT=http)
         # Enable MCP SDK debug logging to catch session crashes
         logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
         logging.getLogger("mcp").setLevel(logging.DEBUG)
@@ -904,7 +842,9 @@ def main() -> None:
         discovery_enabled = os.environ.get("DARKMATTER_DISCOVERY", "true").lower() == "true"
         print_startup_banner(port, "streamable-http", discovery_enabled)
 
-        host = os.environ.get("DARKMATTER_HOST", "0.0.0.0")
+        # Bind address follows the agent's network tier (socket-level enforcement)
+        host = bind_host_for_tier(get_state().network_tier)
+        _log.info("Network tier: %s (binding %s)", get_state().network_tier, host)
         uvicorn.run(app, host=host, port=port)
 
 

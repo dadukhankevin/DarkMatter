@@ -1,30 +1,24 @@
 """
-Dynamic tool show/hide, status line builder.
+Daemon status loop — status line builder, status file, inbox hygiene.
 
-Depends on: config, models, mcp/__init__
+Runs in the daemon process only. (Tool visibility machinery removed in 2.0 —
+all tools are always visible; context piggyback now rides on the tools'
+loopback /context calls.)
+
+Depends on: config, models, mcp/__init__, state
 """
 
 import asyncio
-import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import json
-
-from darkmatter.config import (
-    MAX_CONNECTIONS,
-    CORE_TOOLS,
-)
+from darkmatter.config import MAX_CONNECTIONS
 from darkmatter.models import AgentState, AgentStatus
-from darkmatter.mcp import mcp, _active_sessions, _all_tools, _visible_optional
 from darkmatter.state import get_state, save_state
-from darkmatter.context import build_activity_hint, get_context
 from darkmatter.extensions import crypto_wallets
 from darkmatter.logging import get_logger
 
 _log = get_logger("visibility")
-
 
 
 def build_status_line() -> str:
@@ -79,7 +73,7 @@ def build_status_line() -> str:
             lines.append(f'  {rid}: {display} — "{bio_snippet}" → accept or reject')
         actions.append("\n".join(lines))
     if msgs > 0:
-        actions.append(f"{msgs} inbox message(s) — will be delivered via wait_for_message or context injection.")
+        actions.append(f"{msgs} inbox message(s) — delivered via channel events or wait_for_message.")
     if conns == 0:
         actions.append("No connections — discover and connect to peers now")
     if not state.bio or state.bio in ("A DarkMatter mesh agent.", "Description of what this agent specializes in"):
@@ -98,129 +92,6 @@ def build_status_line() -> str:
         return f"{stats}\n\n{action_block}"
     else:
         return f"{stats}\n\nInbox clear. Proactively share updates, ask peers questions, or broadcast useful info to the mesh."
-
-
-def compute_visible_optional() -> set:
-    """Compute which optional tools should be visible based on current agent state.
-
-    All tools are now CORE (always visible). Non-core operations moved to HTTP API + skill.
-    """
-    return set()
-
-
-async def notify_tools_changed() -> None:
-    """Send tools/list_changed notification to all tracked MCP sessions."""
-    dead = set()
-    for session in list(_active_sessions):
-        try:
-            await session.send_tool_list_changed()
-        except Exception as e:
-            _log.warning("failed to notify session of tool list change: %s", e)
-            dead.add(session)
-    _active_sessions.difference_update(dead)
-
-
-async def update_status_tool() -> None:
-    """Update tool visibility if state changed. Status content is returned by the tool itself."""
-    import darkmatter.mcp as mcp_module
-
-    desired_optional = compute_visible_optional()
-    visibility_changed = desired_optional != mcp_module._visible_optional
-
-    if not visibility_changed:
-        return
-
-    if visibility_changed and mcp_module._all_tools:
-        to_add = desired_optional - mcp_module._visible_optional
-        to_remove = mcp_module._visible_optional - desired_optional
-
-        for name in to_add:
-            if name in mcp_module._all_tools:
-                mcp._tool_manager._tools[name] = mcp_module._all_tools[name]
-
-        for name in to_remove:
-            mcp._tool_manager._tools.pop(name, None)
-
-        mcp_module._visible_optional = desired_optional
-        added_str = ", ".join(sorted(to_add)) if to_add else "none"
-        removed_str = ", ".join(sorted(to_remove)) if to_remove else "none"
-        _log.info("Tool visibility: +[%s] -[%s] (total: %s)", added_str, removed_str, len(mcp._tool_manager._tools))
-
-    await notify_tools_changed()
-
-
-def _inject_activity_hint(result, session_id=None):
-    """Inject activity hint and new context into tool call results."""
-    state = get_state()
-    if state is None:
-        return result
-    hint = build_activity_hint(state, session_id=session_id)
-
-    # Deliver new conversation context piggyback on every tool response.
-    new_context = None
-    if session_id:
-        new_context = get_context(state, mode="piggyback", session_id=session_id)
-
-    # result is a list of content objects from MCP
-    if isinstance(result, list):
-        for item in result:
-            text = getattr(item, "text", None)
-            if text is not None:
-                try:
-                    data = json.loads(text)
-                    if isinstance(data, dict):
-                        data["_hint"] = hint
-                        if new_context:
-                            data["_context"] = new_context
-                        item.text = json.dumps(data)
-                except (json.JSONDecodeError, TypeError):
-                    # Non-JSON text response — append as a suffix
-                    if new_context:
-                        item.text = text + f"\n\n{new_context}"
-    return result
-
-
-def initialize_tool_visibility() -> None:
-    """Snapshot all tools, remove non-core ones, and monkey-patch call_tool for graceful fallback."""
-    import darkmatter.mcp as mcp_module
-
-    mcp_module._all_tools = dict(mcp._tool_manager._tools)
-    all_names = set(mcp_module._all_tools.keys())
-    optional_names = all_names - CORE_TOOLS
-
-    mcp_module._visible_optional = compute_visible_optional()
-
-    to_hide = optional_names - mcp_module._visible_optional
-    for name in to_hide:
-        mcp._tool_manager._tools.pop(name, None)
-
-    visible_count = len(mcp._tool_manager._tools)
-    hidden_count = len(to_hide)
-    _log.info("Tool visibility initialized: %s visible, %s hidden", visible_count, hidden_count)
-    if mcp_module._visible_optional:
-        _log.info("Optional tools shown: %s", ", ".join(sorted(mcp_module._visible_optional)))
-
-    original_call_tool = mcp._tool_manager.call_tool
-
-    async def _patched_call_tool(name, arguments, **kwargs):
-        if name not in mcp._tool_manager._tools and name in mcp_module._all_tools:
-            mcp._tool_manager._tools[name] = mcp_module._all_tools[name]
-            _log.info("Graceful fallback: restored hidden tool '%s' on demand", name)
-            mcp_module._visible_optional.add(name)
-        result = await original_call_tool(name, arguments, **kwargs)
-        # Derive session_id from MCP context for per-session tracking
-        session_id = None
-        ctx = kwargs.get("context")
-        if ctx:
-            try:
-                session_id = str(id(ctx.session))
-            except Exception:
-                pass
-        # Inject activity hints + new context into tool responses.
-        result = _inject_activity_hint(result, session_id=session_id)
-        return result
-
-    mcp._tool_manager.call_tool = _patched_call_tool
 
 
 def check_webrtc_health() -> None:
@@ -288,7 +159,7 @@ def _write_status_file(state) -> None:
 
 
 async def status_updater() -> None:
-    """Background task: periodically update the status tool description."""
+    """Background task: periodic node hygiene + status file refresh."""
     _purge_cycle = 0
     while True:
         await asyncio.sleep(5)
@@ -302,8 +173,6 @@ async def status_updater() -> None:
             if _purge_cycle >= 6:
                 _purge_cycle = 0
                 purge_stale_inbox(state)
-            await update_status_tool()
             _write_status_file(state)
         except Exception as e:
             _log.error("Status updater error: %s", e)
-from darkmatter.extensions import crypto_wallets

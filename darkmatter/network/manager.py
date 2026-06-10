@@ -202,17 +202,10 @@ class NetworkManager:
         return result  # Return the direct failure
 
     def _find_connection(self, agent_id: str):
-        """Find a connection across all hosted agents."""
-        from darkmatter.state import list_hosted_agents, get_state_for
+        """Find a connection by peer agent ID."""
         state = self._get_state()
         if state:
-            conn = state.connections.get(agent_id)
-            if conn:
-                return conn
-        for aid in list_hosted_agents():
-            s = get_state_for(aid)
-            if s and agent_id in s.connections:
-                return s.connections[agent_id]
+            return state.connections.get(agent_id)
         return None
 
     async def _direct_send(self, conn, path: str, payload: dict) -> SendResult:
@@ -274,33 +267,10 @@ class NetworkManager:
 
         return SendResult(success=False, transport_name="relay", error="All relay candidates failed")
 
-    def preferred_transport_for(self, agent_id: str):
-        """Return the first currently-usable transport for a peer, or None."""
-        state = self._get_state()
-        conn = state.connections.get(agent_id) if state else None
-        if conn is None:
-            return None
-        for transport in self._transports:
-            if transport.available:
-                return transport
-        return None
-
-
     def peers(self) -> dict:
-        """Return all current connections across all hosted agents."""
-        from darkmatter.state import list_hosted_agents, get_state_for
-
-        all_conns = {}
-        for aid in list_hosted_agents():
-            s = get_state_for(aid)
-            if s:
-                all_conns.update(s.connections)
-        # Fallback for single-agent
-        if not all_conns:
-            state = self._get_state()
-            if state:
-                return state.connections
-        return all_conns
+        """Return all current connections."""
+        state = self._get_state()
+        return state.connections if state else {}
 
     # -- HTTP request helper --
 
@@ -313,15 +283,8 @@ class NetworkManager:
 
     # -- Peer resolution --
 
-    def get_public_url(self, agent_id: str = None) -> str:
-        """Get the public URL for an agent.
-
-        If agent_id is provided, returns an agent-scoped URL
-        (e.g. http://host:port/__darkmatter__/{agent_id}) so remote peers
-        can route back to the correct local agent.
-
-        If agent_id is None, returns the base URL.
-        """
+    def get_public_url(self) -> str:
+        """Get this agent's public base URL."""
         state = self._get_state()
         base_url = None
         if state is not None and state.public_url:
@@ -331,9 +294,6 @@ class NetworkManager:
         if not base_url:
             port = state.port if state else 8100
             base_url = f"http://localhost:{port}"
-
-        if agent_id:
-            return f"{base_url}/__darkmatter__/{agent_id}"
         return base_url
 
     async def discover_public_url(self) -> str:
@@ -375,81 +335,68 @@ class NetworkManager:
         _log.info("Public URL (fallback): %s", url)
         return url
 
-    async def broadcast_peer_update(self, agent_id: str = None) -> None:
+    async def broadcast_peer_update(self) -> None:
         """Notify all connected peers of our current URL, bio, and display name.
-
-        If agent_id is specified, broadcast for that agent only.
-        Otherwise broadcast for all hosted agents.
 
         Local peers receive our LAN URL (so they can reach us directly) while
         remote peers receive our public URL.
         """
-        from darkmatter.state import list_hosted_agents, get_state_for
+        state = self._get_state()
+        if state is None:
+            return
 
-        if agent_id:
-            agent_ids = [agent_id]
-        else:
-            agent_ids = list_hosted_agents()
+        base_url = state.public_url or f"http://127.0.0.1:{state.port}"
+        from darkmatter.network.discovery import _get_lan_ip
+        lan_ip = _get_lan_ip()
+        lan_base = f"http://{lan_ip}:{state.port}" if lan_ip != "localhost" else f"http://localhost:{state.port}"
 
-        for aid in agent_ids:
-            state = get_state_for(aid) if aid != (self._get_state() or object()).agent_id else self._get_state()
-            if state is None:
-                state = get_state_for(aid)
-            if state is None:
-                continue
+        # Build transport address map
+        addresses = {}
+        for t in self._transports:
+            if t.available:
+                addr = t.get_address(state)
+                if addr:
+                    addresses[t.name] = addr
 
-            base_url = state.public_url or f"http://127.0.0.1:{state.port}"
-            from darkmatter.network.discovery import _get_lan_ip
-            lan_ip = _get_lan_ip()
-            lan_base = f"http://{lan_ip}:{state.port}" if lan_ip != "localhost" else f"http://localhost:{state.port}"
+        def _build_payload(url_for_peer: str, _state=state) -> dict:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            p = {
+                "agent_id": _state.agent_id,
+                "new_url": url_for_peer,
+                "addresses": addresses,
+                "timestamp": timestamp,
+                "bio": _state.bio,
+                "display_name": _state.display_name,
+                # LAN info for same-network peers (hairpin NAT workaround)
+                "lan_ip": lan_ip,
+                "local_port": _state.port,
+                "wallets": crypto_wallets(_state),
+            }
+            if _state.public_key_hex:
+                p["public_key_hex"] = _state.public_key_hex
+            if _state.private_key_hex and _state.public_key_hex:
+                p["signature"] = sign_peer_update(
+                    _state.private_key_hex, _state.agent_id, url_for_peer, timestamp
+                )
+            return p
 
-            # Build transport address map
-            addresses = {}
-            for t in self._transports:
-                if t.available:
-                    addr = t.get_address(state)
-                    if addr:
-                        addresses[t.name] = addr
-
-            def _build_payload(url_for_peer: str, _state=state) -> dict:
-                timestamp = datetime.now(timezone.utc).isoformat()
-                p = {
-                    "agent_id": _state.agent_id,
-                    "new_url": url_for_peer,
-                    "addresses": addresses,
-                    "timestamp": timestamp,
-                    "bio": _state.bio,
-                    "display_name": _state.display_name,
-                    # LAN info for same-network peers (hairpin NAT workaround)
-                    "lan_ip": lan_ip,
-                    "local_port": _state.port,
-                    "wallets": crypto_wallets(_state),
-                }
-                if _state.public_key_hex:
-                    p["public_key_hex"] = _state.public_key_hex
-                if _state.private_key_hex and _state.public_key_hex:
-                    p["signature"] = sign_peer_update(
-                        _state.private_key_hex, _state.agent_id, url_for_peer, timestamp
-                    )
-                return p
-
-            failed_peers = []
-            for conn in list(state.connections.values()):
-                try:
-                    # Local peers get our LAN URL; remote peers get the public URL
-                    peer_url = lan_base if is_local_url(conn.agent_url) else base_url
-                    payload = _build_payload(peer_url)
-                    result = await self.send(
-                        conn.agent_id, "/__darkmatter__/peer_update", payload)
-                    if not result.success:
-                        _log.warning("Failed to notify %s... of URL change: %s", conn.agent_id[:12], result.error)
-                        failed_peers.append((state, conn, _build_payload))
-                except Exception as e:
-                    _log.warning("Failed to notify %s... of URL change: %s", conn.agent_id[:12], e)
+        failed_peers = []
+        for conn in list(state.connections.values()):
+            try:
+                # Local peers get our LAN URL; remote peers get the public URL
+                peer_url = lan_base if is_local_url(conn.agent_url) else base_url
+                payload = _build_payload(peer_url)
+                result = await self.send(
+                    conn.agent_id, "/__darkmatter__/peer_update", payload)
+                if not result.success:
+                    _log.warning("Failed to notify %s... of URL change: %s", conn.agent_id[:12], result.error)
                     failed_peers.append((state, conn, _build_payload))
+            except Exception as e:
+                _log.warning("Failed to notify %s... of URL change: %s", conn.agent_id[:12], e)
+                failed_peers.append((state, conn, _build_payload))
 
-            if failed_peers:
-                asyncio.create_task(self._retry_peer_update(failed_peers))
+        if failed_peers:
+            asyncio.create_task(self._retry_peer_update(failed_peers))
 
     async def _retry_peer_update(self, failed_peers: list) -> None:
         """Background retry for peers that failed during broadcast_peer_update.
@@ -658,7 +605,7 @@ class NetworkManager:
         # 3. Try sending a connection_request to re-establish (if we found any URL)
         try:
             from darkmatter.network.mesh import build_outbound_request_payload, build_connection_from_accepted
-            public_url = self.get_public_url(agent_id=state.agent_id)
+            public_url = self.get_public_url()
             payload = build_outbound_request_payload(state, public_url)
             base = strip_base_url(conn.agent_url)
 
@@ -680,98 +627,78 @@ class NetworkManager:
         return False
 
     def _all_connections(self) -> list[tuple]:
-        """Collect (state, conn) pairs across all hosted agents."""
-        from darkmatter.state import list_hosted_agents, get_state_for
-
-        all_conns = []
-        for aid in list_hosted_agents():
-            s = get_state_for(aid)
-            if s:
-                for conn in s.connections.values():
-                    all_conns.append((s, conn))
-
-        if not all_conns:
-            state = self._get_state()
-            if state:
-                all_conns = [(state, c) for c in state.connections.values()]
-
-        return all_conns
+        """Collect (state, conn) pairs for every connection."""
+        state = self._get_state()
+        if state is None:
+            return []
+        return [(state, c) for c in state.connections.values()]
 
     async def _cleanup_dead_webrtc(self) -> None:
         """Detect dead WebRTC channels, clean up, and downgrade to HTTP.
 
         The connectivity upgrade loop will re-attempt WebRTC later.
         """
-        from darkmatter.state import list_hosted_agents, get_state_for
-
         webrtc = self.get_transport("webrtc")
         if not webrtc:
             return
 
-        for aid in list_hosted_agents():
-            s = get_state_for(aid)
-            if s is None:
+        for _, conn in self._all_connections():
+            if conn.webrtc_pc is None:
                 continue
-            for conn in list(s.connections.values()):
-                if conn.webrtc_pc is None:
-                    continue
-                pc_state = getattr(conn.webrtc_pc, "connectionState", "unknown")
-                if pc_state in ("failed", "closed", "disconnected"):
-                    peer = conn.agent_display_name or conn.agent_id[:12]
-                    _log.info("WebRTC dead channel (%s) for %s, downgrading to HTTP",
-                              pc_state, peer)
-                    await webrtc.cleanup(conn)
+            pc_state = getattr(conn.webrtc_pc, "connectionState", "unknown")
+            if pc_state in ("failed", "closed", "disconnected"):
+                peer = conn.agent_display_name or conn.agent_id[:12]
+                _log.info("WebRTC dead channel (%s) for %s, downgrading to HTTP",
+                          pc_state, peer)
+                await webrtc.cleanup(conn)
 
     async def _check_trust_disconnects(self) -> None:
-        """Auto-disconnect peers with sustained negative trust scores across all hosted agents."""
-        from darkmatter.state import save_state, list_hosted_agents, get_state_for
+        """Auto-disconnect peers with sustained negative trust scores."""
+        from darkmatter.state import save_state
+
+        state = self._get_state()
+        if state is None:
+            return
 
         now = datetime.now(timezone.utc)
-
-        for aid in list_hosted_agents():
-            state = get_state_for(aid)
-            if state is None:
+        to_disconnect = []
+        for agent_id, imp in list(state.impressions.items()):
+            if agent_id not in state.connections:
+                continue
+            if not imp.negative_since:
+                continue
+            try:
+                neg_dt = datetime.fromisoformat(imp.negative_since)
+                if (now - neg_dt).total_seconds() >= TRUST_NEGATIVE_TIMEOUT:
+                    to_disconnect.append(agent_id)
+            except (ValueError, TypeError):
                 continue
 
-            to_disconnect = []
-            for agent_id, imp in list(state.impressions.items()):
-                if agent_id not in state.connections:
-                    continue
-                if not imp.negative_since:
-                    continue
-                try:
-                    neg_dt = datetime.fromisoformat(imp.negative_since)
-                    elapsed = (now - neg_dt).total_seconds()
-                    if elapsed >= TRUST_NEGATIVE_TIMEOUT:
-                        to_disconnect.append(agent_id)
-                except (ValueError, TypeError):
-                    continue
-
-            for agent_id in to_disconnect:
-                try:
-                    imp = state.impressions.get(agent_id)
-                    conn = state.connections.get(agent_id)
-                    peer_name = (conn.agent_display_name if conn else None) or agent_id[:16]
-                    score = round(imp.score, 4) if imp else "?"
-                    neg_since = imp.negative_since if imp else "?"
-                    if await auto_disconnect_peer(state, agent_id):
-                        # Queue self-notification so the agent knows what happened
-                        note = QueuedMessage(
-                            message_id=f"trust-disconnect-{uuid.uuid4().hex[:12]}",
-                            content=(
-                                f"Auto-disconnected {peer_name} ({agent_id[:16]}...) due to "
-                                f"sustained negative trust (score: {score}, negative since: {neg_since}). "
-                                f"The peer was notified. Reset their impression to reconnect."
-                            ),
-                            from_agent_id=state.agent_id,
-                            metadata={"type": "trust_disconnect_notice", "peer_id": agent_id},
-                            hops_remaining=0,
-                            verified=True,
-                        )
-                        state.message_queue.append(note)
-                        save_state(agent_id=aid)
-                except Exception as e:
-                    _log.error("Trust disconnect failed for %s...: %s", agent_id[:16], e)
+        for agent_id in to_disconnect:
+            try:
+                imp = state.impressions.get(agent_id)
+                conn = state.connections.get(agent_id)
+                peer_name = (conn.agent_display_name if conn else None) or agent_id[:16]
+                score = round(imp.score, 4) if imp else "?"
+                neg_since = imp.negative_since if imp else "?"
+                if await auto_disconnect_peer(state, agent_id):
+                    # Queue self-notification so the agent knows what happened
+                    note = QueuedMessage(
+                        message_id=f"trust-disconnect-{uuid.uuid4().hex[:12]}",
+                        content=(
+                            f"Auto-disconnected {peer_name} ({agent_id[:16]}...) due to "
+                            f"sustained negative trust (score: {score}, negative since: {neg_since}). "
+                            f"The peer was notified. Reset their impression to reconnect."
+                        ),
+                        from_agent_id=state.agent_id,
+                        metadata={"type": "trust_disconnect_notice", "peer_id": agent_id},
+                        hops_remaining=0,
+                        verified=True,
+                    )
+                    state.message_queue.append(note)
+                    save_state()
+            except Exception as e:
+                _log.error("Trust disconnect failed for %s...: %s", agent_id[:16], e)
 
     # -- Connectivity level --
 
@@ -802,17 +729,11 @@ class NetworkManager:
         return 0, "unknown"
 
     def update_connectivity_levels(self) -> None:
-        """Update connectivity_level and connectivity_method on all connections across all agents."""
-        from darkmatter.state import list_hosted_agents, get_state_for
-
-        for aid in list_hosted_agents():
-            state = get_state_for(aid)
-            if state is None:
-                continue
-            for conn in state.connections.values():
-                level, method = self.determine_connectivity_level(conn)
-                conn.connectivity_level = level
-                conn.connectivity_method = method
+        """Update connectivity_level and connectivity_method on all connections."""
+        for _, conn in self._all_connections():
+            level, method = self.determine_connectivity_level(conn)
+            conn.connectivity_level = level
+            conn.connectivity_method = method
 
     # -- Connectivity upgrade loop --
 
@@ -1011,18 +932,8 @@ class NetworkManager:
                 if state is None:
                     continue
 
-                # Collect all HEALTHY connected peer URLs across all hosted agents
-                from darkmatter.state import list_hosted_agents, get_state_for
+                # Collect all HEALTHY connected peer URLs
                 healthy_urls = set()
-                for aid in list_hosted_agents():
-                    s = get_state_for(aid)
-                    if s:
-                        for conn in s.connections.values():
-                            failures = getattr(conn, "health_failures", 0)
-                            dormant = getattr(conn, "_dormant", False)
-                            if failures < HEALTH_FAILURE_THRESHOLD and not dormant:
-                                healthy_urls.add(strip_base_url(conn.agent_url))
-                # Fallback for single-agent
                 for conn in state.connections.values():
                     failures = getattr(conn, "health_failures", 0)
                     dormant = getattr(conn, "_dormant", False)
@@ -1048,7 +959,7 @@ class NetworkManager:
                             build_connection_from_accepted,
                         )
 
-                        public_url = self.get_public_url(agent_id=state.agent_id)
+                        public_url = self.get_public_url()
                         payload = build_outbound_request_payload(state, public_url)
 
                         async with httpx.AsyncClient(timeout=15.0) as client:

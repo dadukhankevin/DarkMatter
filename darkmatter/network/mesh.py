@@ -6,9 +6,6 @@ Depends on: config, models, identity, state, wallet, network/resilience, network
 """
 
 import asyncio
-import json
-import os
-import random
 import socket
 import sys
 import time
@@ -18,11 +15,10 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
-import darkmatter as dm
 import httpx
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 
 from darkmatter.config import (
     MAX_AGENT_ID_LENGTH,
@@ -68,18 +64,16 @@ from darkmatter.security import (
 )
 from darkmatter.state import (
     get_state,
-    get_state_for,
     save_state,
-    check_message_replay,
-    check_waiting,
+    is_message_replay,
+    record_message_seen,
 )
 from darkmatter.context import log_conversation
-from darkmatter.router import execute_routing
-from darkmatter.wallet import get_all_providers
 from darkmatter.extensions import CRYPTO_DISABLED_ERROR, crypto_wallets, load_crypto_extensions
+from darkmatter.router import execute_routing
 from darkmatter.trust import compute_seeded_trust
 from darkmatter.network.manager import get_network_manager
-from darkmatter.network.access import check_access, client_ip as _client_ip
+from darkmatter.network.access import client_ip as _client_ip
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 
 from darkmatter.logging import get_logger
@@ -92,18 +86,6 @@ def _extract_host(url: str) -> Optional[str]:
         return urlparse(url).hostname
     except Exception:
         return None
-
-
-def resolve_state(request: "Request") -> Optional[AgentState]:
-    """Resolve the target agent state from a request.
-
-    If the URL contains a {target_agent_id} path param, look up that specific
-    agent. Otherwise fall back to the default agent.
-    """
-    target = request.path_params.get("target_agent_id")
-    if target:
-        return get_state_for(target)
-    return get_state()
 
 
 def local_delivery_capabilities(state: AgentState) -> dict:
@@ -200,9 +182,6 @@ def _queue_connection_request(
     display = from_agent_display_name or from_agent_id[:16] + "..."
     msg_id = request_id or f"conn-{uuid.uuid4().hex[:8]}"
 
-    # Skip if already consumed or already in queue
-    if msg_id in getattr(state, "_consumed_message_ids", set()):
-        return
     if any(m.message_id == msg_id for m in state.message_queue):
         return
 
@@ -291,7 +270,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             existing.capabilities = from_agent_capabilities
             changed = True
         if changed:
-            save_state(state.agent_id)
+            save_state()
         return {
             "auto_accepted": True,
             "agent_id": state.agent_id,
@@ -333,7 +312,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             _log.info("Seeded trust for %s... at %.4f from %d peer opinions",
                        from_agent_id[:12], seeded, peer_trust.get("peers_with_opinion", 0))
 
-        save_state(state.agent_id)
+        save_state()
         _log.info("Auto-accepted local agent %s... (%s)", from_agent_display_name or from_agent_id[:12], from_agent_url)
 
         # Queue so MCP session sees the new connection via wait_for_message / context.
@@ -378,7 +357,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         if seeded > 0 and from_agent_id not in state.impressions:
             state.impressions[from_agent_id] = Impression(score=round(seeded, 4))
 
-        save_state(state.agent_id)
+        save_state()
         _log.info("Auto-accepted agent %s... (bootstrap mode)", from_agent_display_name or from_agent_id[:12])
 
         _queue_connection_request(
@@ -785,7 +764,7 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if not message_id or not content:
         missing = [f for f, v in [("message_id", message_id), ("content", content)] if not v]
         return {"error": f"Missing required fields: {', '.join(missing)}"}, 400
-    if check_message_replay(message_id):
+    if is_message_replay(message_id):
         return {"error": "Duplicate message — already received"}, 409
     if len(content) > MAX_CONTENT_LENGTH:
         return {"error": f"Content exceeds {MAX_CONTENT_LENGTH} bytes"}, 413
@@ -822,6 +801,10 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
     if verified and msg_timestamp and not is_timestamp_fresh(msg_timestamp):
         return {"error": "Message timestamp too old — possible replay"}, 403
 
+    # Record the ID only AFTER verification, so a forged message can't burn
+    # a legitimate message_id and deny delivery of the real one.
+    record_message_seen(message_id)
+
     msg_metadata = data.get("metadata", {})
 
     # Preserve in_reply_to in metadata. The send_message tool puts in_reply_to
@@ -847,16 +830,6 @@ async def _process_incoming_message(state: AgentState, data: dict) -> tuple[dict
             conn.last_activity = datetime.now(timezone.utc).isoformat()
         save_state()
         return {"status": "broadcast_received"}, 200
-
-    # Security push: apply settings at the node level, don't queue
-    if msg_metadata.get("type") == "security_push":
-        ss = state.security_settings
-        for key in ("auto_accept_local",):
-            if key in msg_metadata:
-                ss[key] = bool(msg_metadata[key])
-        save_state()
-        _log.info("Applied security push from %s", from_agent_id[:12])
-        return {"status": "security_push_applied"}, 200
 
     msg, routed_to = await _commit_verified_message(state, {
         "message_id": message_id,
@@ -886,7 +859,7 @@ async def handle_ping(request: Request) -> JSONResponse:
     Body: {"agent_id": str, "timestamp": str}
     Response: {"your_ip": str, "agent_id": str, "timestamp": str}
     """
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -932,7 +905,7 @@ async def handle_ping(request: Request) -> JSONResponse:
 
 async def handle_connection_request(request: Request) -> JSONResponse:
     """Handle an incoming connection request from another agent."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -962,7 +935,7 @@ async def handle_connection_request(request: Request) -> JSONResponse:
 
 async def handle_connection_accepted(request: Request) -> JSONResponse:
     """Handle notification that our connection request was accepted."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -988,7 +961,7 @@ async def handle_connection_proof(request: Request) -> JSONResponse:
     POST /__darkmatter__/connection_proof
     Body: {challenge_id, proof_hex, agent_id}
     """
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1033,7 +1006,7 @@ async def handle_connection_proof(request: Request) -> JSONResponse:
 
 async def handle_accept_pending(request: Request) -> JSONResponse:
     """Accept a pending connection request via HTTP (no MCP needed)."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1395,8 +1368,8 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
 
     visited_set = set(visited)
 
-    # --- Step 1: Am I the target (or hosting it)? ---
-    target_state = get_state_for(target_agent_id)
+    # --- Step 1: Am I the target? ---
+    target_state = state if target_agent_id == state.agent_id else None
     if target_state is not None:
         chain_trust = _compute_chain_trust(trust_chain)
 
@@ -1423,7 +1396,7 @@ async def _process_mesh_route(state: AgentState, data: dict) -> tuple[dict, int]
                    chain_trust, len(trust_chain))
 
         mgr = get_network_manager()
-        public_url = mgr.get_public_url(target_agent_id)
+        public_url = mgr.get_public_url()
 
         # Inject chain trust into the payload so the target can see it
         enriched_payload = {**payload, "chain_trust": chain_trust, "trust_chain": trust_chain}
@@ -1549,7 +1522,7 @@ async def _process_mesh_route_response(state: AgentState, data: dict) -> tuple[d
     _seen_route_ids[route_id] = time.time()
 
     # Are we the target of this response (the original requester)?
-    target_state = get_state_for(target_agent_id)
+    target_state = state if target_agent_id == state.agent_id else None
     if target_state is not None:
         _log.info("Mesh route: connection_response arrived for local agent %s... from %s...",
                    target_agent_id[:12], source_agent_id[:12])
@@ -1644,7 +1617,7 @@ async def _forward_trust_guided(state: AgentState, envelope: dict) -> None:
 
 async def handle_mesh_route(request: Request) -> JSONResponse:
     """Handle a mesh-routed packet (HTTP transport)."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1667,7 +1640,7 @@ async def handle_mesh_route(request: Request) -> JSONResponse:
 
 async def handle_message(request: Request) -> JSONResponse:
     """Handle an incoming routed message from another agent (HTTP transport)."""
-    state = resolve_state(request)
+    state = get_state()
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1683,7 +1656,7 @@ async def handle_message(request: Request) -> JSONResponse:
 
 async def handle_status(request: Request) -> JSONResponse:
     """Return this agent's public status (for health checks and discovery)."""
-    state = resolve_state(request)
+    state = get_state()
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1696,44 +1669,36 @@ async def handle_status(request: Request) -> JSONResponse:
         "status": state.status.value,
         "num_connections": len(state.connections),
         "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
-        "is_waiting": getattr(state, "_is_waiting", False) or (state.public_key_hex and check_waiting(state.public_key_hex)),
+        "is_waiting": bool(state._inbox_events) or getattr(state, "_is_waiting", False),
     })
 
 
 async def handle_local_agents(request: Request) -> JSONResponse:
-    """Return all agents hosted on this daemon with their active sessions (PIDs, cwds).
+    """Return all DarkMatter agents on this machine (one state file per project).
 
-    Localhost-only — gives local agents visibility into what's running on this machine.
-    Prunes dead PIDs on read.
+    Localhost-only — gives local agents visibility into what's running here.
+    Dead session PIDs are pruned on read.
     """
-    from darkmatter.state import list_hosted_agents, get_state_for, _is_pid_alive
+    from darkmatter.state import scan_state_files
 
-    agents = []
-    for agent_id in list_hosted_agents():
-        agent_state = get_state_for(agent_id)
-        if agent_state is None:
-            continue
-        # Prune dead sessions on read
-        alive = [s for s in agent_state.active_sessions if _is_pid_alive(s["pid"])]
-        if len(alive) != len(agent_state.active_sessions):
-            agent_state.active_sessions = alive
-        agents.append({
-            "agent_id": agent_id,
-            "display_name": agent_state.display_name,
-            "bio": agent_state.bio,
-            "status": agent_state.status.value,
-            "port": agent_state.port,
-            "network_tier": agent_state.network_tier,
-            "num_connections": len(agent_state.connections),
-            "active_sessions": agent_state.active_sessions,
-        })
-
+    agents = [
+        {
+            "agent_id": info["agent_id"],
+            "display_name": info.get("display_name"),
+            "bio": info.get("bio", ""),
+            "status": info.get("status", "active"),
+            "port": info.get("port"),
+            "network_tier": info.get("network_tier", "global"),
+            "active_sessions": info.get("active_sessions", []),
+        }
+        for info in scan_state_files()
+    ]
     return JSONResponse({"agents": agents, "count": len(agents)})
 
 
 async def handle_network_info(request: Request) -> JSONResponse:
     """Return this agent's network info for peer discovery."""
-    state = resolve_state(request)
+    state = get_state()
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1759,7 +1724,7 @@ async def handle_network_info(request: Request) -> JSONResponse:
 
 async def handle_status_broadcast(request: Request) -> JSONResponse:
     """Receive a passive status broadcast from a peer (HTTP transport)."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1774,7 +1739,7 @@ async def handle_status_broadcast(request: Request) -> JSONResponse:
 
 async def handle_impression_get(request: Request) -> JSONResponse:
     """Return this agent's impression of a specific agent (asked by peers)."""
-    state = resolve_state(request)
+    state = get_state()
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -1806,7 +1771,7 @@ async def handle_impression_get(request: Request) -> JSONResponse:
 
 async def handle_peer_update(request: Request) -> JSONResponse:
     """Accept a URL change notification from a connected peer (HTTP transport)."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1829,7 +1794,7 @@ async def handle_peer_lookup(request: Request) -> JSONResponse:
     Used by other peers to find an agent's current URL when direct
     communication fails.
     """
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1851,7 +1816,7 @@ async def handle_peer_lookup(request: Request) -> JSONResponse:
 
 async def handle_get_peers(request: Request) -> JSONResponse:
     """Return this agent's top-N most trusted connected peers with bios (HTTP transport)."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -1878,7 +1843,7 @@ async def handle_get_peers(request: Request) -> JSONResponse:
 
 async def handle_antimatter_request(request: Request) -> JSONResponse:
     """B receives antimatter request from A: send fee to A's delegate D."""
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
     if not load_crypto_extensions():
@@ -1929,7 +1894,7 @@ async def handle_webrtc_offer(request: Request) -> JSONResponse:
     Body: {from_agent_id, sdp_offer}
     Returns: {sdp_answer}
     """
-    state = resolve_state(request)
+    state = get_state()
 
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
@@ -2030,7 +1995,7 @@ async def handle_sdp_relay(request: Request) -> JSONResponse:
     Body: {target_agent_id, offer_data, from_agent_id}
     Returns: {sdp, type} — the SDP answer from the target, or error.
     """
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2079,7 +2044,7 @@ async def handle_sdp_relay_deliver(request: Request) -> JSONResponse:
     Body: {from_agent_id, offer_data, relay_agent_id}
     Returns: {sdp, type} — the SDP answer.
     """
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2121,7 +2086,7 @@ async def handle_admin_connect(request: Request) -> JSONResponse:
 
     Only processes requests from connected peers.
     """
-    state = resolve_state(request)
+    state = get_state()
     if state is None:
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
@@ -2167,293 +2132,3 @@ async def handle_admin_connect(request: Request) -> JSONResponse:
             return JSONResponse({"success": True, "status": "pending", "request_id": result.get("request_id")})
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-
-
-
-# =============================================================================
-# Local API — endpoints for skill/curl access (not peer-to-peer)
-# =============================================================================
-
-async def handle_local_inbox(request: Request) -> JSONResponse:
-    """GET /__darkmatter__/inbox — list all queued messages."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    messages = []
-    for msg in state.message_queue:
-        messages.append({
-            "message_id": msg.message_id,
-            "content": msg.content[:500] if msg.content else "",
-            "from_agent_id": msg.from_agent_id,
-            "hops_remaining": msg.hops_remaining,
-            "verified": msg.verified,
-            "received_at": msg.received_at,
-        })
-    return JSONResponse({"count": len(messages), "messages": messages})
-
-
-async def handle_send_proxy(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/send_proxy — proxy a send through the daemon (local-only).
-
-    The MCP stdio session calls this so the daemon uses its own live connection
-    objects (fresh URLs, WebRTC channels) instead of stale in-memory copies.
-    """
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    # Sync connections from disk so MCP-added connections are visible immediately
-    # (without waiting for the 10s agent scan loop)
-    from darkmatter.state import sync_connections_from_disk
-    sync_connections_from_disk(agent_id=state.agent_id)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    target_agent_id = body.get("target_agent_id")
-    path = body.get("path")
-    payload = body.get("payload")
-    if not target_agent_id or not path or payload is None:
-        return JSONResponse(
-            {"error": "Required: target_agent_id, path, payload"}, status_code=400
-        )
-
-    mgr = get_network_manager()
-    result = await mgr.send(target_agent_id, path, payload)
-    return JSONResponse({
-        "success": result.success,
-        "transport": result.transport_name,
-        "response": result.response,
-        "error": result.error,
-    })
-
-
-async def handle_inbox_consume(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/inbox/consume — consume messages from the daemon queue (local-only).
-
-    Removes messages by ID and returns the consumed message details.
-    """
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    message_ids = body.get("message_ids", [])
-    if not message_ids:
-        return JSONResponse({"error": "Required: message_ids"}, status_code=400)
-
-    consumed = []
-    remaining = []
-    id_set = set(message_ids)
-    for msg in state.message_queue:
-        if msg.message_id in id_set:
-            consumed.append({
-                "message_id": msg.message_id,
-                "content": msg.content,
-                "from_agent_id": msg.from_agent_id,
-                "hops_remaining": msg.hops_remaining,
-                "verified": msg.verified,
-                "received_at": msg.received_at,
-            })
-            if not hasattr(state, "_consumed_message_ids"):
-                state._consumed_message_ids = set()
-            state._consumed_message_ids.add(msg.message_id)
-        else:
-            remaining.append(msg)
-    state.message_queue = remaining
-    save_state()
-
-    return JSONResponse({"consumed": len(consumed), "messages": consumed})
-
-
-async def handle_local_pending(request: Request) -> JSONResponse:
-    """GET /__darkmatter__/pending_requests — list pending connection requests."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    requests_list = []
-    for req in state.pending_requests.values():
-        requests_list.append({
-            "request_id": req.request_id,
-            "from_agent_id": req.from_agent_id,
-            "from_agent_display_name": req.from_agent_display_name,
-            "from_agent_url": req.from_agent_url,
-            "from_agent_bio": req.from_agent_bio,
-            "requested_at": req.requested_at,
-        })
-    return JSONResponse({"count": len(requests_list), "requests": requests_list})
-
-
-async def handle_local_connections(request: Request) -> JSONResponse:
-    """GET /__darkmatter__/connections — list connections with details."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    # Sync connections from disk so MCP-added connections are visible immediately
-    from darkmatter.state import sync_connections_from_disk
-    sync_connections_from_disk(agent_id=state.agent_id)
-
-    conns = []
-    for aid, conn in state.connections.items():
-        entry = {
-            "agent_id": aid,
-            "display_name": conn.agent_display_name or aid[:12],
-            "agent_url": conn.agent_url,
-            "bio": (conn.agent_bio or "")[:250],
-            "connected_at": conn.connected_at,
-            "last_activity": conn.last_activity,
-            "messages_sent": conn.messages_sent,
-            "messages_received": conn.messages_received,
-            "connectivity_level": conn.connectivity_level,
-            "connectivity_method": conn.connectivity_method,
-        }
-        imp = state.impressions.get(aid)
-        if imp:
-            entry["impression"] = {"score": imp.score, "note": imp.note}
-        conns.append(entry)
-    return JSONResponse({"count": len(conns), "connections": conns})
-
-
-async def handle_local_set_impression(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/set_impression — set trust score for a peer."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    agent_id = data.get("agent_id", "")
-    score = data.get("score")
-    note = data.get("note", "")
-
-    if not agent_id or score is None:
-        return JSONResponse({"error": "agent_id and score required"}, status_code=400)
-
-    try:
-        score = float(score)
-        if score < -1 or score > 1:
-            return JSONResponse({"error": "score must be between -1.0 and 1.0"}, status_code=400)
-    except (TypeError, ValueError):
-        return JSONResponse({"error": "score must be a number"}, status_code=400)
-
-    state.impressions[agent_id] = Impression(
-        score=score,
-        note=str(note)[:2000],
-    )
-    save_state()
-
-    return JSONResponse({"success": True, "agent_id": agent_id, "score": score})
-
-
-async def handle_local_wallet(request: Request) -> JSONResponse:
-    """GET /__darkmatter__/wallet — wallet balances across all chains."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-    if not load_crypto_extensions():
-        return JSONResponse(
-            {"enabled": False, "wallets": {}, "error": CRYPTO_DISABLED_ERROR},
-            status_code=501,
-        )
-
-    chain_filter = request.query_params.get("chain")
-    results = {}
-
-    for chain, provider in get_all_providers().items():
-        if chain_filter and chain != chain_filter:
-            continue
-        address = state.wallets.get(chain)
-        if not address:
-            continue
-        try:
-            all_bal = await provider.get_all_balances(address)
-            native = all_bal.get("native", {})
-            results[chain] = {
-                "address": address,
-                "balance": native.get("balance", 0) if native.get("success", all_bal.get("success")) else None,
-                "tokens": all_bal.get("tokens", []),
-                "error": native.get("error") if not all_bal.get("success") else None,
-                "attested": chain in state.wallet_attestations,
-            }
-        except Exception as e:
-            results[chain] = {"address": address, "error": str(e)}
-
-    return JSONResponse({"wallets": results})
-
-
-async def handle_local_send_payment(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/send_payment — send payment to a connected peer."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-    if not load_crypto_extensions():
-        return JSONResponse({"success": False, "error": CRYPTO_DISABLED_ERROR}, status_code=501)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    agent_id = data.get("agent_id", "")
-    amount = data.get("amount", 0)
-    currency = data.get("currency", "SOL")
-    token_decimals = data.get("token_decimals", 9)
-    chain = data.get("chain", "solana")
-
-    if not agent_id or amount <= 0:
-        return JSONResponse({"error": "agent_id and amount > 0 required"}, status_code=400)
-
-    from darkmatter.wallet.antimatter import initiate_payment
-
-    result = await initiate_payment(
-        state, agent_id, amount, currency=currency,
-        token_decimals=token_decimals, chain=chain,
-        save_state_fn=save_state,
-    )
-    status = 200 if result.get("success") else 400
-    return JSONResponse(result, status_code=status)
-
-
-async def handle_local_config(request: Request) -> JSONResponse:
-    """POST /__darkmatter__/config — set agent configuration."""
-    state = resolve_state(request)
-    if state is None:
-        return JSONResponse({"error": "Agent not initialized"}, status_code=503)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    changes = {}
-
-    if "status" in data:
-        val = data["status"]
-        if val in ("active", "inactive"):
-            state.status = AgentStatus(val)
-            changes["status"] = val
-
-    if "rate_limit" in data:
-        state.rate_limit_per_connection = int(data["rate_limit"])
-        changes["rate_limit"] = state.rate_limit_per_connection
-
-    if "display_name" in data:
-        state.display_name = str(data["display_name"])[:100]
-        changes["display_name"] = state.display_name
-
-    if changes:
-        save_state()
-
-    return JSONResponse({"success": True, "changes": changes})

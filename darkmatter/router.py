@@ -61,14 +61,9 @@ def rule_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
     return RouterDecision(action=RouterAction.PASS, reason="No rules matched")
 
 
-def spawn_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
-    """Default router: always HANDLE (triggers agent spawn)."""
-    return RouterDecision(action=RouterAction.HANDLE, reason="Spawn mode — handling message")
-
-
 def queue_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
-    """Queue-only router: always HANDLE but without spawn."""
-    return RouterDecision(action=RouterAction.HANDLE, reason="Queue mode — message queued for manual handling")
+    """Default router: keep the message queued for the active MCP session."""
+    return RouterDecision(action=RouterAction.HANDLE, reason="Queued for session")
 
 
 # =============================================================================
@@ -76,10 +71,15 @@ def queue_router(state: AgentState, msg: QueuedMessage) -> RouterDecision:
 # =============================================================================
 
 _ROUTER_CHAINS: dict[str, list] = {
-    "spawn": [rule_router, spawn_router],
-    "rules_first": [rule_router, queue_router],
+    "queue": [rule_router, queue_router],
     "rules_only": [rule_router],
-    "queue_only": [queue_router],
+}
+
+# Pre-2.0 mode names map onto the surviving chains.
+_LEGACY_MODE_ALIASES = {
+    "spawn": "queue",
+    "rules_first": "queue",
+    "queue_only": "queue",
 }
 
 VALID_ROUTER_MODES = set(_ROUTER_CHAINS.keys())
@@ -99,7 +99,8 @@ def set_custom_router(fn: Optional[Callable]) -> None:
 
 def get_router_chain(mode: str) -> list:
     """Return the router function list for the given mode."""
-    chain = _ROUTER_CHAINS.get(mode, _ROUTER_CHAINS["spawn"])
+    mode = _LEGACY_MODE_ALIASES.get(mode, mode)
+    chain = _ROUTER_CHAINS.get(mode, _ROUTER_CHAINS["queue"])
     if _custom_router is not None:
         return [_custom_router] + chain
     return chain

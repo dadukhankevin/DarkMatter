@@ -1,14 +1,15 @@
 """
 State persistence — save/load JSON, replay protection.
 
-Multi-tenant registry: supports multiple agents on a single daemon.
+Singleton: exactly one agent per daemon process. The HTTP daemon is the only
+writer of the state file; MCP stdio sessions proxy all mutations through the
+daemon's local HTTP API and never call save_state().
 
 Depends on: config, models, identity
 """
 
 import json
 import os
-import sys
 import time
 import threading
 from typing import Optional
@@ -50,285 +51,76 @@ def _is_pid_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
             return True
+        except PermissionError:
+            return True  # Exists but owned by another user
         except (OSError, ProcessLookupError):
             return False
 
 
 # =============================================================================
-# Module-level state — multi-agent registry
+# Module-level state — singleton agent
 # =============================================================================
 
-_agent_states: dict[str, AgentState] = {}
-_default_agent_id: Optional[str] = None
+_state: Optional[AgentState] = None
 _state_write_lock = threading.Lock()
 
-# Per-agent replay dedup: agent_id -> {message_id: timestamp}
-_seen_message_ids: dict[str, dict[str, float]] = {}
+# Replay dedup: {message_id: timestamp}
+_seen_message_ids: dict[str, float] = {}
 
-# Per-agent consumed message IDs: agent_id -> set of message_ids
-_consumed_message_ids: dict[str, set[str]] = {}
-
-# Track connection changes made by MCP session (this process).
-# These override the daemon's disk state when merging during save_state().
-_mcp_added_connections: set[str] = set()      # agent IDs added by MCP tools
-_mcp_removed_connections: set[str] = set()    # agent IDs removed by MCP tools
-
-
-# =============================================================================
-# Registry API
-# =============================================================================
-
-def register_agent(agent_id: str, state: AgentState) -> None:
-    """Register an agent in the multi-tenant registry."""
-    global _default_agent_id
-    _agent_states[agent_id] = state
-    if _default_agent_id is None:
-        _default_agent_id = agent_id
-    if agent_id not in _seen_message_ids:
-        _seen_message_ids[agent_id] = {}
-    if agent_id not in _consumed_message_ids:
-        _consumed_message_ids[agent_id] = set()
-    _log.info("Registered agent %s... (total: %d)", agent_id[:12], len(_agent_states))
-
-
-def unregister_agent(agent_id: str) -> None:
-    """Remove an agent from the registry."""
-    global _default_agent_id
-    _agent_states.pop(agent_id, None)
-    _seen_message_ids.pop(agent_id, None)
-    _consumed_message_ids.pop(agent_id, None)
-    if _default_agent_id == agent_id:
-        _default_agent_id = next(iter(_agent_states), None)
-
-
-def get_state_for(agent_id: str) -> Optional[AgentState]:
-    """Get state for a specific agent by ID."""
-    return _agent_states.get(agent_id)
-
-
-def list_hosted_agents() -> list[str]:
-    """Return all registered agent IDs."""
-    return list(_agent_states.keys())
-
-
-# =============================================================================
-# Default Agent API
-# =============================================================================
 
 def get_state() -> Optional[AgentState]:
-    """Get the default agent's state, or the only registered agent, or None."""
-    if _default_agent_id and _default_agent_id in _agent_states:
-        return _agent_states[_default_agent_id]
-    if len(_agent_states) == 1:
-        return next(iter(_agent_states.values()))
-    return None
+    """Get the agent's state, or None if not initialized."""
+    return _state
 
 
 def set_state(state: AgentState) -> None:
-    """Register an agent and set it as the default."""
-    register_agent(state.agent_id, state)
-    global _default_agent_id
-    _default_agent_id = state.agent_id
+    """Set the singleton agent state."""
+    global _state
+    _state = state
 
 
 def _reset_for_tests() -> None:
     """Clear module-level runtime state for isolated tests."""
-    global _default_agent_id
-    _agent_states.clear()
-    _default_agent_id = None
+    global _state
+    _state = None
     _seen_message_ids.clear()
-    _consumed_message_ids.clear()
-    _mcp_added_connections.clear()
-    _mcp_removed_connections.clear()
 
 
 # =============================================================================
-# Per-agent consumed message tracking
+# Replay Protection
 # =============================================================================
 
-def consume_message(message_id: str, agent_id: Optional[str] = None) -> None:
-    """Mark a message as consumed so disk sync won't re-add it."""
-    aid = agent_id or _default_agent_id
-    if aid:
-        if aid not in _consumed_message_ids:
-            _consumed_message_ids[aid] = set()
-        _consumed_message_ids[aid].add(message_id)
+def is_message_replay(message_id: str) -> bool:
+    """Return True if this message_id was already seen recently (replay).
 
-
-def sync_message_queue_from_disk(agent_id: Optional[str] = None) -> None:
-    """Reload message_queue from the on-disk state file into in-memory state.
-
-    This handles the case where the HTTP mesh server (running in a separate
-    process/session) has queued messages that the MCP session doesn't see
-    because its in-memory state was loaded at startup.
-
-    Merges by message_id — new messages from disk are appended, existing
-    messages are left untouched, and messages removed from memory (e.g.
-    by reading or forwarding) are not re-added.
+    Read-only — does NOT record the ID. Call record_message_seen() only
+    after the message passes signature verification, so a forged message
+    cannot burn a legitimate message's ID.
     """
-    aid = agent_id or _default_agent_id
-    state = _agent_states.get(aid) if aid else get_state()
-    if state is None:
-        return
-
-    path = state_file_path(agent_id=aid)
-    if not os.path.exists(path):
-        return
-
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        _log.warning("state file JSON corrupt during queue sync (%s): %s", path, e)
-        return
-
-    disk_queue = data.get("message_queue", [])
-    if not disk_queue:
-        _log.debug("Queue sync: no message_queue in state file (missing or empty)")
-        return
-
-    # Build set of message IDs already in memory + already consumed
-    existing_ids = {m.message_id for m in state.message_queue}
-    consumed = _consumed_message_ids.get(state.agent_id, set())
-
-    for qd in disk_queue:
-        mid = qd.get("message_id", "")
-        if not mid:
-            _log.debug("Queue sync: skipping queued message with empty message_id")
-            continue
-        if mid not in existing_ids and mid not in consumed:
-            state.message_queue.append(QueuedMessage(
-                message_id=mid,
-                content=qd.get("content", ""),
-                hops_remaining=qd.get("hops_remaining", 0),
-                metadata=qd.get("metadata", {}),
-                received_at=qd.get("received_at", ""),
-                from_agent_id=qd.get("from_agent_id"),
-                verified=qd.get("verified", False),
-            ))
+    ts = _seen_message_ids.get(message_id)
+    return ts is not None and time.time() - ts < REPLAY_WINDOW
 
 
-def sync_connections_from_disk(agent_id: Optional[str] = None) -> None:
-    """Reload connections and impressions from the on-disk state file into in-memory state.
-
-    Handles the case where the MCP session (a separate process) has added or
-    removed connections that the daemon doesn't see because its in-memory state
-    was loaded at startup. Merges new connections from disk and removes
-    connections that the MCP session disconnected.
-    """
-    aid = agent_id or _default_agent_id
-    state = _agent_states.get(aid) if aid else get_state()
-    if state is None:
-        return
-
-    path = state_file_path(agent_id=aid)
-    if not os.path.exists(path):
-        return
-
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        _log.warning("state file JSON corrupt during connection sync (%s): %s", path, e)
-        return
-
-    disk_conns = data.get("connections", {})
-    disk_imps = data.get("impressions", {})
-
-    # Add connections from disk that we don't have in memory
-    added = 0
-    for aid_peer, cd in disk_conns.items():
-        if aid_peer not in state.connections:
-            state.connections[aid_peer] = Connection(
-                agent_id=cd["agent_id"],
-                agent_url=cd["agent_url"],
-                agent_bio=cd.get("agent_bio", ""),
-                connected_at=cd.get("connected_at", ""),
-                messages_sent=cd.get("messages_sent", 0),
-                messages_received=cd.get("messages_received", 0),
-                messages_declined=cd.get("messages_declined", 0),
-                total_response_time_ms=cd.get("total_response_time_ms", 0.0),
-                last_activity=cd.get("last_activity"),
-                agent_public_key_hex=cd.get("agent_public_key_hex"),
-                agent_display_name=cd.get("agent_display_name"),
-                wallets=cd.get("wallets", {}),
-                addresses=cd.get("addresses", {}),
-                rate_limit=cd.get("rate_limit", 0),
-                peer_created_at=cd.get("peer_created_at"),
-                identity_verified=cd.get("identity_verified", False),
-                tls_secure=cd.get("tls_secure", False),
-                capabilities=cd.get("capabilities", {}),
-            )
-            added += 1
-
-    # Remove connections from memory that are no longer on disk
-    removed = 0
-    for aid_peer in list(state.connections.keys()):
-        if aid_peer not in disk_conns:
-            del state.connections[aid_peer]
-            removed += 1
-
-    # Merge impressions from disk (newer wins, fill gaps)
-    for aid_peer, idata in disk_imps.items():
-        if aid_peer not in state.impressions:
-            state.impressions[aid_peer] = Impression(
-                score=idata["score"],
-                note=idata.get("note", ""),
-                negative_since=idata.get("negative_since"),
-                msgs_sent=idata.get("msgs_sent", 0),
-                msgs_received=idata.get("msgs_received", 0),
-                infrastructure=idata.get("infrastructure", False),
-            )
-
-    if added or removed:
-        _log.info("Connection sync from disk: +%d added, -%d removed", added, removed)
-
-
-# =============================================================================
-# Replay Protection (per-agent)
-# =============================================================================
-
-def check_message_replay(message_id: str, agent_id: Optional[str] = None) -> bool:
-    """Return True if this message_id was already seen recently (replay)."""
-    aid = agent_id or _default_agent_id
-    if not aid:
-        return False
-    seen = _seen_message_ids.get(aid)
-    if seen is None:
-        seen = {}
-        _seen_message_ids[aid] = seen
-
+def record_message_seen(message_id: str) -> None:
+    """Record a verified message_id in the replay window."""
     now = time.time()
-
-    if len(seen) > REPLAY_MAX_SIZE:
+    if len(_seen_message_ids) > REPLAY_MAX_SIZE:
         cutoff = now - REPLAY_WINDOW
-        expired = [mid for mid, ts in seen.items() if ts < cutoff]
+        expired = [mid for mid, ts in _seen_message_ids.items() if ts < cutoff]
         for mid in expired:
-            del seen[mid]
-
-    if message_id in seen:
-        ts = seen[message_id]
-        if now - ts < REPLAY_WINDOW:
-            return True
-    seen[message_id] = now
-    return False
+            del _seen_message_ids[mid]
+    _seen_message_ids[message_id] = now
 
 
-def get_seen_message_ids(agent_id: Optional[str] = None) -> dict[str, float]:
+def get_seen_message_ids() -> dict[str, float]:
     """Get the seen message IDs dict (for persistence)."""
-    aid = agent_id or _default_agent_id
-    return _seen_message_ids.get(aid, {}) if aid else {}
+    return _seen_message_ids
 
 
-def restore_seen_message_ids(saved: dict[str, float], agent_id: Optional[str] = None) -> None:
+def restore_seen_message_ids(saved: dict[str, float]) -> None:
     """Restore seen message IDs from persistence."""
-    aid = agent_id or _default_agent_id
-    if not aid:
-        return
-    if aid not in _seen_message_ids:
-        _seen_message_ids[aid] = {}
     now = time.time()
-    _seen_message_ids[aid].update({
+    _seen_message_ids.update({
         mid: ts for mid, ts in saved.items()
         if isinstance(ts, (int, float)) and now - ts < REPLAY_WINDOW
     })
@@ -347,66 +139,18 @@ def get_state_dir() -> str:
     return _STATE_DIR
 
 
-def state_file_path(agent_id: Optional[str] = None) -> str:
+def state_file_path() -> str:
     """Return the state file path, keyed by the agent's public key hex."""
     override = os.environ.get("DARKMATTER_STATE_FILE")
     if override:
         os.makedirs(os.path.dirname(override) or ".", exist_ok=True)
         return override
 
-    # If agent_id specified, look up that agent's state
-    if agent_id:
-        state = _agent_states.get(agent_id)
-        if state and state.public_key_hex:
-            return os.path.join(_STATE_DIR, f"{state.public_key_hex}.json")
-
-    # Fall back to default agent
     state = get_state()
     if state is not None and state.public_key_hex:
         return os.path.join(_STATE_DIR, f"{state.public_key_hex}.json")
-    port = os.environ.get("DARKMATTER_PORT", "8100")
+    port = os.environ.get("DARKMATTER_PORT", str(DEFAULT_PORT))
     return os.path.join(_STATE_DIR, f"{port}.json")
-
-
-def waiting_signal_path(public_key_hex: str) -> str:
-    """Return the path to the .waiting signal file for a given agent."""
-    return os.path.join(_STATE_DIR, f"{public_key_hex}.waiting")
-
-
-def set_waiting(waiting: bool, agent_id: Optional[str] = None) -> None:
-    """Create or remove the .waiting signal file for cross-process visibility."""
-    aid = agent_id or _default_agent_id
-    state = _agent_states.get(aid) if aid else get_state()
-    if state is None or not state.public_key_hex:
-        return
-    path = waiting_signal_path(state.public_key_hex)
-    if waiting:
-        try:
-            with open(path, "w") as f:
-                f.write(str(time.time()))
-        except OSError as e:
-            _log.warning("could not write waiting signal: %s", e)
-    else:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-
-
-def check_waiting(public_key_hex: str) -> bool:
-    """Check whether an agent's .waiting signal file exists (cross-process)."""
-    return os.path.exists(waiting_signal_path(public_key_hex))
-
-
-def clear_waiting_signal(agent_id: Optional[str] = None) -> None:
-    """Remove any stale .waiting signal file for this agent."""
-    aid = agent_id or _default_agent_id
-    state = _agent_states.get(aid) if aid else get_state()
-    if state and state.public_key_hex:
-        try:
-            os.remove(waiting_signal_path(state.public_key_hex))
-        except FileNotFoundError:
-            pass
 
 
 # =============================================================================
@@ -449,13 +193,18 @@ def routing_rule_from_dict(d: dict) -> RoutingRule:
 # Save State
 # =============================================================================
 
-def _save_single_state(state: AgentState) -> None:
-    """Persist a single agent's durable state to disk."""
+def save_state() -> None:
+    """Persist durable state to disk (atomic write under an exclusive lock).
+
+    Only the daemon process should ever call this — it is the single writer.
+    """
+    state = get_state()
+    if state is None:
+        return
+
     # Cap conversation_log
     if len(state.conversation_log) > CONVERSATION_LOG_MAX:
         state.conversation_log = state.conversation_log[-CONVERSATION_LOG_MAX:]
-
-    seen = _seen_message_ids.get(state.agent_id, {})
 
     data = {
         "agent_id": state.agent_id,
@@ -497,6 +246,25 @@ def _save_single_state(state: AgentState) -> None:
             }
             for aid, imp in state.impressions.items()
         },
+        "pending_requests": {
+            rid: {
+                "request_id": req.request_id,
+                "from_agent_id": req.from_agent_id,
+                "from_agent_url": req.from_agent_url,
+                "from_agent_bio": req.from_agent_bio,
+                "requested_at": req.requested_at,
+                "from_agent_public_key_hex": req.from_agent_public_key_hex,
+                "from_agent_display_name": req.from_agent_display_name,
+                "from_agent_wallets": req.from_agent_wallets,
+                "from_agent_created_at": req.from_agent_created_at,
+                "peer_trust": req.peer_trust,
+                "mutual": req.mutual,
+                "challenge_id": req.challenge_id,
+                "challenge_hex": req.challenge_hex,
+                "identity_verified": req.identity_verified,
+            }
+            for rid, req in state.pending_requests.items()
+        },
         "inactive_until": state.inactive_until,
         "rate_limit_global": state.rate_limit_global,
         "router_mode": state.router_mode,
@@ -519,140 +287,60 @@ def _save_single_state(state: AgentState) -> None:
             }
             for e in state.conversation_log[-CONVERSATION_LOG_MAX:]
         ],
+        "conversation_log_total": state.conversation_log_total,
         "network_tier": state.network_tier,
-        "active_sessions": state.active_sessions,
+        "active_sessions": [
+            s for s in state.active_sessions if _is_pid_alive(s["pid"])
+        ],
         "security_settings": state.security_settings,
         "seen_message_ids": {
-            mid: ts for mid, ts in seen.items()
+            mid: ts for mid, ts in _seen_message_ids.items()
             if time.time() - ts < REPLAY_WINDOW
         },
-        "message_queue": [],  # filled below after disk merge
-        "consumed_message_ids": [],  # filled below after disk merge
+        "message_queue": [
+            {
+                "message_id": m.message_id,
+                "content": m.content,
+                "hops_remaining": m.hops_remaining,
+                "metadata": m.metadata,
+                "received_at": m.received_at,
+                "from_agent_id": m.from_agent_id,
+                "verified": m.verified,
+            }
+            for m in state.message_queue
+        ],
     }
 
-    path = state_file_path(agent_id=state.agent_id)
-
-    # --- Cross-process state merge ---
-    # The HTTP daemon and MCP stdio session share this state file but run in
-    # separate processes with separate in-memory state. Before writing, merge
-    # on-disk data so we never clobber state added by the other process.
-    consumed = _consumed_message_ids.get(state.agent_id, set())
-    in_memory_ids = {m.message_id for m in state.message_queue}
-    disk_extras: list[dict] = []
-    disk_consumed: set[str] = set()
-    try:
-        if os.path.exists(path):
-            with open(path, "r") as df:
-                disk_data = json.load(df)
-            # Merge messages from disk that we don't have in memory
-            for qd in disk_data.get("message_queue", []):
-                mid = qd.get("message_id", "")
-                if mid and mid not in in_memory_ids and mid not in consumed:
-                    disk_extras.append(qd)
-            # Merge consumed IDs from disk (other process may have consumed)
-            disk_consumed = set(disk_data.get("consumed_message_ids", []))
-            # Connections:
-            # - HTTP daemon saves are authoritative for live peer state.
-            # - stdio/MCP saves start from disk and apply only explicit MCP changes,
-            #   so stale session memory does not erase daemon-side changes.
-            disk_conns = disk_data.get("connections", {})
-            merged_conns = dict(disk_conns)
-
-            if os.environ.get("DARKMATTER_TRANSPORT") == "http":
-                merged_conns.update(data["connections"])
-            else:
-                for aid in _mcp_added_connections:
-                    if aid in data["connections"]:
-                        merged_conns[aid] = data["connections"][aid]
-
-            # Apply explicit local disconnects in either role.
-            for aid in _mcp_removed_connections:
-                merged_conns.pop(aid, None)
-
-            # If there was no disk state yet, persist current in-memory state.
-            if not disk_conns and not merged_conns:
-                for aid in data["connections"]:
-                    merged_conns[aid] = data["connections"][aid]
-
-            data["connections"] = merged_conns
-            # Merge impressions from disk that we don't have in memory
-            disk_imps = disk_data.get("impressions", {})
-            for aid, idata in disk_imps.items():
-                if aid not in data["impressions"]:
-                    data["impressions"][aid] = idata
-            # Merge sessions from disk and prune dead ones
-            disk_sessions = disk_data.get("active_sessions", [])
-            mem_pids = {s["pid"] for s in data["active_sessions"]}
-            merged = list(data["active_sessions"])
-            for ds in disk_sessions:
-                if ds["pid"] not in mem_pids:
-                    merged.append(ds)
-            data["active_sessions"] = [s for s in merged if _is_pid_alive(s["pid"])]
-    except (json.JSONDecodeError, OSError):
-        pass  # Disk unreadable — proceed with in-memory only
-
-    data["consumed_message_ids"] = list(consumed | disk_consumed)
-
-    data["message_queue"] = [
-        {
-            "message_id": m.message_id,
-            "content": m.content,
-            "hops_remaining": m.hops_remaining,
-            "metadata": m.metadata,
-            "received_at": m.received_at,
-            "from_agent_id": m.from_agent_id,
-            "verified": m.verified,
-        }
-        for m in state.message_queue
-    ] + disk_extras
+    path = state_file_path()
     tmp = path + ".tmp"
+    lock_path = path + ".lock"
     try:
         with _state_write_lock:
-            with open(tmp, "w") as f:
-                lock_exclusive(f)
+            # Lock a dedicated lockfile covering the whole write+replace, so a
+            # concurrent writer can never truncate our temp file mid-write.
+            with open(lock_path, "a") as lockf:
+                lock_exclusive(lockf)
                 try:
-                    json.dump(data, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
+                    with open(tmp, "w") as f:
+                        json.dump(data, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                    try:
+                        os.chmod(path, 0o600)
+                    except OSError:
+                        pass
                 finally:
-                    unlock(f)
-            os.replace(tmp, path)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
+                    unlock(lockf)
     except OSError as e:
         _log.warning("could not save state to %s: %s", path, e)
-
-
-def save_state(agent_id: Optional[str] = None) -> None:
-    """Persist durable state to disk.
-
-    If agent_id is given, save just that agent. Otherwise save the default agent.
-    """
-    if agent_id:
-        state = _agent_states.get(agent_id)
-        if state:
-            _save_single_state(state)
-        return
-
-    # Save default agent
-    state = get_state()
-    if state is not None:
-        _save_single_state(state)
-
-
-def save_all_states() -> None:
-    """Persist all registered agents' state to disk."""
-    for state in _agent_states.values():
-        _save_single_state(state)
 
 
 # =============================================================================
 # Load State
 # =============================================================================
 
-def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[AgentState]:
+def load_state_from_file(path: str) -> Optional[AgentState]:
     """Load persisted state from a specific file path. Returns None on failure."""
     if not os.path.exists(path):
         return None
@@ -687,19 +375,11 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
             capabilities=cd.get("capabilities", {}),
         )
 
-    # Restore consumed message IDs first, so we can filter the queue
-    loaded_agent_id = agent_id or data.get("agent_id", "")
-    saved_consumed = set(data.get("consumed_message_ids", []))
-    if saved_consumed and loaded_agent_id:
-        if loaded_agent_id not in _consumed_message_ids:
-            _consumed_message_ids[loaded_agent_id] = set()
-        _consumed_message_ids[loaded_agent_id].update(saved_consumed)
-
     message_queue = []
     for qd in data.get("message_queue", []):
         mid = qd.get("message_id", "")
-        if mid in saved_consumed:
-            continue  # Already consumed — don't re-load
+        if not mid:
+            continue
         message_queue.append(QueuedMessage(
             message_id=mid,
             content=qd["content"],
@@ -710,10 +390,31 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
             verified=qd.get("verified", False),
         ))
 
-    # Restore replay protection (per-agent)
+    # Restore replay protection
     saved_replay = data.get("seen_message_ids", {})
     if isinstance(saved_replay, dict):
-        restore_seen_message_ids(saved_replay, agent_id=loaded_agent_id)
+        restore_seen_message_ids(saved_replay)
+
+    # Deserialize pending connection requests
+    pending_requests = {}
+    for rid, rd in data.get("pending_requests", {}).items():
+        from darkmatter.models import PendingConnectionRequest
+        pending_requests[rid] = PendingConnectionRequest(
+            request_id=rd.get("request_id", rid),
+            from_agent_id=rd.get("from_agent_id", ""),
+            from_agent_url=rd.get("from_agent_url", ""),
+            from_agent_bio=rd.get("from_agent_bio", ""),
+            requested_at=rd.get("requested_at", ""),
+            from_agent_public_key_hex=rd.get("from_agent_public_key_hex"),
+            from_agent_display_name=rd.get("from_agent_display_name"),
+            from_agent_wallets=rd.get("from_agent_wallets", {}),
+            from_agent_created_at=rd.get("from_agent_created_at"),
+            peer_trust=rd.get("peer_trust"),
+            mutual=rd.get("mutual", False),
+            challenge_id=rd.get("challenge_id"),
+            challenge_hex=rd.get("challenge_hex"),
+            identity_verified=rd.get("identity_verified", False),
+        )
 
     # Deserialize conversation log
     conversation_log = []
@@ -740,6 +441,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         public_key_hex=data.get("public_key_hex", ""),
         display_name=data.get("display_name"),
         connections=connections,
+        pending_requests=pending_requests,
         message_queue=message_queue,
         impressions={
             aid: Impression(
@@ -751,21 +453,19 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         },
         rate_limit_global=data.get("rate_limit_global", 0),
         inactive_until=data.get("inactive_until"),
-        router_mode=data.get("router_mode") or "spawn",
+        router_mode=data.get("router_mode") or "queue",
         routing_rules=[routing_rule_from_dict(rd) for rd in data.get("routing_rules", [])],
         antimatter_log=data.get("antimatter_log", []),
         delegated_antimatter_agent=data.get("delegated_antimatter_agent"),
         delegated_antimatter_wallet=data.get("delegated_antimatter_wallet"),
         wallet_attestations=data.get("wallet_attestations", {}),
         conversation_log=conversation_log,
+        conversation_log_total=data.get("conversation_log_total", len(conversation_log)),
         active_sessions=data.get("active_sessions", []),
         network_tier=data.get("network_tier", "global"),
         security_settings=data.get("security_settings", {
-            "pin_hash": "",
             "auto_accept_local": True,
             "auto_peer_local": True,
-            "sandbox_enabled": False,
-            "sandbox_network": True,
         }),
     )
 
@@ -773,13 +473,18 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
 
 
 def scan_state_files() -> list[dict]:
-    """Scan ~/.darkmatter/state/*.json for all agent state files.
+    """Scan ~/.darkmatter/state/*.json for all agent state files on this machine.
 
-    Returns a list of dicts with {agent_id, public_key_hex, path} for each
-    discovered state file. Used by the HTTP daemon to discover hosted agents.
+    Returns a list of dicts with {agent_id, public_key_hex, path, display_name,
+    port, active_sessions}. Used for local visibility (one daemon per project,
+    each with its own state file).
     """
     results = []
-    for filename in os.listdir(_STATE_DIR):
+    try:
+        filenames = os.listdir(_STATE_DIR)
+    except OSError:
+        return results
+    for filename in filenames:
         if not filename.endswith(".json"):
             continue
         path = os.path.join(_STATE_DIR, filename)
@@ -794,8 +499,14 @@ def scan_state_files() -> list[dict]:
                     "public_key_hex": public_key_hex,
                     "path": path,
                     "display_name": data.get("display_name"),
+                    "bio": data.get("bio", ""),
+                    "status": data.get("status", "active"),
+                    "network_tier": data.get("network_tier", "global"),
                     "port": data.get("port", DEFAULT_PORT),
-                    "active_sessions": data.get("active_sessions", []),
+                    "active_sessions": [
+                        s for s in data.get("active_sessions", [])
+                        if _is_pid_alive(s.get("pid", -1))
+                    ],
                 })
         except (json.JSONDecodeError, OSError):
             continue

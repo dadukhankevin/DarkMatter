@@ -49,8 +49,6 @@ mcp = FastMCP("darkmatter_mcp", instructions=MCP_INSTRUCTIONS)
 
 # Session tracking for notifications
 _active_sessions: set = set()
-_all_tools: dict = {}
-_visible_optional: set = set()
 
 
 def track_session(ctx) -> None:
@@ -63,6 +61,7 @@ def track_session(ctx) -> None:
 
 # Advertise the Claude Code channel capability so peer messages get delivered
 # as <channel source="darkmatter"> events in the session.
-from darkmatter.mcp.channel import register_channel_capabilities  # noqa: E402
+from darkmatter.mcp.channel import register_channel_capabilities, install_session_capture  # noqa: E402
 
 register_channel_capabilities(mcp)
+install_session_capture()

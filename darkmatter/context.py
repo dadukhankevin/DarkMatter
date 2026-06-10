@@ -23,8 +23,9 @@ from darkmatter.models import AgentState, ConversationEntry
 
 _session_last_seen: dict[str, dict[str, int]] = {}
 
-# Per-session high-water mark: tracks index into conversation_log already returned.
-# Used by piggyback context to avoid re-showing entries.
+# Per-session high-water mark against state.conversation_log_total (a monotonic
+# counter), NOT a list index — the log itself is trimmed to a cap, so indexes
+# go stale but the total never does.
 _session_context_hwm: dict[str, int] = {}
 
 
@@ -62,8 +63,10 @@ def _context_incremental(state: AgentState, session_id: Optional[str],
     is_first_call = session_id not in _session_context_hwm
     hwm = _session_context_hwm.get(session_id, 0)
     log = state.conversation_log
-    new_entries = log[hwm:]
-    _session_context_hwm[session_id] = len(log)
+    total = state.conversation_log_total
+    new_count = min(max(total - hwm, 0), len(log))
+    new_entries = log[len(log) - new_count:] if new_count else []
+    _session_context_hwm[session_id] = total
 
     if not new_entries:
         return ""
@@ -111,6 +114,7 @@ def log_conversation(state: AgentState, message_id: str, content: str,
         metadata=metadata or {},
     )
     state.conversation_log.append(entry)
+    state.conversation_log_total += 1
 
     # Cap
     if len(state.conversation_log) > CONVERSATION_LOG_MAX:

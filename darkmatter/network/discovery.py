@@ -99,10 +99,11 @@ async def lan_sdp_exchange(state: AgentState, target_agent_id: str,
 async def handle_well_known(request) -> "JSONResponse":
     """Return /.well-known/darkmatter.json for global discovery.
 
-    Multi-tenant: includes an `agents` array with all hosted agents.
-    Top-level fields reference the default/primary agent.
+    One agent per daemon. The single-entry `agents` array is kept for wire
+    compatibility with 1.x peers that read the multi-tenant format.
     """
-    from darkmatter.state import get_state, get_state_for, list_hosted_agents, _is_pid_alive
+    from darkmatter.state import get_state, _is_pid_alive
+    from darkmatter.network.access import client_ip as _client_ip
     from darkmatter.network.tier import ip_allowed_by_tier
 
     state = get_state()
@@ -110,9 +111,7 @@ async def handle_well_known(request) -> "JSONResponse":
         return JSONResponse({"error": "Agent not initialized"}, status_code=503)
 
     # Network tier enforcement — don't expose info to IPs outside the tier
-    xff = request.headers.get("x-forwarded-for")
-    client_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
-    if not ip_allowed_by_tier(client_ip, state.network_tier):
+    if not ip_allowed_by_tier(_client_ip(request), state.network_tier):
         return JSONResponse({"error": "tier_restricted", "tier": state.network_tier}, status_code=403)
 
     public_url = os.environ.get("DARKMATTER_PUBLIC_URL", "").rstrip("/")
@@ -121,43 +120,35 @@ async def handle_well_known(request) -> "JSONResponse":
         scheme = request.headers.get("x-forwarded-proto", "http")
         public_url = f"{scheme}://{host}"
 
-    # Build agents array for multi-tenant discovery
-    agents = []
-    for agent_id in list_hosted_agents():
-        agent_state = get_state_for(agent_id)
-        if agent_state is None:
-            continue
-        if agent_state.active_sessions:
-            agent_state.active_sessions = [
-                s for s in agent_state.active_sessions
-                if _is_pid_alive(s["pid"])
-            ]
-        agents.append({
-            "agent_id": agent_id,
-            "display_name": agent_state.display_name,
-            "public_key_hex": agent_state.public_key_hex,
-            "bio": agent_state.bio,
-            "status": agent_state.status.value,
-            "accepting_connections": len(agent_state.connections) < MAX_CONNECTIONS,
-            "mesh_url": f"{public_url}/__darkmatter__/{agent_id}",
-            "active_sessions": agent_state.active_sessions,
-        })
+    if state.active_sessions:
+        state.active_sessions = [
+            s for s in state.active_sessions if _is_pid_alive(s["pid"])
+        ]
 
+    accepting = len(state.connections) < MAX_CONNECTIONS
     response = {
         "darkmatter": True,
         "protocol_version": PROTOCOL_VERSION,
-        # Primary agent fields at top level
         "agent_id": state.agent_id,
         "display_name": state.display_name,
         "public_key_hex": state.public_key_hex,
         "bio": state.bio,
         "status": state.status.value,
-        "accepting_connections": len(state.connections) < MAX_CONNECTIONS,
+        "accepting_connections": accepting,
         "mesh_url": f"{public_url}/__darkmatter__",
         "mcp_url": f"{public_url}/mcp",
         "webrtc_enabled": True,
-        # Multi-tenant: all hosted agents
-        "agents": agents,
+        # Single entry — kept for 1.x peers that expect the agents array
+        "agents": [{
+            "agent_id": state.agent_id,
+            "display_name": state.display_name,
+            "public_key_hex": state.public_key_hex,
+            "bio": state.bio,
+            "status": state.status.value,
+            "accepting_connections": accepting,
+            "mesh_url": f"{public_url}/__darkmatter__",
+            "active_sessions": state.active_sessions,
+        }],
     }
 
     return JSONResponse(response)

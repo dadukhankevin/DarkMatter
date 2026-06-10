@@ -99,17 +99,6 @@ DEFAULT_RATE_LIMIT_GLOBAL = 10000         # max total inbound requests per windo
 RATE_LIMIT_WINDOW = 60                    # sliding window in seconds
 
 # =============================================================================
-# Tool Visibility
-# =============================================================================
-
-CORE_TOOLS = frozenset({
-    "darkmatter_send_message",
-    "darkmatter_connection",
-    "darkmatter_update_bio",
-    "darkmatter_wait_for_message",
-})
-
-# =============================================================================
 # Solana / Wallet
 # =============================================================================
 
@@ -167,9 +156,9 @@ MESH_ROUTE_PER_SOURCE_WINDOW = 60       # seconds
 # Message Router
 # =============================================================================
 
-# Router mode: "spawn" (handle + route messages), "queue_only" (hold for manual handling),
-# "rules_first" (rules then queue), "rules_only" (rules only).
-AGENT_ROUTER_MODE = os.environ.get("DARKMATTER_ROUTER_MODE", "spawn")
+# Router mode: "queue" (rules first, then hold for the session — default),
+# "rules_only" (rules only; unmatched messages still queue).
+AGENT_ROUTER_MODE = os.environ.get("DARKMATTER_ROUTER_MODE", "queue")
 
 
 # =============================================================================
@@ -193,7 +182,6 @@ ROUTE_ACCESS_DEFAULTS = {
     "connection_request": "public",
     "connection_accepted": "public",
     "connection_proof": "public",
-    "accept_pending": "public",
     # Signed — these endpoints verify identity cryptographically,
     # so IP-based gating would break NAT/proxy scenarios
     "message": "public",
@@ -212,16 +200,26 @@ ROUTE_ACCESS_DEFAULTS = {
     "peer_lookup": "peer",
     "get_peers": "peer",
     "admin_connect": "peer",
-    # Local — localhost only
+    # Local — daemon API, genuine localhost sockets only
+    "accept_pending": "local",
+    "local_agents": "local",
     "inbox": "local",
+    "inbox_consume": "local",
+    "inbox_wait": "local",
+    "send_message": "local",
+    "connect": "local",
+    "respond_pending": "local",
+    "disconnect": "local",
     "pending_requests": "local",
     "connections": "local",
-    "set_impression": "local",
+    "discover": "local",
     "config": "local",
+    "set_impression": "local",
+    "register_session": "local",
+    "context": "local",
     "wallet": "local",
     "send_payment": "local",
     "send_proxy": "local",
-    "inbox_consume": "local",
 }
 
 # Allow overrides via env var: '{"inbox": "peer", "connections": "public"}'
