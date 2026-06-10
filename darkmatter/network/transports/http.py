@@ -7,9 +7,7 @@ and resilience.py (peer URL recovery on send failure).
 Depends on: config, network/transport
 """
 
-import sys
 from typing import Callable, Optional
-from urllib.parse import urlparse
 
 import httpx
 

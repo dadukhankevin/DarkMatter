@@ -66,8 +66,6 @@ def reciprocity_ratio(imp: Impression) -> float:
     total = max(imp.msgs_sent, imp.msgs_received)
     if total < RECIPROCITY_GRACE_THRESHOLD:
         return 1.0
-    if total == 0:
-        return 1.0
     return min(imp.msgs_sent, imp.msgs_received) / total
 
 

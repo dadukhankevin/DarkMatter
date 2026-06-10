@@ -11,8 +11,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from darkmatter.config import ANTIMATTER_LOG_MAX, CONVERSATION_LOG_MAX
-
 
 # =============================================================================
 # Enums

@@ -37,7 +37,6 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 DOMAIN_MESSAGE = "darkmatter.message.v1"
 DOMAIN_PEER_UPDATE = "darkmatter.peer_update.v2"  # v2: covers bio/display_name/wallets
-DOMAIN_RELAY_POLL = "relay_poll"    # matches existing wire format
 DOMAIN_SDP = "darkmatter.sdp.v1"
 DOMAIN_LAN_BEACON = "darkmatter.lan_beacon.v1"
 DOMAIN_CHALLENGE_RESPONSE = "darkmatter.challenge_response.v1"
@@ -145,13 +144,6 @@ def verify_connection_request_signature(public_key_hex: str, signature_hex: str,
     """Verify a signed connection request."""
     return verify_signed_payload(public_key_hex, signature_hex, DOMAIN_CONNECTION_REQUEST,
                                  from_agent_id, from_agent_url, timestamp)
-
-
-def sign_relay_poll(private_key_hex: str, agent_id: str, timestamp: str) -> str:
-    """Sign a relay poll request. Returns signature hex."""
-    return sign_payload(private_key_hex, DOMAIN_RELAY_POLL, agent_id, timestamp)
-
-
 
 
 # =============================================================================

@@ -1,7 +1,7 @@
 """
-Pydantic input/output models for MCP tools.
+Pydantic input models for the MCP tools.
 
-Depends on: config, models
+Depends on: config
 """
 
 from enum import Enum
@@ -9,8 +9,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, ConfigDict
 
-from darkmatter.config import MAX_CONTENT_LENGTH, MAX_URL_LENGTH
-from darkmatter.models import AgentStatus
+from darkmatter.config import MAX_CONTENT_LENGTH
 
 
 class ConnectionAction(str, Enum):
@@ -43,93 +42,12 @@ class SendMessageInput(BaseModel):
     share_with_top_n: int = Field(default=-1, ge=-1, description="For broadcasts: -1 = all connected peers, N = top N by trust score. Ignored for direct messages.")
 
 
-
 class UpdateBioInput(BaseModel):
     """Update this agent's bio, display name, and/or network tier."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     bio: Optional[str] = Field(default=None, description="New bio text describing this agent's specialty", min_length=1, max_length=1000)
     display_name: Optional[str] = Field(default=None, description="New display name for this agent", min_length=1, max_length=100)
-    network_tier: Optional[str] = Field(default=None, description="Network visibility tier: 'local' (localhost only), 'lan' (private networks), or 'global' (fully open, default)")
-
-
-class SetStatusInput(BaseModel):
-    """Set this agent's active/inactive status."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    status: AgentStatus = Field(..., description="'active' or 'inactive'")
-    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440, description="Auto-reactivate after N minutes (inactive only, default: 60)")
-
-
-class GetMessageInput(BaseModel):
-    """Get full details of a specific queued message."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    message_id: str = Field(..., description="The ID of the queued message to inspect")
-
-
-class ConnectionAcceptedInput(BaseModel):
-    """Notification that a connection request was accepted."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The accepting agent's ID")
-    agent_url: str = Field(..., description="The accepting agent's MCP URL")
-    agent_bio: str = Field(..., description="The accepting agent's bio")
-    agent_public_key_hex: Optional[str] = Field(default=None, description="The accepting agent's Ed25519 public key")
-    agent_display_name: Optional[str] = Field(default=None, description="The accepting agent's display name")
-
-
-class DiscoverDomainInput(BaseModel):
-    """Check if a domain hosts a DarkMatter node."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    domain: str = Field(..., description="Domain to check (e.g. 'example.com' or 'localhost:8100')")
-
-
-class SetImpressionInput(BaseModel):
-    """Store or update your impression of an agent."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The agent ID to store an impression of")
-    score: float = Field(..., ge=-1.0, le=1.0, description="Trust score from -1.0 (avoid) to 1.0 (fully trusted)")
-    note: str = Field(default="", description="Optional freeform context", max_length=2000)
-
-
-class GetImpressionInput(BaseModel):
-    """Get your stored impression of an agent."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The agent ID to look up")
-
-
-class SendPaymentInput(BaseModel):
-    """Send a payment to a connected agent with automatic antimatter delegation."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The connected agent to pay")
-    amount: float = Field(..., gt=0, description="Amount to send")
-    currency: str = Field(default="SOL", description="Currency: SOL, or SPL token mint address")
-    token_decimals: int = Field(default=9, ge=0, le=18, description="Token decimals (9 for SOL, 6 for USDC)")
-
-
-class GetBalanceInput(BaseModel):
-    """Check SOL or SPL token balance."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    mint: Optional[str] = Field(default=None, description="SPL token mint address. Omit for SOL balance.")
-
-
-class WalletBalancesInput(BaseModel):
-    """View wallet balances across all chains."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    chain: Optional[str] = Field(default=None, description="Filter to a specific chain (e.g. 'solana'). Omit for all chains.")
-
-
-class WalletSendInput(BaseModel):
-    """Send native currency on any chain."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="The connected agent to send to")
-    amount: float = Field(..., gt=0, description="Amount of native currency to send")
-    chain: str = Field(default="solana", description="Chain to send on (default: solana)")
-    notify: bool = Field(default=True, description="Send a message notifying the recipient")
-
-
-class SetRateLimitInput(BaseModel):
-    """Set rate limits for incoming requests."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: Optional[str] = Field(default=None, description="Agent ID to set per-connection rate limit for. Omit to set global rate limit.")
-    limit: int = Field(..., description="Max requests per 60s window. 0 = use default, -1 = unlimited.")
+    network_tier: Optional[str] = Field(default=None, description="Network visibility tier: 'local' (localhost only), 'lan' (private networks), or 'global' (fully open, default). The daemon's bind address follows the tier on next restart.")
 
 
 class GetPeersFromInput(BaseModel):
@@ -137,10 +55,3 @@ class GetPeersFromInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: str = Field(..., description="Agent ID of the connected peer to ask")
     n: int = Field(default=10, ge=1, le=50, description="Number of peers to return (default 10, max 50)")
-
-
-class CompleteAndSummarizeInput(BaseModel):
-    """Summarize your work and sign off. MANDATORY before finishing — do not skip this."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    summary: str = Field(..., description="Dense summary of what you did. Use @agent_id to reference peers. Include decisions made, things the hivemind should know.", min_length=10, max_length=25000)
-    share_with_top_n: int = Field(default=-1, ge=-1, description="Who sees this summary: -1 = all peers, N = top N by trust")

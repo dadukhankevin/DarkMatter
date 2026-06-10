@@ -37,13 +37,7 @@ from darkmatter.models import (
     Connection,
     Impression,
 )
-from darkmatter.trust import (
-    adjust_trust,
-    auto_disconnect_peer,
-    compute_seeded_trust,
-    reciprocity_ratio,
-    set_network_fns as set_trust_network_fns,
-)
+from darkmatter.trust import adjust_trust
 from darkmatter.wallet import resolve_provider, get_provider
 
 

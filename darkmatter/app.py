@@ -56,7 +56,7 @@ from darkmatter.mcp import mcp
 import darkmatter.mcp.tools  # noqa: F401 — registers @mcp.tool() decorators
 from darkmatter.mcp.client import set_daemon_port
 from darkmatter.mcp.visibility import status_updater
-from darkmatter.network.manager import NetworkManager, set_network_manager, get_network_manager
+from darkmatter.network.manager import NetworkManager, set_network_manager
 from darkmatter.network.transports.http import HttpTransport
 from darkmatter.network.transports.webrtc import WebRTCTransport
 from darkmatter.network.discovery import (

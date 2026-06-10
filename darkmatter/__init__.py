@@ -2,4 +2,4 @@
 DarkMatter — A Self-Replicating MCP Server for Emergent Agent Networks
 """
 
-__version__ = "1.1.1"
+__version__ = "2.0.0"

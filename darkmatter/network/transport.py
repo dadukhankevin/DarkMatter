@@ -5,7 +5,7 @@ This is a leaf module with no internal dependencies.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 

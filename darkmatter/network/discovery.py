@@ -8,7 +8,6 @@ import asyncio
 import json
 import os
 import socket
-import sys
 import time
 from typing import Optional
 from urllib.parse import urlparse
@@ -16,7 +15,6 @@ from urllib.parse import urlparse
 import httpx
 from starlette.responses import JSONResponse
 
-import darkmatter
 from darkmatter.logging import get_logger
 _log = get_logger("discovery")
 from darkmatter.config import (

@@ -26,7 +26,6 @@ from darkmatter.config import (
     MAX_CONNECTIONS,
     MAX_CONTENT_LENGTH,
     MESSAGE_QUEUE_MAX,
-    PROTOCOL_VERSION,
     REQUEST_EXPIRY_S,
     WEBRTC_ICE_SERVERS,
     WEBRTC_ICE_GATHER_TIMEOUT,
@@ -46,7 +45,6 @@ from darkmatter.models import (
 )
 from darkmatter.identity import (
     validate_url,
-    verify_message,
     verify_peer_update_signature,
     is_timestamp_fresh,
     check_rate_limit,

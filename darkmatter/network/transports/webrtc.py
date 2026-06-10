@@ -9,7 +9,6 @@ Depends on: config, network/transport
 
 import asyncio
 import json
-import sys
 import uuid
 from typing import Callable, Optional
 

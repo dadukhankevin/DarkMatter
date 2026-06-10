@@ -13,12 +13,8 @@ import ipaddress
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
-from collections import deque
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
     NoEncryption,
@@ -104,6 +100,7 @@ def load_or_create_passport() -> tuple[str, str]:
         with open(passport_path, "r") as f:
             private_key_hex = f.read().strip()
         public_key_hex = derive_public_key_hex(private_key_hex)
+        _ensure_passport_gitignore(passport_dir)
         print(f"[DarkMatter] Passport loaded: {passport_path}", file=sys.stderr)
         print(f"[DarkMatter] Agent ID (public key): {public_key_hex}", file=sys.stderr)
         return private_key_hex, public_key_hex
@@ -115,6 +112,7 @@ def load_or_create_passport() -> tuple[str, str]:
         with open(passport_path, "w") as f:
             f.write(private_key_hex + "\n")
         os.chmod(passport_path, 0o600)
+        _ensure_passport_gitignore(passport_dir)
     except OSError as e:
         print(f"[DarkMatter] FATAL: cannot create passport at {passport_path}: {e}", file=sys.stderr)
         print(f"[DarkMatter] Check directory permissions for {passport_dir}", file=sys.stderr)
@@ -122,6 +120,19 @@ def load_or_create_passport() -> tuple[str, str]:
     print(f"[DarkMatter] New passport created: {passport_path}", file=sys.stderr)
     print(f"[DarkMatter] Agent ID (public key): {public_key_hex}", file=sys.stderr)
     return private_key_hex, public_key_hex
+
+
+def _ensure_passport_gitignore(passport_dir: str) -> None:
+    """Drop a .gitignore in .darkmatter/ so the private key can never be
+    committed by an accidental `git add .` — the passport lives inside the
+    project working tree by design."""
+    gitignore = os.path.join(passport_dir, ".gitignore")
+    try:
+        if not os.path.exists(gitignore):
+            with open(gitignore, "w") as f:
+                f.write("*\n")
+    except OSError:
+        pass
 
 
 # =============================================================================
@@ -155,12 +166,6 @@ def verify_peer_update_signature(public_key_hex: str, signature_hex: str,
     """Verify a signed peer_update payload. Returns True if valid."""
     from darkmatter.security import verify_peer_update_signature as _verify
     return _verify(public_key_hex, signature_hex, agent_id, new_url, timestamp, **kwargs)
-
-
-def sign_relay_poll(private_key_hex: str, agent_id: str, timestamp: str) -> str:
-    """Sign a relay poll request. Returns signature hex."""
-    from darkmatter.security import sign_relay_poll as _sign
-    return _sign(private_key_hex, agent_id, timestamp)
 
 
 # =============================================================================

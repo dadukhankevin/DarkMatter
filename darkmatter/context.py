@@ -4,7 +4,6 @@ Conversation memory: logging, context feed, activity hints, prompt formatting.
 Depends on: config, models, state
 """
 
-import sys
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -152,30 +151,36 @@ def _cap_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words]) + "..."
 
 
+# Tool-call chrome and terminal UI noise (compiled once, not per call)
+_NOISE_RE = None
+
+
 def _strip_tool_chrome(text: str) -> str:
     """Remove MCP tool call chrome and terminal UI noise from content."""
     import re
-    # Patterns that indicate tool call/response lines
-    _noise = re.compile(
-        r'darkmatter\s*-\s*\w.*\(MCP\).*'
-        r'|\(params:\s*\{.*'
-        r"|['\"]result['\"]:\s*['\"].*"
-        r'|⏺\s*darkmatter.*'
-        r'|⎿\s*(Running|{).*'
-        r'|[✶✻✽✳✢·]\s*(Channeling|Osmosing|Thinking|Reasoning).*'
-        r'|bypass\s*permissions?\s*on.*'
-        r'|shift\+tab\s*to\s*cycle.*'
-        r'|esc\s*to\s*interrupt.*'
-        r'|ctrl\+o\s*to\s*expand.*'
-        r'|\+\d+\s*lines\s*\(ctrl.*'
-        r'|▪▪▪.*'
-        r'|[⏵]+\s*bypass.*'
-    )
+    global _NOISE_RE
+    if _NOISE_RE is None:
+        _NOISE_RE = re.compile(
+            r'darkmatter\s*-\s*\w.*\(MCP\).*'
+            r'|\(params:\s*\{.*'
+            r"|['\"]result['\"]:\s*['\"].*"
+            r'|⏺\s*darkmatter.*'
+            r'|⎿\s*(Running|{).*'
+            r'|[✶✻✽✳✢·]\s*(Channeling|Osmosing|Thinking|Reasoning).*'
+            r'|bypass\s*permissions?\s*on.*'
+            r'|shift\+tab\s*to\s*cycle.*'
+            r'|esc\s*to\s*interrupt.*'
+            r'|ctrl\+o\s*to\s*expand.*'
+            r'|\+\d+\s*lines\s*\(ctrl.*'
+            r'|▪▪▪.*'
+            r'|[⏵]+\s*bypass.*'
+        )
     lines = text.split('\n')
-    cleaned = [l for l in lines if not _noise.search(l)]
+    cleaned = [l for l in lines if not _NOISE_RE.search(l)]
     result = '\n'.join(cleaned).strip()
     # Collapse excessive whitespace left by removals
-    result = re.sub(r'\n{3,}', '\n\n', result)
+    import re as _re
+    result = _re.sub(r'\n{3,}', '\n\n', result)
     return result if result else '(no content)'
 
 

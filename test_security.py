@@ -11,7 +11,7 @@ from darkmatter.security import (
     # Domain constants
     DOMAIN_MESSAGE,
     DOMAIN_PEER_UPDATE,
-    DOMAIN_RELAY_POLL,
+    DOMAIN_CONNECTION_REQUEST,
     DOMAIN_SDP,
     DOMAIN_LAN_BEACON,
     DOMAIN_CHALLENGE_RESPONSE,
@@ -23,7 +23,6 @@ from darkmatter.security import (
     verify_message,
     sign_peer_update,
     verify_peer_update_signature,
-    sign_relay_poll,
     # Inbound verification
     verify_inbound,
     VerifiedPayload,
@@ -77,7 +76,7 @@ class TestSignPayload:
     def test_multiple_domains(self, keypair):
         priv, pub = keypair
         for domain in [DOMAIN_MESSAGE, DOMAIN_PEER_UPDATE, DOMAIN_SDP,
-                       DOMAIN_RELAY_POLL, DOMAIN_CHALLENGE_RESPONSE,
+                       DOMAIN_CONNECTION_REQUEST, DOMAIN_CHALLENGE_RESPONSE,
                        DOMAIN_LAN_BEACON]:
             sig = sign_payload(priv, domain, "a", "b")
             assert verify_signed_payload(pub, sig, domain, "a", "b")
