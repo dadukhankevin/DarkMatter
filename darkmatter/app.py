@@ -37,6 +37,7 @@ from darkmatter.config import (
     DISCOVERY_LOCAL_PORTS,
     AGENT_ROUTER_MODE,
     NETWORK_TIER,
+    MAX_CONNECTIONS,
 )
 from darkmatter.models import AgentState, AgentStatus
 from darkmatter.names import generate_agent_name
@@ -298,6 +299,100 @@ def _register_discovered_agents(daemon_port: int) -> None:
                   agent_id[:12], state.display_name or "unnamed")
 
 
+async def _connect_local_peer(state: AgentState, peer_id: str, base_url: str,
+                              daemon_port: int) -> None:
+    """Establish a connection from `state` to a local peer, auto-accepted.
+
+    Same-daemon peers are connected in-process; peers on other localhost
+    daemons are connected via an HTTP loopback connection_request. Both sides
+    persist so sync_connections_from_disk doesn't wipe the new connection.
+    """
+    from darkmatter.network.mesh import (
+        build_outbound_request_payload,
+        build_connection_from_accepted,
+        process_connection_request,
+    )
+
+    our_url = f"http://127.0.0.1:{daemon_port}/__darkmatter__/{state.agent_id}"
+    payload = build_outbound_request_payload(state, our_url)
+
+    target_state = get_state_for(peer_id)
+    if target_state is not None:
+        # Same daemon — drive the acceptance in-process (no HTTP round trip).
+        peer_url = f"http://127.0.0.1:{daemon_port}/__darkmatter__/{peer_id}"
+        result, status = await process_connection_request(
+            target_state, payload, peer_url, client_ip="127.0.0.1"
+        )
+        if status == 200 and result.get("auto_accepted"):
+            state.connections[result["agent_id"]] = build_connection_from_accepted(result)
+            save_state(state.agent_id)   # our side
+            save_state(peer_id)          # peer's side (process_connection_request saved it too)
+            _log.info("Auto-peered %s... <-> %s... (local)", state.agent_id[:8], peer_id[:8])
+        return
+
+    # Peer lives on another localhost daemon — connect over HTTP loopback.
+    target = base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(
+            f"{target}/__darkmatter__/{peer_id}/connection_request", json=payload
+        )
+        result = resp.json()
+    if result.get("auto_accepted"):
+        state.connections[result["agent_id"]] = build_connection_from_accepted(result)
+        save_state(state.agent_id)
+        _log.info("Auto-peered %s... -> %s... (loopback %s)", state.agent_id[:8], peer_id[:8], target)
+
+
+async def _auto_peer_local_agents(daemon_port: int) -> None:
+    """Ensure every local agent is connected to every other local agent.
+
+    Covers two cases:
+    - Agents hosted on THIS daemon (multi-tenant single port) — connected in-process.
+    - Agents on other localhost daemons — discovered via port scan, connected over loopback.
+
+    Idempotent: peers already connected are skipped, so this is safe to call every tick.
+    Honors the per-agent `auto_peer_local` security setting (default on).
+    """
+    hosted = list(list_hosted_agents())
+    if not hosted:
+        return
+
+    # Build the set of local peer targets: every hosted agent, plus fresh
+    # locally-discovered peers from any hosted agent's scan results.
+    # peer_id -> base URL of the daemon hosting it.
+    local_targets: dict[str, str] = {
+        aid: f"http://127.0.0.1:{daemon_port}" for aid in hosted
+    }
+    now = time.time()
+    for aid in hosted:
+        st = get_state_for(aid)
+        if st is None:
+            continue
+        for peer_id, info in st.discovered_peers.items():
+            if peer_id in local_targets or info.get("source") != "local":
+                continue
+            # Only chase peers seen recently — avoids hammering dead daemons.
+            if now - info.get("ts", 0) > 60:
+                continue
+            base = info.get("url", "")
+            if base:
+                local_targets[peer_id] = base
+
+    for aid in hosted:
+        state = get_state_for(aid)
+        if state is None or not state.security_settings.get("auto_peer_local", True):
+            continue
+        for peer_id, base_url in local_targets.items():
+            if peer_id == aid or peer_id in state.connections:
+                continue
+            if len(state.connections) >= MAX_CONNECTIONS:
+                break
+            try:
+                await _connect_local_peer(state, peer_id, base_url, daemon_port)
+            except Exception as e:
+                _log.debug("Auto-peer %s... -> %s... failed: %s", aid[:8], peer_id[:8], e)
+
+
 async def _agent_scan_loop(daemon_port: int) -> None:
     """Periodically scan for new/removed agent state files and sync connections."""
     while True:
@@ -313,6 +408,8 @@ async def _agent_scan_loop(daemon_port: int) -> None:
                     alive = [s for s in agent_state.active_sessions if _is_pid_alive(s["pid"])]
                     if len(alive) != len(agent_state.active_sessions):
                         agent_state.active_sessions = alive
+            # Auto-peer local agents — every localhost agent becomes a peer.
+            await _auto_peer_local_agents(daemon_port)
         except asyncio.CancelledError:
             return
         except Exception as e:

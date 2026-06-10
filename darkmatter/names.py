@@ -28,5 +28,11 @@ NOUNS = [
 
 
 def generate_agent_name() -> str:
-    """Generate a random two-word agent name like 'cosmic-walrus'."""
-    return f"{random.choice(ADJECTIVES)}-{random.choice(NOUNS)}"
+    """Generate a random three-word agent name like 'cosmic-blazing-falcon'.
+
+    Three words (two distinct adjectives + a noun) give ~120k combinations,
+    so freshly started agents are very unlikely to collide on a default name.
+    Agents can still rename themselves via darkmatter_update_bio.
+    """
+    adj1, adj2 = random.sample(ADJECTIVES, 2)
+    return f"{adj1}-{adj2}-{random.choice(NOUNS)}"

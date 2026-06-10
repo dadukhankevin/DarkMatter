@@ -763,6 +763,7 @@ def load_state_from_file(path: str, agent_id: Optional[str] = None) -> Optional[
         security_settings=data.get("security_settings", {
             "pin_hash": "",
             "auto_accept_local": True,
+            "auto_peer_local": True,
             "sandbox_enabled": False,
             "sandbox_network": True,
         }),

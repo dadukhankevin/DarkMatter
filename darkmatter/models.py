@@ -243,6 +243,7 @@ class AgentState:
     security_settings: dict = field(default_factory=lambda: {
         "pin_hash": "",
         "auto_accept_local": True,
+        "auto_peer_local": True,
         "sandbox_enabled": False,
         "sandbox_network": True,
     })

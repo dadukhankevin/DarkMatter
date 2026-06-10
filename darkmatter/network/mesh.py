@@ -291,7 +291,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             existing.capabilities = from_agent_capabilities
             changed = True
         if changed:
-            save_state()
+            save_state(state.agent_id)
         return {
             "auto_accepted": True,
             "agent_id": state.agent_id,
@@ -333,7 +333,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
             _log.info("Seeded trust for %s... at %.4f from %d peer opinions",
                        from_agent_id[:12], seeded, peer_trust.get("peers_with_opinion", 0))
 
-        save_state()
+        save_state(state.agent_id)
         _log.info("Auto-accepted local agent %s... (%s)", from_agent_display_name or from_agent_id[:12], from_agent_url)
 
         # Queue so MCP session sees the new connection via wait_for_message / context.
@@ -378,7 +378,7 @@ async def process_connection_request(state: AgentState, data: dict, public_url: 
         if seeded > 0 and from_agent_id not in state.impressions:
             state.impressions[from_agent_id] = Impression(score=round(seeded, 4))
 
-        save_state()
+        save_state(state.agent_id)
         _log.info("Auto-accepted agent %s... (bootstrap mode)", from_agent_display_name or from_agent_id[:12])
 
         _queue_connection_request(

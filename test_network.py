@@ -220,3 +220,46 @@ def test_well_known_prunes_dead_active_sessions():
     data = json.loads(response.body)
 
     assert data["agents"][0]["active_sessions"] == [{"pid": os.getpid(), "cwd": "/live"}]
+
+
+def test_auto_peer_connects_same_daemon_agents_mutually(monkeypatch):
+    from darkmatter import app
+    from darkmatter import state as state_mod
+
+    # Don't touch disk during the test.
+    monkeypatch.setattr(state_mod, "_save_single_state", lambda st: None)
+
+    a = make_state()  # registers as default + in registry
+    priv_b, pub_b = generate_keypair()
+    b = AgentState(agent_id=pub_b, bio="b", status=AgentStatus.ACTIVE, port=9900,
+                   private_key_hex=priv_b, public_key_hex=pub_b)
+    state_mod.register_agent(b.agent_id, b)
+
+    asyncio.run(app._auto_peer_local_agents(9900))
+
+    assert b.agent_id in a.connections, "A should auto-peer with B"
+    assert a.agent_id in b.connections, "B should auto-peer with A"
+
+    # Idempotent — a second pass adds nothing.
+    asyncio.run(app._auto_peer_local_agents(9900))
+    assert len(a.connections) == 1 and len(b.connections) == 1
+
+
+def test_auto_peer_respects_opt_out(monkeypatch):
+    from darkmatter import app
+    from darkmatter import state as state_mod
+
+    monkeypatch.setattr(state_mod, "_save_single_state", lambda st: None)
+
+    a = make_state()
+    a.security_settings["auto_peer_local"] = False
+    priv_b, pub_b = generate_keypair()
+    b = AgentState(agent_id=pub_b, bio="b", status=AgentStatus.ACTIVE, port=9900,
+                   private_key_hex=priv_b, public_key_hex=pub_b)
+    b.security_settings["auto_peer_local"] = False
+    state_mod.register_agent(b.agent_id, b)
+
+    asyncio.run(app._auto_peer_local_agents(9900))
+
+    assert b.agent_id not in a.connections
+    assert a.agent_id not in b.connections
