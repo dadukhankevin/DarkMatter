@@ -1727,6 +1727,7 @@ async def handle_local_agents(request: Request) -> JSONResponse:
             "port": info.get("port"),
             "network_tier": info.get("network_tier", "global"),
             "active_sessions": info.get("active_sessions", []),
+            "queued_messages": info.get("queued_messages", 0),
         }
         for info in scan_state_files()
     ]

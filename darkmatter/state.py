@@ -494,6 +494,7 @@ def scan_state_files() -> list[dict]:
             agent_id = data.get("agent_id", "")
             public_key_hex = data.get("public_key_hex", "")
             if agent_id and public_key_hex:
+                queue = data.get("message_queue", [])
                 results.append({
                     "agent_id": agent_id,
                     "public_key_hex": public_key_hex,
@@ -507,6 +508,9 @@ def scan_state_files() -> list[dict]:
                         s for s in data.get("active_sessions", [])
                         if _is_pid_alive(s.get("pid", -1))
                     ],
+                    # Queue depth lets a supervisor decide when to wake an
+                    # agent: undelivered messages AND no live session → wake.
+                    "queued_messages": len(queue),
                 })
         except (json.JSONDecodeError, OSError):
             continue
