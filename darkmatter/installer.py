@@ -46,19 +46,18 @@ def _expand(path: str, home: Path) -> Path:
     return Path(path)
 
 
-def _server_env(client: str, display_name: str, port: int) -> dict[str, str]:
+def _server_env(client: str, display_name: str) -> dict[str, str]:
     return {
         "DARKMATTER_CLIENT": client,
         "DARKMATTER_DISPLAY_NAME": display_name,
-        "DARKMATTER_PORT": str(port),
     }
 
 
-def _stdio_entry(command: str, client: str, display_name: str, port: int) -> dict:
+def _stdio_entry(command: str, client: str, display_name: str) -> dict:
     return {
         "command": command,
         "args": ["-m", "darkmatter"],
-        "env": _server_env(client, display_name, port),
+        "env": _server_env(client, display_name),
     }
 
 
@@ -75,8 +74,8 @@ def _merge_json_config(path: Path, update_fn: Callable[[dict], None]) -> None:
         f.write("\n")
 
 
-def _install_mcp_servers_json(path: Path, command: str, client: str, display_name: str, port: int) -> None:
-    entry = _stdio_entry(command, client, display_name, port)
+def _install_mcp_servers_json(path: Path, command: str, client: str, display_name: str) -> None:
+    entry = _stdio_entry(command, client, display_name)
 
     def update(config: dict) -> None:
         config.setdefault("mcpServers", {})
@@ -85,8 +84,8 @@ def _install_mcp_servers_json(path: Path, command: str, client: str, display_nam
     _merge_json_config(path, update)
 
 
-def _install_opencode(path: Path, command: str, client: str, display_name: str, port: int) -> None:
-    env = _server_env(client, display_name, port)
+def _install_opencode(path: Path, command: str, client: str, display_name: str) -> None:
+    env = _server_env(client, display_name)
 
     def update(config: dict) -> None:
         config.setdefault("mcp", {})
@@ -122,11 +121,11 @@ def _toml_string(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _install_codex_toml(path: Path, command: str, client: str, display_name: str, port: int) -> None:
+def _install_codex_toml(path: Path, command: str, client: str, display_name: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text() if path.exists() else ""
     stripped = _strip_toml_sections(existing, {"mcp_servers.darkmatter", "mcp_servers.darkmatter.env"})
-    env = _server_env(client, display_name, port)
+    env = _server_env(client, display_name)
     args = ', '.join(_toml_string(arg) for arg in ["-m", "darkmatter"])
     env_lines = "\n".join(f"{key} = {_toml_string(value)}" for key, value in env.items())
     block = (
@@ -140,18 +139,18 @@ def _install_codex_toml(path: Path, command: str, client: str, display_name: str
     path.write_text(content)
 
 
-def install_target(target: InstallTarget, *, command: str, display_name: str, port: int, home: Path) -> tuple[bool, str]:
+def install_target(target: InstallTarget, *, command: str, display_name: str, home: Path) -> tuple[bool, str]:
     if not target.supported:
         return False, f"{target.label}: skipped (no native MCP config to install)"
 
     path = _expand(target.path, home)
     try:
         if target.format == "mcpServers":
-            _install_mcp_servers_json(path, command, target.client, display_name, port)
+            _install_mcp_servers_json(path, command, target.client, display_name)
         elif target.format == "codex_toml":
-            _install_codex_toml(path, command, target.client, display_name, port)
+            _install_codex_toml(path, command, target.client, display_name)
         elif target.format == "opencode":
-            _install_opencode(path, command, target.client, display_name, port)
+            _install_opencode(path, command, target.client, display_name)
         else:
             return False, f"{target.label}: unsupported config format"
     except json.JSONDecodeError as exc:
@@ -176,11 +175,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Install DarkMatter into supported MCP client configs.",
     )
     parser.add_argument("--display-name", default=os.environ.get("DARKMATTER_DISPLAY_NAME", "darkmatter-agent"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("DARKMATTER_PORT", "8100")))
     parser.add_argument("--python", dest="python_cmd", default=sys.executable)
     parser.add_argument("--home", default=str(Path.home()))
-    parser.add_argument("--client", action="append", dest="clients", choices=client_names)
-    parser.add_argument("--all", action="store_true", help="Install into every supported native MCP client.")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--client", action="append", dest="clients", choices=client_names)
+    selection.add_argument("--all", action="store_true", help="Install into every supported native MCP client.")
     return parser.parse_args(argv)
 
 
@@ -199,7 +198,6 @@ def main(argv: list[str] | None = None) -> int:
             target,
             command=args.python_cmd,
             display_name=args.display_name,
-            port=args.port,
             home=home,
         )
         print(message)

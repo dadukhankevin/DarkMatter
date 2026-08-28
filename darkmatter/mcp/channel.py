@@ -2,7 +2,7 @@
 Claude Code channel integration for DarkMatter.
 
 Declares the `experimental.claude/channel` capability on the MCP server and
-emits `notifications/claude/channel` events when a mesh message arrives, so
+emits `notifications/claude/channel` events when a mailbox message arrives, so
 peer messages land in the running session as <channel source="darkmatter">
 blocks instead of waiting to be drained by wait_for_message.
 

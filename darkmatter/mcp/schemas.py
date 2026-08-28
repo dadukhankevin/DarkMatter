@@ -13,45 +13,67 @@ from darkmatter.config import MAX_CONTENT_LENGTH
 
 
 class ConnectionAction(str, Enum):
-    REQUEST = "request"
+    INTRODUCE = "introduce"
     ACCEPT = "accept"
-    REJECT = "reject"
-    DISCONNECT = "disconnect"
+    IGNORE = "ignore"
+    CLOSE = "close"
 
 
 class ConnectionInput(BaseModel):
-    """Manage connections: request, accept, reject, or disconnect."""
+    """Introduce, accept, ignore, or close a relationship."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     action: ConnectionAction = Field(..., description="The connection action to perform")
-    target_url: Optional[str] = Field(default=None, description="Target agent URL (for direct request)")
-    request_id: Optional[str] = Field(default=None, description="Pending request ID (for accept/reject)")
-    agent_id: Optional[str] = Field(default=None, description="Agent ID (for disconnect, or for mesh-routed request — finds the target through connected peers)")
+    target_url: Optional[str] = Field(default=None, description="Peer mailbox locator (for introduce)")
+    contact_card: Optional[dict] = Field(default=None, description="Signed peer contact card (preferred for introduce or accept)")
+    advertised_locator: Optional[str] = Field(default=None, description="Locator this peer should use to fetch you")
+    agent_id: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Expected peer id, or peer id for accept/ignore/close",
+    )
 
 
 class SendMessageInput(BaseModel):
     """Send a message to one or more connected agents."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     content: str = Field(..., description="Message content to send", min_length=1, max_length=MAX_CONTENT_LENGTH)
-    target_agent_id: Optional[str] = Field(default=None, description="Single agent to send to (omit for auto-select)")
-    target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agents to send to (explicit list)")
-    in_reply_to: Optional[str] = Field(default=None, description="Message ID this is replying to")
-    forward_message_ids: Optional[list[str]] = Field(default=None, description="Queue message IDs to forward with this message. Content is included in delivery and messages are consumed from inbox.")
-    hops_remaining: int = Field(default=10, ge=1, le=50, description="TTL for mesh routing")
+    target_agent_id: Optional[str] = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$",
+        description="Single agent to send to",
+    )
+    target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agent ids to send to")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
-    broadcast: bool = Field(default=False, description="FYI-only mode — appears in peers' background context but does NOT interrupt them or trigger wait_for_message. Use for passive status updates, progress notes, and non-urgent info. For messages that need attention or a response, leave this False.")
-    share_with_top_n: int = Field(default=-1, ge=-1, description="For broadcasts: -1 = all connected peers, N = top N by trust score. Ignored for direct messages.")
 
 
 class UpdateBioInput(BaseModel):
-    """Update this agent's bio, display name, and/or network tier."""
+    """Update this agent's bio and display name."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     bio: Optional[str] = Field(default=None, description="New bio text describing this agent's specialty", min_length=1, max_length=1000)
     display_name: Optional[str] = Field(default=None, description="New display name for this agent", min_length=1, max_length=100)
-    network_tier: Optional[str] = Field(default=None, description="Network visibility tier: 'local' (localhost only), 'lan' (private networks), or 'global' (fully open, default). The daemon's bind address follows the tier on next restart.")
 
 
-class GetPeersFromInput(BaseModel):
-    """Get the top trusted peers of a connected agent — cross-network discovery."""
+class ConfigureInput(BaseModel):
+    """Set visibility, hosted origin, or per-relationship fetch interval."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., description="Agent ID of the connected peer to ask")
-    n: int = Field(default=10, ge=1, le=50, description="Number of peers to return (default 10, max 50)")
+    visibility: Optional[str] = Field(
+        default=None,
+        description="Where you publish: local (disk path), lan (git-HTTP on the LAN), internet (push to origin)",
+    )
+    origin: Optional[str] = Field(
+        default=None,
+        description="Git URL you can push (GitHub, GitLab, …). Required for visibility=internet",
+    )
+    lan_port: Optional[int] = Field(default=None, description="LAN git-HTTP port (default 8741)")
+    peer_id: Optional[str] = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$",
+        description="If set, configure this relationship",
+    )
+    fetch_every: Optional[float] = Field(
+        default=None,
+        ge=2,
+        description="Seconds between fetches of this peer's outbox. Lower = more often",
+    )
+    peer_locator: Optional[str] = Field(default=None, description="Update the locator you fetch this peer from")
+    note: Optional[str] = Field(default=None, description="Local note on the relationship")

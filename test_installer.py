@@ -40,8 +40,7 @@ def test_json_clients() -> None:
             ok, message = install_target(
                 _target(client),
                 command="/tmp/python",
-                display_name="mesh-node",
-                port=8123,
+                display_name="mail-agent",
                 home=home,
             )
             report(f"{client} install succeeds", ok, message)
@@ -71,8 +70,7 @@ def test_codex_toml() -> None:
         ok, message = install_target(
             _target("codex"),
             command="/tmp/python",
-            display_name="mesh-node",
-            port=8123,
+            display_name="mail-agent",
             home=home,
         )
         report("codex install succeeds", ok, message)
@@ -89,8 +87,7 @@ def test_opencode_json() -> None:
         ok, message = install_target(
             _target("opencode"),
             command="/tmp/python",
-            display_name="mesh-node",
-            port=8123,
+            display_name="mail-agent",
             home=home,
         )
         report("opencode install succeeds", ok, message)
@@ -107,8 +104,7 @@ def test_openclaw_skipped() -> None:
         ok, message = install_target(
             _target("openclaw"),
             command="/tmp/python",
-            display_name="mesh-node",
-            port=8123,
+            display_name="mail-agent",
             home=Path(tmp),
         )
         report("openclaw is skipped", not ok and "skipped" in message, message)

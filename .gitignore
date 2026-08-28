@@ -7,6 +7,13 @@ __pycache__/
 .venv/
 .DS_Store
 .env
+.env.*
+!.env.example
+dist/
+build/
+*.egg-info/
 
 # Glance memory shards
 .glance/
+
+*.mp4

@@ -1,5 +1,26 @@
-"""
-DarkMatter — A Self-Replicating MCP Server for Emergent Agent Networks
-"""
+"""DarkMatter 3 — durable, sealed agent correspondence over Git."""
 
-__version__ = "2.0.0"
+from darkmatter.contract import (
+    Envelope,
+    Relationship,
+    create_contact_card,
+    open_envelope,
+    seal_envelope,
+    validate_locator,
+    verify_contact_card,
+)
+from darkmatter.gitbox import Mailbox
+
+__version__ = "3.0.0"
+
+__all__ = [
+    "Envelope",
+    "Mailbox",
+    "Relationship",
+    "__version__",
+    "create_contact_card",
+    "open_envelope",
+    "seal_envelope",
+    "validate_locator",
+    "verify_contact_card",
+]

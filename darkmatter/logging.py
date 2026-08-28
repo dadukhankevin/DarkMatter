@@ -23,13 +23,13 @@ class _StderrFormatter(logging.Formatter):
     """Stderr format: [DarkMatter] [source] message."""
 
     def format(self, record: logging.LogRecord) -> str:
-        # Extract the child logger name (e.g. "darkmatter.mesh" → "mesh")
+        # Extract the child logger name (e.g. "darkmatter.gitbox" → "gitbox")
         source = record.name.removeprefix("darkmatter.")
         return f"[DarkMatter] [{source}] {record.getMessage()}"
 
 
 class _FileFormatter(logging.Formatter):
-    """File format: [2026-03-10 04:47:56] [darkmatter.mesh] [INFO] message"""
+    """File format: [2026-03-10 04:47:56] [darkmatter.gitbox] [INFO] message"""
 
     def format(self, record: logging.LogRecord) -> str:
         ts = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
@@ -74,7 +74,7 @@ def get_logger(source: str) -> logging.Logger:
 
     Usage:
         from darkmatter.logging import get_logger
-        _log = get_logger("mesh")
+        _log = get_logger("gitbox")
         _log.info("Connected to peer %s", peer_id[:12])
     """
     _ensure_initialized()

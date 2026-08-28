@@ -45,26 +45,6 @@ echo "Installing DarkMatter..."
 VERSION=$("$VENV_DIR/bin/python" -c "import darkmatter; print(darkmatter.__version__)")
 echo "Installed dmagent $VERSION"
 
-# Find free port in 8100-8200
-PORT=8100
-while [ $PORT -le 8200 ]; do
-    if command -v lsof >/dev/null 2>&1; then
-        if ! lsof -i :$PORT >/dev/null 2>&1; then
-            break
-        fi
-    else
-        if ! "$PYTHON_CMD" -c "import socket; s=socket.socket(); s.settimeout(0.1); exit(0 if s.connect_ex(('127.0.0.1',$PORT)) else 1)" 2>/dev/null; then
-            break
-        fi
-    fi
-    PORT=$((PORT + 1))
-done
-if [ $PORT -gt 8200 ]; then
-    echo "ERROR: No free ports in 8100-8200 range"
-    exit 1
-fi
-echo "Using port $PORT"
-
 VENV_PYTHON="$VENV_DIR/bin/python"
 
 # Prompt for display name (read from /dev/tty so curl|bash works)
@@ -80,19 +60,13 @@ echo ""
 echo "Installing MCP config for supported clients..."
 "$VENV_PYTHON" -m darkmatter install-mcp \
   --display-name "$DISPLAY_NAME" \
-  --port "$PORT" \
   --python "$VENV_PYTHON"
 
 echo ""
 echo "=== Setup complete ==="
 echo "Display name: $DISPLAY_NAME"
-echo "Port: $PORT"
 echo "Version: $VERSION"
 echo ""
 echo "Restart your MCP client to connect. Auth is automatic."
 echo ""
 echo "To update later:  $VENV_DIR/bin/pip install --upgrade dmagent"
-echo ""
-echo "Alternative: standalone HTTP mode (manual start):"
-echo "  DARKMATTER_PORT=$PORT nohup $VENV_PYTHON -m darkmatter > /tmp/darkmatter-$PORT.log 2>&1 &"
-echo "  Then set in .mcp.json: {\"type\":\"http\",\"url\":\"http://localhost:$PORT/mcp\"}"

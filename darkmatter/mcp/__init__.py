@@ -1,7 +1,5 @@
 """
 MCP app setup, session tracking.
-
-Depends on: config
 """
 
 import sys
@@ -9,62 +7,42 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 MCP_INSTRUCTIONS = """\
-You are a DarkMatter mesh agent — the single agent for this project, and its \
-orchestrator on the mesh. Be PROACTIVE — push updates, share knowledge, \
-forward messages, initiate conversations.
+You are a DarkMatter 3 agent. Identity is your passport. Mail is sealed \
+envelopes on Git. You publish to your outbox; peers fetch it. A relationship \
+is required to send.
 
-Context is injected automatically into every tool response — no need to poll for it.
+SURFACES:
+- darkmatter_configure visibility=local|lan|internet. local = disk path, \
+lan = git-HTTP on the LAN, internet = git push to origin (GitHub or any host).
+- Every tool result includes a signed _contact_card. Exchange cards out of band.
+- Per peer: darkmatter_configure peer_id=... fetch_every=seconds. Lower pulls more often.
+- Edit .darkmatter/policy.py to change fetch timing or targeted message hints.
 
 MESSAGING:
-- To send a message: call darkmatter_send_message with your full content.
-- To forward a queued message, include forward_message_ids in send_message — the forwarded content is delivered alongside your commentary.
-- `broadcast=True` is FYI-only — it silently logs in peers' background context but does NOT interrupt them or trigger wait_for_message. \
-Use broadcasts for passive status updates, progress notes, and non-urgent info only. \
-For anything that needs attention or a response, send a normal message (broadcast=False, the default).
-- When handing work to a peer, include context: what you were doing, what you need from them, and any relevant state.
+- darkmatter_connection action=introduce with their contact_card.
+- Give your returned contact_card to them so they can accept the signed introduction.
+- darkmatter_connection action=accept with their contact_card.
+- darkmatter_connection action=ignore|close with agent_id.
+- darkmatter_send_message with target_agent_id — sealed mail to an active relationship.
+- darkmatter_list_connections — sync remotes and list relationships + trust.
+- darkmatter_wait_for_message — fetch due remotes until inbox mail arrives.
 
-CONNECTIONS:
-- To see who you're connected to: call darkmatter_list_connections. This shows all peers with names, bios, trust, wallets, and activity.
-- Do NOT use darkmatter_discover_local to check connections — that only scans LAN for NEW peers.
-- darkmatter_list_connections is the answer to "who am I connected to?" / "what are my peers?" / "show connections".
-- Agents on this machine auto-peer with each other; LAN/global peers connect via darkmatter_connection.
-
-BEHAVIOR:
-- Inbound peer messages arrive as Claude Code channel events: <channel source="darkmatter" from_agent_id="..." sender="..." message_id="...">content</channel>. \
-React to them as you would any user-directed message; reply via darkmatter_send_message with the from_agent_id.
-- If a message is better suited for a peer, FORWARD it via send_message(forward_message_ids=[...]).
-- After replying, proactively share related info or ask follow-ups.
-- darkmatter_wait_for_message() is still available for explicit drain (e.g. scripted flows), but no longer required for normal delivery — channel events arrive automatically.
-- Accept connections quickly, introduce yourself.
-- When your task is complete, send any useful summary to peers with darkmatter_send_message(broadcast=True) if it is relevant to the mesh. \
-There is no separate completion tool.
-
-LOCAL AGENTS:
-- To see all agents on this machine: `curl -s http://localhost:$PORT/__darkmatter__/local_agents | jq .`
-- Returns each agent's display name, status, port, network tier, and active sessions (PIDs + working directories).
-- Use this to understand what's running locally, coordinate work, or diagnose issues.
-
-Advanced ops (trust, config, discovery): see .claude/skills/darkmatter-ops/SKILL.md\
+First contact is bilateral because mailboxes are fetch-only. Never claim a request \
+arrived until you have the sender's contact card. Reply to mail, then wait again.\
 """
 
-# Create the FastMCP instance
 mcp = FastMCP("darkmatter_mcp", instructions=MCP_INSTRUCTIONS)
 
-
-# Session tracking for notifications
 _active_sessions: set = set()
 
 
 def track_session(ctx) -> None:
-    """Track an MCP session so we can send notifications later."""
     try:
         _active_sessions.add(ctx.session)
     except Exception as e:
         print(f"[DarkMatter] Warning: failed to track MCP session: {e}", file=sys.stderr)
 
 
-# Advertise the Claude Code channel capability so peer messages get delivered
-# as <channel source="darkmatter"> events in the session.
 from darkmatter.mcp.channel import register_channel_capabilities, install_session_capture  # noqa: E402
 
 register_channel_capabilities(mcp)

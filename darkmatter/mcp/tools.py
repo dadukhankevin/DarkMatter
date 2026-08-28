@@ -1,12 +1,4 @@
-"""
-All MCP tool definitions for the DarkMatter mesh protocol.
-
-Tools are thin clients of the project daemon's loopback API — the daemon owns
-all agent state and networking. This process (stdio MCP session or in-daemon
-HTTP MCP session) never touches the state file.
-
-Depends on: mcp/__init__, mcp/schemas, mcp/client
-"""
+"""MCP tools — thin adapter over the v3 git mailbox."""
 
 import asyncio
 import json
@@ -14,85 +6,82 @@ from typing import Optional
 
 from mcp.server.fastmcp import Context
 
+from darkmatter.gitbox.mailbox import get_mailbox
+from darkmatter.logging import get_logger
 from darkmatter.mcp import mcp, track_session
-from darkmatter.mcp.client import daemon_get, daemon_post
 from darkmatter.mcp.schemas import (
+    ConfigureInput,
     ConnectionAction,
     ConnectionInput,
     SendMessageInput,
     UpdateBioInput,
-    GetPeersFromInput,
 )
-from darkmatter.logging import get_logger
 
 _log = get_logger("tools")
 
-# Each /inbox/wait call holds at most this long; longer waits re-poll.
-_WAIT_CHUNK_S = 25.0
 
-
-async def _with_context(result: dict, ctx: Optional[Context]) -> str:
-    """Append new mesh context + activity hint to a tool result."""
-    session_id = None
-    if ctx is not None:
-        try:
-            session_id = str(id(ctx.session))
-        except Exception:
-            pass
-    if session_id:
-        feed = await daemon_get("/context", {"session_id": session_id}, timeout=5.0)
-        hint = feed.get("hint")
-        context = feed.get("context")
-        if hint:
-            result["_hint"] = hint
-        if context:
-            result["_context"] = context
+def _ctx(result: dict) -> str:
+    mb = get_mailbox()
+    loc = mb.locators()
+    result["_agent_id"] = mb.agent_id
+    result["_contact_card"] = mb.contact_card()
+    result["_locator"] = loc["primary"]
+    result["_remote"] = loc["primary"]
+    result["_visibility"] = loc["visibility"]
+    result["_locators"] = loc
+    result["_unread"] = len(mb.store.unconsumed_messages())
     return json.dumps(result)
 
-
-# =============================================================================
-# MCP Tool Definitions
-# =============================================================================
 
 @mcp.tool(
     name="darkmatter_connection",
     annotations={
-        "title": "Manage Connections",
+        "title": "Manage Relationships",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def connection(params: ConnectionInput, ctx: Context) -> str:
-    """Manage connections. Actions: request (target_url OR agent_id for mesh routing), accept/reject (request_id), disconnect (agent_id)."""
+    """Introduce, accept, ignore, or close a relationship using signed contact cards."""
     track_session(ctx)
+    mb = get_mailbox()
 
-    if params.action == ConnectionAction.REQUEST:
-        if not params.target_url and not params.agent_id:
-            return json.dumps({"success": False, "error": "target_url or agent_id is required for request."})
-        result = await daemon_post("/connect", {
-            "target_url": params.target_url,
-            "agent_id": params.agent_id,
-        })
+    if params.action == ConnectionAction.INTRODUCE:
+        if params.contact_card:
+            result = await asyncio.to_thread(
+                mb.introduce_contact,
+                params.contact_card,
+                params.advertised_locator,
+            )
+            return _ctx(result)
+        if not params.target_url:
+            return _ctx({"success": False, "error": "contact_card or target_url is required"})
+        result = await asyncio.to_thread(
+            mb.introduce,
+            params.target_url,
+            params.advertised_locator,
+            params.agent_id,
+        )
+        return _ctx(result)
 
-    elif params.action in (ConnectionAction.ACCEPT, ConnectionAction.REJECT):
-        if not params.request_id:
-            return json.dumps({"success": False, "error": "request_id is required for accept/reject."})
-        result = await daemon_post("/respond_pending", {
-            "request_id": params.request_id,
-            "accept": params.action == ConnectionAction.ACCEPT,
-        })
+    if params.action == ConnectionAction.ACCEPT:
+        result = await asyncio.to_thread(
+            mb.accept,
+            params.agent_id,
+            params.advertised_locator,
+            params.contact_card,
+        )
+        return _ctx(result)
 
-    elif params.action == ConnectionAction.DISCONNECT:
+    if params.action in (ConnectionAction.IGNORE, ConnectionAction.CLOSE):
         if not params.agent_id:
-            return json.dumps({"success": False, "error": "agent_id is required for disconnect."})
-        result = await daemon_post("/disconnect", {"agent_id": params.agent_id})
+            return _ctx({"success": False, "error": "agent_id is required"})
+        operation = mb.ignore if params.action == ConnectionAction.IGNORE else mb.close
+        return _ctx(await asyncio.to_thread(operation, params.agent_id))
 
-    else:
-        return json.dumps({"success": False, "error": f"Unknown action: {params.action}"})
-
-    return await _with_context(result, ctx)
+    return _ctx({"success": False, "error": f"Unknown action: {params.action}"})
 
 
 @mcp.tool(
@@ -103,30 +92,56 @@ async def connection(params: ConnectionInput, ctx: Context) -> str:
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send a message to connected agents. Include your full message in content.
-
-    Set broadcast=True for FYI-only updates (progress, status) — these appear in
-    peers' background context but do NOT interrupt them or trigger wait_for_message.
-    Broadcasts are silent — peers see them next time they check context, not immediately.
-    For messages that need attention or a response, leave broadcast=False (default).
-    Use share_with_top_n to limit broadcasts to your most trusted peers (-1 = all, N = top N by trust score).
-    """
+    """Send a sealed message to a peer you have an active relationship with."""
     track_session(ctx)
-    result = await daemon_post("/send_message", {
-        "content": params.content,
-        "target_agent_id": params.target_agent_id,
-        "target_agent_ids": params.target_agent_ids,
-        "in_reply_to": params.in_reply_to,
-        "forward_message_ids": params.forward_message_ids,
-        "hops_remaining": params.hops_remaining,
-        "metadata": params.metadata or {},
-        "broadcast": params.broadcast,
-        "share_with_top_n": params.share_with_top_n,
-    })
-    return await _with_context(result, ctx)
+    mb = get_mailbox()
+    targets: list[str] = []
+    if params.target_agent_id:
+        targets.append(params.target_agent_id)
+    if params.target_agent_ids:
+        targets.extend(params.target_agent_ids)
+    if not targets:
+        return _ctx({"success": False, "error": "target_agent_id is required"})
+
+    extra = dict(params.metadata or {})
+    results = []
+    for peer_id in dict.fromkeys(targets):
+        results.append(await asyncio.to_thread(
+            mb.send, peer_id, params.content, None, "message", extra or None,
+        ))
+    ok = all(r.get("success") for r in results)
+    return _ctx({"success": ok, "results": results})
+
+
+@mcp.tool(
+    name="darkmatter_configure",
+    annotations={
+        "title": "Configure Surface or Relationship",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def configure(params: ConfigureInput, ctx: Context) -> str:
+    """Set visibility (local / lan / internet), hosted origin, or a peer's fetch interval."""
+    track_session(ctx)
+    mb = get_mailbox()
+    result = await asyncio.to_thread(
+        mb.configure,
+        params.visibility,
+        params.origin,
+        params.lan_port,
+        None,
+        params.peer_id,
+        params.fetch_every,
+        params.peer_locator,
+        params.note,
+    )
+    return _ctx(result)
 
 
 @mcp.tool(
@@ -137,107 +152,64 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
 async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
-    """Update your bio, display name, and/or network tier. All fields are optional — omit any to keep its current value. Shared with peers for routing decisions."""
+    """Update display name and/or bio. Published in agent.json on your mailbox."""
     track_session(ctx)
-    result = await daemon_post("/config", {
-        "bio": params.bio,
-        "display_name": params.display_name,
-        "network_tier": params.network_tier,
-    })
-    return await _with_context(result, ctx)
+    profile = await asyncio.to_thread(
+        get_mailbox().update_profile,
+        params.display_name,
+        params.bio,
+    )
+    return _ctx({"success": True, "profile": profile})
 
 
 @mcp.tool(
-    name="darkmatter_discover_local",
+    name="darkmatter_contact_card",
     annotations={
-        "title": "Discover Local Peers",
+        "title": "Get Contact Card",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def discover_local(ctx: Context) -> str:
-    """Scan LAN and localhost for DarkMatter agents. Returns discovered peers not yet connected."""
+async def contact_card(ctx: Context) -> str:
+    """Return your signed contact card and available mailbox locators."""
     track_session(ctx)
-    result = await daemon_post("/discover", {}, timeout=60.0)
-    return await _with_context(result, ctx)
+    mb = get_mailbox()
+    loc = mb.locators()
+    return _ctx({
+        "success": True,
+        "contact_card": mb.contact_card(),
+        "locators": loc,
+        "hint": "Exchange signed contact cards out of band before introducing.",
+    })
 
 
 @mcp.tool(
     name="darkmatter_list_connections",
     annotations={
-        "title": "List Connections",
-        "readOnlyHint": True,
+        "title": "List Relationships",
+        "readOnlyHint": False,
         "destructiveHint": False,
-        "idempotentHint": True,
+        "idempotentHint": False,
         "openWorldHint": False,
-    }
+    },
 )
 async def list_connections(ctx: Context) -> str:
-    """List all your connections with display names, bios, trust scores, wallets, and activity.
-
-    This is the first thing to check when you want to know who you're connected to.
-    Returns up to 100 connections sorted by most recent activity.
-    """
+    """List relationships (peer id, locator, state, trust). Syncs mailboxes first."""
     track_session(ctx)
-    data = await daemon_get("/connections")
-    conns = data.get("connections", [])
-    for c in conns:
-        imp_data = c.pop("impression", None)
-        c["trust_score"] = round(imp_data["score"], 4) if imp_data else 0.0
-    conns.sort(key=lambda c: c.get("last_activity") or "", reverse=True)
-    conns = conns[:100]
-    return await _with_context({"count": len(conns), "connections": conns}, ctx)
-
-
-@mcp.tool(
-    name="darkmatter_get_peers_from",
-    annotations={
-        "title": "Get Peers From Agent",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
-    """Ask a connected peer for their top trusted peers. Cross-network discovery — find agents beyond your direct reach."""
-    track_session(ctx)
-
-    proxy = await daemon_post("/send_proxy", {
-        "target_agent_id": input.agent_id,
-        "path": "/__darkmatter__/get_peers",
-        "payload": {"n": input.n},
+    mb = get_mailbox()
+    sync = await asyncio.to_thread(mb.sync)
+    rels = mb.list_relationships()
+    rels.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+    return _ctx({
+        "count": len(rels),
+        "connections": rels,
+        "ingested": sync.get("ingested", []),
     })
-    if not proxy.get("success"):
-        return json.dumps({"success": False, "error": proxy.get("error", "Peer unreachable")})
-    data = proxy.get("response") or {}
-
-    # Filter out already-connected peers and ourselves
-    known = await daemon_get("/connections")
-    known_ids = {c.get("agent_id") for c in known.get("connections", [])}
-
-    new_peers = []
-    already_known = []
-    for peer in data.get("peers", []):
-        pid = peer.get("agent_id", "")
-        if pid in known_ids:
-            already_known.append(peer)
-        else:
-            new_peers.append(peer)
-
-    return await _with_context({
-        "success": True,
-        "source_agent_id": input.agent_id,
-        "source_display_name": data.get("display_name", ""),
-        "source_peer_count": data.get("peer_count", 0),
-        "new_peers": new_peers,
-        "already_connected": already_known,
-    }, ctx)
 
 
 @mcp.tool(
@@ -248,56 +220,45 @@ async def get_peers_from(input: GetPeersFromInput, ctx: Context) -> str:
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def wait_for_message(
     from_agents: Optional[list[str]] = None,
     timeout_seconds: float = 3600,
     ctx: Context = None,
 ) -> str:
-    """Block until a new inbox message arrives. Consumes and returns all matching messages.
-
-    Use darkmatter_send_message(broadcast=True) for FYI-only updates that don't need a response.
-    Broadcasts are silent — they won't trigger this function on the receiving end.
-    """
+    """Fetch remotes until a new inbox message arrives, then consume it."""
     if ctx is not None:
         track_session(ctx)
-
-    _log.info("wait_for_message: waiting (timeout=%ds, filter=%s)",
-              int(timeout_seconds), from_agents or "any")
-
-    loop = asyncio.get_event_loop()
+    mb = get_mailbox()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
     waited = False
 
     while True:
+        await asyncio.to_thread(mb.sync, True)
+        messages = mb.store.unconsumed_messages(from_agents)
+        if messages:
+            consumed = mb.store.consume_inbox(from_agents)
+            try:
+                from darkmatter.mcp.channel import emit_channel_message
+                for msg in consumed:
+                    await emit_channel_message(
+                        msg.get("content", ""),
+                        {"from_agent_id": msg.get("from", ""), "message_id": msg.get("id", "")},
+                    )
+            except Exception:
+                pass
+            return _ctx({"success": True, "messages": consumed, "waited": waited})
+
         remaining = deadline - loop.time()
         if remaining <= 0:
             mins = int(timeout_seconds / 60)
-            filter_desc = f" from {from_agents}" if from_agents else ""
-            return json.dumps({
+            return _ctx({
                 "success": False,
                 "timed_out": True,
-                "error": f"No message{filter_desc} received after {mins} minutes.",
-                "action": "Proactively reach out to peers or share updates. Use broadcast=True only "
-                          "for FYI/passive info — it won't interrupt peers. Then resume listening "
-                          "with darkmatter_wait_for_message.",
+                "error": f"No message received after {mins} minutes.",
+                "action": "Introduce a peer or send them a message, then wait again.",
             })
-
-        result = await daemon_post("/inbox/wait", {
-            "timeout_seconds": min(_WAIT_CHUNK_S, remaining),
-            "from_agents": from_agents,
-            "consume": True,
-        }, timeout=_WAIT_CHUNK_S + 10.0)
-
-        if result.get("error") and "messages" not in result:
-            return json.dumps({"success": False, "error": result["error"]})
-
-        messages = result.get("messages") or []
-        if messages:
-            _log.info("wait_for_message: matched %d message(s)", len(messages))
-            return await _with_context(
-                {"success": True, "messages": messages, "waited": waited, "_reminder": "listen"},
-                ctx,
-            )
         waited = True
+        await asyncio.sleep(min(2.0, remaining, mb.next_fetch_wait()))

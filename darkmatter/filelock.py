@@ -1,55 +1,91 @@
-"""
-Cross-platform file locking (Unix fcntl / Windows msvcrt).
+"""Small cross-process lock used to serialize one project's mailbox."""
 
-Usage:
-    from darkmatter.filelock import lock_exclusive, lock_shared, unlock, lock_exclusive_nb
+from __future__ import annotations
 
-All functions take a file object (or file descriptor).
-"""
-
-import os
 import sys
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
 
-if sys.platform == "win32":
-    import msvcrt
 
-    def lock_exclusive(f):
-        """Blocking exclusive lock."""
-        fd = f.fileno() if hasattr(f, "fileno") else f
-        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+class _LockState:
+    def __init__(self) -> None:
+        self.thread_lock = threading.RLock()
+        self.depth = 0
+        self.handle = None
 
-    def lock_shared(f):
-        """Shared lock (Windows has no true shared lock — falls back to exclusive)."""
-        lock_exclusive(f)
 
-    def lock_exclusive_nb(f):
-        """Non-blocking exclusive lock. Raises OSError if already locked."""
-        fd = f.fileno() if hasattr(f, "fileno") else f
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+_registry_guard = threading.Lock()
+_registry: dict[str, _LockState] = {}
 
-    def unlock(f):
-        """Release lock."""
-        fd = f.fileno() if hasattr(f, "fileno") else f
-        try:
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        except OSError:
-            pass  # Unlock may fail if fd was already closed or never locked; safe to ignore
 
-else:
-    import fcntl
+def _state_for(path: Path) -> _LockState:
+    key = str(path.resolve())
+    with _registry_guard:
+        return _registry.setdefault(key, _LockState())
 
-    def lock_exclusive(f):
-        fd = f.fileno() if hasattr(f, "fileno") else f
-        fcntl.flock(fd, fcntl.LOCK_EX)
 
-    def lock_shared(f):
-        fd = f.fileno() if hasattr(f, "fileno") else f
-        fcntl.flock(fd, fcntl.LOCK_SH)
+def _lock(handle) -> None:
+    if sys.platform == "win32":
+        import msvcrt
 
-    def lock_exclusive_nb(f):
-        fd = f.fileno() if hasattr(f, "fileno") else f
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        if not handle.read(1):
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
 
-    def unlock(f):
-        fd = f.fileno() if hasattr(f, "fileno") else f
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock(handle) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class ProjectLock:
+    """Re-entrant in-process and exclusive cross-process file lock."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._state = _state_for(self.path)
+
+    @contextmanager
+    def acquire(self) -> Iterator[None]:
+        with self._state.thread_lock:
+            if self._state.depth == 0:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                handle = self.path.open("a+b")
+                try:
+                    _lock(handle)
+                except Exception:
+                    handle.close()
+                    raise
+                self._state.handle = handle
+            self._state.depth += 1
+            try:
+                yield
+            finally:
+                self._state.depth -= 1
+                if self._state.depth == 0:
+                    handle = self._state.handle
+                    self._state.handle = None
+                    if handle is not None:
+                        try:
+                            _unlock(handle)
+                        finally:
+                            handle.close()
+
+
+__all__ = ["ProjectLock"]

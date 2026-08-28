@@ -1,0 +1,86 @@
+"""Portable, signed contact cards used for out-of-band first contact."""
+
+from __future__ import annotations
+
+import json
+from urllib.parse import urlsplit
+
+from darkmatter.security import sign_payload, verify_signed_payload
+
+DOMAIN_CONTACT = "darkmatter.contact.v3"
+CONTACT_VERSION = 3
+
+
+def validate_locator(locator: str) -> str:
+    if not isinstance(locator, str) or not locator.strip():
+        raise ValueError("Contact card locator is required")
+    locator = locator.strip()
+    parsed = urlsplit(locator)
+    if parsed.scheme in ("http", "https") and "@" in parsed.netloc:
+        raise ValueError("Mailbox locators must not contain embedded HTTP credentials")
+    return locator
+
+
+def _payload(card: dict) -> dict:
+    return {
+        "version": card.get("version"),
+        "agent_id": card.get("agent_id"),
+        "locator": card.get("locator"),
+        "display_name": card.get("display_name", ""),
+        "bio": card.get("bio", ""),
+    }
+
+
+def _canonical(card: dict) -> str:
+    return json.dumps(_payload(card), sort_keys=True, separators=(",", ":"))
+
+
+def create_contact_card(
+    private_key_hex: str,
+    agent_id: str,
+    locator: str,
+    *,
+    display_name: str = "",
+    bio: str = "",
+) -> dict:
+    locator = validate_locator(locator)
+    card = {
+        "version": CONTACT_VERSION,
+        "agent_id": agent_id,
+        "locator": locator,
+        "display_name": display_name,
+        "bio": bio,
+    }
+    card["signature"] = sign_payload(private_key_hex, DOMAIN_CONTACT, _canonical(card))
+    return card
+
+
+def verify_contact_card(card: dict) -> dict:
+    if not isinstance(card, dict):
+        raise ValueError("Contact card must be an object")
+    payload = _payload(card)
+    if payload["version"] != CONTACT_VERSION:
+        raise ValueError(f"Unsupported contact card version: {payload['version']}")
+    agent_id = payload["agent_id"]
+    if not isinstance(agent_id, str) or len(agent_id) != 64:
+        raise ValueError("Contact card agent_id must be a 32-byte public key")
+    try:
+        bytes.fromhex(agent_id)
+    except ValueError as exc:
+        raise ValueError("Contact card agent_id is not hexadecimal") from exc
+    payload["locator"] = validate_locator(payload["locator"])
+    signature = card.get("signature")
+    if not isinstance(signature, str) or not verify_signed_payload(
+        agent_id, signature, DOMAIN_CONTACT, _canonical(card),
+    ):
+        raise ValueError("Invalid contact card signature")
+    return {**payload, "signature": signature}
+
+
+__all__ = [
+    "CONTACT_VERSION",
+    "DOMAIN_CONTACT",
+    "create_contact_card",
+    "validate_locator",
+    "verify_contact_card",
+]
