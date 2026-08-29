@@ -18,6 +18,13 @@ from darkmatter.names import generate_agent_name
 PASSPORT_NAMES = ("passport", "passport.key")
 
 
+def _is_actionable(item: dict) -> bool:
+    item_type = item.get("type")
+    return item_type == "message" or (
+        isinstance(item_type, str) and item_type.startswith("antimatter_")
+    )
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -265,6 +272,7 @@ class LocalStore:
             return True
 
     def consume_inbox(self, from_agents: Optional[list[str]] = None) -> list[dict]:
+        """Consume unread messages and AntiMatter events."""
         with self.locked():
             items = self.load_inbox()
             matched, kept = [], []
@@ -275,7 +283,7 @@ class LocalStore:
                 if from_agents and item.get("from") not in from_agents:
                     kept.append(item)
                     continue
-                if item.get("type") != "message":
+                if not _is_actionable(item):
                     kept.append(item)
                     continue
                 item = dict(item)
@@ -286,9 +294,10 @@ class LocalStore:
             return matched
 
     def unconsumed_messages(self, from_agents: Optional[list[str]] = None) -> list[dict]:
+        """Return unread actionable correspondence, including AntiMatter events."""
         out = []
         for item in self.load_inbox():
-            if item.get("consumed") or item.get("type") != "message":
+            if item.get("consumed") or not _is_actionable(item):
                 continue
             if from_agents and item.get("from") not in from_agents:
                 continue

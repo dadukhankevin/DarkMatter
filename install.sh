@@ -40,7 +40,7 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 echo "Installing DarkMatter..."
-"$VENV_DIR/bin/pip" install --quiet --upgrade dmagent
+"$VENV_DIR/bin/pip" install --quiet --upgrade 'dmagent[solana]'
 
 VERSION=$("$VENV_DIR/bin/python" -c "import darkmatter; print(darkmatter.__version__)")
 echo "Installed dmagent $VERSION"
@@ -69,4 +69,4 @@ echo "Version: $VERSION"
 echo ""
 echo "Restart your MCP client to connect. Auth is automatic."
 echo ""
-echo "To update later:  $VENV_DIR/bin/pip install --upgrade dmagent"
+echo "To update later:  $VENV_DIR/bin/pip install --upgrade 'dmagent[solana]'"

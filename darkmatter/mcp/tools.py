@@ -10,12 +10,18 @@ from darkmatter.gitbox.mailbox import get_mailbox
 from darkmatter.logging import get_logger
 from darkmatter.mcp import mcp, track_session
 from darkmatter.mcp.schemas import (
+    AntimatterAction,
+    AntimatterInput,
     ConfigureInput,
     ConnectionAction,
     ConnectionInput,
     SendMessageInput,
     UpdateBioInput,
+    WalletAction,
+    WalletInput,
 )
+from darkmatter.wallet.payments import SolanaPaymentService
+from darkmatter.wallet.solana import WalletError, network_context
 from darkmatter.wakeup import (
     consume_available_messages,
     format_wake_message,
@@ -63,6 +69,14 @@ def _ctx(result: dict) -> str:
     result["_locators"] = loc
     result["_unread"] = len(mb.store.unconsumed_messages())
     return json.dumps(result)
+
+
+def _wallet_ctx(result: dict, network: str) -> str:
+    context = network_context(network)
+    result["network"] = context["network"]
+    result["network_alert"] = context["alert"]
+    result["network_context"] = context
+    return _ctx(result)
 
 
 @mcp.tool(
@@ -146,6 +160,221 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
         ))
     ok = all(r.get("success") for r in results)
     return _ctx({"success": ok, "results": results})
+
+
+@mcp.tool(
+    name="darkmatter_antimatter",
+    annotations={
+        "title": "Manage AntiMatter Settlements",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def antimatter(params: AntimatterInput, ctx: Context) -> str:
+    """Offer, accept, invoice, receipt, confirm, dispute, or inspect a settlement."""
+    track_session(ctx)
+    mb = get_mailbox()
+
+    if params.action in (AntimatterAction.LIST, AntimatterAction.GET):
+        sync = await asyncio.to_thread(mb.sync)
+        if params.action == AntimatterAction.LIST:
+            settlements = await asyncio.to_thread(
+                mb.list_settlements,
+                params.peer_id,
+                params.status,
+            )
+            return _ctx({
+                "success": True,
+                "count": len(settlements),
+                "settlements": settlements,
+                "ingested": sync.get("ingested", []),
+            })
+        if not params.settlement_id:
+            return _ctx({"success": False, "error": "settlement_id is required for get"})
+        settlement = await asyncio.to_thread(mb.get_settlement, params.settlement_id)
+        if settlement is None:
+            return _ctx({"success": False, "error": "Unknown settlement_id"})
+        return _ctx({"success": True, "settlement": settlement, "ingested": sync.get("ingested", [])})
+
+    if not params.peer_id:
+        return _ctx({"success": False, "error": "peer_id is required"})
+
+    if params.action == AntimatterAction.OFFER:
+        result = await asyncio.to_thread(
+            mb.antimatter_offer,
+            params.peer_id,
+            params.description,
+            params.amount,
+            params.currency,
+            params.rail,
+            params.proposer_role.value,
+            params.terms,
+            params.metadata,
+            params.valid_until,
+            params.settlement_id,
+        )
+        return _ctx(result)
+
+    if not params.settlement_id:
+        return _ctx({"success": False, "error": "settlement_id is required"})
+
+    if params.action == AntimatterAction.ACCEPT:
+        result = await asyncio.to_thread(
+            mb.antimatter_accept,
+            params.peer_id,
+            params.settlement_id,
+            params.note or "",
+            params.metadata,
+        )
+    elif params.action == AntimatterAction.INVOICE:
+        result = await asyncio.to_thread(
+            mb.antimatter_invoice,
+            params.peer_id,
+            params.settlement_id,
+            params.destination,
+            params.note or "",
+            params.due_at,
+        )
+    elif params.action == AntimatterAction.RECEIPT:
+        if not params.tx_id:
+            return _ctx({"success": False, "error": "tx_id is required for receipt"})
+        result = await asyncio.to_thread(
+            mb.antimatter_receipt,
+            params.peer_id,
+            params.settlement_id,
+            params.tx_id,
+            params.proof,
+            params.note or "",
+        )
+    elif params.action == AntimatterAction.CONFIRM:
+        result = await asyncio.to_thread(
+            mb.antimatter_confirm,
+            params.peer_id,
+            params.settlement_id,
+            params.receipt_id,
+            params.verification,
+            params.note or "",
+        )
+    elif params.action == AntimatterAction.DISPUTE:
+        if not params.reason:
+            return _ctx({"success": False, "error": "reason is required for dispute"})
+        result = await asyncio.to_thread(
+            mb.antimatter_dispute,
+            params.peer_id,
+            params.settlement_id,
+            params.reason,
+            params.reference_id,
+            params.evidence,
+        )
+    else:
+        result = {"success": False, "error": f"Unknown AntiMatter action: {params.action}"}
+    return _ctx(result)
+
+
+@mcp.tool(
+    name="darkmatter_wallet",
+    annotations={
+        "title": "Use AntiMatter Solana Wallet",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def wallet(params: WalletInput, ctx: Context) -> str:
+    """Use a passport-bound Solana wallet; devnet is the safe default."""
+    track_session(ctx)
+    mb = get_mailbox()
+    selected_network = params.network
+    try:
+        service = SolanaPaymentService(mb, network=params.network)
+        selected_network = service.network
+        if params.action == WalletAction.TOKENS:
+            return _wallet_ctx(service.tokens(), selected_network)
+        if params.action == WalletAction.STATUS:
+            return _wallet_ctx(
+                await asyncio.to_thread(service.status, params.asset),
+                selected_network,
+            )
+        if params.action == WalletAction.CLAIM:
+            return _wallet_ctx({
+                "success": True,
+                "network": service.network,
+                "wallet_claim": await asyncio.to_thread(service.claim),
+            }, selected_network)
+        if params.action == WalletAction.AIRDROP:
+            result = await asyncio.to_thread(
+                service.wallet.request_airdrop,
+                params.amount or "1",
+            )
+            return _wallet_ctx(result, selected_network)
+
+        await asyncio.to_thread(mb.sync)
+        if params.action == WalletAction.OFFER:
+            if not params.peer_id or not params.description or not params.amount:
+                return _wallet_ctx({
+                    "success": False,
+                    "error": "peer_id, description, and amount are required for offer",
+                }, selected_network)
+            result = await asyncio.to_thread(
+                service.offer,
+                params.peer_id,
+                params.description,
+                params.amount,
+                params.asset,
+                delegate_claim=params.delegate_claim,
+                metadata=params.metadata,
+                valid_until=params.valid_until,
+                settlement_id=params.settlement_id,
+            )
+            return _wallet_ctx(result, selected_network)
+        if not params.settlement_id:
+            return _wallet_ctx(
+                {"success": False, "error": "settlement_id is required"},
+                selected_network,
+            )
+        if params.action == WalletAction.QUOTE:
+            result = await asyncio.to_thread(service.quote, params.settlement_id)
+        elif params.action == WalletAction.INVOICE:
+            result = await asyncio.to_thread(
+                service.invoice,
+                params.settlement_id,
+                memo=params.memo,
+                due_at=params.due_at,
+            )
+        elif params.action == WalletAction.PAY:
+            result = await asyncio.to_thread(
+                service.pay,
+                params.settlement_id,
+                confirm_external=params.confirm_external,
+                allow_create_ata=params.allow_create_ata,
+                note=params.memo,
+            )
+        elif params.action == WalletAction.VERIFY:
+            result = await asyncio.to_thread(
+                service.verify,
+                params.settlement_id,
+                receipt_id=params.receipt_id,
+            )
+        elif params.action == WalletAction.SETTLE:
+            result = await asyncio.to_thread(
+                service.settle,
+                params.settlement_id,
+                confirm_external=params.confirm_external,
+                allow_create_ata=params.allow_create_ata,
+                receipt_id=params.receipt_id,
+                note=params.memo,
+            )
+        else:
+            result = {"success": False, "error": f"Unknown wallet action: {params.action}"}
+        return _wallet_ctx(result, selected_network)
+    except (WalletError, ValueError, OSError) as exc:
+        return _wallet_ctx(
+            {"success": False, "error": str(exc)},
+            selected_network,
+        )
 
 
 @mcp.tool(

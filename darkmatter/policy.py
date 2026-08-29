@@ -1,4 +1,4 @@
-"""Optional `.darkmatter/policy.py` — fetch_interval, should_hint, on_fetched."""
+"""Optional project policy hooks for fetching, hints, and settlement trust."""
 
 from __future__ import annotations
 

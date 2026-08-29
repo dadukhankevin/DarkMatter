@@ -24,9 +24,19 @@ MESSAGING:
 - darkmatter_connection action=accept with their contact_card.
 - darkmatter_connection action=ignore|close with agent_id.
 - darkmatter_send_message with target_agent_id — sealed mail to an active relationship.
+- darkmatter_antimatter — optional rail-neutral offers, invoices, receipts, confirmations, and disputes.
+- darkmatter_wallet — explicit Solana devnet/mainnet settlement, proof verification, and 1% contribution.
 - darkmatter_list_connections — sync remotes and list relationships + trust.
 - darkmatter_wait_for_message — fetch due remotes until inbox mail arrives.
 - darkmatter_stop_hook — host lifecycle adapter installed by install-mcp --wake.
+
+SOLANA:
+- darkmatter_wallet defaults to devnet and binds payment addresses to passports.
+- Every wallet result has network_alert. DEVNET means test assets; MAINNET-BETA means real assets.
+- Read network_alert before any action and surface it when discussing a transaction.
+- pay/settle may move assets only with confirm_external=true; never infer approval.
+- mainnet spending also needs DARKMATTER_SOLANA_ENABLE_MAINNET=I_UNDERSTAND.
+- The DarkMatter token is asset=DM on mainnet-beta (Token-2022); there is no named devnet DM mint.
 
 First contact is bilateral because mailboxes are fetch-only. Never claim a request \
 arrived until you have the sender's contact card. Reply to mail, then wait again.\

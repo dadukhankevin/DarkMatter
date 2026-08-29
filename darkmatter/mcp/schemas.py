@@ -19,6 +19,35 @@ class ConnectionAction(str, Enum):
     CLOSE = "close"
 
 
+class AntimatterAction(str, Enum):
+    OFFER = "offer"
+    ACCEPT = "accept"
+    INVOICE = "invoice"
+    RECEIPT = "receipt"
+    CONFIRM = "confirm"
+    DISPUTE = "dispute"
+    LIST = "list"
+    GET = "get"
+
+
+class AntimatterRole(str, Enum):
+    PAYER = "payer"
+    PAYEE = "payee"
+
+
+class WalletAction(str, Enum):
+    TOKENS = "tokens"
+    STATUS = "status"
+    CLAIM = "claim"
+    AIRDROP = "airdrop"
+    OFFER = "offer"
+    QUOTE = "quote"
+    INVOICE = "invoice"
+    PAY = "pay"
+    VERIFY = "verify"
+    SETTLE = "settle"
+
+
 class ConnectionInput(BaseModel):
     """Introduce, accept, ignore, or close a relationship."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -45,6 +74,110 @@ class SendMessageInput(BaseModel):
     )
     target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agent ids to send to")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
+
+
+class AntimatterInput(BaseModel):
+    """Create or inspect a rail-neutral AntiMatter settlement."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    action: AntimatterAction
+    peer_id: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Active relationship counterparty; optional only for list/get",
+    )
+    settlement_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+    proposer_role: AntimatterRole = Field(
+        default=AntimatterRole.PAYER,
+        description="Whether the offer sender will pay or be paid",
+    )
+    description: Optional[str] = Field(default=None, min_length=1, max_length=2000)
+    amount: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Positive decimal string; strings preserve exact amounts",
+    )
+    currency: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    rail: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Settlement rail identifier, such as manual, stripe, solana, or credits",
+    )
+    terms: Optional[dict] = Field(default_factory=dict, description="Additional offer terms")
+    metadata: Optional[dict] = Field(default_factory=dict)
+    valid_until: Optional[str] = Field(default=None, max_length=64)
+    note: Optional[str] = Field(default="", max_length=1000)
+    destination: Optional[dict] = Field(
+        default_factory=dict,
+        description="Encrypted rail-specific invoice destination; never include credentials",
+    )
+    due_at: Optional[str] = Field(default=None, max_length=64)
+    tx_id: Optional[str] = Field(default=None, min_length=1, max_length=512)
+    proof: Optional[dict] = Field(default_factory=dict, description="Rail-specific settlement proof")
+    receipt_id: Optional[str] = Field(default=None, max_length=128)
+    verification: Optional[dict] = Field(default_factory=dict)
+    reason: Optional[str] = Field(default=None, min_length=1, max_length=2000)
+    reference_id: Optional[str] = Field(default=None, max_length=128)
+    evidence: Optional[dict] = Field(default_factory=dict)
+    status: Optional[str] = Field(default=None, max_length=32, description="Optional list filter")
+
+
+class WalletInput(BaseModel):
+    """Use the optional Solana rail for an AntiMatter settlement."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    action: WalletAction
+    network: str = Field(
+        default="devnet",
+        pattern=r"^(devnet|mainnet|mainnet-beta)$",
+        description=(
+            "devnet uses test assets; mainnet/mainnet-beta uses real assets and also "
+            "requires an environment opt-in for spending"
+        ),
+    )
+    asset: str = Field(
+        default="SOL",
+        min_length=1,
+        max_length=64,
+        description="SOL, a named token, or an arbitrary mint address",
+    )
+    peer_id: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    settlement_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+    description: Optional[str] = Field(default=None, min_length=1, max_length=2000)
+    amount: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    delegate_claim: Optional[dict] = Field(
+        default=None,
+        description="Passport-signed wallet claim from the third-party AntiMatter delegate",
+    )
+    metadata: Optional[dict] = Field(default_factory=dict)
+    valid_until: Optional[str] = Field(default=None, max_length=64)
+    memo: str = Field(default="", max_length=1000)
+    due_at: Optional[str] = Field(default=None, max_length=64)
+    receipt_id: Optional[str] = Field(default=None, max_length=128)
+    confirm_external: bool = Field(
+        default=False,
+        description="Must be true for any action that may submit an on-chain transfer",
+    )
+    allow_create_ata: bool = Field(
+        default=False,
+        description="Allow this wallet to pay rent to create a recipient token account",
+    )
 
 
 class UpdateBioInput(BaseModel):

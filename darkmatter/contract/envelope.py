@@ -19,6 +19,15 @@ from darkmatter.security import (
     verify_signed_payload,
 )
 
+ANTIMATTER_ENVELOPE_TYPES = frozenset({
+    "antimatter_offer",
+    "antimatter_accept",
+    "antimatter_invoice",
+    "antimatter_receipt",
+    "antimatter_confirm",
+    "antimatter_dispute",
+})
+
 ENVELOPE_TYPES = frozenset({
     "introduce",
     "message",
@@ -26,7 +35,9 @@ ENVELOPE_TYPES = frozenset({
     "ignore",
     "receipt",
     "hint",
-})
+}) | ANTIMATTER_ENVELOPE_TYPES
+
+ACTIONABLE_ENVELOPE_TYPES = frozenset({"message"}) | ANTIMATTER_ENVELOPE_TYPES
 
 
 def _now() -> str:

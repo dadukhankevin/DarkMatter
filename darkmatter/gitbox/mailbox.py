@@ -13,7 +13,27 @@ from typing import Optional
 
 from darkmatter.config import MAX_CONTENT_LENGTH, MAX_ENVELOPE_FILE_SIZE, VISIBILITIES
 from darkmatter.contract.contact import create_contact_card, validate_locator, verify_contact_card
-from darkmatter.contract.envelope import is_expired, is_expired_at, open_envelope, seal_envelope
+from darkmatter.antimatter import (
+    ACCEPT as ANTIMATTER_ACCEPT,
+    CONFIRM as ANTIMATTER_CONFIRM,
+    DISPUTE as ANTIMATTER_DISPUTE,
+    INVOICE as ANTIMATTER_INVOICE,
+    OFFER as ANTIMATTER_OFFER,
+    RECEIPT as ANTIMATTER_RECEIPT,
+    AntimatterLedger,
+    event_body as antimatter_event_body,
+    new_settlement_id,
+    offer_body as antimatter_offer_body,
+    summarize_event as summarize_antimatter_event,
+)
+from darkmatter.contract.envelope import (
+    ACTIONABLE_ENVELOPE_TYPES,
+    ANTIMATTER_ENVELOPE_TYPES,
+    is_expired,
+    is_expired_at,
+    open_envelope,
+    seal_envelope,
+)
 from darkmatter.contract.types import REL_ACTIVE, REL_CLOSED, REL_PENDING, Envelope, Relationship
 from darkmatter.gitbox.gitutil import (
     clone_or_update,
@@ -78,6 +98,7 @@ class Mailbox:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.store = LocalStore(self.root)
+        self.antimatter = AntimatterLedger(self.store)
         self.work = self.root / ".darkmatter" / "mailbox"
         self.bare = self.root / ".darkmatter" / "mailbox.git"
         self.peers_dir = self.root / ".darkmatter" / "peers"
@@ -403,13 +424,23 @@ class Mailbox:
             return {"success": False, "error": "Message content is required"}
         if len(content) > MAX_CONTENT_LENGTH:
             return {"success": False, "error": f"Message exceeds {MAX_CONTENT_LENGTH} characters"}
+        body = {"content": content}
+        if extra:
+            body["metadata"] = dict(extra)
+        return self._send_envelope(peer_id, env_type, body, expires_at)
+
+    def _send_envelope(
+        self,
+        peer_id: str,
+        env_type: str,
+        body: dict,
+        expires_at: Optional[str] = None,
+    ) -> dict:
+        """Seal, project, and publish a relationship-scoped envelope."""
         rel = self.store.get_relationship(peer_id)
         if rel is None or rel.state != REL_ACTIVE:
             return {"success": False, "error": "No active relationship"}
         try:
-            body = {"content": content}
-            if extra:
-                body["metadata"] = dict(extra)
             env = seal_envelope(
                 self.store.private_key_hex,
                 self.agent_id,
@@ -420,9 +451,194 @@ class Mailbox:
             )
         except (TypeError, ValueError) as exc:
             return {"success": False, "error": str(exc)}
+        projection = None
+        if env_type in ANTIMATTER_ENVELOPE_TYPES:
+            projection = self.antimatter.apply_event(
+                env_type,
+                self.agent_id,
+                peer_id,
+                env.id,
+                env.timestamp,
+                body,
+            )
+            if not projection.get("success"):
+                return projection
         self._write_outbox(env)
         self._publish(f"{env_type} {env.id[:12]}")
-        return self._with_publish({"success": True, "envelope_id": env.id, "to": peer_id})
+        result = {"success": True, "envelope_id": env.id, "to": peer_id}
+        if projection:
+            result["settlement"] = projection["settlement"]
+            result["trust_delta"] = projection.get("trust_delta", 0.0)
+        return self._with_publish(result)
+
+    @_locked
+    def antimatter_offer(
+        self,
+        peer_id: str,
+        description: str,
+        amount,
+        currency: str,
+        rail: str,
+        proposer_role: str = "payer",
+        terms: Optional[dict] = None,
+        metadata: Optional[dict] = None,
+        valid_until: Optional[str] = None,
+        settlement_id: Optional[str] = None,
+    ) -> dict:
+        """Offer exact settlement terms to an active relationship."""
+        settlement_id = settlement_id or new_settlement_id()
+        payer_id = self.agent_id if proposer_role == "payer" else peer_id
+        payee_id = self.agent_id if proposer_role == "payee" else peer_id
+        body = antimatter_offer_body(
+            settlement_id,
+            payer_id=payer_id,
+            payee_id=payee_id,
+            proposer_role=proposer_role,
+            description=description,
+            amount=amount,
+            currency=currency,
+            rail=rail,
+            terms=terms,
+            metadata=metadata,
+            valid_until=valid_until,
+        )
+        return self._send_envelope(peer_id, ANTIMATTER_OFFER, body, valid_until)
+
+    def _antimatter_record(self, peer_id: str, settlement_id: str) -> tuple[Optional[dict], Optional[dict]]:
+        record = self.antimatter.get(settlement_id)
+        if record is None:
+            return None, {"success": False, "error": "Unknown settlement_id"}
+        if record.get("peer_id") != peer_id:
+            return None, {"success": False, "error": "settlement belongs to a different relationship"}
+        return record, None
+
+    @_locked
+    def antimatter_accept(
+        self,
+        peer_id: str,
+        settlement_id: str,
+        note: str = "",
+        metadata: Optional[dict] = None,
+    ) -> dict:
+        record, error = self._antimatter_record(peer_id, settlement_id)
+        if error:
+            return error
+        body = antimatter_event_body(
+            "accept",
+            settlement_id,
+            offer_id=record["offer"]["id"],
+            note=note,
+            metadata=metadata or {},
+        )
+        return self._send_envelope(peer_id, ANTIMATTER_ACCEPT, body)
+
+    @_locked
+    def antimatter_invoice(
+        self,
+        peer_id: str,
+        settlement_id: str,
+        destination: Optional[dict] = None,
+        memo: str = "",
+        due_at: Optional[str] = None,
+    ) -> dict:
+        record, error = self._antimatter_record(peer_id, settlement_id)
+        if error:
+            return error
+        acceptance = record.get("acceptance")
+        if not acceptance:
+            return {"success": False, "error": "settlement has not been accepted"}
+        body = antimatter_event_body(
+            "invoice",
+            settlement_id,
+            acceptance_id=acceptance["id"],
+            destination=destination or {},
+            memo=memo,
+            due_at=due_at,
+        )
+        return self._send_envelope(peer_id, ANTIMATTER_INVOICE, body)
+
+    @_locked
+    def antimatter_receipt(
+        self,
+        peer_id: str,
+        settlement_id: str,
+        tx_id: str,
+        proof: Optional[dict] = None,
+        note: str = "",
+    ) -> dict:
+        record, error = self._antimatter_record(peer_id, settlement_id)
+        if error:
+            return error
+        acceptance = record.get("acceptance")
+        if not acceptance:
+            return {"success": False, "error": "settlement has not been accepted"}
+        invoice = record.get("invoice")
+        body = antimatter_event_body(
+            "receipt",
+            settlement_id,
+            acceptance_id=acceptance["id"],
+            invoice_id=invoice["id"] if invoice else None,
+            tx_id=tx_id,
+            proof=proof or {},
+            note=note,
+        )
+        return self._send_envelope(peer_id, ANTIMATTER_RECEIPT, body)
+
+    @_locked
+    def antimatter_confirm(
+        self,
+        peer_id: str,
+        settlement_id: str,
+        receipt_id: Optional[str] = None,
+        verification: Optional[dict] = None,
+        note: str = "",
+    ) -> dict:
+        record, error = self._antimatter_record(peer_id, settlement_id)
+        if error:
+            return error
+        receipts = record.get("receipts") or []
+        if not receipts:
+            return {"success": False, "error": "settlement has no receipt"}
+        receipt_id = receipt_id or receipts[-1]["id"]
+        body = antimatter_event_body(
+            "confirm",
+            settlement_id,
+            receipt_id=receipt_id,
+            verification=verification or {},
+            note=note,
+        )
+        return self._send_envelope(peer_id, ANTIMATTER_CONFIRM, body)
+
+    @_locked
+    def antimatter_dispute(
+        self,
+        peer_id: str,
+        settlement_id: str,
+        reason: str,
+        reference_id: Optional[str] = None,
+        evidence: Optional[dict] = None,
+    ) -> dict:
+        record, error = self._antimatter_record(peer_id, settlement_id)
+        if error:
+            return error
+        body = antimatter_event_body(
+            "dispute",
+            settlement_id,
+            reason=reason,
+            reference_id=reference_id,
+            evidence=evidence or {},
+        )
+        return self._send_envelope(peer_id, ANTIMATTER_DISPUTE, body)
+
+    def list_settlements(
+        self,
+        peer_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[dict]:
+        return self.antimatter.list(peer_id=peer_id, status=status)
+
+    def get_settlement(self, settlement_id: str) -> Optional[dict]:
+        return self.antimatter.get(settlement_id)
 
     @_locked
     def accept(
@@ -544,6 +760,20 @@ class Mailbox:
                 return "receipt"
             return None
 
+        antimatter_result = None
+        if env.type in ANTIMATTER_ENVELOPE_TYPES:
+            rel = self.store.get_relationship(env.from_id)
+            if rel is None or rel.state != REL_ACTIVE:
+                return None
+            antimatter_result = self.antimatter.apply_event(
+                env.type,
+                env.from_id,
+                env.from_id,
+                env.id,
+                env.timestamp,
+                body,
+            )
+
         if env.type == "accept":
             peer_locator = body.get("locator") or body.get("remote") or peer_remote
             self.store.upsert_relationship(
@@ -572,6 +802,9 @@ class Mailbox:
                 if existing is not None and existing.state != REL_CLOSED:
                     self.store.upsert_relationship(about, last_fetched_at="")
 
+        content = body.get("content", "")
+        if env.type in ANTIMATTER_ENVELOPE_TYPES:
+            content = summarize_antimatter_event(env.type, body)
         item = {
             "id": env.id,
             "type": env.type,
@@ -579,10 +812,12 @@ class Mailbox:
             "to": env.to_id,
             "timestamp": env.timestamp,
             "expires_at": env.expires_at,
-            "content": body.get("content", ""),
+            "content": content,
             "body": body,
-            "consumed": env.type != "message",
+            "consumed": env.type not in ACTIONABLE_ENVELOPE_TYPES,
         }
+        if antimatter_result and not antimatter_result.get("success"):
+            item["protocol_error"] = antimatter_result.get("error", "Invalid AntiMatter event")
         self.store.append_inbox(item)
         if env.type not in ("receipt", "hint"):
             self._receipt(env.from_id, env.id)
@@ -605,7 +840,7 @@ class Mailbox:
         return min(waits) if waits else 2.0
 
     def _new_message_recipients(self, repo: Path, old_tip: str, new_tip: str) -> set[str]:
-        """Recipients of message envelopes added or changed since the last fetch."""
+        """Recipients of actionable envelopes added or changed since the last fetch."""
         if not old_tip or not new_tip or old_tip == new_tip:
             return set()
         changed = git(
@@ -625,7 +860,7 @@ class Mailbox:
                 data = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError):
                 continue
-            if data.get("type") == "message" and data.get("to"):
+            if data.get("type") in ACTIONABLE_ENVELOPE_TYPES and data.get("to"):
                 recipients.add(data["to"])
         return recipients
 

@@ -58,9 +58,12 @@ def format_wake_message(messages: list[dict]) -> str:
     payload = [
         {
             "id": message.get("id", ""),
+            "type": message.get("type", "message"),
             "from": message.get("from", ""),
             "timestamp": message.get("timestamp", ""),
             "content": message.get("content", ""),
+            "settlement_id": (message.get("body") or {}).get("settlement_id", ""),
+            "protocol_error": message.get("protocol_error", ""),
             "metadata": (message.get("body") or {}).get("metadata", {}),
         }
         for message in messages

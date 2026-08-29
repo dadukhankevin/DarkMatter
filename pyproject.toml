@@ -31,6 +31,12 @@ dependencies = [
     "pydantic>=2.0.0",
 ]
 
+[project.optional-dependencies]
+solana = [
+    "solana>=0.36.11,<0.41.0",
+    "solders>=0.27.1,<0.30.0",
+]
+
 [project.scripts]
 darkmatter = "darkmatter.cli:main"
 
@@ -45,6 +51,7 @@ path = "darkmatter/__init__.py"
 [tool.hatch.build.targets.sdist]
 include = [
     "darkmatter/",
+    "ANTIMATTER.md",
     "README.md",
     "LICENSE",
 ]
