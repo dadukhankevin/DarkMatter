@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Callable
 
 
+DEFAULT_WAKE_TIMEOUT = 3600.0
+
+
 @dataclass(frozen=True)
 class InstallTarget:
     client: str
@@ -72,6 +75,78 @@ def _merge_json_config(path: Path, update_fn: Callable[[dict], None]) -> None:
     with path.open("w") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
+
+
+def _is_darkmatter_wake_handler(handler: object) -> bool:
+    if not isinstance(handler, dict):
+        return False
+    if (
+        handler.get("type") == "mcp_tool"
+        and handler.get("server") == "darkmatter"
+        and handler.get("tool") == "darkmatter_stop_hook"
+    ):
+        return True
+    args = handler.get("args")
+    return (
+        handler.get("type") == "command"
+        and isinstance(args, list)
+        and "darkmatter" in args
+        and "wait-hook" in args
+    )
+
+
+def _replace_darkmatter_stop_hook(config: dict, handler: dict) -> None:
+    hooks = config.setdefault("hooks", {})
+    stop_groups = hooks.setdefault("Stop", [])
+    if not isinstance(stop_groups, list):
+        raise ValueError("hooks.Stop must be a JSON array")
+
+    kept_groups = []
+    for group in stop_groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            kept_groups.append(group)
+            continue
+        kept_handlers = [item for item in group["hooks"] if not _is_darkmatter_wake_handler(item)]
+        if kept_handlers:
+            updated = dict(group)
+            updated["hooks"] = kept_handlers
+            kept_groups.append(updated)
+    kept_groups.append({"hooks": [handler]})
+    hooks["Stop"] = kept_groups
+
+
+def _install_claude_wake_hook(
+    path: Path,
+    command: str,
+    timeout_seconds: float,
+) -> None:
+    handler = {
+        "type": "command",
+        "command": command,
+        "args": [
+            "-m",
+            "darkmatter",
+            "wait-hook",
+            "--timeout-seconds",
+            f"{timeout_seconds:g}",
+        ],
+        "asyncRewake": True,
+        "timeout": timeout_seconds + 30,
+        "statusMessage": "Waiting for DarkMatter mail",
+    }
+    _merge_json_config(path, lambda config: _replace_darkmatter_stop_hook(config, handler))
+
+
+def _install_codex_wake_hook(path: Path, timeout_seconds: float) -> None:
+    handler = {
+        "type": "mcp_tool",
+        "server": "darkmatter",
+        "tool": "darkmatter_stop_hook",
+        "input": {"timeout_seconds": timeout_seconds},
+        "timeout": timeout_seconds + 30,
+        "statusMessage": "Waiting for DarkMatter mail",
+    }
+    _merge_json_config(path, lambda config: _replace_darkmatter_stop_hook(config, handler))
 
 
 def _install_mcp_servers_json(path: Path, command: str, client: str, display_name: str) -> None:
@@ -139,7 +214,15 @@ def _install_codex_toml(path: Path, command: str, client: str, display_name: str
     path.write_text(content)
 
 
-def install_target(target: InstallTarget, *, command: str, display_name: str, home: Path) -> tuple[bool, str]:
+def install_target(
+    target: InstallTarget,
+    *,
+    command: str,
+    display_name: str,
+    home: Path,
+    wake: bool = False,
+    wake_timeout_seconds: float = DEFAULT_WAKE_TIMEOUT,
+) -> tuple[bool, str]:
     if not target.supported:
         return False, f"{target.label}: skipped (no native MCP config to install)"
 
@@ -153,12 +236,20 @@ def install_target(target: InstallTarget, *, command: str, display_name: str, ho
             _install_opencode(path, command, target.client, display_name)
         else:
             return False, f"{target.label}: unsupported config format"
+        wake_path = None
+        if wake and target.client == "claude-code":
+            wake_path = home / ".claude/settings.json"
+            _install_claude_wake_hook(wake_path, command, wake_timeout_seconds)
+        elif wake and target.client == "codex":
+            wake_path = home / ".codex/hooks.json"
+            _install_codex_wake_hook(wake_path, wake_timeout_seconds)
     except json.JSONDecodeError as exc:
         return False, f"{target.label}: invalid JSON in {path} ({exc})"
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return False, f"{target.label}: failed to write {path} ({exc})"
 
-    return True, f"{target.label}: installed to {path}"
+    suffix = f" with wake hook at {wake_path}" if wake_path else ""
+    return True, f"{target.label}: installed to {path}{suffix}"
 
 
 def _target_by_client(client: str) -> InstallTarget:
@@ -177,6 +268,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--display-name", default=os.environ.get("DARKMATTER_DISPLAY_NAME", "darkmatter-agent"))
     parser.add_argument("--python", dest="python_cmd", default=sys.executable)
     parser.add_argument("--home", default=str(Path.home()))
+    parser.add_argument(
+        "--wake",
+        action="store_true",
+        help="Install a Stop hook for Codex or Claude Code that waits for peer mail.",
+    )
+    parser.add_argument(
+        "--wake-timeout",
+        type=float,
+        default=DEFAULT_WAKE_TIMEOUT,
+        metavar="SECONDS",
+        help=f"How long each wake waiter remains active (default: {DEFAULT_WAKE_TIMEOUT:g}).",
+    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--client", action="append", dest="clients", choices=client_names)
     selection.add_argument("--all", action="store_true", help="Install into every supported native MCP client.")
@@ -185,6 +288,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.wake_timeout <= 0:
+        raise SystemExit("--wake-timeout must be greater than zero")
     home = Path(args.home).expanduser()
 
     if args.clients:
@@ -199,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
             command=args.python_cmd,
             display_name=args.display_name,
             home=home,
+            wake=args.wake,
+            wake_timeout_seconds=args.wake_timeout,
         )
         print(message)
         if ok:

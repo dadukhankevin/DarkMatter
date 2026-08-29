@@ -26,6 +26,7 @@ MESSAGING:
 - darkmatter_send_message with target_agent_id — sealed mail to an active relationship.
 - darkmatter_list_connections — sync remotes and list relationships + trust.
 - darkmatter_wait_for_message — fetch due remotes until inbox mail arrives.
+- darkmatter_stop_hook — host lifecycle adapter installed by install-mcp --wake.
 
 First contact is bilateral because mailboxes are fetch-only. Never claim a request \
 arrived until you have the sender's contact card. Reply to mail, then wait again.\

@@ -80,6 +80,62 @@ def test_codex_toml() -> None:
         report("adds codex client env", 'DARKMATTER_CLIENT = "codex"' in text, text)
 
 
+def test_wake_hooks() -> None:
+    print("\nTest: editable wake hooks")
+    with tempfile.TemporaryDirectory(prefix="dm_installer_") as tmp:
+        home = Path(tmp)
+        codex_hooks = home / ".codex/hooks.json"
+        codex_hooks.parent.mkdir(parents=True, exist_ok=True)
+        codex_hooks.write_text(json.dumps({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "keep-me"}]}],
+            },
+        }))
+        ok, message = install_target(
+            _target("codex"),
+            command="/tmp/python",
+            display_name="mail-agent",
+            home=home,
+            wake=True,
+            wake_timeout_seconds=45,
+        )
+        report("codex wake install succeeds", ok, message)
+        data = json.loads(codex_hooks.read_text())
+        handlers = [handler for group in data["hooks"]["Stop"] for handler in group["hooks"]]
+        wake = [handler for handler in handlers if handler.get("tool") == "darkmatter_stop_hook"]
+        report("codex preserves other Stop hooks", any(h.get("command") == "keep-me" for h in handlers), str(data))
+        report("codex adds MCP Stop hook", len(wake) == 1, str(data))
+        report("codex wake timeout is editable", wake[0]["input"]["timeout_seconds"] == 45, str(wake))
+
+        install_target(
+            _target("codex"),
+            command="/tmp/python",
+            display_name="mail-agent",
+            home=home,
+            wake=True,
+            wake_timeout_seconds=60,
+        )
+        data = json.loads(codex_hooks.read_text())
+        handlers = [handler for group in data["hooks"]["Stop"] for handler in group["hooks"]]
+        wake = [handler for handler in handlers if handler.get("tool") == "darkmatter_stop_hook"]
+        report("codex wake install is idempotent", len(wake) == 1, str(data))
+        report("codex wake install updates timeout", wake[0]["input"]["timeout_seconds"] == 60, str(wake))
+
+        ok, message = install_target(
+            _target("claude-code"),
+            command="/tmp/python",
+            display_name="mail-agent",
+            home=home,
+            wake=True,
+            wake_timeout_seconds=45,
+        )
+        report("claude wake install succeeds", ok, message)
+        data = json.loads((home / ".claude/settings.json").read_text())
+        handler = data["hooks"]["Stop"][-1]["hooks"][0]
+        report("claude uses asyncRewake", handler["asyncRewake"] is True, str(handler))
+        report("claude runs editable wait-hook args", handler["args"][-2:] == ["--timeout-seconds", "45"], str(handler))
+
+
 def test_opencode_json() -> None:
     print("\nTest: OpenCode config")
     with tempfile.TemporaryDirectory(prefix="dm_installer_") as tmp:
@@ -113,6 +169,7 @@ def test_openclaw_skipped() -> None:
 def main() -> int:
     test_json_clients()
     test_codex_toml()
+    test_wake_hooks()
     test_opencode_json()
     test_openclaw_skipped()
     failed = [name for name, passed, _ in results if not passed]

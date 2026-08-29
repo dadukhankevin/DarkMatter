@@ -16,8 +16,40 @@ from darkmatter.mcp.schemas import (
     SendMessageInput,
     UpdateBioInput,
 )
+from darkmatter.wakeup import (
+    consume_available_messages,
+    format_wake_message,
+    has_fetchable_relationships,
+)
 
 _log = get_logger("tools")
+
+
+async def _wait_for_messages(
+    mb,
+    from_agents: Optional[list[str]],
+    timeout_seconds: float,
+) -> tuple[list[dict], bool, bool]:
+    """Wait without leaving an uncancellable worker thread behind."""
+    loop = asyncio.get_running_loop()
+    timeout_seconds = max(0.0, float(timeout_seconds))
+    deadline = loop.time() + timeout_seconds
+    waited = False
+
+    while True:
+        await asyncio.to_thread(mb.sync, True)
+        messages = await asyncio.to_thread(consume_available_messages, mb, from_agents)
+        if messages:
+            return messages, waited, False
+        if not await asyncio.to_thread(has_fetchable_relationships, mb):
+            return [], waited, True
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return [], waited, False
+        waited = True
+        next_wait = max(0.25, float(await asyncio.to_thread(mb.next_fetch_wait)))
+        await asyncio.sleep(min(2.0, remaining, next_wait))
 
 
 def _ctx(result: dict) -> str:
@@ -231,34 +263,54 @@ async def wait_for_message(
     if ctx is not None:
         track_session(ctx)
     mb = get_mailbox()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_seconds
-    waited = False
+    consumed, waited, no_peers = await _wait_for_messages(mb, from_agents, timeout_seconds)
+    if consumed:
+        try:
+            from darkmatter.mcp.channel import emit_channel_message
+            for msg in consumed:
+                await emit_channel_message(
+                    msg.get("content", ""),
+                    {"from_agent_id": msg.get("from", ""), "message_id": msg.get("id", "")},
+                )
+        except Exception:
+            pass
+        return _ctx({"success": True, "messages": consumed, "waited": waited})
 
-    while True:
-        await asyncio.to_thread(mb.sync, True)
-        messages = mb.store.unconsumed_messages(from_agents)
-        if messages:
-            consumed = mb.store.consume_inbox(from_agents)
-            try:
-                from darkmatter.mcp.channel import emit_channel_message
-                for msg in consumed:
-                    await emit_channel_message(
-                        msg.get("content", ""),
-                        {"from_agent_id": msg.get("from", ""), "message_id": msg.get("id", "")},
-                    )
-            except Exception:
-                pass
-            return _ctx({"success": True, "messages": consumed, "waited": waited})
+    if no_peers:
+        return _ctx({
+            "success": False,
+            "no_peers": True,
+            "error": "No fetchable relationships are configured.",
+            "action": "Introduce a peer, then wait again.",
+        })
 
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            mins = int(timeout_seconds / 60)
-            return _ctx({
-                "success": False,
-                "timed_out": True,
-                "error": f"No message received after {mins} minutes.",
-                "action": "Introduce a peer or send them a message, then wait again.",
-            })
-        waited = True
-        await asyncio.sleep(min(2.0, remaining, mb.next_fetch_wait()))
+    return _ctx({
+        "success": False,
+        "timed_out": True,
+        "error": f"No message received after {timeout_seconds:g} seconds.",
+        "action": "Send a peer a message or wait again.",
+    })
+
+
+@mcp.tool(
+    name="darkmatter_stop_hook",
+    annotations={
+        "title": "DarkMatter Stop Hook",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def stop_hook(
+    timeout_seconds: float = 3600,
+    from_agents: Optional[list[str]] = None,
+    ctx: Context = None,
+) -> str:
+    """Codex Stop-hook adapter: continue the turn when authenticated mail arrives."""
+    if ctx is not None:
+        track_session(ctx)
+    messages, _, _ = await _wait_for_messages(get_mailbox(), from_agents, timeout_seconds)
+    if not messages:
+        return "{}"
+    return json.dumps({"decision": "block", "reason": format_wake_message(messages)})
