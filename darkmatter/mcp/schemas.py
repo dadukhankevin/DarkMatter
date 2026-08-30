@@ -35,6 +35,18 @@ class AntimatterRole(str, Enum):
     PAYEE = "payee"
 
 
+class ContributionAction(str, Enum):
+    START = "start"
+    ADVANCE = "advance"
+    RESOLVE = "resolve"
+    DECLINE = "decline"
+    FULFILL = "fulfill"
+    PRESENCE = "presence"
+    LIST = "list"
+    GET = "get"
+    VERIFY = "verify"
+
+
 class WalletAction(str, Enum):
     TOKENS = "tokens"
     STATUS = "status"
@@ -74,6 +86,41 @@ class SendMessageInput(BaseModel):
     )
     target_agent_ids: Optional[list[str]] = Field(default=None, description="Multiple agent ids to send to")
     metadata: Optional[dict] = Field(default_factory=dict, description="Arbitrary metadata")
+
+
+class ForwardMessageInput(BaseModel):
+    """Explicitly forward a received message with its signed provenance."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    message_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Inbox message or forward envelope id",
+    )
+    target_agent_id: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Active relationship that should receive the forward",
+    )
+    note: str = Field(
+        default="",
+        max_length=4000,
+        description="Your signed context for why you are forwarding it",
+    )
+    max_hops: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum total forwards; applies when beginning a chain",
+    )
+    ttl_seconds: float = Field(
+        default=86400,
+        ge=60,
+        le=2592000,
+        description="Forward lifetime, capped by every earlier expiry",
+    )
 
 
 class AntimatterInput(BaseModel):
@@ -129,6 +176,45 @@ class AntimatterInput(BaseModel):
     status: Optional[str] = Field(default=None, max_length=32, description="Optional list filter")
 
 
+class ContributionInput(BaseModel):
+    """Route and prove AntiMatter's transparent 1% network contribution."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    action: ContributionAction
+    settlement_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+    contribution_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+    target_agent_id: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Optional eligible older relationship; the default is deterministic",
+    )
+    destination: Optional[dict] = Field(
+        default_factory=dict,
+        description="Optional passport-bound destination disclosed by the beneficiary",
+    )
+    transaction_id: Optional[str] = Field(default=None, min_length=1, max_length=512)
+    proof: Optional[dict] = Field(default_factory=dict)
+    proof_package: Optional[dict] = Field(
+        default=None,
+        description="Portable package to verify without trusting the local ledger",
+    )
+    status: Optional[str] = Field(default=None, max_length=32)
+    max_hops: int = Field(default=42, ge=1, le=42)
+    ttl_seconds: int = Field(default=604800, ge=60, le=2592000)
+    liveness_window_seconds: int = Field(default=604800, ge=60, le=2592000)
+
+
 class WalletInput(BaseModel):
     """Use the optional Solana rail for an AntiMatter settlement."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -163,7 +249,7 @@ class WalletInput(BaseModel):
     amount: Optional[str] = Field(default=None, min_length=1, max_length=128)
     delegate_claim: Optional[dict] = Field(
         default=None,
-        description="Passport-signed wallet claim from the third-party AntiMatter delegate",
+        description="Legacy field; rejected because AntiMatter selects beneficiaries through routing",
     )
     metadata: Optional[dict] = Field(default_factory=dict)
     valid_until: Optional[str] = Field(default=None, max_length=64)
@@ -210,3 +296,7 @@ class ConfigureInput(BaseModel):
     )
     peer_locator: Optional[str] = Field(default=None, description="Update the locator you fetch this peer from")
     note: Optional[str] = Field(default=None, description="Local note on the relationship")
+    antimatter_auto_route: Optional[bool] = Field(
+        default=None,
+        description="Follow or relay valid AntiMatter contribution tickets automatically on sync",
+    )

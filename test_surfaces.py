@@ -2,11 +2,13 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+import socket
 
 import pytest
 
 from darkmatter.gitbox.gitutil import clone_or_update, init_repo
 from darkmatter.gitbox.mailbox import Mailbox, reset_mailbox
+from darkmatter.contract.contact import verify_contact_card
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +52,36 @@ def test_visibility_local_is_disk_path(make_box):
     assert loc["primary"] == loc["local"]
     assert loc["lan"] == ""
     assert Path(loc["primary"]).exists()
+
+
+def test_nearby_returns_signed_local_cards_without_connecting(make_box, tmp_path, monkeypatch):
+    monkeypatch.setenv("DARKMATTER_NEARBY_DIR", str(tmp_path / "nearby"))
+    a = make_box("a")
+    b = make_box("b")
+    result = a.nearby(timeout_seconds=0)
+    peer = next(item for item in result["nearby"] if item["agent_id"] == b.agent_id)
+    assert peer["scopes"] == ["local"]
+    assert verify_contact_card(peer["contact_card"])["agent_id"] == b.agent_id
+    assert a.store.get_relationship(b.agent_id) is None
+
+
+def test_nearby_discovers_lan_contact_card(make_box, tmp_path, monkeypatch):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    discovery_port = probe.getsockname()[1]
+    probe.close()
+    monkeypatch.setenv("DARKMATTER_NEARBY_PORT", str(discovery_port))
+    monkeypatch.setenv("DARKMATTER_NEARBY_DIR", str(tmp_path / "registry-a"))
+    a = make_box("a", visibility="lan", lan_bind="127.0.0.1", lan_port=0)
+    monkeypatch.setenv("DARKMATTER_NEARBY_DIR", str(tmp_path / "registry-b"))
+    b = make_box("b")
+
+    result = b.nearby(timeout_seconds=0.75)
+    peer = next(item for item in result["nearby"] if item["agent_id"] == a.agent_id)
+    assert "lan" in peer["scopes"]
+    assert peer["locator"] == a.lan_url
+    assert verify_contact_card(peer["contact_card"])["locator"] == a.lan_url
+    assert b.store.get_relationship(a.agent_id) is None
 
 
 def test_visibility_internet_requires_origin(make_box):

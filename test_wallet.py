@@ -232,9 +232,15 @@ def test_wallet_key_is_separate_from_passport_and_private(tmp_path):
 
 
 @pytest.mark.skipif(Keypair is None, reason="optional Solana dependencies are not installed")
-def test_solana_antimatter_payment_and_delegate_contribution(tmp_path):
-    payer, payee = _connected(tmp_path)
+def test_solana_antimatter_payment_and_routed_contribution(tmp_path):
     delegate = Mailbox(tmp_path / "delegate")
+    delegate.store.save_settings(antimatter_auto_route=False)
+    payer, payee = _connected(tmp_path)
+    assert payee.introduce(delegate.remote)["success"]
+    assert delegate.introduce(payee.remote)["success"]
+    delegate.sync()
+    assert delegate.accept(payee.agent_id)["success"]
+    payee.sync()
     chain = {}
     payer_wallet = FakeWallet(payer.root, str(Keypair().pubkey()), chain)
     payee_wallet = FakeWallet(payee.root, str(Keypair().pubkey()), chain)
@@ -253,7 +259,6 @@ def test_solana_antimatter_payment_and_delegate_contribution(tmp_path):
         "Ship the release",
         "1",
         "SOL",
-        delegate_claim=delegate_claim,
     )
     settlement_id = offered["settlement"]["settlement_id"]
     payee.sync()
@@ -271,14 +276,29 @@ def test_solana_antimatter_payment_and_delegate_contribution(tmp_path):
     assert verified["verification"]["amount"] == "1"
     assert payee.store.get_relationship(payer.agent_id).trust == 0
 
+    pending = payee_service.settle(settlement_id, confirm_external=True)
+    assert pending["settlement_pending"] is True
+    contribution_id = pending["contribution_id"]
+    delegate.sync()
+    resolved = delegate.antimatter_advance_contribution(
+        contribution_id,
+        resolve_here=True,
+        destination={"rail": "solana:devnet", "wallet_claim": delegate_claim},
+    )
+    assert resolved["success"]
+    payee.sync()
+
     settled = payee_service.settle(settlement_id, confirm_external=True)
     assert settled["contribution"]["amount"] == "0.01"
     assert settled["contribution"]["destination_wallet"] == delegate_address
+    assert settled["contribution"]["beneficiary_agent_id"] == delegate.agent_id
     assert len(chain) == 2
-    assert payee.store.get_relationship(payer.agent_id).trust == 0.05
+    assert payee.store.get_relationship(payer.agent_id).trust == 0
+    delegate.sync()
+    assert delegate.get_contribution(contribution_id)["status"] == "fulfilled"
     payer.sync()
     assert payer.get_settlement(settlement_id)["status"] == "settled"
-    assert payer.store.get_relationship(payee.agent_id).trust == 0.05
+    assert payer.store.get_relationship(payee.agent_id).trust == 0
 
 
 def test_wallet_mcp_lists_safe_devnet_catalog(tmp_path, monkeypatch):

@@ -19,7 +19,7 @@ from darkmatter.security import (
     verify_signed_payload,
 )
 
-ANTIMATTER_ENVELOPE_TYPES = frozenset({
+ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES = frozenset({
     "antimatter_offer",
     "antimatter_accept",
     "antimatter_invoice",
@@ -28,6 +28,16 @@ ANTIMATTER_ENVELOPE_TYPES = frozenset({
     "antimatter_dispute",
 })
 
+ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES = frozenset({
+    "antimatter_contribution",
+    "antimatter_resolution",
+    "antimatter_fulfillment",
+})
+
+ANTIMATTER_ENVELOPE_TYPES = (
+    ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES | ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES
+)
+
 ENVELOPE_TYPES = frozenset({
     "introduce",
     "message",
@@ -35,9 +45,11 @@ ENVELOPE_TYPES = frozenset({
     "ignore",
     "receipt",
     "hint",
+    "forward",
+    "presence",
 }) | ANTIMATTER_ENVELOPE_TYPES
 
-ACTIONABLE_ENVELOPE_TYPES = frozenset({"message"}) | ANTIMATTER_ENVELOPE_TYPES
+ACTIONABLE_ENVELOPE_TYPES = frozenset({"message", "forward"}) | ANTIMATTER_ENVELOPE_TYPES
 
 
 def _now() -> str:
@@ -73,6 +85,7 @@ def seal_envelope(
     body: dict,
     expires_at: Optional[str] = None,
     envelope_id: Optional[str] = None,
+    timestamp: Optional[str] = None,
 ) -> Envelope:
     """Encrypt body to to_id and sign the public envelope."""
     if env_type not in ENVELOPE_TYPES:
@@ -92,6 +105,11 @@ def seal_envelope(
             _parse_datetime(expires_at)
         except ValueError as exc:
             raise ValueError("expires_at must be an ISO-8601 timestamp") from exc
+    if timestamp:
+        try:
+            _parse_datetime(timestamp)
+        except ValueError as exc:
+            raise ValueError("timestamp must be an ISO-8601 timestamp") from exc
     try:
         plaintext = json.dumps(body, sort_keys=True).encode("utf-8")
     except (TypeError, ValueError) as exc:
@@ -106,7 +124,7 @@ def seal_envelope(
         type=env_type,
         from_id=from_id,
         to_id=to_id,
-        timestamp=_now(),
+        timestamp=timestamp or _now(),
         ciphertext=ciphertext,
         signature="",
         expires_at=expires_at,
@@ -116,8 +134,8 @@ def seal_envelope(
     return env
 
 
-def open_envelope(env: Envelope | dict, recipient_private_key_hex: str) -> Envelope:
-    """Verify signature and decrypt body. Raises ValueError on failure."""
+def verify_envelope_signature(env: Envelope | dict) -> Envelope:
+    """Verify public envelope metadata without attempting recipient decryption."""
     if isinstance(env, dict):
         try:
             env = Envelope.from_public_dict(env)
@@ -137,6 +155,12 @@ def open_envelope(env: Envelope | dict, recipient_private_key_hex: str) -> Envel
         valid_signature = False
     if not valid_signature:
         raise ValueError("Invalid envelope signature")
+    return env
+
+
+def open_envelope(env: Envelope | dict, recipient_private_key_hex: str) -> Envelope:
+    """Verify signature and decrypt body. Raises ValueError on failure."""
+    env = verify_envelope_signature(env)
     if env.to_id != derive_public_key_hex(recipient_private_key_hex):
         raise ValueError("Envelope is addressed to a different passport")
     raw = decrypt_from_peer(

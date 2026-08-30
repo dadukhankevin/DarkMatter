@@ -13,13 +13,17 @@ from darkmatter.mcp.schemas import (
     AntimatterAction,
     AntimatterInput,
     ConfigureInput,
+    ContributionAction,
+    ContributionInput,
     ConnectionAction,
     ConnectionInput,
+    ForwardMessageInput,
     SendMessageInput,
     UpdateBioInput,
     WalletAction,
     WalletInput,
 )
+from darkmatter.contract.contribution import verify_contribution_package
 from darkmatter.wallet.payments import SolanaPaymentService
 from darkmatter.wallet.solana import WalletError, network_context
 from darkmatter.wakeup import (
@@ -163,6 +167,50 @@ async def send_message(params: SendMessageInput, ctx: Context) -> str:
 
 
 @mcp.tool(
+    name="darkmatter_forward_message",
+    annotations={
+        "title": "Forward Message",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
+    """Forward one inbox message with its original signature and signed hop chain."""
+    track_session(ctx)
+    result = await asyncio.to_thread(
+        get_mailbox().forward,
+        params.message_id,
+        params.target_agent_id,
+        params.note,
+        params.max_hops,
+        params.ttl_seconds,
+    )
+    return _ctx(result)
+
+
+@mcp.tool(
+    name="darkmatter_nearby",
+    annotations={
+        "title": "Find Nearby Agents",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def nearby(timeout_seconds: float = 1.0, ctx: Context = None) -> str:
+    """Find signed contact cards on this machine and LAN without connecting."""
+    if ctx is not None:
+        track_session(ctx)
+    if timeout_seconds < 0 or timeout_seconds > 5:
+        return _ctx({"success": False, "error": "timeout_seconds must be between 0 and 5"})
+    result = await asyncio.to_thread(get_mailbox().nearby, timeout_seconds)
+    return _ctx(result)
+
+
+@mcp.tool(
     name="darkmatter_antimatter",
     annotations={
         "title": "Manage AntiMatter Settlements",
@@ -271,6 +319,80 @@ async def antimatter(params: AntimatterInput, ctx: Context) -> str:
     else:
         result = {"success": False, "error": f"Unknown AntiMatter action: {params.action}"}
     return _ctx(result)
+
+
+@mcp.tool(
+    name="darkmatter_antimatter_contribution",
+    annotations={
+        "title": "Route AntiMatter Contribution",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def antimatter_contribution(params: ContributionInput, ctx: Context) -> str:
+    """Route, resolve, fulfill, inspect, or independently verify a public contribution."""
+    track_session(ctx)
+    mb = get_mailbox()
+    if params.action == ContributionAction.VERIFY:
+        if not params.proof_package:
+            return _ctx({"success": False, "error": "proof_package is required for verify"})
+        try:
+            package = verify_contribution_package(params.proof_package)
+            return _ctx({"success": True, "valid": True, "proof_package": package})
+        except (TypeError, ValueError) as exc:
+            return _ctx({"success": False, "valid": False, "error": str(exc)})
+    await asyncio.to_thread(mb.sync)
+    if params.action == ContributionAction.LIST:
+        records = await asyncio.to_thread(mb.list_contributions, params.status)
+        return _ctx({"success": True, "count": len(records), "contributions": records})
+    if params.action == ContributionAction.GET:
+        if not params.contribution_id:
+            return _ctx({"success": False, "error": "contribution_id is required for get"})
+        record = await asyncio.to_thread(mb.get_contribution, params.contribution_id)
+        return _ctx(
+            {"success": True, "contribution": record, "valid": True}
+            if record else {"success": False, "error": "Unknown contribution_id"}
+        )
+    if params.action == ContributionAction.PRESENCE:
+        return _ctx(await asyncio.to_thread(mb.antimatter_presence, params.target_agent_id))
+    if params.action == ContributionAction.START:
+        if not params.settlement_id:
+            return _ctx({"success": False, "error": "settlement_id is required for start"})
+        return _ctx(await asyncio.to_thread(
+            mb.antimatter_contribute,
+            params.settlement_id,
+            target_agent_id=params.target_agent_id,
+            max_hops=params.max_hops,
+            ttl_seconds=params.ttl_seconds,
+            liveness_window_seconds=params.liveness_window_seconds,
+        ))
+    if not params.contribution_id:
+        return _ctx({"success": False, "error": "contribution_id is required"})
+    if params.action in (
+        ContributionAction.ADVANCE,
+        ContributionAction.RESOLVE,
+        ContributionAction.DECLINE,
+    ):
+        return _ctx(await asyncio.to_thread(
+            mb.antimatter_advance_contribution,
+            params.contribution_id,
+            target_agent_id=params.target_agent_id,
+            resolve_here=params.action == ContributionAction.RESOLVE,
+            decline=params.action == ContributionAction.DECLINE,
+            destination=params.destination,
+        ))
+    if params.action == ContributionAction.FULFILL:
+        if not params.transaction_id:
+            return _ctx({"success": False, "error": "transaction_id is required for fulfill"})
+        return _ctx(await asyncio.to_thread(
+            mb.antimatter_fulfill_contribution,
+            params.contribution_id,
+            params.transaction_id,
+            params.proof,
+        ))
+    return _ctx({"success": False, "error": f"Unknown contribution action: {params.action}"})
 
 
 @mcp.tool(
@@ -393,14 +515,14 @@ async def configure(params: ConfigureInput, ctx: Context) -> str:
     mb = get_mailbox()
     result = await asyncio.to_thread(
         mb.configure,
-        params.visibility,
-        params.origin,
-        params.lan_port,
-        None,
-        params.peer_id,
-        params.fetch_every,
-        params.peer_locator,
-        params.note,
+        visibility=params.visibility,
+        origin=params.origin,
+        lan_port=params.lan_port,
+        peer_id=params.peer_id,
+        fetch_every=params.fetch_every,
+        peer_locator=params.peer_locator,
+        note=params.note,
+        antimatter_auto_route=params.antimatter_auto_route,
     )
     return _ctx(result)
 

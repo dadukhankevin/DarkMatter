@@ -1,8 +1,9 @@
-"""AntiMatter: signed, rail-neutral settlements over DarkMatter relationships.
+"""Signed, rail-neutral settlement rail beneath AntiMatter contributions.
 
 DarkMatter transports encrypted events. AntiMatter projects those events into a
-local settlement ledger and writes only bilaterally confirmed outcomes onto the
-relationship trust record. It never moves money and never controls mail delivery.
+local settlement ledger. A confirmation records a bilateral outcome but changes
+no trust score by default. Contribution routing lives in ``contributions.py`` and
+``contract/contribution.py``. This module never moves money or controls delivery.
 """
 
 from __future__ import annotations
@@ -15,14 +16,15 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from darkmatter.contract.envelope import ANTIMATTER_ENVELOPE_TYPES
+from darkmatter.contract.envelope import ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES
+from darkmatter.contract.contribution import verify_source_receipt
 from darkmatter.contract.types import REL_ACTIVE
 from darkmatter.policy import load_policy
 from darkmatter.store.local import LocalStore, atomic_write_text
 
 
 PROTOCOL = "antimatter/1"
-DEFAULT_SETTLEMENT_TRUST_DELTA = 0.05
+DEFAULT_SETTLEMENT_TRUST_DELTA = 0.0
 
 OFFER = "antimatter_offer"
 ACCEPT = "antimatter_accept"
@@ -252,7 +254,7 @@ class AntimatterLedger:
         }
 
     def _common(self, env_type: str, body: dict) -> tuple[str, dict]:
-        if env_type not in ANTIMATTER_ENVELOPE_TYPES:
+        if env_type not in ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES:
             raise AntimatterError(f"Unknown AntiMatter event type: {env_type}")
         if not isinstance(body, dict):
             raise AntimatterError("AntiMatter body must be an object")
@@ -439,6 +441,26 @@ class AntimatterLedger:
                         if not invoice and invoice_id:
                             raise AntimatterError("invoice_id was provided but no invoice exists")
                         normalized["tx_id"] = _text(normalized.get("tx_id"), "tx_id", maximum=512)
+                        attestation = verify_source_receipt(
+                            normalized.get("receipt_attestation"),
+                        )
+                        expected_attestation = {
+                            "settlement_id": settlement_id,
+                            "payer_id": record["payer_id"],
+                            "payee_id": record["payee_id"],
+                            "receipt_id": envelope_id,
+                            "timestamp": event["timestamp"],
+                            "transaction_id": normalized["tx_id"],
+                            "amount": record["terms"]["amount"],
+                            "currency": record["terms"]["currency"],
+                            "rail": record["terms"]["rail"],
+                        }
+                        for key, value in expected_attestation.items():
+                            if attestation[key] != value:
+                                raise AntimatterError(
+                                    f"receipt_attestation {key} does not match the settlement",
+                                )
+                        normalized["receipt_attestation"] = attestation
                         normalized["proof"] = _object(normalized.get("proof"), "proof", maximum_bytes=32_768)
                         normalized["note"] = _text(
                             normalized.get("note"), "note", maximum=1000, required=False,
@@ -516,7 +538,7 @@ class AntimatterLedger:
 
 __all__ = [
     "ACCEPT",
-    "ANTIMATTER_ENVELOPE_TYPES",
+    "ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES",
     "AntimatterError",
     "AntimatterLedger",
     "CONFIRM",

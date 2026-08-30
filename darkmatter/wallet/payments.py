@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
 from darkmatter.store.local import atomic_write_text
@@ -107,46 +107,46 @@ class SolanaPaymentService:
             raise WalletError("Settlement currency is missing")
         return value
 
-    @staticmethod
-    def _details(record: dict) -> dict:
-        details = record.get("terms", {}).get("details")
-        return details if isinstance(details, dict) else {}
+    def _contribution_record(self, settlement_id: str) -> dict | None:
+        return self.mailbox.contributions.for_settlement(settlement_id)
 
-    def _delegate_claim(self, record: dict, *, required: bool = False) -> dict | None:
-        terms = self._details(record).get("antimatter")
-        if not isinstance(terms, dict):
-            if required:
-                raise WalletError("Settlement has no AntiMatter contribution terms")
+    def _beneficiary_claim(self, record: dict) -> dict | None:
+        contribution = self._contribution_record(record["settlement_id"])
+        if not contribution or contribution.get("status") not in ("resolved", "fulfilled"):
             return None
-        try:
-            rate = Decimal(str(terms.get("rate")))
-        except (InvalidOperation, ValueError) as exc:
-            raise WalletError("AntiMatter contribution rate is invalid") from exc
-        if rate != ANTIMATTER_RATE:
-            raise WalletError("AntiMatter v1 contribution rate must be exactly 0.01")
-        claim = verify_wallet_claim(terms.get("delegate"), network=self.network)
+        resolution = contribution["package"].get("resolution") or {}
+        beneficiary = resolution.get("beneficiary") or {}
+        destination = resolution.get("destination") or {}
+        claim = destination.get("wallet_claim")
+        if claim is None:
+            return None
+        claim = verify_wallet_claim(
+            claim,
+            expected_agent_id=beneficiary.get("agent_id"),
+            network=self.network,
+        )
         if claim["agent_id"] in (record["payer_id"], record["payee_id"]):
-            raise WalletError("AntiMatter delegate must be a third-party agent")
+            raise WalletError("AntiMatter beneficiary must be a third-party agent")
         return claim
 
     def _quote(self, record: dict) -> dict:
         token = self.wallet.resolve_asset(self._asset(record))
         amount, raw = amount_to_base_units(record["terms"]["amount"], token.decimals)
-        delegate = self._delegate_claim(record)
+        beneficiary = self._beneficiary_claim(record)
         contribution_raw = int(
             (Decimal(raw) * ANTIMATTER_RATE).to_integral_value(rounding=ROUND_DOWN),
-        ) if delegate else 0
-        if delegate and contribution_raw < 1:
+        )
+        if contribution_raw < 1:
             raise WalletError("Settlement is too small to represent its 1% contribution")
         return {
             "network": self.network,
             "asset": token.to_dict(),
             "amount": amount,
             "amount_base_units": str(raw),
-            "contribution_rate": format(ANTIMATTER_RATE, "f") if delegate else "0",
+            "contribution_rate": format(ANTIMATTER_RATE, "f"),
             "contribution_amount": format_base_units(contribution_raw, token.decimals),
             "contribution_base_units": str(contribution_raw),
-            "delegate": delegate,
+            "beneficiary": beneficiary,
         }
 
     def quote(self, settlement_id: str) -> dict:
@@ -167,16 +167,10 @@ class SolanaPaymentService:
     ) -> dict:
         token = self.wallet.resolve_asset(asset)
         amount, _ = amount_to_base_units(amount, token.decimals)
-        details = {}
         if delegate_claim is not None:
-            delegate = verify_wallet_claim(delegate_claim, network=self.network)
-            if delegate["agent_id"] in (self.mailbox.agent_id, peer_id):
-                raise WalletError("AntiMatter delegate must be a third-party agent")
-            details["antimatter"] = {
-                "version": 1,
-                "rate": format(ANTIMATTER_RATE, "f"),
-                "delegate": delegate,
-            }
+            raise WalletError(
+                "Manual delegates are not AntiMatter; omit delegate_claim and let the signed route select one",
+            )
         return self.mailbox.antimatter_offer(
             peer_id,
             description,
@@ -184,7 +178,7 @@ class SolanaPaymentService:
             asset,
             f"solana:{self.network}",
             "payer",
-            details,
+            {"antimatter": {"version": 2, "rate": format(ANTIMATTER_RATE, "f")}},
             metadata or {},
             valid_until,
             settlement_id,
@@ -353,40 +347,105 @@ class SolanaPaymentService:
         if payee_claim["address"] != self.wallet.address:
             raise WalletError("Current wallet does not match the wallet used in the invoice")
         quote = self._quote(record)
-        delegate = quote["delegate"]
+        contribution_record = self._contribution_record(settlement_id)
+        if contribution_record is None:
+            started = self.mailbox.antimatter_contribute(settlement_id)
+            if not started.get("success"):
+                return {
+                    **started,
+                    "primary_verified": True,
+                    "contribution_started": False,
+                }
+            contribution_record = self._contribution_record(settlement_id)
+        contribution_id = contribution_record["contribution_id"]
+        if contribution_record["status"] in ("created", "routing"):
+            return {
+                "success": True,
+                "primary_verified": True,
+                "settlement_pending": True,
+                "contribution_started": True,
+                "contribution_id": contribution_id,
+                "contribution_status": contribution_record["status"],
+                "message": "The signed contribution ticket is routing; sync and settle again after resolution.",
+            }
+        if contribution_record["status"] in ("unroutable", "declined"):
+            verification = {
+                "rail": f"solana:{self.network}",
+                "primary": primary,
+                "contribution": {
+                    "status": contribution_record["status"],
+                    "contribution_id": contribution_id,
+                    "resolution": contribution_record["package"]["resolution"],
+                },
+            }
+            confirmation = self.mailbox.antimatter_confirm(
+                record["peer_id"], settlement_id, receipt["id"], verification, note,
+            )
+            return {
+                **confirmation,
+                "primary_verified": True,
+                "contribution": verification["contribution"],
+            }
+
+        beneficiary = self._beneficiary_claim(record)
+        if beneficiary is None:
+            raise WalletError(
+                "The resolved beneficiary did not provide a passport-bound Solana destination",
+            )
         contribution = None
-        if delegate:
+        if contribution_record["status"] == "fulfilled":
+            fulfillment = contribution_record["package"]["fulfillment"]
+            transfer = {"signature": fulfillment["transaction_id"]}
+        else:
             if not confirm_external:
                 raise WalletError(
-                    "Set confirm_external=true to authorize the 1% delegate contribution",
+                    "Set confirm_external=true to authorize the routed 1% contribution",
                 )
-            journaled = self.journal.get(settlement_id, "contribution")
+            journaled = self.journal.get(settlement_id, f"contribution:{contribution_id}")
             if journaled:
                 transfer = journaled["transfer"]
             else:
                 transfer = self.wallet.transfer(
-                    delegate["address"],
+                    beneficiary["address"],
                     quote["contribution_amount"],
                     self._asset(record),
                     allow_create_ata=allow_create_ata,
                 )
-                self.journal.put(settlement_id, "contribution", {
+                self.journal.put(settlement_id, f"contribution:{contribution_id}", {
                     "signature": transfer["signature"],
                     "transfer": transfer,
                 })
-            contribution = self.wallet.verify_transfer(
+        contribution = self.wallet.verify_transfer(
+            transfer["signature"],
+            source_wallet=self.wallet.address,
+            destination_wallet=beneficiary["address"],
+            amount=quote["contribution_amount"],
+            asset=self._asset(record),
+        )
+        contribution["beneficiary_agent_id"] = beneficiary["agent_id"]
+        contribution["rate"] = format(ANTIMATTER_RATE, "f")
+        contribution["contribution_id"] = contribution_id
+        if contribution_record["status"] != "fulfilled":
+            published = self.mailbox.antimatter_fulfill_contribution(
+                contribution_id,
                 transfer["signature"],
-                source_wallet=self.wallet.address,
-                destination_wallet=delegate["address"],
-                amount=quote["contribution_amount"],
-                asset=self._asset(record),
+                {
+                    "rail": f"solana:{self.network}",
+                    "verified_transfer": contribution,
+                },
             )
-            contribution["delegate_agent_id"] = delegate["agent_id"]
-            contribution["rate"] = format(ANTIMATTER_RATE, "f")
+            if not published.get("success"):
+                return {
+                    **published,
+                    "payment_succeeded": True,
+                    "primary_verified": True,
+                    "contribution": contribution,
+                    "warning": "Contribution is confirmed and journaled, but its proof was not relayed; retry settle.",
+                }
         verification = {
             "rail": f"solana:{self.network}",
             "primary": primary,
-            "contribution": contribution or {"status": "not_configured"},
+            "contribution": contribution,
         }
         confirmation = self.mailbox.antimatter_confirm(
             record["peer_id"],

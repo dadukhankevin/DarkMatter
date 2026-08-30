@@ -79,6 +79,51 @@ def test_message_metadata_cannot_override_content(tmp_path):
     assert message["body"]["metadata"] == {"content": "spoof", "kind": "note"}
 
 
+def test_explicit_forward_preserves_provenance_and_does_not_consume(tmp_path):
+    a = _agent(tmp_path / "a")
+    b = _agent(tmp_path / "b")
+    c = _agent(tmp_path / "c")
+    for left, right in ((a, b), (b, c)):
+        left.introduce(right.remote)
+        right.introduce(left.remote)
+        right.sync()
+        right.accept(left.agent_id)
+        left.sync()
+
+    sent = a.send(b.agent_id, "useful original", extra={"topic": "routing"})
+    assert sent["success"]
+    b.sync()
+    original = next(item for item in b.store.unconsumed_messages() if item["id"] == sent["envelope_id"])
+    assert original["forwardable"] is True
+
+    forwarded = b.forward(
+        sent["envelope_id"],
+        c.agent_id,
+        note="This belongs with C",
+        max_hops=1,
+    )
+    assert forwarded["success"]
+    assert forwarded["hops_remaining"] == 0
+    assert any(item["id"] == sent["envelope_id"] for item in b.store.unconsumed_messages())
+
+    c.sync()
+    received = next(
+        item for item in c.store.unconsumed_messages()
+        if item["id"] == forwarded["envelope_id"]
+    )
+    assert received["type"] == "forward"
+    assert received["forwardable"] is False
+    assert received["body"]["forward"]["original_envelope"] == original["envelope"]
+    assert received["body"]["forward"]["message"]["content"] == "useful original"
+    assert received["body"]["forward"]["path"][0]["from"] == b.agent_id
+    assert received["body"]["forward"]["path"][0]["to"] == c.agent_id
+    assert "This belongs with C" in received["content"]
+
+    blocked = c.forward(received["id"], b.agent_id, note="one hop too far")
+    assert blocked["success"] is False
+    assert "hop limit" in blocked["error"]
+
+
 def test_ignore_closes_relationship(tmp_path):
     a = _agent(tmp_path / "a")
     b = _agent(tmp_path / "b")

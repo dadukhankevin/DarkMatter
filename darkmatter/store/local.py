@@ -20,7 +20,7 @@ PASSPORT_NAMES = ("passport", "passport.key")
 
 def _is_actionable(item: dict) -> bool:
     item_type = item.get("type")
-    return item_type == "message" or (
+    return item_type in ("message", "forward") or (
         isinstance(item_type, str) and item_type.startswith("antimatter_")
     )
 
@@ -98,15 +98,26 @@ class LocalStore:
         bio = os.environ.get("DARKMATTER_BIO", "").strip() or "A DarkMatter agent."
         if path.exists():
             data = json.loads(path.read_text())
+            if not data.get("passport_created_at"):
+                passport = self.passport_path()
+                try:
+                    created = datetime.fromtimestamp(
+                        passport.stat().st_mtime, timezone.utc,
+                    ).isoformat()
+                except OSError:
+                    created = _now()
+                data["passport_created_at"] = created
             if display:
                 data["display_name"] = display
             if os.environ.get("DARKMATTER_BIO"):
                 data["bio"] = bio
+            atomic_write_text(path, json.dumps(data, indent=2) + "\n")
             return data
         data = {
             "agent_id": self.agent_id,
             "display_name": display or generate_agent_name(),
             "bio": bio,
+            "passport_created_at": _now(),
         }
         atomic_write_text(path, json.dumps(data, indent=2) + "\n")
         return data
@@ -120,6 +131,10 @@ class LocalStore:
             atomic_write_text(self.profile_path(), json.dumps(self.profile, indent=2) + "\n")
             return dict(self.profile)
 
+    @property
+    def passport_created_at(self) -> str:
+        return self.profile["passport_created_at"]
+
     def settings_path(self) -> Path:
         return self.dir / "settings.json"
 
@@ -129,6 +144,7 @@ class LocalStore:
             "origin": "",
             "lan_port": 8741,
             "lan_bind": "0.0.0.0",
+            "antimatter_auto_route": True,
         }
         path = self.settings_path()
         if path.exists():
@@ -142,6 +158,7 @@ class LocalStore:
         if data.get("visibility") not in VISIBILITIES:
             data["visibility"] = "local"
         data["lan_port"] = int(data.get("lan_port") or 8741)
+        data["antimatter_auto_route"] = bool(data.get("antimatter_auto_route", True))
         return data
 
     def save_settings(self, **kwargs) -> dict:

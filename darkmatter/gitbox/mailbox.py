@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
@@ -28,13 +29,35 @@ from darkmatter.antimatter import (
 )
 from darkmatter.contract.envelope import (
     ACTIONABLE_ENVELOPE_TYPES,
-    ANTIMATTER_ENVELOPE_TYPES,
+    ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES,
+    ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES,
     is_expired,
     is_expired_at,
     open_envelope,
     seal_envelope,
 )
+from darkmatter.contract.contribution import (
+    MAX_CONTRIBUTION_HOPS,
+    append_contribution_hop,
+    create_contribution_ticket,
+    create_source_receipt,
+    fulfill_contribution,
+    resolve_contribution,
+    verify_contribution_package,
+)
+from darkmatter.contract.forwarding import (
+    create_forward_package,
+    create_message_record,
+    verify_forward_package,
+    verify_message_record,
+)
 from darkmatter.contract.types import REL_ACTIVE, REL_CLOSED, REL_PENDING, Envelope, Relationship
+from darkmatter.contract.tenure import (
+    create_passport_claim,
+    parse_timestamp,
+    verify_passport_claim,
+)
+from darkmatter.contributions import ContributionLedger
 from darkmatter.gitbox.gitutil import (
     clone_or_update,
     commit_all,
@@ -47,6 +70,7 @@ from darkmatter.gitbox.gitutil import (
     rev_parse,
 )
 from darkmatter.gitbox.serve import GitHTTPServer
+from darkmatter.nearby import LANNearbyResponder, LocalNearbyRegistry, discover_lan
 from darkmatter.policy import load_policy
 from darkmatter.store import LocalStore
 from darkmatter.store.local import atomic_write_text
@@ -99,10 +123,14 @@ class Mailbox:
         self.root = Path(root)
         self.store = LocalStore(self.root)
         self.antimatter = AntimatterLedger(self.store)
+        self.contributions = ContributionLedger(self.store)
         self.work = self.root / ".darkmatter" / "mailbox"
         self.bare = self.root / ".darkmatter" / "mailbox.git"
         self.peers_dir = self.root / ".darkmatter" / "peers"
         self._http: Optional[GitHTTPServer] = None
+        self._nearby_registry = LocalNearbyRegistry(self.agent_id)
+        self._nearby_responder: Optional[LANNearbyResponder] = None
+        self._nearby_error = ""
         self._last_publish_errors: list[str] = []
         with self.store.locked():
             self._ensure_mailbox()
@@ -133,6 +161,14 @@ class Mailbox:
             locator or self.locator,
             display_name=profile.get("display_name", ""),
             bio=profile.get("bio", ""),
+            passport=self.passport_claim(),
+        )
+
+    def passport_claim(self) -> dict:
+        return create_passport_claim(
+            self.store.private_key_hex,
+            self.agent_id,
+            self.store.passport_created_at,
         )
 
     def locators(self) -> dict:
@@ -163,6 +199,7 @@ class Mailbox:
 
     def shutdown(self) -> None:
         self._stop_lan()
+        self._nearby_registry.unregister()
 
     def _ensure_mailbox(self) -> None:
         if not (self.work / ".git").exists():
@@ -184,6 +221,7 @@ class Mailbox:
             "agent_id": self.agent_id,
             "display_name": profile.get("display_name", ""),
             "bio": profile.get("bio", ""),
+            "passport": self.passport_claim(),
         }
         path = self.work / "agent.json"
         atomic_write_text(path, json.dumps(data, indent=2) + "\n")
@@ -193,11 +231,67 @@ class Mailbox:
         s = self.store.load_settings()
         if s["visibility"] == "lan":
             self._http = GitHTTPServer(self.bare, s.get("lan_bind", "0.0.0.0"), int(s["lan_port"])).start()
+            try:
+                self._nearby_responder = LANNearbyResponder(
+                    lambda: self.contact_card(self.lan_url),
+                ).start()
+                self._nearby_error = ""
+            except OSError as exc:
+                self._nearby_responder = None
+                self._nearby_error = str(exc)
+        self._refresh_nearby()
+
+    def _refresh_nearby(self) -> None:
+        """Publish a same-host card with a local locator; never creates a relationship."""
+        self._nearby_registry.register(self.contact_card(str(self.bare.resolve())))
 
     def _stop_lan(self) -> None:
+        if self._nearby_responder:
+            self._nearby_responder.stop()
+            self._nearby_responder = None
         if self._http:
             self._http.stop()
             self._http = None
+
+    def nearby(self, timeout_seconds: float = 1.0) -> dict:
+        """Return verified local/LAN cards without fetching or auto-connecting."""
+        self._refresh_nearby()
+        sightings = self._nearby_registry.discover()
+        sightings.extend(discover_lan(self.agent_id, timeout_seconds))
+        relationships = self.store.load_relationships()
+        merged: dict[str, dict] = {}
+        for sighting in sightings:
+            card = sighting["card"]
+            peer_id = card["agent_id"]
+            current = merged.get(peer_id)
+            if current is None:
+                current = {
+                    "agent_id": peer_id,
+                    "display_name": card.get("display_name", ""),
+                    "bio": card.get("bio", ""),
+                    "locator": card["locator"],
+                    "contact_card": card,
+                    "scopes": [],
+                    "relationship_state": None,
+                }
+                merged[peer_id] = current
+            scope = sighting["scope"]
+            if scope not in current["scopes"]:
+                current["scopes"].append(scope)
+            if scope == "lan":
+                current["locator"] = card["locator"]
+                current["contact_card"] = card
+            rel = relationships.get(peer_id)
+            if rel is not None:
+                current["relationship_state"] = rel.state
+        peers = sorted(
+            merged.values(),
+            key=lambda item: (item.get("display_name") or "", item["agent_id"]),
+        )
+        result = {"success": True, "count": len(peers), "nearby": peers}
+        if self._nearby_error:
+            result["lan_discovery_error"] = self._nearby_error
+        return result
 
     @_locked
     def configure(
@@ -210,6 +304,7 @@ class Mailbox:
         fetch_every: Optional[float] = None,
         peer_locator: Optional[str] = None,
         note: Optional[str] = None,
+        antimatter_auto_route: Optional[bool] = None,
     ) -> dict:
         if visibility is not None:
             if visibility not in VISIBILITIES:
@@ -235,13 +330,20 @@ class Mailbox:
                 peer_locator = validate_locator(peer_locator)
             except ValueError as exc:
                 return {"success": False, "error": str(exc)}
-        if visibility is not None or origin is not None or lan_port is not None or lan_bind is not None:
+        if (
+            visibility is not None
+            or origin is not None
+            or lan_port is not None
+            or lan_bind is not None
+            or antimatter_auto_route is not None
+        ):
             previous = self.store.load_settings()
             self.store.save_settings(
                 visibility=visibility,
                 origin=origin,
                 lan_port=lan_port,
                 lan_bind=lan_bind,
+                antimatter_auto_route=antimatter_auto_route,
             )
             try:
                 self._apply_visibility()
@@ -264,6 +366,7 @@ class Mailbox:
             "success": True,
             "locators": self.locators(),
             "relationship": rel.to_dict() if rel else None,
+            "antimatter_auto_route": self.store.load_settings()["antimatter_auto_route"],
         }
 
     def _publish_urls(self, extra: Optional[str] = None) -> list[str]:
@@ -376,12 +479,17 @@ class Mailbox:
             return {"success": False, "error": "Contact card does not match the mailbox identity"}
         if peer_id == self.agent_id:
             return {"success": False, "error": "Cannot introduce yourself"}
+        try:
+            peer_passport = verify_passport_claim(agent.get("passport"), peer_id)
+        except ValueError as exc:
+            return {"success": False, "error": f"Mailbox has no valid passport tenure claim: {exc}"}
         advertised_locator = (advertised_locator or "").strip() or self.locator
         self.store.upsert_relationship(
             peer_id,
             peer_locator=target_locator,
             advertised_locator=advertised_locator,
             state=REL_PENDING,
+            peer_passport=peer_passport,
         )
         env = seal_envelope(
             self.store.private_key_hex,
@@ -392,6 +500,7 @@ class Mailbox:
                 "locator": advertised_locator,
                 "display_name": self.store.profile.get("display_name", ""),
                 "bio": self.store.profile.get("bio", ""),
+                "passport": self.passport_claim(),
             },
         )
         self._write_outbox(env)
@@ -427,7 +536,31 @@ class Mailbox:
         body = {"content": content}
         if extra:
             body["metadata"] = dict(extra)
-        return self._send_envelope(peer_id, env_type, body, expires_at)
+        if env_type != "message":
+            return self._send_envelope(peer_id, env_type, body, expires_at)
+        envelope_id = uuid.uuid4().hex
+        timestamp = datetime.now(timezone.utc).isoformat()
+        try:
+            body["provenance"] = create_message_record(
+                self.store.private_key_hex,
+                self.agent_id,
+                peer_id,
+                envelope_id,
+                timestamp,
+                content,
+                metadata=body.get("metadata", {}),
+                expires_at=expires_at,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+        return self._send_envelope(
+            peer_id,
+            env_type,
+            body,
+            expires_at,
+            envelope_id=envelope_id,
+            timestamp=timestamp,
+        )
 
     def _send_envelope(
         self,
@@ -435,6 +568,9 @@ class Mailbox:
         env_type: str,
         body: dict,
         expires_at: Optional[str] = None,
+        *,
+        envelope_id: Optional[str] = None,
+        timestamp: Optional[str] = None,
     ) -> dict:
         """Seal, project, and publish a relationship-scoped envelope."""
         rel = self.store.get_relationship(peer_id)
@@ -448,11 +584,13 @@ class Mailbox:
                 env_type,
                 body,
                 expires_at=expires_at,
+                envelope_id=envelope_id,
+                timestamp=timestamp,
             )
         except (TypeError, ValueError) as exc:
             return {"success": False, "error": str(exc)}
         projection = None
-        if env_type in ANTIMATTER_ENVELOPE_TYPES:
+        if env_type in ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES:
             projection = self.antimatter.apply_event(
                 env_type,
                 self.agent_id,
@@ -470,6 +608,443 @@ class Mailbox:
             result["settlement"] = projection["settlement"]
             result["trust_delta"] = projection.get("trust_delta", 0.0)
         return self._with_publish(result)
+
+    @_locked
+    def forward(
+        self,
+        envelope_id: str,
+        peer_id: str,
+        note: str = "",
+        max_hops: int = 3,
+        ttl_seconds: float = 24 * 60 * 60,
+    ) -> dict:
+        """Explicitly forward one message while preserving signed provenance."""
+        if not isinstance(note, str) or len(note) > 4000:
+            return {"success": False, "error": "forward note exceeds 4000 characters"}
+        if ttl_seconds < 60 or ttl_seconds > 30 * 24 * 60 * 60:
+            return {"success": False, "error": "ttl_seconds must be between 60 and 2592000"}
+        rel = self.store.get_relationship(peer_id)
+        if rel is None or rel.state != REL_ACTIVE:
+            return {"success": False, "error": "No active relationship"}
+        item = next(
+            (candidate for candidate in self.store.load_inbox() if candidate.get("id") == envelope_id),
+            None,
+        )
+        if item is None:
+            return {"success": False, "error": "Message is not present in the local inbox"}
+        if item.get("type") == "message":
+            original_envelope = item.get("envelope")
+            message_record = (item.get("body") or {}).get("provenance")
+            path = []
+        elif item.get("type") == "forward":
+            prior = (item.get("body") or {}).get("forward")
+            try:
+                verified = verify_forward_package(
+                    prior,
+                    envelope_from=item.get("from"),
+                    envelope_to=self.agent_id,
+                    envelope_expires_at=item.get("expires_at"),
+                )
+            except ValueError as exc:
+                return {"success": False, "error": f"Invalid prior forward: {exc}"}
+            original_envelope = verified["original_envelope"]
+            message_record = verified["message"]
+            path = verified["path"]
+        else:
+            return {"success": False, "error": "Only messages and prior forwards may be forwarded"}
+        try:
+            message_record = verify_message_record(message_record, original_envelope)
+        except (TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": f"Message lacks transferable signed provenance: {exc}",
+            }
+        hooks = self._hooks()
+        if hooks and hasattr(hooks, "should_forward"):
+            try:
+                allowed = bool(hooks.should_forward(dict(item), rel))
+            except Exception:
+                allowed = False
+            if not allowed:
+                return {"success": False, "error": "Local policy declined this forward"}
+
+        expires_at = _expires_in(float(ttl_seconds))
+        previous_expiry = None
+        if path:
+            previous_expiry = path[-1].get("expires_at")
+        elif original_envelope:
+            previous_expiry = original_envelope.get("expires_at")
+        if previous_expiry:
+            previous_ts = _parse_ts(previous_expiry)
+            candidate_ts = _parse_ts(expires_at)
+            if previous_ts is None or previous_ts <= time.time():
+                return {"success": False, "error": "Message forwarding window has expired"}
+            if candidate_ts is not None and previous_ts < candidate_ts:
+                expires_at = previous_expiry
+        try:
+            package = create_forward_package(
+                self.store.private_key_hex,
+                self.agent_id,
+                peer_id,
+                original_envelope,
+                message_record,
+                path=path,
+                note=note,
+                max_hops=max_hops,
+                expires_at=expires_at,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+        original_content = package["message"]["content"]
+        rendered = (
+            (note.strip() + "\n\n") if note.strip() else ""
+        ) + f"[Forwarded from {package['message']['from'][:12]}]\n{original_content}"
+        result = self._send_envelope(
+            peer_id,
+            "forward",
+            {"content": rendered, "forward": package},
+            expires_at,
+        )
+        if result.get("success"):
+            result.update({
+                "original_envelope_id": package["message"]["envelope_id"],
+                "hops_remaining": package["path"][-1]["hops_remaining"],
+                "expires_at": expires_at,
+            })
+        return result
+
+    def _write_contribution_audit(self, package: dict) -> None:
+        """Publish the portable proof, never the local ledger or private keys."""
+        verified = verify_contribution_package(package)
+        contribution_id = verified["ticket"]["contribution_id"]
+        path = self.work / "antimatter" / f"{contribution_id}.json"
+        atomic_write_text(path, json.dumps(verified, indent=2, sort_keys=True) + "\n")
+
+    def _eligible_older_relationships(self, package: dict) -> list[Relationship]:
+        verified = verify_contribution_package(package, require_unexpired=True)
+        ticket = verified["ticket"]
+        current_claim = self.passport_claim()
+        current_created = parse_timestamp(current_claim["created_at"], "current passport created_at")
+        excluded = {
+            ticket["source"]["payer_id"],
+            ticket["source"]["payee_id"],
+        }
+        for hop in verified["path"]:
+            excluded.add(hop["from"])
+            excluded.add(hop["to"])
+        now = datetime.now(timezone.utc).timestamp()
+        candidates = []
+        for rel in self.store.load_relationships().values():
+            if rel.state != REL_ACTIVE or rel.peer_id in excluded or not rel.last_seen_at:
+                continue
+            try:
+                claim = verify_passport_claim(rel.peer_passport, rel.peer_id)
+                peer_created = parse_timestamp(claim["created_at"], "peer passport created_at")
+                last_seen = _parse_ts(rel.last_seen_at)
+            except (TypeError, ValueError):
+                continue
+            if (
+                peer_created >= current_created
+                or last_seen is None
+                or now - last_seen > ticket["liveness_window_seconds"]
+                or last_seen > now + 300
+            ):
+                continue
+            candidates.append(rel)
+        seed = ticket["contribution_id"] + ":" + self.agent_id + ":"
+        return sorted(
+            candidates,
+            key=lambda rel: hashlib.sha256((seed + rel.peer_id).encode()).hexdigest(),
+        )
+
+    def _select_older_relationship(
+        self,
+        package: dict,
+        target_agent_id: Optional[str] = None,
+    ) -> Optional[Relationship]:
+        candidates = self._eligible_older_relationships(package)
+        if target_agent_id:
+            selected = next((rel for rel in candidates if rel.peer_id == target_agent_id), None)
+            if selected is None:
+                raise ValueError(
+                    "target_agent_id is not an older, recently observed active relationship",
+                )
+            return selected
+        return candidates[0] if candidates else None
+
+    def _append_contribution_to(self, package: dict, rel: Relationship) -> dict:
+        return append_contribution_hop(
+            self.store.private_key_hex,
+            package,
+            from_passport=self.passport_claim(),
+            to_passport=verify_passport_claim(rel.peer_passport, rel.peer_id),
+            observed_active_at=rel.last_seen_at,
+            relationship_since=rel.created_at,
+        )
+
+    def _default_contribution_destination(self, package: dict) -> dict:
+        """Offer a passport-bound rail destination when the adapter is available."""
+        rail = package["ticket"]["contribution"]["rail"]
+        if not rail.startswith("solana:"):
+            return {}
+        try:
+            from darkmatter.wallet.payments import SolanaPaymentService
+
+            network = rail.split(":", 1)[1]
+            return {"rail": rail, "wallet_claim": SolanaPaymentService(
+                self, network=network,
+            ).claim()}
+        except Exception:
+            return {}
+
+    def _store_contribution(self, package: dict) -> dict:
+        record = self.contributions.put(package)
+        self._write_contribution_audit(package)
+        return record
+
+    def _send_contribution_package(self, peer_id: str, env_type: str, package: dict) -> dict:
+        expires_at = package["ticket"]["expires_at"]
+        result = self._send_envelope(
+            peer_id,
+            env_type,
+            {"package": package},
+            expires_at,
+        )
+        if result.get("success"):
+            result.update({
+                "contribution_id": package["ticket"]["contribution_id"],
+                "status": self.contributions.get(
+                    package["ticket"]["contribution_id"],
+                )["status"],
+                "hop_count": len(package["path"]),
+                "proof_package": package,
+            })
+        return result
+
+    @_locked
+    def antimatter_contribute(
+        self,
+        settlement_id: str,
+        *,
+        target_agent_id: Optional[str] = None,
+        max_hops: int = MAX_CONTRIBUTION_HOPS,
+        ttl_seconds: int = 7 * 24 * 60 * 60,
+        liveness_window_seconds: int = 7 * 24 * 60 * 60,
+    ) -> dict:
+        """Turn a received settlement into a public 1% contribution route."""
+        existing = self.contributions.for_settlement(settlement_id)
+        if existing:
+            return {
+                "success": True,
+                "existing": True,
+                **existing,
+                "proof_package": existing["package"],
+            }
+        settlement = self.antimatter.get(settlement_id)
+        if settlement is None:
+            return {"success": False, "error": "Unknown settlement_id"}
+        if settlement.get("payee_id") != self.agent_id:
+            return {"success": False, "error": "Only the payee that received value may originate"}
+        receipts = settlement.get("receipts") or []
+        if not receipts:
+            return {"success": False, "error": "A payment receipt is required before contribution routing"}
+        receipt = receipts[-1]
+        terms = settlement["terms"]
+        source = {
+            "settlement_id": settlement_id,
+            "payer_id": settlement["payer_id"],
+            "payee_id": settlement["payee_id"],
+            "receipt_id": receipt["id"],
+            "transaction_id": receipt["body"]["tx_id"],
+            "amount": terms["amount"],
+            "currency": terms["currency"],
+            "rail": terms["rail"],
+            "receipt_attestation": receipt["body"].get("receipt_attestation"),
+        }
+        try:
+            ticket = create_contribution_ticket(
+                self.store.private_key_hex,
+                self.agent_id,
+                source,
+                max_hops=max_hops,
+                ttl_seconds=ttl_seconds,
+                liveness_window_seconds=liveness_window_seconds,
+            )
+            package = {
+                "version": 1,
+                "ticket": ticket,
+                "path": [],
+                "resolution": None,
+                "fulfillment": None,
+            }
+            rel = self._select_older_relationship(package, target_agent_id)
+            if rel is None:
+                package = resolve_contribution(
+                    self.store.private_key_hex,
+                    package,
+                    passport=self.passport_claim(),
+                    reason="no_older_live_relationship",
+                )
+                record = self._store_contribution(package)
+                self._publish(f"antimatter unroutable {ticket['contribution_id'][:12]}")
+                return {
+                    "success": True,
+                    **record,
+                    "proof_package": package,
+                    "explanation": "No older, recently observed active relationship was eligible.",
+                }
+            package = self._append_contribution_to(package, rel)
+            self._store_contribution(package)
+            return self._send_contribution_package(
+                rel.peer_id, "antimatter_contribution", package,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    @_locked
+    def antimatter_advance_contribution(
+        self,
+        contribution_id: str,
+        *,
+        target_agent_id: Optional[str] = None,
+        resolve_here: bool = False,
+        decline: bool = False,
+        destination: Optional[dict] = None,
+    ) -> dict:
+        """Apply the default: route older until terminal, then resolve transparently."""
+        record = self.contributions.get(contribution_id)
+        if not record:
+            return {"success": False, "error": "Unknown contribution_id"}
+        package = record["package"]
+        if package.get("resolution"):
+            return {"success": True, "existing": True, **record, "proof_package": package}
+        path = package["path"]
+        expected = path[-1]["to"] if path else package["ticket"]["origin_id"]
+        if expected != self.agent_id:
+            return {"success": False, "error": "This agent is not the current route recipient"}
+        try:
+            at_limit = len(path) >= package["ticket"]["max_hops"]
+            rel = None if (resolve_here or decline or at_limit) else self._select_older_relationship(
+                package, target_agent_id,
+            )
+            if rel is not None:
+                package = self._append_contribution_to(package, rel)
+                self._store_contribution(package)
+                return self._send_contribution_package(
+                    rel.peer_id, "antimatter_contribution", package,
+                )
+            reason = (
+                "declined" if decline
+                else "max_hops" if at_limit
+                else "voluntary_acceptance" if resolve_here
+                else "no_older_live_relationship"
+            )
+            selected_destination = destination or self._default_contribution_destination(package)
+            package = resolve_contribution(
+                self.store.private_key_hex,
+                package,
+                passport=self.passport_claim(),
+                reason=reason,
+                destination=selected_destination,
+            )
+            self._store_contribution(package)
+            if not path:
+                self._publish(f"antimatter resolve {contribution_id[:12]}")
+                return {
+                    "success": True,
+                    **self.contributions.get(contribution_id),
+                    "proof_package": package,
+                }
+            previous = path[-1]["from"]
+            return self._send_contribution_package(
+                previous, "antimatter_resolution", package,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    @_locked
+    def antimatter_relay_resolution(self, contribution_id: str) -> dict:
+        record = self.contributions.get(contribution_id)
+        if not record or not record["package"].get("resolution"):
+            return {"success": False, "error": "Contribution has no resolution"}
+        package = record["package"]
+        nodes = [package["ticket"]["origin_id"]] + [hop["to"] for hop in package["path"]]
+        if self.agent_id not in nodes:
+            return {"success": False, "error": "This agent is not on the route"}
+        index = nodes.index(self.agent_id)
+        if index == 0:
+            return {"success": True, "arrived": True, **record, "proof_package": package}
+        return self._send_contribution_package(
+            nodes[index - 1], "antimatter_resolution", package,
+        )
+
+    @_locked
+    def antimatter_fulfill_contribution(
+        self,
+        contribution_id: str,
+        transaction_id: str,
+        proof: Optional[dict] = None,
+    ) -> dict:
+        record = self.contributions.get(contribution_id)
+        if not record:
+            return {"success": False, "error": "Unknown contribution_id"}
+        try:
+            package = fulfill_contribution(
+                self.store.private_key_hex,
+                record["package"],
+                transaction_id,
+                proof or {},
+            )
+            self._store_contribution(package)
+            first = package["path"][0]["to"]
+            return self._send_contribution_package(
+                first, "antimatter_fulfillment", package,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    @_locked
+    def antimatter_relay_fulfillment(self, contribution_id: str) -> dict:
+        record = self.contributions.get(contribution_id)
+        if not record or not record["package"].get("fulfillment"):
+            return {"success": False, "error": "Contribution has no fulfillment"}
+        package = record["package"]
+        nodes = [package["ticket"]["origin_id"]] + [hop["to"] for hop in package["path"]]
+        if self.agent_id not in nodes:
+            return {"success": False, "error": "This agent is not on the route"}
+        index = nodes.index(self.agent_id)
+        if index == len(nodes) - 1:
+            return {"success": True, "arrived": True, **record, "proof_package": package}
+        return self._send_contribution_package(
+            nodes[index + 1], "antimatter_fulfillment", package,
+        )
+
+    @_locked
+    def antimatter_presence(self, peer_id: Optional[str] = None) -> dict:
+        """Publish a signed liveness pulse to one or every active relationship."""
+        relationships = self.store.load_relationships()
+        targets = [peer_id] if peer_id else [
+            rel.peer_id for rel in relationships.values() if rel.state == REL_ACTIVE
+        ]
+        results = []
+        for target in targets:
+            results.append(self._send_envelope(
+                target,
+                "presence",
+                {"passport": self.passport_claim(), "purpose": "antimatter_liveness"},
+                _expires_in(7 * 24 * 60 * 60),
+            ))
+        return {
+            "success": bool(results) and all(item.get("success") for item in results),
+            "count": len(results),
+            "results": results,
+        }
+
+    def get_contribution(self, contribution_id: str) -> Optional[dict]:
+        return self.contributions.get(contribution_id)
+
+    def list_contributions(self, status: Optional[str] = None) -> list[dict]:
+        return self.contributions.list(status)
 
     @_locked
     def antimatter_offer(
@@ -573,6 +1148,24 @@ class Mailbox:
         if not acceptance:
             return {"success": False, "error": "settlement has not been accepted"}
         invoice = record.get("invoice")
+        envelope_id = uuid.uuid4().hex
+        timestamp = datetime.now(timezone.utc).isoformat()
+        terms = record["terms"]
+        try:
+            source_receipt = create_source_receipt(
+                self.store.private_key_hex,
+                payer_id=record["payer_id"],
+                payee_id=record["payee_id"],
+                settlement_id=settlement_id,
+                receipt_id=envelope_id,
+                timestamp=timestamp,
+                transaction_id=tx_id,
+                amount=terms["amount"],
+                currency=terms["currency"],
+                rail=terms["rail"],
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
         body = antimatter_event_body(
             "receipt",
             settlement_id,
@@ -581,8 +1174,15 @@ class Mailbox:
             tx_id=tx_id,
             proof=proof or {},
             note=note,
+            receipt_attestation=source_receipt,
         )
-        return self._send_envelope(peer_id, ANTIMATTER_RECEIPT, body)
+        return self._send_envelope(
+            peer_id,
+            ANTIMATTER_RECEIPT,
+            body,
+            envelope_id=envelope_id,
+            timestamp=timestamp,
+        )
 
     @_locked
     def antimatter_confirm(
@@ -607,7 +1207,16 @@ class Mailbox:
             verification=verification or {},
             note=note,
         )
-        return self._send_envelope(peer_id, ANTIMATTER_CONFIRM, body)
+        result = self._send_envelope(peer_id, ANTIMATTER_CONFIRM, body)
+        if result.get("success"):
+            contribution = self.antimatter_contribute(settlement_id)
+            result["contribution"] = contribution
+            if not contribution.get("success"):
+                result["contribution_warning"] = (
+                    "Settlement was confirmed, but its AntiMatter ticket was not created: "
+                    + contribution.get("error", "unknown error")
+                )
+        return result
 
     @_locked
     def antimatter_dispute(
@@ -662,7 +1271,10 @@ class Mailbox:
             if agent.get("agent_id") != peer_id:
                 return {"success": False, "error": "Contact card does not match the mailbox identity"}
             self.store.upsert_relationship(
-                peer_id, peer_locator=card["locator"], state=REL_PENDING,
+                peer_id,
+                peer_locator=card["locator"],
+                state=REL_PENDING,
+                peer_passport=card.get("passport"),
             )
             repo = self._fetch_remote(card["locator"], peer_id)
             for data in self._read_outbox_files(repo):
@@ -698,6 +1310,7 @@ class Mailbox:
             {
                 "locator": advertised_locator,
                 "display_name": self.store.profile.get("display_name", ""),
+                "passport": self.passport_claim(),
             },
         )
         self._write_outbox(env)
@@ -756,12 +1369,15 @@ class Mailbox:
 
         body = env.body or {}
         if env.type == "receipt":
+            rel = self.store.get_relationship(env.from_id)
+            if rel is not None and rel.state != REL_CLOSED:
+                self.store.upsert_relationship(env.from_id, last_seen_at=env.timestamp)
             if self._move_to_readbox(body.get("envelope_id", "")):
                 return "receipt"
             return None
 
         antimatter_result = None
-        if env.type in ANTIMATTER_ENVELOPE_TYPES:
+        if env.type in ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES:
             rel = self.store.get_relationship(env.from_id)
             if rel is None or rel.state != REL_ACTIVE:
                 return None
@@ -776,21 +1392,93 @@ class Mailbox:
 
         if env.type == "accept":
             peer_locator = body.get("locator") or body.get("remote") or peer_remote
+            try:
+                peer_passport = verify_passport_claim(body.get("passport"), env.from_id)
+            except ValueError:
+                return None
             self.store.upsert_relationship(
-                env.from_id, peer_locator=peer_locator, state=REL_ACTIVE,
+                env.from_id,
+                peer_locator=peer_locator,
+                state=REL_ACTIVE,
+                peer_passport=peer_passport,
+                last_seen_at=env.timestamp,
             )
         elif env.type == "ignore":
             self.store.upsert_relationship(env.from_id, state=REL_CLOSED)
         elif env.type == "introduce":
             peer_locator = body.get("locator") or body.get("remote") or peer_remote
+            try:
+                peer_passport = verify_passport_claim(body.get("passport"), env.from_id)
+            except ValueError:
+                return None
             existing = self.store.get_relationship(env.from_id)
             if existing is None or existing.state == REL_PENDING:
                 self.store.upsert_relationship(
-                    env.from_id, peer_locator=peer_locator, state=REL_PENDING,
+                    env.from_id,
+                    peer_locator=peer_locator,
+                    state=REL_PENDING,
+                    peer_passport=peer_passport,
+                    last_seen_at=env.timestamp,
                 )
         elif env.type == "message":
             rel = self.store.get_relationship(env.from_id)
             if rel is None or rel.state != REL_ACTIVE:
+                return None
+        elif env.type == "forward":
+            rel = self.store.get_relationship(env.from_id)
+            if rel is None or rel.state != REL_ACTIVE:
+                return None
+            try:
+                package = verify_forward_package(
+                    body.get("forward"),
+                    envelope_from=env.from_id,
+                    envelope_to=env.to_id,
+                    envelope_expires_at=env.expires_at,
+                )
+            except (TypeError, ValueError):
+                return None
+            body["forward"] = package
+        elif env.type == "presence":
+            rel = self.store.get_relationship(env.from_id)
+            if rel is None or rel.state != REL_ACTIVE:
+                return None
+            try:
+                verify_passport_claim(body.get("passport"), env.from_id)
+            except ValueError:
+                return None
+        elif env.type in ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES:
+            rel = self.store.get_relationship(env.from_id)
+            if rel is None or rel.state != REL_ACTIVE:
+                return None
+            try:
+                package = verify_contribution_package(
+                    body.get("package"),
+                    require_unexpired=env.type == "antimatter_contribution",
+                )
+                path = package["path"]
+                if env.type == "antimatter_contribution":
+                    if not path or package["resolution"] or package["fulfillment"]:
+                        raise ValueError("route package is not awaiting a recipient")
+                    if path[-1]["from"] != env.from_id or path[-1]["to"] != env.to_id:
+                        raise ValueError("route envelope does not match its final hop")
+                elif env.type == "antimatter_resolution":
+                    if not package["resolution"] or package["fulfillment"]:
+                        raise ValueError("resolution envelope has the wrong package state")
+                    nodes = [package["ticket"]["origin_id"]] + [hop["to"] for hop in path]
+                    index = nodes.index(env.to_id)
+                    if index + 1 >= len(nodes) or nodes[index + 1] != env.from_id:
+                        raise ValueError("resolution did not follow the reverse route")
+                else:
+                    if not package["fulfillment"]:
+                        raise ValueError("fulfillment envelope has no fulfillment proof")
+                    nodes = [package["ticket"]["origin_id"]] + [hop["to"] for hop in path]
+                    index = nodes.index(env.from_id)
+                    if index + 1 >= len(nodes) or nodes[index + 1] != env.to_id:
+                        raise ValueError("fulfillment did not follow the contribution route")
+                body["package"] = package
+                self.contributions.put(package)
+                self._write_contribution_audit(package)
+            except (TypeError, ValueError):
                 return None
         elif env.type == "hint":
             rel = self.store.get_relationship(env.from_id)
@@ -803,8 +1491,29 @@ class Mailbox:
                     self.store.upsert_relationship(about, last_fetched_at="")
 
         content = body.get("content", "")
-        if env.type in ANTIMATTER_ENVELOPE_TYPES:
+        forwardable = False
+        if env.type == "message" and body.get("provenance"):
+            try:
+                body["provenance"] = verify_message_record(
+                    body["provenance"], env.to_public_dict(),
+                )
+                forwardable = True
+            except (TypeError, ValueError):
+                forwardable = False
+        elif env.type == "forward":
+            package = body["forward"]
+            hop = package["path"][-1]
+            note = hop.get("note", "").strip()
+            content = (
+                (note + "\n\n") if note else ""
+            ) + f"[Forwarded from {package['message']['from'][:12]}]\n{package['message']['content']}"
+            forwardable = hop["hops_remaining"] > 0
+        if env.type in ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES:
             content = summarize_antimatter_event(env.type, body)
+        elif env.type in ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES:
+            package = body["package"]
+            contribution_id = package["ticket"]["contribution_id"]
+            content = f"AntiMatter {env.type.removeprefix('antimatter_')} {contribution_id}"
         item = {
             "id": env.id,
             "type": env.type,
@@ -814,12 +1523,17 @@ class Mailbox:
             "expires_at": env.expires_at,
             "content": content,
             "body": body,
+            "envelope": env.to_public_dict(),
+            "forwardable": forwardable,
             "consumed": env.type not in ACTIONABLE_ENVELOPE_TYPES,
         }
         if antimatter_result and not antimatter_result.get("success"):
             item["protocol_error"] = antimatter_result.get("error", "Invalid AntiMatter event")
         self.store.append_inbox(item)
-        if env.type not in ("receipt", "hint"):
+        current = self.store.get_relationship(env.from_id)
+        if current is not None and current.state != REL_CLOSED:
+            self.store.upsert_relationship(env.from_id, last_seen_at=env.timestamp)
+        if env.type not in ("receipt", "hint", "presence"):
             self._receipt(env.from_id, env.id)
         return env.type
 
@@ -898,6 +1612,37 @@ class Mailbox:
             wrote += 1
         return wrote
 
+    def _process_contribution_events(self, ingested: list[dict]) -> list[dict]:
+        """Follow the transparent default while remaining locally disableable."""
+        if not self.store.load_settings().get("antimatter_auto_route", True):
+            return []
+        inbox = {item.get("id"): item for item in self.store.load_inbox()}
+        processed = []
+        seen = set()
+        for event in ingested:
+            env_type = event.get("type")
+            if env_type not in ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES:
+                continue
+            item = inbox.get(event.get("id")) or {}
+            package = (item.get("body") or {}).get("package") or {}
+            contribution_id = (package.get("ticket") or {}).get("contribution_id")
+            if not contribution_id or (env_type, contribution_id) in seen:
+                continue
+            seen.add((env_type, contribution_id))
+            if env_type == "antimatter_contribution":
+                result = self.antimatter_advance_contribution(contribution_id)
+            elif env_type == "antimatter_resolution":
+                result = self.antimatter_relay_resolution(contribution_id)
+            else:
+                result = self.antimatter_relay_fulfillment(contribution_id)
+            processed.append({
+                "type": env_type,
+                "contribution_id": contribution_id,
+                "success": bool(result.get("success")),
+                "error": result.get("error"),
+            })
+        return processed
+
     @_locked
     def sync(self, only_due: bool = False) -> dict:
         self.expire()
@@ -937,11 +1682,13 @@ class Mailbox:
                 hinted += self._emit_hints(updated, hint_recipients)
         if ingested or hinted:
             self._publish("receipts")
+        contribution_actions = self._process_contribution_events(ingested)
         return {
             "success": True,
             "ingested": ingested,
             "errors": errors,
             "hints": hinted,
+            "antimatter_actions": contribution_actions,
             "inbox": self.store.unconsumed_messages(),
             "publish_errors": list(self._last_publish_errors),
         }
@@ -984,4 +1731,5 @@ class Mailbox:
         profile = self.store.save_profile(display_name=display_name, bio=bio)
         self._write_agent_json()
         self._publish("update profile")
+        self._refresh_nearby()
         return profile

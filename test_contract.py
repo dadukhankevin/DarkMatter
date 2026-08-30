@@ -2,11 +2,18 @@
 
 import json
 import multiprocessing
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from darkmatter.contract.contact import create_contact_card, verify_contact_card
 from darkmatter.contract.envelope import open_envelope, seal_envelope
+from darkmatter.contract.forwarding import (
+    create_forward_package,
+    create_message_record,
+    verify_forward_package,
+)
+from darkmatter.contract.tenure import create_passport_claim
 from darkmatter.identity import generate_keypair
 from darkmatter.security import DOMAIN_ENVELOPE, DOMAIN_MESSAGE, sign_message, verify_message
 from darkmatter.store import LocalStore
@@ -78,11 +85,89 @@ def test_contact_card_roundtrip_and_tamper(keys):
         agent_id,
         "/tmp/mailbox.git",
         display_name="opal-fox",
+        passport=create_passport_claim(
+            private_key, agent_id, "2025-01-01T00:00:00+00:00",
+        ),
     )
-    assert verify_contact_card(card)["agent_id"] == agent_id
+    verified = verify_contact_card(card)
+    assert verified["agent_id"] == agent_id
+    assert verified["passport"]["agent_id"] == agent_id
     card["locator"] = "/tmp/impostor.git"
     with pytest.raises(ValueError, match="signature"):
         verify_contact_card(card)
+
+
+def test_forward_package_preserves_original_and_signed_hops():
+    a_priv, a_id = generate_keypair()
+    b_priv, b_id = generate_keypair()
+    _, c_id = generate_keypair()
+    envelope_id = "original-message"
+    timestamp = datetime.now(timezone.utc).isoformat()
+    record = create_message_record(
+        a_priv, a_id, b_id, envelope_id, timestamp, "portable truth",
+        metadata={"topic": "test"},
+    )
+    original = seal_envelope(
+        a_priv,
+        a_id,
+        b_id,
+        "message",
+        {"content": "portable truth", "provenance": record},
+        envelope_id=envelope_id,
+        timestamp=timestamp,
+    ).to_public_dict()
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    package = create_forward_package(
+        b_priv,
+        b_id,
+        c_id,
+        original,
+        record,
+        note="C should see this",
+        max_hops=2,
+        expires_at=expires_at,
+    )
+    verified = verify_forward_package(
+        package,
+        envelope_from=b_id,
+        envelope_to=c_id,
+        envelope_expires_at=expires_at,
+    )
+    assert verified["original_envelope"] == original
+    assert verified["message"]["content"] == "portable truth"
+    assert verified["path"][0]["note"] == "C should see this"
+    assert verified["path"][0]["hops_remaining"] == 1
+
+
+def test_forward_package_rejects_tampered_original_content():
+    a_priv, a_id = generate_keypair()
+    b_priv, b_id = generate_keypair()
+    _, c_id = generate_keypair()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    record = create_message_record(
+        a_priv, a_id, b_id, "m1", timestamp, "original",
+    )
+    original = seal_envelope(
+        a_priv,
+        a_id,
+        b_id,
+        "message",
+        {"content": "original", "provenance": record},
+        envelope_id="m1",
+        timestamp=timestamp,
+    ).to_public_dict()
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    package = create_forward_package(
+        b_priv, b_id, c_id, original, record, expires_at=expires_at,
+    )
+    package["message"]["content"] = "rewritten"
+    with pytest.raises(ValueError, match="message record signature"):
+        verify_forward_package(
+            package,
+            envelope_from=b_id,
+            envelope_to=c_id,
+            envelope_expires_at=expires_at,
+        )
 
 
 def test_passport_and_relationships(tmp_path):

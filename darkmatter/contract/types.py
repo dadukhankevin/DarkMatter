@@ -31,6 +31,8 @@ class Relationship:
     negative_since: Optional[str] = None
     fetch_every: Optional[float] = None
     last_fetched_at: str = ""
+    last_seen_at: str = ""
+    peer_passport: Optional[dict] = None
     outbox_tip: str = ""
 
     def to_dict(self) -> dict:
@@ -47,6 +49,8 @@ class Relationship:
             "negative_since": self.negative_since,
             "fetch_every": self.fetch_every,
             "last_fetched_at": self.last_fetched_at,
+            "last_seen_at": self.last_seen_at,
+            "peer_passport": self.peer_passport,
             "outbox_tip": self.outbox_tip,
         }
 
@@ -66,6 +70,8 @@ class Relationship:
             negative_since=data.get("negative_since"),
             fetch_every=_opt_float(data.get("fetch_every")),
             last_fetched_at=data.get("last_fetched_at", ""),
+            last_seen_at=data.get("last_seen_at", ""),
+            peer_passport=data.get("peer_passport"),
             outbox_tip=data.get("outbox_tip", ""),
         )
 
