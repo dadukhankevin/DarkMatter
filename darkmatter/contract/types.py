@@ -33,6 +33,7 @@ class Relationship:
     last_fetched_at: str = ""
     last_seen_at: str = ""
     peer_passport: Optional[dict] = None
+    peer_liveness: Optional[dict] = None
     outbox_tip: str = ""
 
     def to_dict(self) -> dict:
@@ -51,6 +52,7 @@ class Relationship:
             "last_fetched_at": self.last_fetched_at,
             "last_seen_at": self.last_seen_at,
             "peer_passport": self.peer_passport,
+            "peer_liveness": self.peer_liveness,
             "outbox_tip": self.outbox_tip,
         }
 
@@ -72,6 +74,7 @@ class Relationship:
             last_fetched_at=data.get("last_fetched_at", ""),
             last_seen_at=data.get("last_seen_at", ""),
             peer_passport=data.get("peer_passport"),
+            peer_liveness=data.get("peer_liveness"),
             outbox_tip=data.get("outbox_tip", ""),
         )
 

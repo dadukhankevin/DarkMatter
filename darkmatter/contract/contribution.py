@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from darkmatter.contract.envelope import is_expired_at
+from darkmatter.contract.liveness import verify_liveness_claim
 from darkmatter.contract.tenure import parse_timestamp, verify_passport_claim
 from darkmatter.identity import derive_public_key_hex
 from darkmatter.security import sign_payload, verify_signed_payload
@@ -376,6 +377,9 @@ def _hop_payload(hop: dict) -> dict:
         raise ValueError("route previous digest is invalid") from exc
     timestamp = parse_timestamp(hop.get("timestamp"), "route timestamp").isoformat()
     observed = parse_timestamp(hop.get("observed_active_at"), "route observed_active_at").isoformat()
+    liveness = verify_liveness_claim(hop.get("liveness"), to_id)
+    if liveness["timestamp"] != observed:
+        raise ValueError("route liveness claim does not match observed_active_at")
     relationship_since = parse_timestamp(
         hop.get("relationship_since"), "route relationship_since",
     ).isoformat()
@@ -389,6 +393,7 @@ def _hop_payload(hop: dict) -> dict:
         "to_passport": to_passport,
         "timestamp": timestamp,
         "observed_active_at": observed,
+        "liveness": liveness,
         "relationship_since": relationship_since,
         "previous": previous.lower(),
         "decision": _text(hop.get("decision"), "route decision", 128),
@@ -453,6 +458,7 @@ def append_contribution_hop(
     from_passport: dict,
     to_passport: dict,
     observed_active_at: str,
+    liveness: dict,
     relationship_since: str,
 ) -> dict:
     verified = verify_contribution_package(package, require_unexpired=True)
@@ -480,6 +486,7 @@ def append_contribution_hop(
         "to_passport": to_passport,
         "timestamp": timestamp,
         "observed_active_at": observed_active_at,
+        "liveness": liveness,
         "relationship_since": relationship_since,
         "previous": _digest(path[-1]) if path else _digest(ticket),
         "decision": "older_recently_observed_relationship",
@@ -698,6 +705,8 @@ def contribution_state(package: dict) -> str:
         if verified["resolution"]["reason"] == "declined":
             return "declined"
         return "resolved" if verified["resolution"]["beneficiary"] else "unroutable"
+    if is_expired_at(verified["ticket"]["expires_at"]):
+        return "expired"
     return "routing" if verified["path"] else "created"
 
 

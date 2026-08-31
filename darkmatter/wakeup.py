@@ -63,6 +63,13 @@ def format_wake_message(messages: list[dict]) -> str:
             "timestamp": message.get("timestamp", ""),
             "content": message.get("content", ""),
             "settlement_id": (message.get("body") or {}).get("settlement_id", ""),
+            "contribution_id": (
+                ((message.get("body") or {}).get("package") or {}).get("ticket") or {}
+            ).get("contribution_id", ""),
+            "contact_card": (
+                (message.get("body") or {}).get("contact_card")
+                if message.get("type") == "referral" else None
+            ),
             "protocol_error": message.get("protocol_error", ""),
             "metadata": (message.get("body") or {}).get("metadata", {}),
         }

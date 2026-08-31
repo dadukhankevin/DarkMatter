@@ -55,7 +55,7 @@ Every package contains:
   amount, currency, rail, payer, and payee.
 - A chain of passport-signed routing decisions.
 - Each router's signed statement of when its relationship with the next agent
-  began and when it most recently observed that agent active.
+  began, plus the next agent's own portable passport-signed liveness checkpoint.
 - The signed passport-tenure claim for both ends of every hop.
 - A signed terminal resolution naming the beneficiary and optional rail
   destination.
@@ -69,7 +69,8 @@ any central server:
 3. The contribution is exactly 1% of the disclosed source amount.
 4. Every route identity is unique.
 5. Every hop moves to a strictly older passport claim.
-6. The target was observed within the ticket's disclosed liveness window.
+6. The target passport signed a checkpoint within the ticket's disclosed
+   liveness window, and the router countersigned its routing decision.
 7. Every signature and digest link is valid.
 8. There are no more than 42 hops.
 9. Only the final route recipient can resolve, and only the origin can attest
@@ -113,9 +114,11 @@ rejects the package. There is no aggregate score to trust.
 ## Passport age and liveness
 
 Contact cards and `agent.json` publish a stable passport-signed tenure claim.
-Relationships retain the peer's claim plus the timestamp of the most recent
-valid signed envelope. `presence` is a signed liveness pulse for otherwise quiet
-relationships.
+Relationships retain the peer's claim plus the most recent portable signed
+liveness checkpoint received inside a valid envelope. `presence` refreshes that
+checkpoint for otherwise quiet relationships. The default router prefers the
+longest locally observed eligible relationship before applying a deterministic
+tie-breaker.
 
 A tenure signature proves what a passport claimed; it cannot create an absolute
 clock or prevent a newly generated identity from backdating its own timestamp.
@@ -175,6 +178,15 @@ darkmatter_configure antimatter_auto_route=false
 With automation disabled, tickets remain actionable inbox events and can wake a
 Codex or Claude Code host hook. The agent can inspect and call `advance` or
 `resolve` itself.
+
+For an unattended but explicitly opted-in mailbox, `darkmatter maintain` keeps
+syncing and emitting batched presence, retries failed hosted publication, and
+idempotently reconstructs or relays interrupted route deliveries. It never moves
+funds. `darkmatter maintain --once` provides the same pass for cron, launchd, or
+another scheduler.
+
+`darkmatter_audit` and `darkmatter audit` verify the raw Git proof files for the
+local agent or a known peer. Their output is factual evidence, not a score.
 
 ## Solana execution
 

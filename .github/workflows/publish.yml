@@ -13,7 +13,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install build
+      - run: pip install build pytest
+      - run: pip install -e .
+      - run: pytest -q
       - run: python -m build
       - uses: actions/upload-artifact@v4
         with:

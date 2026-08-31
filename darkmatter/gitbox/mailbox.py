@@ -39,6 +39,7 @@ from darkmatter.contract.envelope import (
 from darkmatter.contract.contribution import (
     MAX_CONTRIBUTION_HOPS,
     append_contribution_hop,
+    contribution_state,
     create_contribution_ticket,
     create_source_receipt,
     fulfill_contribution,
@@ -51,6 +52,7 @@ from darkmatter.contract.forwarding import (
     verify_forward_package,
     verify_message_record,
 )
+from darkmatter.contract.liveness import create_liveness_claim, verify_liveness_claim
 from darkmatter.contract.types import REL_ACTIVE, REL_CLOSED, REL_PENDING, Envelope, Relationship
 from darkmatter.contract.tenure import (
     create_passport_claim,
@@ -222,6 +224,14 @@ class Mailbox:
             "display_name": profile.get("display_name", ""),
             "bio": profile.get("bio", ""),
             "passport": self.passport_claim(),
+            "capabilities": {
+                "contact_card": 4,
+                "envelope": 3,
+                "antimatter_contribution": 1,
+                "liveness": 1,
+                "passport_succession": 1,
+                "referral": 1,
+            },
         }
         path = self.work / "agent.json"
         atomic_write_text(path, json.dumps(data, indent=2) + "\n")
@@ -457,6 +467,38 @@ class Mailbox:
             raise ValueError(f"No agent.json at remote {remote}")
         return agent
 
+    def _seal_envelope(
+        self,
+        peer_id: str,
+        env_type: str,
+        body: dict,
+        expires_at: Optional[str] = None,
+        *,
+        envelope_id: Optional[str] = None,
+        timestamp: Optional[str] = None,
+    ) -> Envelope:
+        """Seal mail with a portable passport-signed liveness checkpoint."""
+        timestamp = timestamp or datetime.now(timezone.utc).isoformat()
+        body = dict(body)
+        body.setdefault(
+            "_liveness",
+            create_liveness_claim(
+                self.store.private_key_hex,
+                self.agent_id,
+                timestamp,
+            ),
+        )
+        return seal_envelope(
+            self.store.private_key_hex,
+            self.agent_id,
+            peer_id,
+            env_type,
+            body,
+            expires_at=expires_at,
+            envelope_id=envelope_id,
+            timestamp=timestamp,
+        )
+
     @_locked
     def introduce(
         self,
@@ -491,9 +533,7 @@ class Mailbox:
             state=REL_PENDING,
             peer_passport=peer_passport,
         )
-        env = seal_envelope(
-            self.store.private_key_hex,
-            self.agent_id,
+        env = self._seal_envelope(
             peer_id,
             "introduce",
             {
@@ -577,9 +617,7 @@ class Mailbox:
         if rel is None or rel.state != REL_ACTIVE:
             return {"success": False, "error": "No active relationship"}
         try:
-            env = seal_envelope(
-                self.store.private_key_hex,
-                self.agent_id,
+            env = self._seal_envelope(
                 peer_id,
                 env_type,
                 body,
@@ -608,6 +646,37 @@ class Mailbox:
             result["settlement"] = projection["settlement"]
             result["trust_delta"] = projection.get("trust_delta", 0.0)
         return self._with_publish(result)
+
+    @_locked
+    def refer_contact(
+        self,
+        peer_id: str,
+        contact_card: dict,
+        note: str = "",
+    ) -> dict:
+        """Explicitly introduce one peer's untouched signed card to another."""
+        if not isinstance(note, str) or len(note) > 4000:
+            return {"success": False, "error": "Referral note exceeds 4000 characters"}
+        try:
+            card = verify_contact_card(contact_card)
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+        if card["agent_id"] == self.agent_id:
+            return {"success": False, "error": "Use your own contact card directly"}
+        if card["agent_id"] == peer_id:
+            return {"success": False, "error": "Cannot refer a recipient to itself"}
+        result = self._send_envelope(
+            peer_id,
+            "referral",
+            {"contact_card": card, "note": note.strip()},
+            _expires_in(30 * 24 * 60 * 60),
+        )
+        if result.get("success"):
+            result.update({
+                "referred_agent_id": card["agent_id"],
+                "contact_card": card,
+            })
+        return result
 
     @_locked
     def forward(
@@ -735,17 +804,24 @@ class Mailbox:
         now = datetime.now(timezone.utc).timestamp()
         candidates = []
         for rel in self.store.load_relationships().values():
-            if rel.state != REL_ACTIVE or rel.peer_id in excluded or not rel.last_seen_at:
+            if (
+                rel.state != REL_ACTIVE
+                or rel.peer_id in excluded
+                or not rel.peer_liveness
+            ):
                 continue
             try:
                 claim = verify_passport_claim(rel.peer_passport, rel.peer_id)
+                liveness = verify_liveness_claim(rel.peer_liveness, rel.peer_id)
                 peer_created = parse_timestamp(claim["created_at"], "peer passport created_at")
-                last_seen = _parse_ts(rel.last_seen_at)
+                last_seen = _parse_ts(liveness["timestamp"])
+                relationship_since = _parse_ts(rel.created_at)
             except (TypeError, ValueError):
                 continue
             if (
                 peer_created >= current_created
                 or last_seen is None
+                or relationship_since is None
                 or now - last_seen > ticket["liveness_window_seconds"]
                 or last_seen > now + 300
             ):
@@ -754,7 +830,10 @@ class Mailbox:
         seed = ticket["contribution_id"] + ":" + self.agent_id + ":"
         return sorted(
             candidates,
-            key=lambda rel: hashlib.sha256((seed + rel.peer_id).encode()).hexdigest(),
+            key=lambda rel: (
+                _parse_ts(rel.created_at) or now,
+                hashlib.sha256((seed + rel.peer_id).encode()).hexdigest(),
+            ),
         )
 
     def _select_older_relationship(
@@ -773,12 +852,14 @@ class Mailbox:
         return candidates[0] if candidates else None
 
     def _append_contribution_to(self, package: dict, rel: Relationship) -> dict:
+        liveness = verify_liveness_claim(rel.peer_liveness, rel.peer_id)
         return append_contribution_hop(
             self.store.private_key_hex,
             package,
             from_passport=self.passport_claim(),
             to_passport=verify_passport_claim(rel.peer_passport, rel.peer_id),
-            observed_active_at=rel.last_seen_at,
+            observed_active_at=liveness["timestamp"],
+            liveness=liveness,
             relationship_since=rel.created_at,
         )
 
@@ -802,13 +883,58 @@ class Mailbox:
         self._write_contribution_audit(package)
         return record
 
+    def _contribution_delivery_id(self, peer_id: str, env_type: str, package: dict) -> str:
+        contribution_id = package["ticket"]["contribution_id"]
+        material = ":".join((
+            "darkmatter-contribution-delivery-v1",
+            contribution_id,
+            env_type,
+            self.agent_id,
+            peer_id,
+        ))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @_locked
     def _send_contribution_package(self, peer_id: str, env_type: str, package: dict) -> dict:
         expires_at = package["ticket"]["expires_at"]
+        envelope_id = self._contribution_delivery_id(peer_id, env_type, package)
+        read_path = self.work / "readbox" / f"{envelope_id}.json"
+        out_path = self.work / "outbox" / f"{envelope_id}.json"
+        if read_path.exists():
+            return {
+                "success": True,
+                "delivered": True,
+                "existing": True,
+                "envelope_id": envelope_id,
+                "to": peer_id,
+                "contribution_id": package["ticket"]["contribution_id"],
+                "status": self.contributions.get(
+                    package["ticket"]["contribution_id"],
+                )["status"],
+                "hop_count": len(package["path"]),
+                "proof_package": package,
+            }
+        if out_path.exists():
+            self._publish(f"retry {env_type} {package['ticket']['contribution_id'][:12]}")
+            return self._with_publish({
+                "success": True,
+                "queued": True,
+                "existing": True,
+                "envelope_id": envelope_id,
+                "to": peer_id,
+                "contribution_id": package["ticket"]["contribution_id"],
+                "status": self.contributions.get(
+                    package["ticket"]["contribution_id"],
+                )["status"],
+                "hop_count": len(package["path"]),
+                "proof_package": package,
+            })
         result = self._send_envelope(
             peer_id,
             env_type,
             {"package": package},
             expires_at,
+            envelope_id=envelope_id,
         )
         if result.get("success"):
             result.update({
@@ -820,6 +946,97 @@ class Mailbox:
                 "proof_package": package,
             })
         return result
+
+    def reconcile_contributions(self) -> dict:
+        """Resume every locally actionable nonterminal route idempotently."""
+        actions = []
+        for record in self.contributions.list():
+            package = record["package"]
+            contribution_id = record["contribution_id"]
+            status = record["status"]
+            if status == "expired":
+                continue
+            path = package["path"]
+            nodes = [package["ticket"]["origin_id"]] + [hop["to"] for hop in path]
+            result = None
+            action = None
+            if package.get("fulfillment"):
+                if self.agent_id in nodes and nodes.index(self.agent_id) < len(nodes) - 1:
+                    action = "relay_fulfillment"
+                    result = self.antimatter_relay_fulfillment(contribution_id)
+            elif package.get("resolution"):
+                if self.agent_id in nodes and nodes.index(self.agent_id) > 0:
+                    action = "relay_resolution"
+                    result = self.antimatter_relay_resolution(contribution_id)
+                elif (
+                    self.agent_id == package["ticket"]["origin_id"]
+                    and package["resolution"].get("beneficiary")
+                ):
+                    actions.append({
+                        "contribution_id": contribution_id,
+                        "action": "awaiting_fulfillment",
+                        "success": True,
+                    })
+            elif not path and self.agent_id == package["ticket"]["origin_id"]:
+                action = "advance"
+                result = self.antimatter_advance_contribution(contribution_id)
+            elif path and self.agent_id == path[-1]["to"]:
+                action = "advance"
+                result = self.antimatter_advance_contribution(contribution_id)
+            elif path and self.agent_id == path[-1]["from"]:
+                action = "retry_route_delivery"
+                result = self._send_contribution_package(
+                    path[-1]["to"], "antimatter_contribution", package,
+                )
+            if result is not None:
+                actions.append({
+                    "contribution_id": contribution_id,
+                    "action": action,
+                    "success": bool(result.get("success")),
+                    "error": result.get("error"),
+                    "publish_errors": result.get("publish_errors", []),
+                })
+        return {
+            "success": all(item.get("success") for item in actions),
+            "count": len(actions),
+            "actions": actions,
+        }
+
+    @_locked
+    def retry_publication(self) -> dict:
+        errors = self._publish("maintenance publication retry")
+        return {"success": not errors, "publish_errors": errors}
+
+    def _maintenance_state_path(self) -> Path:
+        return self.store.dir / "maintenance.json"
+
+    def maintain_once(self, presence_interval_seconds: float = 86400) -> dict:
+        """Perform one transparent sync, recovery, publication, and presence pass."""
+        presence_interval_seconds = max(60.0, float(presence_interval_seconds))
+        sync = self.sync()
+        recovery = self.reconcile_contributions()
+        state_path = self._maintenance_state_path()
+        try:
+            state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            state = {}
+        last_presence = _parse_ts(state.get("last_presence_at", ""))
+        now = datetime.now(timezone.utc)
+        presence = None
+        if last_presence is None or now.timestamp() - last_presence >= presence_interval_seconds:
+            presence = self.antimatter_presence()
+            if presence.get("success") or presence.get("count") == 0:
+                state["last_presence_at"] = now.isoformat()
+                atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+        publication = self.retry_publication()
+        return {
+            "success": bool(sync.get("success")) and recovery.get("success") and publication.get("success"),
+            "sync": sync,
+            "recovery": recovery,
+            "presence": presence,
+            "publication": publication,
+            "unread": len(self.store.unconsumed_messages()),
+        }
 
     @_locked
     def antimatter_contribute(
@@ -1028,16 +1245,24 @@ class Mailbox:
         ]
         results = []
         for target in targets:
-            results.append(self._send_envelope(
+            rel = relationships.get(target)
+            if rel is None or rel.state != REL_ACTIVE:
+                results.append({"success": False, "to": target, "error": "No active relationship"})
+                continue
+            env = self._seal_envelope(
                 target,
                 "presence",
                 {"passport": self.passport_claim(), "purpose": "antimatter_liveness"},
                 _expires_in(7 * 24 * 60 * 60),
-            ))
+            )
+            self._write_outbox(env)
+            results.append({"success": True, "to": target, "envelope_id": env.id})
+        publish_errors = self._publish(f"presence {len(results)}") if results else []
         return {
             "success": bool(results) and all(item.get("success") for item in results),
             "count": len(results),
             "results": results,
+            "publish_errors": publish_errors,
         }
 
     def get_contribution(self, contribution_id: str) -> Optional[dict]:
@@ -1045,6 +1270,87 @@ class Mailbox:
 
     def list_contributions(self, status: Optional[str] = None) -> list[dict]:
         return self.contributions.list(status)
+
+    def audit(self, peer_id: Optional[str] = None, include_proofs: bool = False) -> dict:
+        """Report verifiable public AntiMatter facts without deriving a score."""
+        audited_agent_id = self.agent_id
+        repo = self.work
+        if peer_id:
+            rel = self.store.get_relationship(peer_id)
+            if rel is None or not rel.peer_locator:
+                return {"success": False, "error": "Unknown or unfetchable peer"}
+            try:
+                repo = self._fetch_remote(rel.peer_locator, peer_id)
+                agent = self._read_peer_agent(repo)
+            except Exception as exc:
+                return {"success": False, "error": f"Could not fetch peer audit: {exc}"}
+            if not agent or agent.get("agent_id") != peer_id:
+                return {"success": False, "error": "Peer mailbox identity does not match"}
+            audited_agent_id = peer_id
+
+        records = []
+        invalid = []
+        audit_dir = repo / "antimatter"
+        for path in sorted(audit_dir.glob("*.json")) if audit_dir.is_dir() else []:
+            try:
+                if path.stat().st_size > MAX_ENVELOPE_FILE_SIZE * 8:
+                    raise ValueError("audit proof exceeds size limit")
+                package = verify_contribution_package(json.loads(path.read_text()))
+                ticket = package["ticket"]
+                resolution = package.get("resolution")
+                fulfillment = package.get("fulfillment")
+                route = [ticket["origin_id"]] + [hop["to"] for hop in package["path"]]
+                item = {
+                    "contribution_id": ticket["contribution_id"],
+                    "status": contribution_state(package),
+                    "origin_id": ticket["origin_id"],
+                    "source_payer_id": ticket["source"]["payer_id"],
+                    "source_payee_id": ticket["source"]["payee_id"],
+                    "source_amount": ticket["source"]["amount"],
+                    "contribution_amount": ticket["contribution"]["amount"],
+                    "currency": ticket["contribution"]["currency"],
+                    "rail": ticket["contribution"]["rail"],
+                    "route": route,
+                    "hop_count": len(package["path"]),
+                    "resolution_reason": resolution.get("reason") if resolution else None,
+                    "beneficiary_id": (
+                        (resolution.get("beneficiary") or {}).get("agent_id")
+                        if resolution else None
+                    ),
+                    "transaction_id": fulfillment.get("transaction_id") if fulfillment else None,
+                }
+                if include_proofs:
+                    item["proof_package"] = package
+                records.append(item)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                invalid.append({"file": path.name, "error": str(exc)})
+
+        counts: dict[str, int] = {}
+        for record in records:
+            counts[record["status"]] = counts.get(record["status"], 0) + 1
+        facts = {
+            "originated": sum(item["origin_id"] == audited_agent_id for item in records),
+            "route_hops_signed": sum(
+                audited_agent_id in item["route"][:-1] for item in records
+            ),
+            "beneficiary": sum(
+                item["beneficiary_id"] == audited_agent_id for item in records
+            ),
+            "fulfilled_as_origin": sum(
+                item["origin_id"] == audited_agent_id and bool(item["transaction_id"])
+                for item in records
+            ),
+        }
+        return {
+            "success": True,
+            "agent_id": audited_agent_id,
+            "count": len(records),
+            "counts": counts,
+            "facts": facts,
+            "records": records,
+            "invalid": invalid,
+            "interpretation": "Raw signed evidence only; DarkMatter does not compute a trust score.",
+        }
 
     @_locked
     def antimatter_offer(
@@ -1302,9 +1608,7 @@ class Mailbox:
         self.store.upsert_relationship(
             peer_id, advertised_locator=advertised_locator, state=REL_ACTIVE,
         )
-        env = seal_envelope(
-            self.store.private_key_hex,
-            self.agent_id,
+        env = self._seal_envelope(
             peer_id,
             "accept",
             {
@@ -1328,9 +1632,7 @@ class Mailbox:
         if rel is None:
             return {"success": False, "error": "Unknown peer"}
         self.store.upsert_relationship(peer_id, state=REL_CLOSED)
-        env = seal_envelope(
-            self.store.private_key_hex,
-            self.agent_id,
+        env = self._seal_envelope(
             peer_id,
             "ignore",
             {"reason": "ignored"},
@@ -1343,9 +1645,7 @@ class Mailbox:
         return self.ignore(peer_id)
 
     def _receipt(self, peer_id: str, envelope_id: str) -> None:
-        env = seal_envelope(
-            self.store.private_key_hex,
-            self.agent_id,
+        env = self._seal_envelope(
             peer_id,
             "receipt",
             {"envelope_id": envelope_id},
@@ -1368,10 +1668,24 @@ class Mailbox:
             return None
 
         body = env.body or {}
+        peer_liveness = None
+        if body.get("_liveness") is not None:
+            try:
+                peer_liveness = verify_liveness_claim(body["_liveness"], env.from_id)
+                if peer_liveness["timestamp"] != parse_timestamp(
+                    env.timestamp, "envelope timestamp",
+                ).isoformat():
+                    return None
+            except (TypeError, ValueError):
+                return None
         if env.type == "receipt":
             rel = self.store.get_relationship(env.from_id)
             if rel is not None and rel.state != REL_CLOSED:
-                self.store.upsert_relationship(env.from_id, last_seen_at=env.timestamp)
+                self.store.upsert_relationship(
+                    env.from_id,
+                    last_seen_at=env.timestamp,
+                    peer_liveness=peer_liveness,
+                )
             if self._move_to_readbox(body.get("envelope_id", "")):
                 return "receipt"
             return None
@@ -1438,6 +1752,20 @@ class Mailbox:
             except (TypeError, ValueError):
                 return None
             body["forward"] = package
+        elif env.type == "referral":
+            rel = self.store.get_relationship(env.from_id)
+            if rel is None or rel.state != REL_ACTIVE:
+                return None
+            try:
+                card = verify_contact_card(body.get("contact_card"))
+            except (TypeError, ValueError):
+                return None
+            if card["agent_id"] in (self.agent_id, env.from_id):
+                return None
+            note = body.get("note", "")
+            if not isinstance(note, str) or len(note) > 4000:
+                return None
+            body["contact_card"] = card
         elif env.type == "presence":
             rel = self.store.get_relationship(env.from_id)
             if rel is None or rel.state != REL_ACTIVE:
@@ -1508,6 +1836,15 @@ class Mailbox:
                 (note + "\n\n") if note else ""
             ) + f"[Forwarded from {package['message']['from'][:12]}]\n{package['message']['content']}"
             forwardable = hop["hops_remaining"] > 0
+        elif env.type == "referral":
+            card = body["contact_card"]
+            note = body.get("note", "").strip()
+            content = (
+                ((note + "\n\n") if note else "")
+                + f"Contact referral: {card.get('display_name') or card['agent_id'][:12]} "
+                + f"({card['agent_id']})\nSigned contact card:\n"
+                + json.dumps(card, sort_keys=True)
+            )
         if env.type in ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES:
             content = summarize_antimatter_event(env.type, body)
         elif env.type in ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES:
@@ -1532,7 +1869,11 @@ class Mailbox:
         self.store.append_inbox(item)
         current = self.store.get_relationship(env.from_id)
         if current is not None and current.state != REL_CLOSED:
-            self.store.upsert_relationship(env.from_id, last_seen_at=env.timestamp)
+            self.store.upsert_relationship(
+                env.from_id,
+                last_seen_at=env.timestamp,
+                peer_liveness=peer_liveness,
+            )
         if env.type not in ("receipt", "hint", "presence"):
             self._receipt(env.from_id, env.id)
         return env.type
@@ -1596,9 +1937,7 @@ class Mailbox:
                     allow = False
             if not allow:
                 continue
-            env = seal_envelope(
-                self.store.private_key_hex,
-                self.agent_id,
+            env = self._seal_envelope(
                 peer_id,
                 "hint",
                 {

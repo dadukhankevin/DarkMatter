@@ -20,7 +20,7 @@ PASSPORT_NAMES = ("passport", "passport.key")
 
 def _is_actionable(item: dict) -> bool:
     item_type = item.get("type")
-    return item_type in ("message", "forward") or (
+    return item_type in ("message", "forward", "referral") or (
         isinstance(item_type, str) and item_type.startswith("antimatter_")
     )
 

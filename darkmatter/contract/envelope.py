@@ -46,10 +46,11 @@ ENVELOPE_TYPES = frozenset({
     "receipt",
     "hint",
     "forward",
+    "referral",
     "presence",
 }) | ANTIMATTER_ENVELOPE_TYPES
 
-ACTIONABLE_ENVELOPE_TYPES = frozenset({"message", "forward"}) | ANTIMATTER_ENVELOPE_TYPES
+ACTIONABLE_ENVELOPE_TYPES = frozenset({"message", "forward", "referral"}) | ANTIMATTER_ENVELOPE_TYPES
 
 
 def _now() -> str:

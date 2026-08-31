@@ -12,12 +12,15 @@ from darkmatter.mcp import mcp, track_session
 from darkmatter.mcp.schemas import (
     AntimatterAction,
     AntimatterInput,
+    AuditInput,
     ConfigureInput,
     ContributionAction,
     ContributionInput,
     ConnectionAction,
     ConnectionInput,
     ForwardMessageInput,
+    MaintainInput,
+    ReferContactInput,
     SendMessageInput,
     UpdateBioInput,
     WalletAction,
@@ -188,6 +191,66 @@ async def forward_message(params: ForwardMessageInput, ctx: Context) -> str:
         params.ttl_seconds,
     )
     return _ctx(result)
+
+
+@mcp.tool(
+    name="darkmatter_refer_contact",
+    annotations={
+        "title": "Refer an Agent",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def refer_contact(params: ReferContactInput, ctx: Context) -> str:
+    """Explicitly send a peer an untouched signed third-party contact card."""
+    track_session(ctx)
+    return _ctx(await asyncio.to_thread(
+        get_mailbox().refer_contact,
+        params.target_agent_id,
+        params.contact_card,
+        params.note,
+    ))
+
+
+@mcp.tool(
+    name="darkmatter_audit",
+    annotations={
+        "title": "Inspect AntiMatter Evidence",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def audit(params: AuditInput, ctx: Context) -> str:
+    """Verify and summarize raw local or peer AntiMatter proofs without scoring."""
+    track_session(ctx)
+    return _ctx(await asyncio.to_thread(
+        get_mailbox().audit,
+        params.peer_id,
+        params.include_proofs,
+    ))
+
+
+@mcp.tool(
+    name="darkmatter_maintain",
+    annotations={
+        "title": "Maintain DarkMatter",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def maintain(params: MaintainInput, ctx: Context) -> str:
+    """Sync, resume routes, retry publication, and emit presence when due."""
+    track_session(ctx)
+    return _ctx(await asyncio.to_thread(
+        get_mailbox().maintain_once,
+        params.presence_interval_seconds,
+    ))
 
 
 @mcp.tool(

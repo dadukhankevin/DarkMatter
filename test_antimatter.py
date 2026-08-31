@@ -24,6 +24,7 @@ from darkmatter.contract.contribution import (
     verify_contribution_package,
 )
 from darkmatter.contract.envelope import seal_envelope
+from darkmatter.contract.liveness import create_liveness_claim
 from darkmatter.contract.tenure import create_passport_claim
 from darkmatter.gitbox.mailbox import Mailbox, get_mailbox, reset_mailbox
 from darkmatter.identity import generate_keypair
@@ -178,6 +179,7 @@ def test_contribution_routes_to_older_live_agent_and_publishes_proof(tmp_path):
     contribution_id = routed["contribution_id"]
     assert routed["hop_count"] == 1
     assert routed["proof_package"]["path"][0]["to"] == elder.agent_id
+    assert routed["proof_package"]["path"][0]["liveness"]["agent_id"] == elder.agent_id
 
     elder_sync = elder.sync()
     assert elder_sync["antimatter_actions"][0]["success"]
@@ -202,6 +204,52 @@ def test_contribution_routes_to_older_live_agent_and_publishes_proof(tmp_path):
     assert public_proof.exists()
     assert json.loads(public_proof.read_text())["ticket"]["contribution"]["rate"] == "0.01"
     assert payee.store.get_relationship(payer.agent_id).trust == 0
+    local_audit = payee.audit()
+    assert local_audit["success"]
+    assert local_audit["counts"] == {"fulfilled": 1}
+    assert local_audit["facts"]["fulfilled_as_origin"] == 1
+    peer_audit = elder.audit(payee.agent_id)
+    assert peer_audit["success"]
+    assert peer_audit["records"][0]["contribution_id"] == contribution_id
+    assert "score" not in peer_audit
+
+
+def test_maintenance_recreates_interrupted_route_delivery_idempotently(tmp_path):
+    elder = Mailbox(tmp_path / "maintenance-elder")
+    payer, payee = _connected(tmp_path)
+    _connect_existing(payee, elder)
+
+    offered = payer.antimatter_offer(
+        payee.agent_id, "Recover route", "8", "credit", "manual",
+    )
+    settlement_id = offered["settlement"]["settlement_id"]
+    payee.sync()
+    assert payee.antimatter_accept(payer.agent_id, settlement_id)["success"]
+    payer.sync()
+    assert payer.antimatter_receipt(
+        payee.agent_id, settlement_id, "manual:recover",
+    )["success"]
+    payee.sync()
+    started = payee.antimatter_contribute(settlement_id)
+    package = started["proof_package"]
+    envelope_id = payee._contribution_delivery_id(
+        elder.agent_id, "antimatter_contribution", package,
+    )
+    outbox = payee.work / "outbox" / f"{envelope_id}.json"
+    assert outbox.exists()
+    outbox.unlink()
+    payee._publish("simulate interrupted route delivery")
+
+    maintained = payee.maintain_once(presence_interval_seconds=3600)
+    assert maintained["recovery"]["success"]
+    assert any(
+        action["action"] == "retry_route_delivery"
+        for action in maintained["recovery"]["actions"]
+    )
+    assert outbox.exists()
+    second = payee.reconcile_contributions()
+    assert second["success"]
+    assert outbox.exists()
 
 
 def test_multihop_resolution_returns_and_fulfillment_reaches_beneficiary(tmp_path):
@@ -300,6 +348,7 @@ def test_contribution_proof_enforces_older_hops_and_hard_42_limit():
             from_passport=identities[0][2],
             to_passport=younger_claim,
             observed_active_at=observed,
+            liveness=create_liveness_claim(younger_private, younger_id, observed),
             relationship_since=relationship_since,
         )
     with pytest.raises(ValueError, match="liveness window"):
@@ -309,6 +358,11 @@ def test_contribution_proof_enforces_older_hops_and_hard_42_limit():
             from_passport=identities[0][2],
             to_passport=identities[1][2],
             observed_active_at=(now - timedelta(days=8)).isoformat(),
+            liveness=create_liveness_claim(
+                identities[1][0],
+                identities[1][1],
+                (now - timedelta(days=8)).isoformat(),
+            ),
             relationship_since=relationship_since,
         )
     for index in range(MAX_CONTRIBUTION_HOPS):
@@ -320,6 +374,9 @@ def test_contribution_proof_enforces_older_hops_and_hard_42_limit():
             from_passport=from_claim,
             to_passport=to_claim,
             observed_active_at=observed,
+            liveness=create_liveness_claim(
+                identities[index + 1][0], identities[index + 1][1], observed,
+            ),
             relationship_since=relationship_since,
         )
     assert len(verify_contribution_package(package)["path"]) == 42
@@ -330,6 +387,9 @@ def test_contribution_proof_enforces_older_hops_and_hard_42_limit():
             from_passport=identities[42][2],
             to_passport=identities[43][2],
             observed_active_at=observed,
+            liveness=create_liveness_claim(
+                identities[43][0], identities[43][1], observed,
+            ),
             relationship_since=relationship_since,
         )
     resolved = resolve_contribution(

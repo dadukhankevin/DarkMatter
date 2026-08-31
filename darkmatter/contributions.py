@@ -68,7 +68,11 @@ class ContributionLedger:
     def get(self, contribution_id: str) -> Optional[dict]:
         with self.store.locked():
             record = self._load()["contributions"].get(contribution_id)
-            return deepcopy(record) if record else None
+            if not record:
+                return None
+            record = deepcopy(record)
+            record["status"] = contribution_state(record["package"])
+            return record
 
     def for_settlement(self, settlement_id: str) -> Optional[dict]:
         matches = [
@@ -80,6 +84,8 @@ class ContributionLedger:
     def list(self, status: Optional[str] = None) -> list[dict]:
         with self.store.locked():
             records = list(self._load()["contributions"].values())
+        for record in records:
+            record["status"] = contribution_state(record["package"])
         if status:
             records = [record for record in records if record.get("status") == status]
         records.sort(key=lambda record: record.get("updated_at", ""), reverse=True)

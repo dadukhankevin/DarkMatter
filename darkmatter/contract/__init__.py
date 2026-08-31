@@ -29,6 +29,11 @@ from darkmatter.contract.forwarding import (
     verify_forward_package,
     verify_message_record,
 )
+from darkmatter.contract.liveness import create_liveness_claim, verify_liveness_claim
+from darkmatter.contract.succession import (
+    create_passport_succession,
+    verify_passport_succession,
+)
 from darkmatter.contract.types import Relationship
 from darkmatter.contract.tenure import create_passport_claim, verify_passport_claim
 
@@ -47,7 +52,9 @@ __all__ = [
     "create_source_receipt",
     "create_forward_package",
     "create_message_record",
+    "create_liveness_claim",
     "create_passport_claim",
+    "create_passport_succession",
     "fulfill_contribution",
     "is_expired_at",
     "open_envelope",
@@ -60,5 +67,7 @@ __all__ = [
     "verify_source_receipt",
     "verify_forward_package",
     "verify_message_record",
+    "verify_liveness_claim",
     "verify_passport_claim",
+    "verify_passport_succession",
 ]

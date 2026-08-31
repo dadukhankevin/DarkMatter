@@ -12,7 +12,9 @@ from darkmatter.contract import (
     create_source_receipt,
     create_forward_package,
     create_message_record,
+    create_liveness_claim,
     create_passport_claim,
+    create_passport_succession,
     fulfill_contribution,
     open_envelope,
     resolve_contribution,
@@ -23,7 +25,9 @@ from darkmatter.contract import (
     verify_source_receipt,
     verify_forward_package,
     verify_message_record,
+    verify_liveness_claim,
     verify_passport_claim,
+    verify_passport_succession,
 )
 from darkmatter.gitbox import Mailbox
 
@@ -43,7 +47,9 @@ __all__ = [
     "create_source_receipt",
     "create_forward_package",
     "create_message_record",
+    "create_liveness_claim",
     "create_passport_claim",
+    "create_passport_succession",
     "fulfill_contribution",
     "open_envelope",
     "resolve_contribution",
@@ -54,5 +60,7 @@ __all__ = [
     "verify_source_receipt",
     "verify_forward_package",
     "verify_message_record",
+    "verify_liveness_claim",
     "verify_passport_claim",
+    "verify_passport_succession",
 ]

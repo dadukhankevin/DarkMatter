@@ -123,6 +123,39 @@ class ForwardMessageInput(BaseModel):
     )
 
 
+class ReferContactInput(BaseModel):
+    """Explicitly share one agent's untouched signed contact card with another."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    target_agent_id: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Active relationship that should receive the referral",
+    )
+    contact_card: dict = Field(..., description="Original signed card of the referred agent")
+    note: str = Field(default="", max_length=4000)
+
+
+class AuditInput(BaseModel):
+    """Inspect raw public AntiMatter evidence without computing a score."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    peer_id: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Known peer to fetch; omit for this agent",
+    )
+    include_proofs: bool = Field(default=False)
+
+
+class MaintainInput(BaseModel):
+    """Run one idempotent mailbox maintenance pass."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    presence_interval_seconds: float = Field(default=86400, ge=60, le=2592000)
+
+
 class AntimatterInput(BaseModel):
     """Create or inspect a rail-neutral AntiMatter settlement."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")

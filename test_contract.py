@@ -13,6 +13,11 @@ from darkmatter.contract.forwarding import (
     create_message_record,
     verify_forward_package,
 )
+from darkmatter.contract.liveness import create_liveness_claim, verify_liveness_claim
+from darkmatter.contract.succession import (
+    create_passport_succession,
+    verify_passport_succession,
+)
 from darkmatter.contract.tenure import create_passport_claim
 from darkmatter.identity import generate_keypair
 from darkmatter.security import DOMAIN_ENVELOPE, DOMAIN_MESSAGE, sign_message, verify_message
@@ -95,6 +100,33 @@ def test_contact_card_roundtrip_and_tamper(keys):
     card["locator"] = "/tmp/impostor.git"
     with pytest.raises(ValueError, match="signature"):
         verify_contact_card(card)
+
+
+def test_liveness_and_passport_succession_are_portable_and_tamper_evident(keys):
+    (old_private, old_id), (new_private, new_id) = keys
+    timestamp = datetime.now(timezone.utc).isoformat()
+    liveness = create_liveness_claim(old_private, old_id, timestamp)
+    assert verify_liveness_claim(liveness, old_id)["timestamp"] == timestamp
+    liveness["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    with pytest.raises(ValueError, match="signature"):
+        verify_liveness_claim(liveness, old_id)
+
+    predecessor = create_passport_claim(
+        old_private,
+        old_id,
+        (datetime.now(timezone.utc) - timedelta(days=100)).isoformat(),
+    )
+    proof = create_passport_succession(
+        old_private,
+        new_private,
+        predecessor,
+    )
+    verified = verify_passport_succession(proof, new_id)
+    assert verified["predecessor"]["agent_id"] == old_id
+    assert verified["successor_id"] == new_id
+    proof["successor_id"] = "00" * 32
+    with pytest.raises(ValueError, match="signature"):
+        verify_passport_succession(proof)
 
 
 def test_forward_package_preserves_original_and_signed_hops():

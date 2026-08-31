@@ -124,6 +124,26 @@ def test_explicit_forward_preserves_provenance_and_does_not_consume(tmp_path):
     assert "hop limit" in blocked["error"]
 
 
+def test_explicit_contact_referral_preserves_card_and_never_auto_connects(tmp_path):
+    a = _agent(tmp_path / "referrer")
+    b = _agent(tmp_path / "recipient")
+    c = _agent(tmp_path / "referred")
+    for left, right in ((a, b), (a, c)):
+        left.introduce(right.remote)
+        right.introduce(left.remote)
+        right.sync()
+        right.accept(left.agent_id)
+        left.sync()
+
+    referred = a.refer_contact(b.agent_id, c.contact_card(), "You should meet C")
+    assert referred["success"]
+    b.sync()
+    item = next(entry for entry in b.store.unconsumed_messages() if entry["type"] == "referral")
+    assert item["body"]["contact_card"] == c.contact_card()
+    assert "You should meet C" in item["content"]
+    assert b.store.get_relationship(c.agent_id) is None
+
+
 def test_ignore_closes_relationship(tmp_path):
     a = _agent(tmp_path / "a")
     b = _agent(tmp_path / "b")

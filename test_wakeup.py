@@ -81,6 +81,19 @@ def test_wake_message_is_labeled_and_keeps_metadata():
     assert "run `pytest`" in text
 
 
+def test_wake_message_keeps_actionable_referral_card():
+    message = _message("Contact referral")
+    message["type"] = "referral"
+    message["body"]["contact_card"] = {
+        "version": 4,
+        "agent_id": "ab" * 32,
+        "locator": "https://example.test/mailbox.git",
+    }
+    text = format_wake_message([message])
+    assert '"contact_card"' in text
+    assert "https://example.test/mailbox.git" in text
+
+
 def test_wake_lease_deduplicates_session_waiters(tmp_path):
     with wake_lease(tmp_path, "session-1") as first:
         with wake_lease(tmp_path, "session-1") as second:

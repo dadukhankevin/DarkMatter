@@ -6,9 +6,22 @@ import json
 import pytest
 
 from darkmatter.gitbox.mailbox import Mailbox, reset_mailbox
-from darkmatter.mcp.schemas import ConnectionAction, ConnectionInput
-from darkmatter.mcp.tools import configure, connection, list_connections, send_message
-from darkmatter.mcp.schemas import ConfigureInput, SendMessageInput
+from darkmatter.mcp.schemas import (
+    AuditInput,
+    ConfigureInput,
+    ConnectionAction,
+    ConnectionInput,
+    MaintainInput,
+    SendMessageInput,
+)
+from darkmatter.mcp.tools import (
+    audit,
+    configure,
+    connection,
+    list_connections,
+    maintain,
+    send_message,
+)
 
 
 class _Ctx:
@@ -75,3 +88,12 @@ def test_tools_configure_visibility_and_fetch(tmp_path):
     assert set_fetch["success"]
     assert set_fetch["relationship"]["fetch_every"] == 15
     reset_mailbox()
+
+
+def test_tools_maintain_and_audit_return_raw_local_state():
+    maintained = json.loads(asyncio.run(maintain(MaintainInput(), _Ctx())))
+    assert maintained["success"]
+    audited = json.loads(asyncio.run(audit(AuditInput(), _Ctx())))
+    assert audited["success"]
+    assert audited["count"] == 0
+    assert audited["interpretation"].startswith("Raw signed evidence")
