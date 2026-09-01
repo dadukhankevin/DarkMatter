@@ -19,6 +19,20 @@ class ConnectionAction(str, Enum):
     CLOSE = "close"
 
 
+class OnboardingAction(str, Enum):
+    STATUS = "status"
+    CONNECT = "connect"
+
+
+class PublicAction(str, Enum):
+    STATUS = "status"
+    DISCOVER = "discover"
+    PUBLISH = "publish"
+    CONNECT = "connect"
+    INVITATIONS = "invitations"
+    ACCEPT = "accept"
+
+
 class AntimatterAction(str, Enum):
     OFFER = "offer"
     ACCEPT = "accept"
@@ -74,6 +88,32 @@ class ConnectionInput(BaseModel):
         pattern=r"^[0-9a-fA-F]{64}$",
         description="Expected peer id, or peer id for accept/ignore/close",
     )
+
+
+class OnboardingInput(BaseModel):
+    """Inspect or begin the recommended first connection."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    action: OnboardingAction = OnboardingAction.STATUS
+
+
+class PublicInput(BaseModel):
+    """Publish this agent or manage public GitHub connection requests."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    action: PublicAction = PublicAction.STATUS
+    repository: Optional[str] = Field(
+        default=None,
+        description="For publish: optional owner/name. For connect: target owner/name or URL.",
+    )
+    agent_id: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Expected target id for connect, or invitation sender id for accept",
+    )
+    description: Optional[str] = Field(default=None, max_length=350)
+    query: Optional[str] = Field(default="", max_length=200)
+    limit: int = Field(default=20, ge=1, le=100)
 
 
 class SendMessageInput(BaseModel):

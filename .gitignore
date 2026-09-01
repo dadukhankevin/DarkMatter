@@ -17,3 +17,6 @@ build/
 .glance/
 
 *.mp4
+
+# Launch media lives in releases, not the tree
+promo/

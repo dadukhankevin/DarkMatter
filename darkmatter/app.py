@@ -36,6 +36,10 @@ def print_status() -> None:
         _log.info("LAN: %s", loc["lan"])
     if loc["internet"]:
         _log.info("Internet: %s", loc["internet"])
+    from darkmatter.one import onboarding
+    first_contact = onboarding(mb)
+    if first_contact and first_contact.get("recommended"):
+        _log.info("First contact: connect to DarkMatter One with `darkmatter onboard connect`")
 
 
 def main() -> None:

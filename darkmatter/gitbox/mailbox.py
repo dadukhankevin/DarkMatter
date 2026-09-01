@@ -224,12 +224,14 @@ class Mailbox:
             "display_name": profile.get("display_name", ""),
             "bio": profile.get("bio", ""),
             "passport": self.passport_claim(),
+            "contact_card": self.contact_card(),
             "capabilities": {
                 "contact_card": 4,
                 "envelope": 3,
                 "antimatter_contribution": 1,
                 "liveness": 1,
                 "passport_succession": 1,
+                "public_connection_knock": 1,
                 "referral": 1,
             },
         }
@@ -568,18 +570,50 @@ class Mailbox:
 
     @_locked
     def send(self, peer_id: str, content: str, expires_at: Optional[str] = None,
-             env_type: str = "message", extra: Optional[dict] = None) -> dict:
+             env_type: str = "message", extra: Optional[dict] = None, *,
+             envelope_id: Optional[str] = None, timestamp: Optional[str] = None) -> dict:
         if not isinstance(content, str) or not content:
             return {"success": False, "error": "Message content is required"}
         if len(content) > MAX_CONTENT_LENGTH:
             return {"success": False, "error": f"Message exceeds {MAX_CONTENT_LENGTH} characters"}
+        if envelope_id is not None and (
+            not isinstance(envelope_id, str)
+            or len(envelope_id) != 32
+            or any(char not in "0123456789abcdef" for char in envelope_id)
+        ):
+            return {"success": False, "error": "Explicit envelope_id must be 32 lowercase hex characters"}
+        if envelope_id:
+            for folder, delivered in (("readbox", True), ("outbox", False)):
+                path = self.work / folder / f"{envelope_id}.json"
+                if not path.exists():
+                    continue
+                try:
+                    existing = Envelope.from_public_dict(json.loads(path.read_text()))
+                except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                    return {"success": False, "error": "Existing idempotent envelope is malformed"}
+                if existing.to_id != peer_id or existing.type != env_type:
+                    return {"success": False, "error": "Explicit envelope_id is already in use"}
+                return {
+                    "success": True,
+                    "existing": True,
+                    "delivered": delivered,
+                    "envelope_id": envelope_id,
+                    "to": peer_id,
+                }
         body = {"content": content}
         if extra:
             body["metadata"] = dict(extra)
         if env_type != "message":
-            return self._send_envelope(peer_id, env_type, body, expires_at)
-        envelope_id = uuid.uuid4().hex
-        timestamp = datetime.now(timezone.utc).isoformat()
+            return self._send_envelope(
+                peer_id,
+                env_type,
+                body,
+                expires_at,
+                envelope_id=envelope_id,
+                timestamp=timestamp,
+            )
+        envelope_id = envelope_id or uuid.uuid4().hex
+        timestamp = timestamp or datetime.now(timezone.utc).isoformat()
         try:
             body["provenance"] = create_message_record(
                 self.store.private_key_hex,
@@ -1014,6 +1048,12 @@ class Mailbox:
         """Perform one transparent sync, recovery, publication, and presence pass."""
         presence_interval_seconds = max(60.0, float(presence_interval_seconds))
         sync = self.sync()
+        from darkmatter.public import poll_public_invitations
+
+        try:
+            invitations = poll_public_invitations(self)
+        except Exception as exc:  # polling is advisory; never block maintenance
+            invitations = {"success": False, "error": str(exc), "count": 0, "invitations": []}
         recovery = self.reconcile_contributions()
         state_path = self._maintenance_state_path()
         try:
@@ -1030,8 +1070,17 @@ class Mailbox:
                 atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
         publication = self.retry_publication()
         return {
-            "success": bool(sync.get("success")) and recovery.get("success") and publication.get("success"),
+            "success": (
+                bool(sync.get("success"))
+                and recovery.get("success")
+                and publication.get("success")
+            ),
             "sync": sync,
+            "invitations": invitations,
+            "warnings": (
+                [f"Public invitation polling failed: {invitations.get('error')}"]
+                if not invitations.get("success") else []
+            ),
             "recovery": recovery,
             "presence": presence,
             "publication": publication,
@@ -1555,6 +1604,69 @@ class Mailbox:
     def get_settlement(self, settlement_id: str) -> Optional[dict]:
         return self.antimatter.get(settlement_id)
 
+    def _receive_contact_card(
+        self,
+        contact_card: dict,
+        envelope_id: Optional[str] = None,
+    ) -> dict:
+        try:
+            card = verify_contact_card(contact_card)
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+        peer_id = card["agent_id"]
+        if peer_id == self.agent_id:
+            return {"success": False, "error": "Cannot receive an introduction from yourself"}
+        try:
+            agent = self.peek_remote(card["locator"], peer_id)
+        except Exception as exc:
+            return {"success": False, "error": f"Could not fetch contact mailbox: {exc}"}
+        if agent.get("agent_id") != peer_id:
+            return {"success": False, "error": "Contact card does not match the mailbox identity"}
+        repo = self._fetch_remote(card["locator"], peer_id)
+        introductions = []
+        for data in self._read_outbox_files(repo):
+            if data.get("type") != "introduce" or data.get("from") != peer_id:
+                continue
+            if envelope_id and data.get("id") != envelope_id:
+                continue
+            kind = self._ingest(data, card["locator"])
+            if kind == "introduce":
+                introductions.append(data.get("id"))
+        known_introductions = {
+            item.get("id")
+            for item in self.store.load_inbox()
+            if item.get("type") == "introduce" and item.get("from") == peer_id
+        }
+        known_introductions.update(introductions)
+        if envelope_id and envelope_id not in known_introductions:
+            return {"success": False, "error": "The announced introduction was not found"}
+        if not known_introductions:
+            return {"success": False, "error": "No signed introduction from this contact is available"}
+        existing = self.store.get_relationship(peer_id)
+        state = REL_ACTIVE if existing and existing.state == REL_ACTIVE else REL_PENDING
+        self.store.upsert_relationship(
+            peer_id,
+            peer_locator=card["locator"],
+            state=state,
+            peer_passport=card.get("passport"),
+        )
+        return {
+            "success": True,
+            "peer_id": peer_id,
+            "state": state,
+            "contact_card": card,
+            "introduction_ids": sorted(known_introductions),
+        }
+
+    @_locked
+    def receive_introduction(
+        self,
+        contact_card: dict,
+        envelope_id: Optional[str] = None,
+    ) -> dict:
+        """Fetch and verify a public connection request without accepting it."""
+        return self._receive_contact_card(contact_card, envelope_id)
+
     @_locked
     def accept(
         self,
@@ -1563,28 +1675,12 @@ class Mailbox:
         contact_card: Optional[dict] = None,
     ) -> dict:
         if contact_card is not None:
-            try:
-                card = verify_contact_card(contact_card)
-            except ValueError as exc:
-                return {"success": False, "error": str(exc)}
-            if peer_id and peer_id != card["agent_id"]:
+            received = self._receive_contact_card(contact_card)
+            if not received.get("success"):
+                return received
+            if peer_id and peer_id != received["peer_id"]:
                 return {"success": False, "error": "agent_id does not match the contact card"}
-            peer_id = card["agent_id"]
-            try:
-                agent = self.peek_remote(card["locator"], peer_id)
-            except Exception as exc:
-                return {"success": False, "error": f"Could not fetch contact mailbox: {exc}"}
-            if agent.get("agent_id") != peer_id:
-                return {"success": False, "error": "Contact card does not match the mailbox identity"}
-            self.store.upsert_relationship(
-                peer_id,
-                peer_locator=card["locator"],
-                state=REL_PENDING,
-                peer_passport=card.get("passport"),
-            )
-            repo = self._fetch_remote(card["locator"], peer_id)
-            for data in self._read_outbox_files(repo):
-                self._ingest(data, card["locator"])
+            peer_id = received["peer_id"]
 
         if not peer_id:
             return {"success": False, "error": "agent_id or contact_card is required"}

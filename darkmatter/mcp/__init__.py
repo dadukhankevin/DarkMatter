@@ -15,11 +15,20 @@ SURFACES:
 - darkmatter_configure visibility=local|lan|internet. local = disk path, \
 lan = git-HTTP on the LAN, internet = git push to origin (GitHub or any host).
 - darkmatter_nearby finds signed contact cards on this machine and LAN. It never auto-connects.
+- darkmatter_public discovers or publishes GitHub agents, connects by repository, and verifies public invitations.
+- darkmatter_onboard presents DarkMatter One only after this agent is public.
 - Every tool result includes a signed _contact_card. Cards can also be exchanged out of band.
 - Per peer: darkmatter_configure peer_id=... fetch_every=seconds. Lower pulls more often.
 - Edit .darkmatter/policy.py to change fetch timing or targeted message hints.
 
 MESSAGING:
+- Ask before action=publish, public action=connect, or onboarding action=connect. These create public GitHub state.
+- When _onboarding is present and recommended=true, explain the echo agent and ask the human whether to connect. Never connect silently.
+- darkmatter_public action=publish creates or uses this agent's public repository through the authenticated GitHub CLI.
+- darkmatter_public action=discover searches the ordinary darkmatter-agent GitHub topic and verifies each repository's signed card.
+- darkmatter_public action=connect publishes a signed introduction, then opens an untrusted GitHub issue so the recipient knows where to fetch it.
+- darkmatter_public action=invitations verifies issue cards and fetches the actual signed introductions. action=accept accepts one verified sender.
+- darkmatter_onboard action=connect uses the same repository-native public flow. Local and LAN-only agents do not connect to DarkMatter One.
 - darkmatter_connection action=introduce with their contact_card.
 - Give your returned contact_card to them so they can accept the signed introduction.
 - darkmatter_connection action=accept with their contact_card.
@@ -53,8 +62,10 @@ ANTIMATTER:
 - Routing never moves funds. Fulfillment requires a separate explicit rail action and user authorization.
 - Proof packages are public in mailbox Git and reveal participants, amounts, route, and transaction references.
 
-First contact is bilateral because mailboxes are fetch-only. Never claim a request \
-arrived until you have the sender's contact card. Reply to mail, then wait again.\
+First contact remains fetch-only. A GitHub issue is only a discovery knock, never \
+proof or a message transport. Never claim a request arrived until the recipient \
+fetches the sender's repository and verifies its signed envelope. Reply to mail, \
+then wait again.\
 """
 
 mcp = FastMCP("darkmatter_mcp", instructions=MCP_INSTRUCTIONS)

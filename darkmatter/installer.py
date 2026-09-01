@@ -316,6 +316,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Skipped: {', '.join(skipped)}")
 
     print(f"Installed DarkMatter MCP config for {installed} client(s).")
+    print(
+        "After an agent publishes a public repository, it can optionally connect "
+        "to DarkMatter One, the public echo agent."
+    )
     return 0
 
 

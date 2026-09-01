@@ -79,6 +79,28 @@ def test_message_metadata_cannot_override_content(tmp_path):
     assert message["body"]["metadata"] == {"content": "spoof", "kind": "note"}
 
 
+def test_explicit_message_id_is_idempotent(tmp_path):
+    a = _agent(tmp_path / "a")
+    b = _agent(tmp_path / "b")
+    a.introduce(b.remote)
+    b.introduce(a.remote)
+    b.sync()
+    b.accept(a.agent_id)
+    a.sync()
+
+    envelope_id = "ab" * 16
+    first = a.send(b.agent_id, "exactly once", envelope_id=envelope_id)
+    second = a.send(b.agent_id, "exactly once", envelope_id=envelope_id)
+    assert first["success"]
+    assert second["success"]
+    assert second["existing"] is True
+    assert second["envelope_id"] == envelope_id
+
+    b.sync()
+    messages = [item for item in b.store.unconsumed_messages() if item["id"] == envelope_id]
+    assert len(messages) == 1
+
+
 def test_explicit_forward_preserves_provenance_and_does_not_consume(tmp_path):
     a = _agent(tmp_path / "a")
     b = _agent(tmp_path / "b")
