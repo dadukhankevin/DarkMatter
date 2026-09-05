@@ -8,10 +8,13 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+from darkmatter.store.local import atomic_write_text
 
 
 DEFAULT_WAKE_TIMEOUT = 3600.0
@@ -59,7 +62,7 @@ def _server_env(client: str, display_name: str) -> dict[str, str]:
 def _stdio_entry(command: str, client: str, display_name: str) -> dict:
     return {
         "command": command,
-        "args": ["-m", "darkmatter"],
+        "args": ["-I", "-m", "darkmatter"],
         "env": _server_env(client, display_name),
     }
 
@@ -72,9 +75,39 @@ def _merge_json_config(path: Path, update_fn: Callable[[dict], None]) -> None:
     else:
         config = {}
     update_fn(config)
-    with path.open("w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
+    if path.exists():
+        backup = path.with_name(path.name + ".darkmatter-backup")
+        if not backup.exists():
+            atomic_write_text(backup, path.read_text(), mode=0o600)
+    atomic_write_text(path, json.dumps(config, indent=2) + "\n", mode=0o600)
+
+
+def _install_collaboration_hooks(path: Path, command: str, client: str) -> None:
+    # A single quoted command works with both clients' documented shell contract.
+    shell_command = shlex.join([command, "-I", "-m", "darkmatter", "collaborate", "hook", "--client", client])
+
+    def update(config):
+        hooks = config.setdefault("hooks", {})
+        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "SessionEnd"):
+            groups = hooks.setdefault(event, [])
+            if not isinstance(groups, list):
+                raise ValueError(f"hooks.{event} must be an array")
+            kept = []
+            for group in groups:
+                if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                    kept.append(group)
+                    continue
+                handlers = [h for h in group["hooks"] if not (
+                    isinstance(h, dict) and h.get("statusMessage") == "DarkMatter local collaboration"
+                )]
+                if handlers:
+                    kept.append({**group, "hooks": handlers})
+            handler = {"type": "command", "command": shell_command,
+                       "timeout": 3 if event == "SessionEnd" else 10,
+                       "statusMessage": "DarkMatter local collaboration"}
+            kept.append({"hooks": [handler]})
+            hooks[event] = kept
+    _merge_json_config(path, update)
 
 
 def _is_darkmatter_wake_handler(handler: object) -> bool:
@@ -167,7 +200,7 @@ def _install_opencode(path: Path, command: str, client: str, display_name: str) 
         config["mcp"]["darkmatter"] = {
             "type": "local",
             "enabled": True,
-            "command": [command, "-m", "darkmatter"],
+            "command": [command, "-I", "-m", "darkmatter"],
             "environment": env,
         }
 
@@ -201,7 +234,7 @@ def _install_codex_toml(path: Path, command: str, client: str, display_name: str
     existing = path.read_text() if path.exists() else ""
     stripped = _strip_toml_sections(existing, {"mcp_servers.darkmatter", "mcp_servers.darkmatter.env"})
     env = _server_env(client, display_name)
-    args = ', '.join(_toml_string(arg) for arg in ["-m", "darkmatter"])
+    args = ', '.join(_toml_string(arg) for arg in ["-I", "-m", "darkmatter"])
     env_lines = "\n".join(f"{key} = {_toml_string(value)}" for key, value in env.items())
     block = (
         "[mcp_servers.darkmatter]\n"
@@ -211,7 +244,11 @@ def _install_codex_toml(path: Path, command: str, client: str, display_name: str
         f"{env_lines}\n"
     )
     content = f"{stripped}\n\n{block}" if stripped else block
-    path.write_text(content)
+    if path.exists():
+        backup = path.with_name(path.name + ".darkmatter-backup")
+        if not backup.exists():
+            atomic_write_text(backup, existing, mode=0o600)
+    atomic_write_text(path, content, mode=0o600)
 
 
 def install_target(
@@ -222,6 +259,7 @@ def install_target(
     home: Path,
     wake: bool = False,
     wake_timeout_seconds: float = DEFAULT_WAKE_TIMEOUT,
+    collaborate: bool = False,
 ) -> tuple[bool, str]:
     if not target.supported:
         return False, f"{target.label}: skipped (no native MCP config to install)"
@@ -243,6 +281,9 @@ def install_target(
         elif wake and target.client == "codex":
             wake_path = home / ".codex/hooks.json"
             _install_codex_wake_hook(wake_path, wake_timeout_seconds)
+        if collaborate and target.client in ("codex", "claude-code"):
+            hook_path = home / (".codex/hooks.json" if target.client == "codex" else ".claude/settings.json")
+            _install_collaboration_hooks(hook_path, command, target.client)
     except json.JSONDecodeError as exc:
         return False, f"{target.label}: invalid JSON in {path} ({exc})"
     except (OSError, ValueError) as exc:
@@ -268,6 +309,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--display-name", default=os.environ.get("DARKMATTER_DISPLAY_NAME", "darkmatter-agent"))
     parser.add_argument("--python", dest="python_cmd", default=sys.executable)
     parser.add_argument("--home", default=str(Path.home()))
+    parser.add_argument("--collaborate", action="store_true",
+                        help="Install local session discovery and inbox notification hooks for Codex/Claude Code.")
     parser.add_argument(
         "--wake",
         action="store_true",
@@ -306,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
             home=home,
             wake=args.wake,
             wake_timeout_seconds=args.wake_timeout,
+            collaborate=args.collaborate,
         )
         print(message)
         if ok:

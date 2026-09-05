@@ -278,6 +278,23 @@ def _accept(argv: list[str]) -> int:
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else None
 
+    if cmd == "collaborate":
+        from darkmatter.collaboration_cli import main as collaborate_main
+        raise SystemExit(collaborate_main(sys.argv[2:]))
+
+    if cmd == "commitment":
+        from darkmatter.commitment import MODES, declare_commitment, read_commitment
+        from darkmatter.gitbox.mailbox import get_mailbox
+        parser = argparse.ArgumentParser(prog="darkmatter commitment")
+        parser.add_argument("mode", choices=("status", *MODES), nargs="?", default="status")
+        parser.add_argument("--note", default="")
+        args = parser.parse_args(sys.argv[2:])
+        mb = get_mailbox()
+        result = ({"success": True, "commitment": read_commitment(mb.work, mb.agent_id)}
+                  if args.mode == "status" else declare_commitment(mb, args.mode, args.note))
+        print(json.dumps(result, indent=2))
+        raise SystemExit(0)
+
     if cmd == "install-mcp":
         from darkmatter.installer import main as installer_main
         raise SystemExit(installer_main(sys.argv[2:]))

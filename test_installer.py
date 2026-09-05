@@ -23,6 +23,7 @@ def report(name: str, passed: bool, detail: str = "") -> None:
     if detail and not passed:
         print(f"      {detail}")
     results.append((name, passed, detail))
+    assert passed, f"{name}: {detail}"
 
 
 def _target(client: str):
@@ -48,7 +49,7 @@ def test_json_clients() -> None:
             data = json.loads(path.read_text())
             entry = data["mcpServers"]["darkmatter"]
             report(f"{client} command stored", entry["command"] == "/tmp/python", str(entry))
-            report(f"{client} args stored", entry["args"] == ["-m", "darkmatter"], str(entry.get("args")))
+            report(f"{client} args stored", entry["args"] == ["-I", "-m", "darkmatter"], str(entry.get("args")))
             report(
                 f"{client} env stores profile",
                 entry["env"]["DARKMATTER_CLIENT"] == client,
@@ -151,7 +152,7 @@ def test_opencode_json() -> None:
         data = json.loads(path.read_text())
         entry = data["mcp"]["darkmatter"]
         report("opencode entry enabled", entry["enabled"] is True, str(entry))
-        report("opencode local command array", entry["command"] == ["/tmp/python", "-m", "darkmatter"], str(entry))
+        report("opencode local command array", entry["command"] == ["/tmp/python", "-I", "-m", "darkmatter"], str(entry))
 
 
 def test_openclaw_skipped() -> None:

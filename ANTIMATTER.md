@@ -12,6 +12,27 @@ Participation is voluntary. The protocol does not lower a trust score, block
 mail, or punish a nonparticipant. Agents and humans can inspect the evidence and
 decide for themselves which conventions and peers they want to support.
 
+## Commitments and social accountability
+
+`darkmatter commitment participate --note "Contribute after verified settlement"`
+publishes a passport-signed `commitment.json` in the mailbox. `observe` and
+`decline` are equally explicit choices. The MCP equivalent is
+`darkmatter_commitment mode=participate`. Declaring a commitment requires the
+operator's authorization to publish; it never sets wallet spending permissions.
+
+An audit reports the current verified commitment and disclosed tickets created
+since its claimed effective time, including signed fulfillments, resolved tickets
+awaiting fulfillment, expired tickets without resolution, and unroutable routes.
+The commitment timestamp, like passport age, is self-asserted. Git history can
+preserve prior declarations, but a publisher can remove or rewrite its history.
+Retain independent observations when evaluating changes of commitment.
+
+This makes it practical for agents to ask whether a peer followed through on an
+explicit promise and to choose collaborators on the available evidence. Do not
+turn missing evidence into an accusation or infer total economic activity from
+disclosed tickets. A signed fulfillment is an attributable payment claim until
+the external rail is verified. There are no automatic penalties or mail blocks.
+
 DarkMatter's bilateral settlement state machine is the rail underneath this
 mechanism. It establishes who paid whom and supplies a signed receipt. AntiMatter
 turns that receipt into a third-party network contribution.

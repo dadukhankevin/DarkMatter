@@ -421,9 +421,20 @@ class Mailbox:
         dest = self.work / "outbox" / f"{env.id}.json"
         atomic_write_text(dest, json.dumps(env.to_public_dict(), indent=2) + "\n")
 
-    def _move_to_readbox(self, envelope_id: str) -> bool:
+    def _move_to_readbox(self, envelope_id: str, receipt_sender: str) -> bool:
+        from darkmatter.contract.envelope import validate_envelope_id
+        try:
+            validate_envelope_id(envelope_id)
+        except ValueError:
+            return False
         src = self.work / "outbox" / f"{envelope_id}.json"
-        if not src.exists():
+        if not src.is_file() or src.is_symlink():
+            return False
+        try:
+            original = json.loads(src.read_text())
+            if original.get("to") != receipt_sender or original.get("from") != self.agent_id:
+                return False
+        except (ValueError, OSError, AttributeError):
             return False
         dest = self.work / "readbox" / f"{envelope_id}.json"
         atomic_write_text(dest, src.read_text())
@@ -1351,6 +1362,7 @@ class Mailbox:
                 route = [ticket["origin_id"]] + [hop["to"] for hop in package["path"]]
                 item = {
                     "contribution_id": ticket["contribution_id"],
+                    "created_at": ticket["created_at"],
                     "status": contribution_state(package),
                     "origin_id": ticket["origin_id"],
                     "source_payer_id": ticket["source"]["payer_id"],
@@ -1390,12 +1402,19 @@ class Mailbox:
                 for item in records
             ),
         }
+        from darkmatter.commitment import accountability, read_commitment
+        try:
+            commitment = read_commitment(repo, audited_agent_id)
+        except (ValueError, TypeError, OSError) as exc:
+            invalid.append({"file": "commitment.json", "error": str(exc)})
+            commitment = None
         return {
             "success": True,
             "agent_id": audited_agent_id,
             "count": len(records),
             "counts": counts,
             "facts": facts,
+            "accountability": accountability(commitment, records, audited_agent_id),
             "records": records,
             "invalid": invalid,
             "interpretation": "Raw signed evidence only; DarkMatter does not compute a trust score.",
@@ -1749,6 +1768,21 @@ class Mailbox:
         )
         self._write_outbox(env)
 
+    def _introduced_locally(self, peer_id: str) -> bool:
+        """Acceptance must answer an introduction this mailbox actually sent."""
+        for folder in ("outbox", "readbox"):
+            for path in (self.work / folder).glob("*.json"):
+                if path.is_symlink():
+                    continue
+                try:
+                    data = json.loads(path.read_text())
+                    if (isinstance(data, dict) and data.get("type") == "introduce"
+                            and data.get("from") == self.agent_id and data.get("to") == peer_id):
+                        return True
+                except (ValueError, OSError):
+                    continue
+        return False
+
     def _ingest(self, data: dict, peer_remote: str) -> Optional[str]:
         if data.get("to") != self.agent_id:
             return None
@@ -1776,13 +1810,14 @@ class Mailbox:
                 return None
         if env.type == "receipt":
             rel = self.store.get_relationship(env.from_id)
-            if rel is not None and rel.state != REL_CLOSED:
-                self.store.upsert_relationship(
-                    env.from_id,
-                    last_seen_at=env.timestamp,
-                    peer_liveness=peer_liveness,
-                )
-            if self._move_to_readbox(body.get("envelope_id", "")):
+            if rel is None or rel.state == REL_CLOSED:
+                return None
+            self.store.upsert_relationship(
+                env.from_id,
+                last_seen_at=env.timestamp,
+                peer_liveness=peer_liveness,
+            )
+            if self._move_to_readbox(body.get("envelope_id", ""), env.from_id):
                 return "receipt"
             return None
 
@@ -1801,8 +1836,14 @@ class Mailbox:
             )
 
         if env.type == "accept":
+            existing = self.store.get_relationship(env.from_id)
+            if existing is None or existing.state == REL_CLOSED:
+                return None
+            if existing.state == REL_PENDING and not self._introduced_locally(env.from_id):
+                return None
             peer_locator = body.get("locator") or body.get("remote") or peer_remote
             try:
+                peer_locator = validate_locator(peer_locator)
                 peer_passport = verify_passport_claim(body.get("passport"), env.from_id)
             except ValueError:
                 return None
@@ -1814,10 +1855,13 @@ class Mailbox:
                 last_seen_at=env.timestamp,
             )
         elif env.type == "ignore":
+            if self.store.get_relationship(env.from_id) is None:
+                return None
             self.store.upsert_relationship(env.from_id, state=REL_CLOSED)
         elif env.type == "introduce":
             peer_locator = body.get("locator") or body.get("remote") or peer_remote
             try:
+                peer_locator = validate_locator(peer_locator)
                 peer_passport = verify_passport_claim(body.get("passport"), env.from_id)
             except ValueError:
                 return None

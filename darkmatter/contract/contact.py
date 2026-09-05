@@ -16,7 +16,15 @@ def validate_locator(locator: str) -> str:
     if not isinstance(locator, str) or not locator.strip():
         raise ValueError("Contact card locator is required")
     locator = locator.strip()
+    if locator.startswith("-") or any(ord(c) < 32 or ord(c) == 127 for c in locator):
+        raise ValueError("Mailbox locator contains options or control characters")
+    if "::" in locator and "://" not in locator:
+        raise ValueError("Git remote helpers are not mailbox locators")
     parsed = urlsplit(locator)
+    if parsed.scheme and parsed.scheme not in ("http", "https", "ssh"):
+        raise ValueError("Unsupported mailbox locator scheme")
+    if parsed.scheme in ("http", "https", "ssh") and (not parsed.hostname or parsed.hostname.startswith("-")):
+        raise ValueError("Mailbox locator requires a valid host")
     if parsed.scheme in ("http", "https") and "@" in parsed.netloc:
         raise ValueError("Mailbox locators must not contain embedded HTTP credentials")
     return locator
