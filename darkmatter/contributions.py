@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from darkmatter.contract.contribution import contribution_state, verify_contribution_package
+from darkmatter.contract.obligation import source_matches
 from darkmatter.store.local import LocalStore, atomic_write_text
 
 
@@ -74,10 +75,11 @@ class ContributionLedger:
             record["status"] = contribution_state(record["package"])
             return record
 
-    def for_settlement(self, settlement_id: str) -> Optional[dict]:
+    def for_settlement(self, settlement_id: str, *, settlement: Optional[dict] = None) -> Optional[dict]:
         matches = [
             item for item in self.list()
             if item.get("settlement_id") == settlement_id
+            and (settlement is None or source_matches(settlement, verify_contribution_package(item["package"])["ticket"]["source"]))
         ]
         return matches[0] if matches else None
 

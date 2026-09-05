@@ -108,7 +108,7 @@ class SolanaPaymentService:
         return value
 
     def _contribution_record(self, settlement_id: str) -> dict | None:
-        return self.mailbox.contributions.for_settlement(settlement_id)
+        return self.mailbox.contributions.for_settlement(settlement_id, settlement=self._record(settlement_id))
 
     def _beneficiary_claim(self, record: dict) -> dict | None:
         contribution = self._contribution_record(record["settlement_id"])
@@ -136,14 +136,17 @@ class SolanaPaymentService:
         contribution_raw = int(
             (Decimal(raw) * ANTIMATTER_RATE).to_integral_value(rounding=ROUND_DOWN),
         )
-        if contribution_raw < 1:
+        participating = (record.get("contribution_agreement") or {}).get("mode", "participate") == "participate"
+        if not participating:
+            contribution_raw = 0
+        if participating and contribution_raw < 1:
             raise WalletError("Settlement is too small to represent its 1% contribution")
         return {
             "network": self.network,
             "asset": token.to_dict(),
             "amount": amount,
             "amount_base_units": str(raw),
-            "contribution_rate": format(ANTIMATTER_RATE, "f"),
+            "contribution_rate": format(ANTIMATTER_RATE, "f") if participating else "0",
             "contribution_amount": format_base_units(contribution_raw, token.decimals),
             "contribution_base_units": str(contribution_raw),
             "beneficiary": beneficiary,
@@ -346,10 +349,16 @@ class SolanaPaymentService:
         payee_claim = self._invoice_claim(record)
         if payee_claim["address"] != self.wallet.address:
             raise WalletError("Current wallet does not match the wallet used in the invoice")
+        if (record.get("contribution_agreement") or {}).get("mode", "participate") != "participate":
+            confirmation = self.mailbox.antimatter_confirm(
+                record["peer_id"], settlement_id, receipt["id"],
+                {"rail": f"solana:{self.network}", "primary": primary, "contribution": {"status": "not_committed"}}, note,
+            )
+            return {**confirmation, "primary_verified": True, "contribution": {"status": "not_committed"}}
         quote = self._quote(record)
         contribution_record = self._contribution_record(settlement_id)
         if contribution_record is None:
-            started = self.mailbox.antimatter_contribute(settlement_id)
+            started = self.mailbox.antimatter_contribute(settlement_id, receipt_id=receipt["id"])
             if not started.get("success"):
                 return {
                     **started,
@@ -357,6 +366,8 @@ class SolanaPaymentService:
                     "contribution_started": False,
                 }
             contribution_record = self._contribution_record(settlement_id)
+        if contribution_record["package"]["ticket"]["source"]["receipt_id"] != receipt["id"]:
+            raise WalletError("Contribution does not match the selected primary receipt")
         contribution_id = contribution_record["contribution_id"]
         if contribution_record["status"] in ("created", "routing"):
             return {

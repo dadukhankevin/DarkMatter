@@ -24,6 +24,7 @@ from darkmatter.antimatter import (
     AntimatterLedger,
     event_body as antimatter_event_body,
     new_settlement_id,
+    normalize_terms,
     offer_body as antimatter_offer_body,
     summarize_event as summarize_antimatter_event,
 )
@@ -59,6 +60,8 @@ from darkmatter.contract.tenure import (
     parse_timestamp,
     verify_passport_claim,
 )
+from darkmatter.contract.obligation import create_proposal, create_acceptance, create_discussion
+from darkmatter.commitment import read_commitment
 from darkmatter.contributions import ContributionLedger
 from darkmatter.gitbox.gitutil import (
     clone_or_update,
@@ -684,6 +687,10 @@ class Mailbox:
             )
             if not projection.get("success"):
                 return projection
+        if env_type == "antimatter_obligation":
+            outcome = self.antimatter.apply_discussion(body.get("settlement_id"), self.agent_id, body.get("statement"))
+            if not outcome.get("success"):
+                return outcome
         self._write_outbox(env)
         self._publish(f"{env_type} {env.id[:12]}")
         result = {"success": True, "envelope_id": env.id, "to": peer_id}
@@ -1107,16 +1114,9 @@ class Mailbox:
         max_hops: int = MAX_CONTRIBUTION_HOPS,
         ttl_seconds: int = 7 * 24 * 60 * 60,
         liveness_window_seconds: int = 7 * 24 * 60 * 60,
+        receipt_id: Optional[str] = None,
     ) -> dict:
         """Turn a received settlement into a public 1% contribution route."""
-        existing = self.contributions.for_settlement(settlement_id)
-        if existing:
-            return {
-                "success": True,
-                "existing": True,
-                **existing,
-                "proof_package": existing["package"],
-            }
         settlement = self.antimatter.get(settlement_id)
         if settlement is None:
             return {"success": False, "error": "Unknown settlement_id"}
@@ -1125,7 +1125,20 @@ class Mailbox:
         receipts = settlement.get("receipts") or []
         if not receipts:
             return {"success": False, "error": "A payment receipt is required before contribution routing"}
-        receipt = receipts[-1]
+        if (settlement.get("contribution_agreement") or {}).get("mode", "participate") != "participate":
+            return {"success": False, "error": "This settlement did not agree to a contribution"}
+        confirmed_id = (settlement.get("confirmation") or {}).get("body", {}).get("receipt_id")
+        if receipt_id and confirmed_id and receipt_id != confirmed_id:
+            return {"success": False, "error": "Receipt differs from the confirmed primary receipt"}
+        selected_id = receipt_id or confirmed_id or receipts[-1]["id"]
+        receipt = next((r for r in receipts if r["id"] == selected_id), None)
+        if receipt is None:
+            return {"success": False, "error": "Unknown receipt_id"}
+        existing = self.contributions.for_settlement(settlement_id, settlement=settlement)
+        if existing:
+            if existing["package"]["ticket"]["source"]["receipt_id"] != receipt["id"]:
+                return {"success": False, "error": "Existing contribution refers to a different receipt"}
+            return {"success": True, "existing": True, **existing, "proof_package": existing["package"]}
         terms = settlement["terms"]
         source = {
             "settlement_id": settlement_id,
@@ -1349,6 +1362,7 @@ class Mailbox:
             audited_agent_id = peer_id
 
         records = []
+        verified_contributions = []
         invalid = []
         audit_dir = repo / "antimatter"
         for path in sorted(audit_dir.glob("*.json")) if audit_dir.is_dir() else []:
@@ -1357,6 +1371,7 @@ class Mailbox:
                     raise ValueError("audit proof exceeds size limit")
                 package = verify_contribution_package(json.loads(path.read_text()))
                 ticket = package["ticket"]
+                verified_contributions.append({"settlement_id": ticket["source"]["settlement_id"], "package": package})
                 resolution = package.get("resolution")
                 fulfillment = package.get("fulfillment")
                 route = [ticket["origin_id"]] + [hop["to"] for hop in package["path"]]
@@ -1408,8 +1423,11 @@ class Mailbox:
         except (ValueError, TypeError, OSError) as exc:
             invalid.append({"file": "commitment.json", "error": str(exc)})
             commitment = None
+        from darkmatter.obligations import project_obligation
+        retained = self.antimatter.list(peer_id=peer_id) if peer_id else self.antimatter.list()
         return {
             "success": True,
+            "retained_obligations": [project_obligation(r, verified_contributions, include_proofs) for r in retained],
             "agent_id": audited_agent_id,
             "count": len(records),
             "counts": counts,
@@ -1433,6 +1451,7 @@ class Mailbox:
         metadata: Optional[dict] = None,
         valid_until: Optional[str] = None,
         settlement_id: Optional[str] = None,
+        contribution_mode: Optional[str] = None,
     ) -> dict:
         """Offer exact settlement terms to an active relationship."""
         settlement_id = settlement_id or new_settlement_id()
@@ -1451,7 +1470,21 @@ class Mailbox:
             metadata=metadata,
             valid_until=valid_until,
         )
-        return self._send_envelope(peer_id, ANTIMATTER_OFFER, body, valid_until)
+        envelope_id = uuid.uuid4().hex
+        timestamp = datetime.now(timezone.utc).isoformat()
+        try:
+            body["terms"] = normalize_terms(body["terms"])
+            commitment = read_commitment(self.work, self.agent_id) if payee_id == self.agent_id else None
+            mode = contribution_mode or (commitment["mode"] if commitment else "participate")
+            body["contribution_agreement"] = create_proposal(
+                self.store.private_key_hex, settlement_id=settlement_id, offer_id=envelope_id,
+                payer_id=payer_id, payee_id=payee_id, terms=body["terms"], mode=mode,
+                commitment=commitment, timestamp=timestamp,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+        return self._send_envelope(peer_id, ANTIMATTER_OFFER, body, valid_until,
+                                   envelope_id=envelope_id, timestamp=timestamp)
 
     def _antimatter_record(self, peer_id: str, settlement_id: str) -> tuple[Optional[dict], Optional[dict]]:
         record = self.antimatter.get(settlement_id)
@@ -1472,6 +1505,8 @@ class Mailbox:
         record, error = self._antimatter_record(peer_id, settlement_id)
         if error:
             return error
+        if record["status"] in ("settled", "disputed"):
+            return {"success": False, "error": f"settlement is {record['status']}"}
         body = antimatter_event_body(
             "accept",
             settlement_id,
@@ -1479,7 +1514,15 @@ class Mailbox:
             note=note,
             metadata=metadata or {},
         )
-        return self._send_envelope(peer_id, ANTIMATTER_ACCEPT, body)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if record.get("contribution_agreement"):
+            try:
+                body["contribution_acceptance"] = create_acceptance(
+                    self.store.private_key_hex, record["contribution_agreement"], timestamp,
+                )
+            except (TypeError, ValueError) as exc:
+                return {"success": False, "error": str(exc)}
+        return self._send_envelope(peer_id, ANTIMATTER_ACCEPT, body, timestamp=timestamp)
 
     @_locked
     def antimatter_invoice(
@@ -1582,7 +1625,7 @@ class Mailbox:
             note=note,
         )
         result = self._send_envelope(peer_id, ANTIMATTER_CONFIRM, body)
-        if result.get("success"):
+        if result.get("success") and (record.get("contribution_agreement") or {}).get("mode", "participate") == "participate":
             contribution = self.antimatter_contribute(settlement_id)
             result["contribution"] = contribution
             if not contribution.get("success"):
@@ -1612,6 +1655,38 @@ class Mailbox:
             evidence=evidence or {},
         )
         return self._send_envelope(peer_id, ANTIMATTER_DISPUTE, body)
+
+    @_locked
+    def obligation_discuss(self, settlement_id, action, reason, reference=""):
+        record = self.antimatter.get(settlement_id)
+        if record is None:
+            return {"success": False, "error": "Unknown settlement_id"}
+        try:
+            statement = create_discussion(
+                self.store.private_key_hex,
+                {"proposal": record.get("contribution_agreement"), "acceptance": record.get("contribution_acceptance")},
+                event_id=uuid.uuid4().hex, action=action, reference=reference, reason=reason,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+        result = self._send_envelope(record["peer_id"], "antimatter_obligation",
+                                     {"settlement_id": settlement_id, "statement": statement})
+        if result.get("success"):
+            result["statement"] = statement
+        return result
+
+    def obligations(self, settlement_id=None, include_proofs=False, peer_id=None):
+        from darkmatter.obligations import project_obligation
+        records = self.antimatter.list(peer_id=peer_id)
+        if settlement_id is not None:
+            records = [r for r in records if r["settlement_id"] == settlement_id]
+            if not records:
+                return {"success": False, "error": "Unknown settlement_id"}
+        contributions = self.contributions.list()
+        return {"success": True, "obligations": [project_obligation(r, contributions, include_proofs) for r in records],
+                "evidence_boundary": "Retained bilateral evidence, not a global score. Missing evidence is unknown; signatures do not verify payment.",
+                "privacy": "Proof export includes private settlement and payment details. Sharing requires explicit authorization."}
 
     def list_settlements(
         self,
@@ -1835,6 +1910,15 @@ class Mailbox:
                 body,
             )
 
+        if env.type == "antimatter_obligation":
+            rel = self.store.get_relationship(env.from_id)
+            record = self.antimatter.get(body.get("settlement_id"))
+            if rel is None or rel.state != REL_ACTIVE or not record or record["peer_id"] != env.from_id:
+                return None
+            outcome = self.antimatter.apply_discussion(body.get("settlement_id"), env.from_id, body.get("statement"))
+            if not outcome.get("success"):
+                return None
+
         if env.type == "accept":
             existing = self.store.get_relationship(env.from_id)
             if existing is None or existing.state == REL_CLOSED:
@@ -1985,6 +2069,8 @@ class Mailbox:
                 + f"({card['agent_id']})\nSigned contact card:\n"
                 + json.dumps(card, sort_keys=True)
             )
+        if env.type == "antimatter_obligation":
+            content = f"AntiMatter contribution {body['statement']['action']}: {body['statement']['reason']}"
         if env.type in ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES:
             content = summarize_antimatter_event(env.type, body)
         elif env.type in ANTIMATTER_CONTRIBUTION_ENVELOPE_TYPES:

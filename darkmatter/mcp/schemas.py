@@ -213,6 +213,7 @@ class AntimatterInput(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
     )
+    contribution_mode: Optional[str] = Field(default=None, pattern=r"^(participate|observe|decline)$")
     proposer_role: AntimatterRole = Field(
         default=AntimatterRole.PAYER,
         description="Whether the offer sender will pay or be paid",

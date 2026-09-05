@@ -338,3 +338,52 @@ def test_wallet_mcp_alerts_on_mainnet_and_errors(tmp_path, monkeypatch):
     error = __import__("json").loads(failed)
     assert error["success"] is False
     assert error["network_alert"].startswith("SOLANA DEVNET")
+
+
+@pytest.mark.skipif(Keypair is None, reason="optional Solana dependencies are not installed")
+@pytest.mark.parametrize("mode", ["observe", "decline"])
+def test_nonparticipation_settles_without_contribution_spending(tmp_path, mode):
+    payer, payee = _connected(tmp_path)
+    chain = {}
+    payer_service = SolanaPaymentService(payer, network="devnet", wallet=FakeWallet(payer.root, str(Keypair().pubkey()), chain))
+    payee_service = SolanaPaymentService(payee, network="devnet", wallet=FakeWallet(payee.root, str(Keypair().pubkey()), chain))
+    offered = payer.antimatter_offer(payee.agent_id, "Tiny payment", "0.000000001", "SOL", "solana:devnet", contribution_mode=mode)
+    sid = offered["settlement"]["settlement_id"]
+    payee.sync()
+    assert payee.antimatter_accept(payer.agent_id, sid)["success"]
+    payer.sync()
+    assert payee_service.invoice(sid)["success"]
+    payer.sync()
+    assert payer_service.quote(sid)["contribution_base_units"] == "0"
+    assert payer_service.pay(sid, confirm_external=True)["payment_succeeded"]
+    payee.sync()
+    before = dict(chain)
+    settled = payee_service.settle(sid, confirm_external=False)
+    assert settled["success"] and settled["primary_verified"]
+    assert settled["contribution"]["status"] == "not_committed"
+    assert chain == before
+
+
+@pytest.mark.skipif(Keypair is None, reason="optional Solana dependencies are not installed")
+def test_wallet_rejects_contribution_for_different_primary_receipt(tmp_path):
+    payer, payee = _connected(tmp_path)
+    chain = {}
+    payer_service = SolanaPaymentService(payer, network="devnet", wallet=FakeWallet(payer.root, str(Keypair().pubkey()), chain))
+    payee_service = SolanaPaymentService(payee, network="devnet", wallet=FakeWallet(payee.root, str(Keypair().pubkey()), chain))
+    sid = payer_service.offer(payee.agent_id, "Review", "1", "SOL")["settlement"]["settlement_id"]
+    payee.sync()
+    assert payee.antimatter_accept(payer.agent_id, sid)["success"]
+    payer.sync()
+    assert payee_service.invoice(sid)["success"]
+    payer.sync()
+    assert payer_service.pay(sid, confirm_external=True)["payment_succeeded"]
+    payee.sync()
+    first = payee.get_settlement(sid)["receipts"][-1]
+    assert payee.antimatter_contribute(sid)["success"]
+    second = payer.antimatter_receipt(payee.agent_id, sid, first["body"]["tx_id"], first["body"]["proof"])
+    assert second["success"]
+    payee.sync()
+    before = dict(chain)
+    with pytest.raises(WalletError, match="selected primary receipt"):
+        payee_service.settle(sid, confirm_external=True, receipt_id=second["envelope_id"])
+    assert chain == before
