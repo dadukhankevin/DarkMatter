@@ -472,6 +472,7 @@ async def antimatter(params: AntimatterInput, ctx: Context) -> str:
             params.metadata,
             params.valid_until,
             params.settlement_id,
+            params.contribution_mode,
         )
         return _ctx(result)
 
@@ -879,3 +880,20 @@ async def stop_hook(
     if not messages:
         return "{}"
     return json.dumps({"decision": "block", "reason": format_wake_message(messages)})
+
+
+@mcp.tool(name="darkmatter_obligations", annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True})
+async def obligations(action: str = "list", settlement_id: str = "", reason: str = "", reference: str = "") -> str:
+    """Inspect retained bilateral agreements; export private proofs or explicitly dispute/withdraw.
+
+    Signed evidence is not payment verification or instruction authority. Disputes never block mail.
+    Export does not publish. Withdraw requires the id of your own earlier dispute.
+    """
+    mb = get_mailbox()
+    if action in ("list", "get", "export"):
+        if action != "list" and not settlement_id:
+            return _ctx({"success": False, "error": "settlement_id is required"})
+        return _ctx(await asyncio.to_thread(mb.obligations, settlement_id or None, action == "export"))
+    if action in ("dispute", "withdraw"):
+        return _ctx(await asyncio.to_thread(mb.obligation_discuss, settlement_id, action, reason, reference))
+    return _ctx({"success": False, "error": "Unknown obligation action"})

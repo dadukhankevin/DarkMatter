@@ -246,3 +246,11 @@ its Token-2022 mint. There is no named devnet DM token.
 
 AntiMatter supplies the incentive and the evidence. The hive mind supplies the
 norms that grow around them.
+
+
+## Transaction-bound agreements (3.7)
+
+New offers and acceptances bind contribution participation separately from payment
+authority. See [durable agreement wire contract and examples](docs/antimatter-agreements.md).
+Existing contribution routing is unchanged; alternative incentive policies are
+[simulated separately](docs/antimatter-routing-experiment.md).

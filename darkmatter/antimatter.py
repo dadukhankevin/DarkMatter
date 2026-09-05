@@ -19,6 +19,8 @@ from typing import Optional
 from darkmatter.contract.envelope import ANTIMATTER_SETTLEMENT_ENVELOPE_TYPES
 from darkmatter.contract.contribution import verify_source_receipt
 from darkmatter.contract.types import REL_ACTIVE
+from darkmatter.contract.tenure import parse_timestamp
+from darkmatter.contract.obligation import digest, verify_proposal, verify_agreement, verify_discussion
 from darkmatter.policy import load_policy
 from darkmatter.store.local import LocalStore, atomic_write_text
 
@@ -109,6 +111,18 @@ def normalize_amount(value) -> str:
     if len(rendered) > 128:
         raise AntimatterError("amount is too large")
     return rendered
+
+
+def normalize_terms(terms):
+    if not isinstance(terms, dict):
+        raise AntimatterError("terms must be an object")
+    return {
+        "description": _text(terms.get("description"), "description", maximum=2000),
+        "amount": normalize_amount(terms.get("amount")),
+        "currency": _text(terms.get("currency"), "currency", maximum=64),
+        "rail": _text(terms.get("rail"), "rail", maximum=128),
+        "details": _object(terms.get("details"), "terms.details"),
+    }
 
 
 def new_settlement_id() -> str:
@@ -329,15 +343,7 @@ class AntimatterLedger:
                     terms = normalized.get("terms")
                     if not isinstance(terms, dict):
                         raise AntimatterError("terms must be an object")
-                    clean_terms = {
-                        "description": _text(
-                            terms.get("description"), "description", maximum=2000,
-                        ),
-                        "amount": normalize_amount(terms.get("amount")),
-                        "currency": _text(terms.get("currency"), "currency", maximum=64),
-                        "rail": _text(terms.get("rail"), "rail", maximum=128),
-                        "details": _object(terms.get("details"), "terms.details"),
-                    }
+                    clean_terms = normalize_terms(terms)
                     valid_until = _iso_time(normalized.get("valid_until"), "valid_until")
                     if valid_until and datetime.fromisoformat(valid_until) <= datetime.now(timezone.utc):
                         raise AntimatterError("valid_until must be in the future")
@@ -348,6 +354,17 @@ class AntimatterLedger:
                         "terms": clean_terms,
                         "metadata": _object(normalized.get("metadata"), "metadata"),
                     })
+                    proposal = normalized.get("contribution_agreement")
+                    if proposal is not None:
+                        proposal = verify_proposal(proposal)
+                        expected = {"settlement_id": settlement_id, "offer_id": envelope_id,
+                                    "proposer_id": actor_id, "payer_id": payer_id, "payee_id": payee_id,
+                                    "terms_digest": digest(clean_terms), "amount": clean_terms["amount"],
+                                    "currency": clean_terms["currency"], "rail": clean_terms["rail"],
+                                    "timestamp": event["timestamp"]}
+                        if any(proposal[key] != value for key, value in expected.items()):
+                            raise AntimatterError("Contribution proposal does not match settlement terms")
+                        normalized["contribution_agreement"] = proposal
                     if valid_until:
                         normalized["valid_until"] = valid_until
                     else:
@@ -365,6 +382,9 @@ class AntimatterLedger:
                         "valid_until": valid_until or None,
                         "offer": event,
                         "acceptance": None,
+                        "contribution_agreement": proposal,
+                        "contribution_acceptance": None,
+                        "contribution_discussions": [],
                         "invoice": None,
                         "receipts": [],
                         "confirmation": None,
@@ -391,6 +411,15 @@ class AntimatterLedger:
                         valid_until = record.get("valid_until")
                         if valid_until and datetime.fromisoformat(valid_until) <= datetime.now(timezone.utc):
                             raise AntimatterError("offer has expired")
+                        proposal = record.get("contribution_agreement")
+                        accepted = normalized.get("contribution_acceptance")
+                        if proposal is not None:
+                            agreement = verify_agreement(proposal, accepted)
+                            if agreement["acceptance"]["actor_id"] != actor_id or agreement["acceptance"]["timestamp"] != event["timestamp"]:
+                                raise AntimatterError("Contribution acceptance does not match its envelope")
+                            record["contribution_acceptance"] = agreement["acceptance"]
+                        elif accepted is not None:
+                            raise AntimatterError("Legacy offer has no contribution proposal to accept")
                         normalized["note"] = _text(
                             normalized.get("note"), "note", maximum=1000, required=False,
                         )
@@ -532,6 +561,41 @@ class AntimatterLedger:
                     "settlement": deepcopy(record),
                     "trust_delta": trust_delta,
                 }
+        except (AntimatterError, KeyError, TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    def apply_discussion(self, settlement_id: str, actor_id: str, statement: dict) -> dict:
+        """Retain attributed disputes after settlement without changing payment state."""
+        try:
+            with self.store.locked():
+                data = self._load()
+                record = data["settlements"].get(settlement_id)
+                if record is None:
+                    raise AntimatterError("Unknown settlement_id")
+                agreement = {"proposal": record.get("contribution_agreement"),
+                             "acceptance": record.get("contribution_acceptance")}
+                event = verify_discussion(statement, agreement)
+                if event["actor_id"] != actor_id:
+                    raise AntimatterError("Discussion sender mismatch")
+                events = record.setdefault("contribution_discussions", [])
+                previous = next((e for e in events if e["id"] == event["id"]), None)
+                if previous:
+                    if previous != event:
+                        raise AntimatterError("Discussion id already has different content")
+                    return {"success": True, "duplicate": True}
+                if event["action"] == "dispute" and sum(e["action"] == "dispute" and e["actor_id"] == actor_id for e in events) >= 128:
+                    raise AntimatterError("Author dispute limit reached")
+                if event["action"] == "withdraw":
+                    reference = next((e for e in events if e["id"] == event["reference"]), None)
+                    if not reference or reference["action"] != "dispute" or reference["actor_id"] != actor_id:
+                        raise AntimatterError("Only the author can withdraw their own dispute")
+                    if any(e["action"] == "withdraw" and e["reference"] == event["reference"] for e in events):
+                        raise AntimatterError("Dispute is already withdrawn")
+                    if parse_timestamp(event["timestamp"], "timestamp") < parse_timestamp(reference["timestamp"], "timestamp"):
+                        raise AntimatterError("Withdrawal predates its dispute")
+                events.append(event)
+                self._save(data)
+                return {"success": True, "statement": event}
         except (AntimatterError, KeyError, TypeError, ValueError) as exc:
             return {"success": False, "error": str(exc)}
 

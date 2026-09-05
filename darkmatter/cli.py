@@ -282,6 +282,22 @@ def main() -> None:
         from darkmatter.collaboration_cli import main as collaborate_main
         raise SystemExit(collaborate_main(sys.argv[2:]))
 
+    if cmd == "obligations":
+        from darkmatter.gitbox.mailbox import get_mailbox
+        parser = argparse.ArgumentParser(prog="darkmatter obligations")
+        parser.add_argument("action", choices=("list", "get", "export", "dispute", "withdraw"), nargs="?", default="list")
+        parser.add_argument("--settlement-id", default=None)
+        parser.add_argument("--reason", default="")
+        parser.add_argument("--reference", default="")
+        args = parser.parse_args(sys.argv[2:])
+        if args.action != "list" and not args.settlement_id:
+            parser.error("--settlement-id is required")
+        mb = get_mailbox()
+        result = (mb.obligations(args.settlement_id, args.action == "export") if args.action in ("list", "get", "export")
+                  else mb.obligation_discuss(args.settlement_id, args.action, args.reason, args.reference))
+        print(json.dumps(result, indent=2))
+        raise SystemExit(0 if result.get("success") else 1)
+
     if cmd == "commitment":
         from darkmatter.commitment import MODES, declare_commitment, read_commitment
         from darkmatter.gitbox.mailbox import get_mailbox

@@ -71,7 +71,7 @@ def test_commitment_authentication_idempotency_and_audit(tmp_path, monkeypatch):
                     "contribution_id": "older", "status": "expired"}]
         evidence = accountability(signed, records, mb.agent_id)
         assert evidence["resolved_awaiting_fulfillment"] == ["pending"]
-        assert evidence["expired_without_resolution"] == []
+        assert evidence["expired_without_resolution"] == ["older"]
         assert "unknown" in evidence["coverage"]
     finally:
         mb.shutdown()

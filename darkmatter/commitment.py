@@ -65,9 +65,6 @@ def declare_commitment(mailbox, mode, note=""):
 def accountability(commitment, records, agent_id):
     """Show disclosed follow-through; absence of evidence is explicitly unknown."""
     originated = [r for r in records if r["origin_id"] == agent_id]
-    if commitment:
-        since = parse_timestamp(commitment["effective_from"], "effective_from")
-        originated = [r for r in originated if parse_timestamp(r["created_at"], "created_at") >= since]
     return {
         "commitment": commitment,
         "disclosed_contributions": len(originated),

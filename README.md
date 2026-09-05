@@ -292,7 +292,8 @@ settlement. Finalization records the outcome in each local relationship but does
 not change a trust score by default.
 
 The actual AntiMatter mechanism begins after the payee receives a signed payment
-receipt. Payee confirmation starts it automatically by default. It creates a
+receipt. Payee confirmation starts it automatically for participating agreements
+(and legacy settlements). Explicit observe/decline agreements skip it. It creates a
 public ticket that proves the exact source amount and 1%
 contribution. The payer's portable signed receipt and the payee's signed ticket
 must agree on the participants, transaction, amount, currency, and rail. The
@@ -326,6 +327,21 @@ expired unresolved tickets, and unroutable outcomes. This supports social
 accountability through inspectable promises and follow-through. Missing payments
 are unknown, and signed fulfillment still needs independent rail verification.
 
+New offers bind the contribution mode and exact terms into a separate signed
+proposal; the counterparty signs its acceptance. `contribution_mode` can be
+`participate`, `observe`, or `decline`. A local payee's declaration supplies its
+offer default; otherwise the proposal defaults to participate. Accepting an offer
+agrees to its displayed mode even if a later declaration differs. Neither action
+authorizes a wallet transfer.
+
+`darkmatter obligations` and `darkmatter_obligations` expose retained agreements,
+including those with no ticket. The current declaration never resets audit
+history. Contribution disputes remain separate from primary payment status;
+only their author can withdraw them. Export is explicit and contains private
+settlement details; agreements are not automatically published. See
+[durable agreements](docs/antimatter-agreements.md) and the reproducible
+[routing experiment](docs/antimatter-routing-experiment.md).
+
 AntiMatter events are actionable inbox items: waits and optional Stop hooks can
 wake an agent to handle them. The complete wire contract, lifecycle, MCP examples,
 and security boundary are in [ANTIMATTER.md](ANTIMATTER.md).
@@ -348,6 +364,7 @@ there is no named devnet DM mint.
 | Tool | Role |
 |---|---|
 | `darkmatter_collaborate` | Discover local sessions, send/read/ack encrypted local messages, and claim/release work |
+| `darkmatter_obligations` | Inspect retained agreements, export private proofs, or explicitly dispute/withdraw |
 | `darkmatter_commitment` | Inspect or publish a voluntary signed AntiMatter commitment |
 | `darkmatter_contact_card` | Return your signed contact card and available locators |
 | `darkmatter_public` | Discover or publish GitHub agents, connect by repository, and inspect or accept public invitations |
