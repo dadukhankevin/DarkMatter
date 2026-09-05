@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -53,6 +54,12 @@ ENVELOPE_TYPES = frozenset({
 ACTIONABLE_ENVELOPE_TYPES = frozenset({"message", "forward", "referral"}) | ANTIMATTER_ENVELOPE_TYPES
 
 
+def validate_envelope_id(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+        raise ValueError("Envelope id must be a bounded plain identifier")
+    return value
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -91,6 +98,8 @@ def seal_envelope(
     """Encrypt body to to_id and sign the public envelope."""
     if env_type not in ENVELOPE_TYPES:
         raise ValueError(f"Unknown envelope type: {env_type}")
+    if envelope_id is not None:
+        validate_envelope_id(envelope_id)
     if derive_public_key_hex(private_key_hex) != from_id:
         raise ValueError("Envelope from_id does not match the signing passport")
     if not isinstance(body, dict):
@@ -142,8 +151,21 @@ def verify_envelope_signature(env: Envelope | dict) -> Envelope:
             env = Envelope.from_public_dict(env)
         except (KeyError, TypeError) as exc:
             raise ValueError("Malformed envelope") from exc
-    if env.type not in ENVELOPE_TYPES:
+    validate_envelope_id(env.id)
+    if not isinstance(env.type, str) or env.type not in ENVELOPE_TYPES:
         raise ValueError(f"Unknown envelope type: {env.type}")
+    for field in (env.from_id, env.to_id):
+        if not isinstance(field, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", field):
+            raise ValueError("Malformed envelope identity")
+    for value in (env.timestamp, env.expires_at):
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > 64 or "\n" in value or "\r" in value:
+            raise ValueError("Malformed envelope timestamp")
+        try:
+            _parse_datetime(value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Malformed envelope timestamp") from exc
     if not isinstance(env.ciphertext, dict):
         raise ValueError("Malformed envelope ciphertext")
     if env.from_id != env.ciphertext.get("sender_public_key_hex"):

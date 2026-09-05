@@ -310,6 +310,20 @@ class LocalStore:
             self.save_inbox(kept)
             return matched
 
+    def consume_inbox_item(self, item_id: str) -> bool:
+        """Mark one exact inbox item consumed without hiding unrelated events."""
+        with self.locked():
+            items = self.load_inbox()
+            changed = False
+            for item in items:
+                if item.get("id") == item_id and not item.get("consumed"):
+                    item["consumed"] = True
+                    changed = True
+                    break
+            if changed:
+                self.save_inbox(items)
+            return changed
+
     def unconsumed_messages(self, from_agents: Optional[list[str]] = None) -> list[dict]:
         """Return unread actionable correspondence, including AntiMatter events."""
         out = []

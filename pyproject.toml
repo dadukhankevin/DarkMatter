@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mcp[cli]>=1.0.0,<2.0.0",
+    "mcp>=1.0.0,<2.0.0",
     "cryptography>=42.0.0",
     "anyio>=4.0.0",
     "pydantic>=2.0.0",
@@ -50,14 +50,14 @@ path = "darkmatter/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "darkmatter/",
-    "ANTIMATTER.md",
-    "README.md",
-    "LICENSE",
+    "/darkmatter/",
+    "/ANTIMATTER.md",
+    "/README.md",
+    "/LICENSE",
 ]
 exclude = [
-    "archive/",
-    "dist/",
+    "/archive/",
+    "/dist/",
 ]
 
 [tool.hatch.build.targets.wheel]

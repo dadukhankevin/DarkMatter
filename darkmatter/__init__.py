@@ -2,6 +2,7 @@
 
 from darkmatter.antimatter import AntimatterLedger
 from darkmatter.contributions import ContributionLedger
+from darkmatter.collaboration import Collaboration
 from darkmatter.contract import (
     Envelope,
     Relationship,
@@ -31,7 +32,7 @@ from darkmatter.contract import (
 )
 from darkmatter.gitbox import Mailbox
 
-__version__ = "3.4.0"
+__version__ = "3.6.0"
 
 __all__ = [
     "Envelope",
@@ -41,6 +42,7 @@ __all__ = [
     "Relationship",
     "MAX_CONTRIBUTION_HOPS",
     "__version__",
+    "Collaboration",
     "append_contribution_hop",
     "create_contact_card",
     "create_contribution_ticket",

@@ -21,7 +21,7 @@ jobs:
       # Pin the repository's lint baseline; newer Ruff releases deliberately
       # expand rule families and should be adopted in a separate formatting PR.
       - run: python -m pip install -e . pytest ruff==0.6.8
-      - run: ruff check darkmatter test_*.py
+      - run: ruff check darkmatter test_*.py conftest.py
       - run: pytest -q
 
   solana:
