@@ -55,13 +55,26 @@ def main(argv=None):
             if len(raw) > 65536:
                 return 0
             event = json.loads(raw or "{}")
-            if not isinstance(event, dict) or not event.get("session_id"):
+            if not isinstance(event, dict):
+                return 0
+            cursor = args.client == "cursor"
+            session_id = event.get("conversation_id") if cursor else event.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
                 return 0
             name = event.get("hook_event_name", "")
+            cursor_names = {"sessionStart": "SessionStart", "postToolUse": "PostToolUse", "sessionEnd": "SessionEnd"}
+            if cursor:
+                name = cursor_names.get(name, "")
             if name not in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"):
                 return 0
-            board = Collaboration(args.project_dir or event.get("cwd") or os.getcwd(),
-                                  str(event["session_id"]), args.client)
+            if cursor:
+                roots = event.get("workspace_roots")
+                if not isinstance(roots, list) or not roots or not isinstance(roots[0], str) or not roots[0]:
+                    return 0
+                root = roots[0]
+            else:
+                root = event.get("cwd") or os.getcwd()
+            board = Collaboration(args.project_dir or root, session_id, args.client)
             if name == "SessionEnd":
                 board.leave()
                 return 0
@@ -70,7 +83,8 @@ def main(argv=None):
                 note["cli_fallback"] = shlex.join([sys.executable, "-I", "-m", "darkmatter", "collaborate",
                                                   "status", "--scope", "repo", "--client", board.client, "--session", board.session_id])
                 text = "DarkMatter local collaboration update (identifiers only):\n" + json.dumps(note, ensure_ascii=True)
-                print(json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}))
+                output = {"additional_context": text} if cursor else {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
+                print(json.dumps(output))
             return 0
         board = Collaboration(args.project_dir or os.getcwd(), args.session_id, args.client)
         result = execute(board, args.action, scope=args.scope, objective=args.objective,

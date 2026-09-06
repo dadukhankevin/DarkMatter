@@ -23,14 +23,16 @@ uv tool install dmagent
 darkmatter install-mcp --all
 ```
 
-For automatic local discovery and inbox notifications in Codex and Claude Code:
+For automatic local discovery and inbox notifications in Codex, Claude Code, and Cursor:
 
 ```bash
 darkmatter install-mcp --all --collaborate
 ```
 
 This installs editable SessionStart, UserPromptSubmit, PreToolUse, PostToolUse and SessionEnd
-hooks for those two clients. Review Codex hooks in `/hooks`, then restart MCP
+hooks for Codex and Claude Code. Cursor uses its native `sessionStart`,
+`postToolUse`, and `sessionEnd` hooks, so Grok in Cursor shares the same local
+coordination protocol. Review Codex hooks in `/hooks`, then restart MCP
 clients to load the new tools. Other MCP clients use `darkmatter_collaborate`
 directly. The installer preserves unrelated settings and saves the first
 pre-install configuration as a sibling `*.darkmatter-backup` file.
@@ -51,7 +53,10 @@ the same remote are not automatically grouped. Repo discovery inspects at most 1
 participants per query; it is not a directory of every agent ever installed.
 
 `PreToolUse` and `PostToolUse` provide change-triggered notifications before and
-after tool calls. Hooks add identifiers and counts, never peer message content or
+after tool calls in Codex and Claude Code. Cursor injects context at session start
+and after tool calls using its documented `additional_context` output. Cursor
+identities use `conversation_id`, not the per-turn `generation_id`; in multi-root
+workspaces the first workspace root is the coordination home. Hooks add identifiers and counts, never peer message content or
 permission overrides. Oversized hook input (over 64 KiB) is skipped; a later
 supported lifecycle event can notify again. Idle agents are not forcibly woken.
 

@@ -82,6 +82,32 @@ def _merge_json_config(path: Path, update_fn: Callable[[dict], None]) -> None:
     atomic_write_text(path, json.dumps(config, indent=2) + "\n", mode=0o600)
 
 
+def _install_cursor_collaboration_hooks(path: Path, command: str) -> None:
+    args = ["-I", "-m", "darkmatter", "collaborate", "hook", "--client", "cursor"]
+    shell_command = shlex.join([command, *args])
+
+    def owned(handler):
+        if not isinstance(handler, dict) or not isinstance(handler.get("command"), str):
+            return False
+        try:
+            return shlex.split(handler["command"])[1:] == args
+        except ValueError:
+            return False
+
+    def update(config):
+        if config.get("version", 1) != 1:
+            raise ValueError("Unsupported Cursor hooks version")
+        config["version"] = 1
+        hooks = config.setdefault("hooks", {})
+        for event in ("sessionStart", "postToolUse", "sessionEnd"):
+            handlers = hooks.setdefault(event, [])
+            if not isinstance(handlers, list):
+                raise ValueError(f"hooks.{event} must be an array")
+            hooks[event] = [h for h in handlers if not owned(h)] + [
+                {"command": shell_command, "timeout": 3 if event == "sessionEnd" else 10}]
+    _merge_json_config(path, update)
+
+
 def _install_collaboration_hooks(path: Path, command: str, client: str) -> None:
     # A single quoted command works with both clients' documented shell contract.
     shell_command = shlex.join([command, "-I", "-m", "darkmatter", "collaborate", "hook", "--client", client])
@@ -281,6 +307,8 @@ def install_target(
         elif wake and target.client == "codex":
             wake_path = home / ".codex/hooks.json"
             _install_codex_wake_hook(wake_path, wake_timeout_seconds)
+        if collaborate and target.client == "cursor":
+            _install_cursor_collaboration_hooks(home / ".cursor/hooks.json", command)
         if collaborate and target.client in ("codex", "claude-code"):
             hook_path = home / (".codex/hooks.json" if target.client == "codex" else ".claude/settings.json")
             _install_collaboration_hooks(hook_path, command, target.client)
@@ -310,7 +338,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--python", dest="python_cmd", default=sys.executable)
     parser.add_argument("--home", default=str(Path.home()))
     parser.add_argument("--collaborate", action="store_true",
-                        help="Install local session discovery and inbox notification hooks for Codex/Claude Code.")
+                        help="Install local session discovery and inbox notification hooks for Codex/Claude Code/Cursor.")
     parser.add_argument(
         "--wake",
         action="store_true",

@@ -158,7 +158,8 @@ def test_collaboration_hooks_preserve_configs_and_are_idempotent(tmp_path, clien
     assert json.loads(path.with_name(path.name + ".darkmatter-backup").read_text()) == original
 
 
-def test_two_real_stdio_servers_coordinate_without_shared_inbox(boards):
+@pytest.mark.parametrize("peer_client", ["claude-code", "cursor"])
+def test_two_real_stdio_servers_coordinate_without_shared_inbox(boards, peer_client):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
@@ -169,7 +170,7 @@ def test_two_real_stdio_servers_coordinate_without_shared_inbox(boards):
             return StdioServerParameters(command=sys.executable, args=["-I", "-m", "darkmatter"],
                 env={**os.environ, "DARKMATTER_PROJECT_DIR": str(a.root), "DARKMATTER_CLIENT": client})
 
-        async with stdio_client(parameters("codex")) as streams_a, stdio_client(parameters("claude-code")) as streams_b:
+        async with stdio_client(parameters("codex")) as streams_a, stdio_client(parameters(peer_client)) as streams_b:
             async with ClientSession(*streams_a) as session_a, ClientSession(*streams_b) as session_b:
                 await session_a.initialize()
                 await session_b.initialize()
@@ -260,3 +261,44 @@ def test_malformed_git_marker_does_not_break_discovery(tmp_path, marker):
     root.mkdir()
     (root / ".git").write_bytes(marker)
     assert repository_root(root) == root.resolve()
+
+
+def test_cursor_installer_preserves_native_hooks_and_updates_its_command(tmp_path):
+    import shlex
+    target = next(t for t in SUPPORTED_TARGETS if t.client == "cursor")
+    path = tmp_path / ".cursor/hooks.json"
+    path.parent.mkdir()
+    original = {"version": 1, "hooks": {"postToolUse": [{"command": "keep-me", "matcher": "Shell"}]}}
+    path.write_text(json.dumps(original))
+    for command in ("/old/python", "/new path/python", "/new path/python"):
+        assert install_target(target, command=command, display_name="test", home=tmp_path, collaborate=True)[0]
+    saved = json.loads(path.read_text())
+    assert saved["hooks"]["postToolUse"][0] == original["hooks"]["postToolUse"][0]
+    assert len(saved["hooks"]["postToolUse"]) == 2
+    assert shlex.split(saved["hooks"]["postToolUse"][1]["command"])[0] == "/new path/python"
+    assert json.loads(path.with_name(path.name + ".darkmatter-backup").read_text()) == original
+
+
+def test_cursor_native_hook_uses_stable_conversation_and_workspace(boards, monkeypatch, capsys):
+    a, _ = boards
+    cursor = Collaboration(a.root, "cursor-conversation", "cursor")
+    cursor.join()
+    a.send(cursor.agent_id, "Do not automatically inject this content", "cursor-message")
+    event = {"hook_event_name": "postToolUse", "conversation_id": "cursor-conversation",
+             "generation_id": "changes-each-turn", "workspace_roots": [str(a.root)],
+             "cwd": str(a.root / "subdirectory"), "model": "grok", "tool_output": "private output"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["hook", "--client", "cursor"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert set(output) == {"additional_context"}
+    assert "cursor-message" in output["additional_context"]
+    assert cursor.agent_id in output["additional_context"]
+    assert "private output" not in output["additional_context"]
+    assert "automatically inject" not in output["additional_context"]
+    assert a.delivery("cursor-message")["delivery"] == "queued"
+    cursor.claim("cursor.py")
+    event["hook_event_name"] = "sessionEnd"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["hook", "--client", "cursor"]) == 0
+    assert capsys.readouterr().out == ""
+    assert not any(c["owner"] == cursor.agent_id for c in a.status()["claims"])
