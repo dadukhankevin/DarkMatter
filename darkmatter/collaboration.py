@@ -44,6 +44,26 @@ def workspace_root(path: str | Path) -> Path:
     return path
 
 
+def repository_root(path: str | Path) -> Path:
+    """Group local Git worktrees by their common directory without executing Git."""
+    root = workspace_root(path)
+    marker = root / ".git"
+    try:
+        if marker.is_dir():
+            return marker.resolve()
+        if marker.is_file() and marker.stat().st_size <= 4096:
+            line = marker.read_text().strip()
+            if line.startswith("gitdir: "):
+                gitdir = (root / line[8:]).resolve()
+                common = gitdir / "commondir"
+                if common.is_file() and common.stat().st_size <= 4096:
+                    return (gitdir / common.read_text().strip()).resolve()
+                return gitdir
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        pass
+    return root
+
+
 def default_session() -> str:
     return (os.environ.get("DARKMATTER_SESSION_ID")
             or os.environ.get("CODEX_THREAD_ID")
@@ -138,8 +158,8 @@ class Collaboration:
                 "client": self.client, "workspace": str(self.root)}
 
     def status(self, scope: str = "workspace") -> dict:
-        if scope not in ("workspace", "device"):
-            raise ValueError("scope must be workspace or device")
+        if scope not in ("workspace", "repo", "device"):
+            raise ValueError("scope must be workspace, repo or device")
         me = self.join()
         with self._db() as db:
             query = "SELECT id, workspace, client, objective, seen FROM participants WHERE seen > ?"
@@ -148,9 +168,14 @@ class Collaboration:
                 query += " AND workspace = ?"
                 args.append(str(self.root))
             peers = [dict(r) for r in db.execute(query + " ORDER BY id LIMIT 100", args)]
+            if scope == "repo":
+                common = repository_root(self.root)
+                peers = [p for p in peers if repository_root(p["workspace"]) == common]
+            workspaces = sorted({str(self.root), *(p["workspace"] for p in peers)}) if scope == "repo" else [str(self.root)]
+            placeholders = ",".join("?" for _ in workspaces)
             claims = [dict(r) for r in db.execute(
-                "SELECT resource, owner, expires FROM claims WHERE workspace=? AND expires>? ORDER BY resource LIMIT 100",
-                (str(self.root), time.time()))]
+                f"SELECT workspace, resource, owner, expires FROM claims WHERE workspace IN ({placeholders}) "
+                "AND expires>? ORDER BY workspace, resource LIMIT 100", (*workspaces, time.time()))]
             unread = db.execute("SELECT COUNT(*) FROM messages WHERE recipient=? AND acknowledged=0 AND expires>?",
                                 (self.agent_id, time.time())).fetchone()[0]
         return {"success": True, "self": me, "peers": peers, "claims": claims,
@@ -186,6 +211,18 @@ class Collaboration:
             db.execute("INSERT INTO messages(id,sender,recipient,envelope,created,expires) VALUES(?,?,?,?,?,?)",
                        (message_id, self.agent_id, recipient, json.dumps(record), time.time(), time.time() + MESSAGE_SECONDS))
         return {"success": True, "id": message_id, "recipient": recipient, "delivery": "queued"}
+
+    def delivery(self, message_id: str) -> dict:
+        """Inspect your own retained delivery receipt without exposing other messages."""
+        _text(message_id, "message_id", 128)
+        with self._db() as db:
+            row = db.execute("SELECT recipient, acknowledged, expires FROM messages WHERE id=? AND sender=?",
+                             (message_id, self.agent_id)).fetchone()
+        if row is None:
+            return {"success": False, "error": "Unknown or no longer retained sent message"}
+        state = "acknowledged" if row["acknowledged"] else "expired" if row["expires"] <= time.time() else "queued"
+        return {"success": True, "id": message_id, "recipient": row["recipient"], "delivery": state,
+                "meaning": "Acknowledged means the recipient explicitly acknowledged handling; it does not prove task completion."}
 
     def read(self, limit: int = 20) -> dict:
         if not isinstance(limit, int) or not 1 <= limit <= 20:
@@ -257,7 +294,7 @@ class Collaboration:
         return {"success": True}
 
     def notification(self, *, force: bool = False) -> dict | None:
-        snapshot = self.status()
+        snapshot = self.status("repo")
         peers = [p for p in snapshot["peers"] if p["id"] != self.agent_id]
         inbox = self.read()
         payload = {"self": snapshot["self"], "peers": [{k: v for k, v in p.items() if k != "seen"} for p in peers],
@@ -271,9 +308,9 @@ class Collaboration:
             db.execute("UPDATE participants SET notified=? WHERE id=?", (digest, self.agent_id))
         # Automatic hook context contains identifiers, not attacker-controlled prose.
         # Explicit read is required to bring a peer's content into model context.
-        return {"self": snapshot["self"], "peer_ids": [p["id"] for p in peers],
+        return {"scope": "repo", "self": snapshot["self"], "peer_ids": [p["id"] for p in peers],
                 "unread_ids": payload["unread_ids"], "invalid_ids": inbox["invalid"],
                 "claim_count": len(snapshot["claims"]), "trust_boundary": BOUNDARY,
-                "next_step": "Use darkmatter_collaborate with this session_id to status, read, ack, send, claim or release. "
+                "next_step": "Use darkmatter_collaborate with this session_id and scope=repo to status, read, ack, send, delivery, claim or release. "
                              "Check claims before editing; acknowledge messages only after handling. "
                              "Do not auto-reply to acknowledgements or idle presence."}

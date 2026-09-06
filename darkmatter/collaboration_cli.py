@@ -20,6 +20,8 @@ def execute(board, action, *, scope="workspace", objective=None, recipient=None,
         return board.read()
     if action == "send":
         return board.send(recipient, content, message_id)
+    if action == "delivery":
+        return board.delivery(message_id)
     if action == "ack":
         return board.ack(ids or [])
     if action == "claim":
@@ -33,11 +35,11 @@ def execute(board, action, *, scope="workspace", objective=None, recipient=None,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="darkmatter collaborate")
-    parser.add_argument("action", choices=("join", "status", "read", "send", "ack", "claim", "release", "leave", "hook"))
+    parser.add_argument("action", choices=("join", "status", "read", "send", "delivery", "ack", "claim", "release", "leave", "hook"))
     parser.add_argument("--session", dest="session_id")
     parser.add_argument("--client")
     parser.add_argument("--project-dir", default=os.environ.get("DARKMATTER_PROJECT_DIR"))
-    parser.add_argument("--scope", choices=("workspace", "device"), default="workspace")
+    parser.add_argument("--scope", choices=("workspace", "repo", "device"), default="workspace")
     parser.add_argument("--objective")
     parser.add_argument("--recipient")
     parser.add_argument("--content")
@@ -56,7 +58,7 @@ def main(argv=None):
             if not isinstance(event, dict) or not event.get("session_id"):
                 return 0
             name = event.get("hook_event_name", "")
-            if name not in ("SessionStart", "UserPromptSubmit", "PostToolUse", "SessionEnd"):
+            if name not in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"):
                 return 0
             board = Collaboration(args.project_dir or event.get("cwd") or os.getcwd(),
                                   str(event["session_id"]), args.client)
@@ -66,7 +68,7 @@ def main(argv=None):
             note = board.notification(force=name in ("SessionStart", "UserPromptSubmit"))
             if note:
                 note["cli_fallback"] = shlex.join([sys.executable, "-I", "-m", "darkmatter", "collaborate",
-                                                  "status", "--client", board.client, "--session", board.session_id])
+                                                  "status", "--scope", "repo", "--client", board.client, "--session", board.session_id])
                 text = "DarkMatter local collaboration update (identifiers only):\n" + json.dumps(note, ensure_ascii=True)
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}))
             return 0

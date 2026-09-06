@@ -88,7 +88,7 @@ def _install_collaboration_hooks(path: Path, command: str, client: str) -> None:
 
     def update(config):
         hooks = config.setdefault("hooks", {})
-        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "SessionEnd"):
+        for event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"):
             groups = hooks.setdefault(event, [])
             if not isinstance(groups, list):
                 raise ValueError(f"hooks.{event} must be an array")
