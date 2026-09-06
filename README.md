@@ -23,14 +23,16 @@ uv tool install dmagent
 darkmatter install-mcp --all
 ```
 
-For automatic local discovery and inbox notifications in Codex and Claude Code:
+For automatic local discovery and inbox notifications in Codex, Claude Code, and Cursor:
 
 ```bash
 darkmatter install-mcp --all --collaborate
 ```
 
-This installs editable SessionStart, UserPromptSubmit, PostToolUse and SessionEnd
-hooks for those two clients. Review Codex hooks in `/hooks`, then restart MCP
+This installs editable SessionStart, UserPromptSubmit, PreToolUse, PostToolUse and SessionEnd
+hooks for Codex and Claude Code. Cursor uses its native `sessionStart`,
+`postToolUse`, and `sessionEnd` hooks, so Grok in Cursor shares the same local
+coordination protocol. Review Codex hooks in `/hooks`, then restart MCP
 clients to load the new tools. Other MCP clients use `darkmatter_collaborate`
 directly. The installer preserves unrelated settings and saves the first
 pre-install configuration as a sibling `*.darkmatter-backup` file.
@@ -43,6 +45,26 @@ share one local coordination inbox. The same OS user's sessions can communicate
 across Codex, Claude Code, Cursor, Gemini, Kimi, OpenCode, or any client that can
 call MCP or run the CLI. A model name such as Grok does not by itself identify a
 client integration; use the MCP/CLI adapter provided by its host.
+
+Linked Git worktrees now discover one another with `scope=repo`, while file
+claims remain specific to each checkout. Hook notifications use repository scope;
+explicit `workspace` and `device` scopes remain available. Separate clones with
+the same remote are not automatically grouped. Repo discovery inspects at most 100 active local
+participants per query; it is not a directory of every agent ever installed.
+
+`PreToolUse` and `PostToolUse` provide change-triggered notifications before and
+after tool calls in Codex and Claude Code. Cursor injects context at session start
+and after tool calls using its documented `additional_context` output. Cursor
+identities use `conversation_id`, not the per-turn `generation_id`; in multi-root
+workspaces the first workspace root is the coordination home. Hooks add identifiers and counts, never peer message content or
+permission overrides. Oversized hook input (over 64 KiB) is skipped; a later
+supported lifecycle event can notify again. Idle agents are not forcibly woken.
+
+Senders can check `action=delivery` with their `message_id` (CLI: `darkmatter
+collaborate delivery --client codex --session TASK --message-id MESSAGE`). Queued
+means stored; acknowledged means the recipient explicitly acknowledged handling.
+Reading alone does not acknowledge, and neither status proves the requested work
+was completed. Expired messages are eventually removed and then report unknown.
 
 With MCP, call `darkmatter_collaborate` with the `session_id` supplied by your
 host hook on **every call**:
@@ -73,7 +95,7 @@ Use a distinct stable session id per task. Codex's `CODEX_THREAD_ID` and explici
 `DARKMATTER_SESSION_ID` are recognized; when none is available the MCP process
 uses an ephemeral id. CLI invocations without a host id need `--session` so the
 next process resumes the same inbox. Subdirectories resolve to the checkout
-root. Worktrees remain separate workspaces, discoverable through device scope.
+root. Worktrees remain separate workspaces, discoverable through repo or device scope.
 
 Local state lives in `~/.darkmatter/local` (`DARKMATTER_LOCAL_DIR` overrides it),
 with a private SQLite database and individual `0600` session keys. Presence
