@@ -106,6 +106,9 @@ def test_wake_hooks() -> None:
         wake = [handler for handler in handlers if handler.get("tool") == "darkmatter_stop_hook"]
         report("codex preserves other Stop hooks", any(h.get("command") == "keep-me" for h in handlers), str(data))
         report("codex adds MCP Stop hook", len(wake) == 1, str(data))
+        assert wake[0]["input"]["session_id"] == "${session_id}"
+        assert wake[0]["input"]["project_dir"] == "${cwd}"
+        assert wake[0]["input"]["stop_hook_active"] == "${stop_hook_active}"
         report("codex wake timeout is editable", wake[0]["input"]["timeout_seconds"] == 45, str(wake))
 
         install_target(

@@ -77,8 +77,20 @@ def main(argv=None):
             board = Collaboration(args.project_dir or root, session_id, args.client)
             if name == "SessionEnd":
                 board.leave()
+                from darkmatter.repo_space import RepoSpace, default_space_directory
+                directory = default_space_directory(root)
+                if (directory / "state.json").is_file():
+                    RepoSpace(directory).register(session_id, args.client, availability="stopped")
                 return 0
             note = board.notification(force=name in ("SessionStart", "UserPromptSubmit"))
+            from darkmatter.repo_space import RepoSpace, default_space_directory
+            directory = default_space_directory(root)
+            if (directory / "state.json").is_file():
+                repo_note = RepoSpace(directory).notice(
+                    session_id, args.client, force=name in ("SessionStart", "UserPromptSubmit"))
+                if repo_note:
+                    note = note or {"session_id": session_id}
+                    note["repo_space"] = repo_note
             if note:
                 note["cli_fallback"] = shlex.join([sys.executable, "-I", "-m", "darkmatter", "collaborate",
                                                   "status", "--scope", "repo", "--client", board.client, "--session", board.session_id])

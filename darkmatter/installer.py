@@ -201,7 +201,8 @@ def _install_codex_wake_hook(path: Path, timeout_seconds: float) -> None:
         "type": "mcp_tool",
         "server": "darkmatter",
         "tool": "darkmatter_stop_hook",
-        "input": {"timeout_seconds": timeout_seconds},
+        "input": {"timeout_seconds": timeout_seconds, "session_id": "${session_id}",
+                  "project_dir": "${cwd}", "stop_hook_active": "${stop_hook_active}"},
         "timeout": timeout_seconds + 30,
         "statusMessage": "Waiting for DarkMatter mail",
     }

@@ -149,3 +149,75 @@ __all__ = [
     "wait_for_messages_sync",
     "wake_lease",
 ]
+
+
+def session_mail_notice(root, session_id, client):
+    """Inspect local and enrolled repo-space inboxes without consuming messages."""
+    from darkmatter.collaboration import BOUNDARY, Collaboration
+    from darkmatter.repo_space import RepoSpace, default_space_directory
+    board = Collaboration(root, session_id, client)
+    board.join()
+    ids = [item["id"] for item in board.read()["messages"]]
+    space_ids = []
+    directory = default_space_directory(root)
+    if (directory / "state.json").is_file():
+        space = RepoSpace(directory)
+        space_ids = [item["id"] for item in space.read(session_id)["messages"]]
+    if not ids and not space_ids:
+        return None
+    # Notification attempts are durable and independent of read/ack. A host
+    # that does not set stop_hook_active must not repeatedly wake on the same mail.
+    from darkmatter.filelock import ProjectLock
+    from darkmatter.store.local import atomic_write_text
+    path = board.directory / (board.identity + ".wake.json")
+    lock_path = board.directory / (board.identity + ".wake.lock")
+    if path.is_symlink() or lock_path.is_symlink():
+        raise ValueError("Wake notification state must not be a symlink")
+    with ProjectLock(lock_path).acquire():
+        now = time.time()
+        saved = json.loads(path.read_text()) if path.exists() else {"ids": {}, "attempts": []}
+        saved["ids"] = {k: v for k, v in saved["ids"].items() if v > now}
+        saved["attempts"] = [t for t in saved["attempts"] if now - t < 3600]
+        keys = ["local:" + mid for mid in ids] + ["repo:" + mid for mid in space_ids]
+        new = [key for key in keys if key not in saved["ids"]]
+        if not new or len(saved["attempts"]) >= 4 or len(saved["ids"]) + len(new) > 4096:
+            return None
+        if saved["attempts"] and now - saved["attempts"][-1] < 300:
+            return None
+        saved["ids"].update({key: now + 7 * 86400 for key in new})
+        saved["attempts"].append(now)
+        atomic_write_text(path, json.dumps(saved), mode=0o600)
+    return {"session_id": session_id, "client": client, "local_unread_ids": ids,
+            "repo_unread_ids": space_ids, "trust_boundary": BOUNDARY,
+            "next_step": "Read local mail with darkmatter_collaborate or repo mail with darkmatter_repo. "
+                         "Use this session_id and acknowledge only after handling."}
+
+
+def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds):
+    """Watch both local session queues and legacy Git correspondence, boundedly."""
+    timeout = float(timeout_seconds)
+    if not 0 <= timeout <= 3600:
+        raise ValueError("Wait timeout must be between zero and 3600 seconds")
+    deadline = time.monotonic() + timeout
+    while True:
+        if session_is_paused(root, session_id):
+            return None
+        notice = session_mail_notice(root, session_id, client)
+        if notice:
+            return "DarkMatter session mail available (identifiers only):\n" + json.dumps(notice)
+        mailbox.sync(True)
+        messages = consume_available_messages(mailbox)
+        if messages:
+            return format_wake_message(messages)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(2, remaining))
+
+
+def session_is_paused(root, session_id):
+    from darkmatter.repo_space import RepoSpace, default_space_directory
+    directory = default_space_directory(root)
+    if not (directory / "state.json").is_file():
+        return False
+    return RepoSpace(directory).status()["sessions"].get(session_id, {}).get("paused", False)

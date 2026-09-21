@@ -34,21 +34,24 @@ def _wait_hook(argv: list[str]) -> int:
         or hook_input.get("cwd")
         or os.getcwd()
     )
-    session_id = str(hook_input.get("session_id") or "default")
+    session_id = hook_input.get("session_id")
+    if not isinstance(session_id, str) or not session_id or hook_input.get("stop_hook_active"):
+        return 0
+    if not 0 <= args.timeout_seconds <= 3600:
+        parser.error("--timeout-seconds must be between zero and 3600")
 
     from darkmatter.gitbox.mailbox import get_mailbox
-    from darkmatter.wakeup import format_wake_message, wait_for_messages_sync, wake_lease
+    from darkmatter.wakeup import wait_for_session_activity, wake_lease
 
     with wake_lease(root, session_id) as acquired:
         if not acquired:
             return 0
-        messages = wait_for_messages_sync(
-            get_mailbox(root),
-            timeout_seconds=args.timeout_seconds,
+        message = wait_for_session_activity(
+            root, session_id, "claude-code", get_mailbox(root), args.timeout_seconds,
         )
-    if not messages:
+    if not message:
         return 0
-    print(format_wake_message(messages), file=sys.stderr)
+    print(message, file=sys.stderr)
     return 2
 
 
@@ -277,6 +280,10 @@ def _accept(argv: list[str]) -> int:
 
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else None
+
+    if cmd == "space":
+        from darkmatter.repo_space_cli import main as space_main
+        raise SystemExit(space_main(sys.argv[2:]))
 
     if cmd == "collaborate":
         from darkmatter.collaboration_cli import main as collaborate_main

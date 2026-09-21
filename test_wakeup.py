@@ -134,3 +134,59 @@ def test_codex_stop_hook_is_noop_without_mail(monkeypatch):
     monkeypatch.setattr(tools, "_wait_for_messages", fake_wait)
     monkeypatch.setattr(tools, "get_mailbox", lambda: SimpleNamespace())
     assert asyncio.run(tools.stop_hook(timeout_seconds=1)) == "{}"
+
+
+def test_wait_hook_wakes_for_local_mail_without_consuming(tmp_path, monkeypatch, capsys):
+    from darkmatter.collaboration import Collaboration
+    sender = Collaboration(tmp_path, "sender", "codex")
+    recipient = Collaboration(tmp_path, "claude-1", "claude-code")
+    recipient.join()
+    sent = sender.send(recipient.agent_id, "DO NOT AUTO-INJECT PEER PROSE")
+    monkeypatch.setattr("darkmatter.gitbox.mailbox.get_mailbox", lambda root=None: _Mailbox())
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps({"cwd": str(tmp_path), "session_id": "claude-1"})))
+    assert cli._wait_hook(["--timeout-seconds", "0"]) == 2
+    output = capsys.readouterr().err
+    assert sent["id"] in output
+    assert "DO NOT AUTO-INJECT" not in output
+    assert recipient.read()["messages"]
+
+
+def test_codex_stop_hook_local_session_and_loop_guard(tmp_path, monkeypatch):
+    from darkmatter.collaboration import Collaboration
+    recipient = Collaboration(tmp_path, "codex-1", "codex")
+    recipient.join()
+    sender = Collaboration(tmp_path, "sender", "claude-code")
+    sent = sender.send(recipient.agent_id, "review")
+    monkeypatch.setattr(tools, "get_mailbox", lambda: _Mailbox())
+    result = asyncio.run(tools.stop_hook(timeout_seconds=0, session_id="codex-1", project_dir=str(tmp_path)))
+    assert sent["id"] in json.loads(result)["reason"]
+    assert asyncio.run(tools.stop_hook(timeout_seconds=0, session_id="codex-1", stop_hook_active=True)) == "{}"
+    assert recipient.read()["messages"]
+
+
+def test_native_notification_attempt_is_durable_without_ack(tmp_path):
+    from darkmatter.collaboration import Collaboration
+    from darkmatter.wakeup import session_mail_notice
+    a = Collaboration(tmp_path, "a", "codex")
+    b = Collaboration(tmp_path, "b", "claude-code")
+    b.join()
+    a.send(b.agent_id, "handle once")
+    assert session_mail_notice(tmp_path, "b", "claude-code")
+    assert session_mail_notice(tmp_path, "b", "claude-code") is None
+    assert b.read()["messages"]
+
+
+def test_native_wait_rejects_symlink_notification_state(tmp_path):
+    import pytest
+    from darkmatter.collaboration import Collaboration
+    from darkmatter.wakeup import session_mail_notice
+    a = Collaboration(tmp_path, "a", "codex")
+    b = Collaboration(tmp_path, "b", "claude-code")
+    b.join()
+    a.send(b.agent_id, "handle once")
+    victim = tmp_path / "untouched"
+    victim.write_text("original")
+    (b.directory / (b.identity + ".wake.json")).symlink_to(victim)
+    with pytest.raises(ValueError, match="symlink"):
+        session_mail_notice(tmp_path, "b", "claude-code")
+    assert victim.read_text() == "original"

@@ -554,3 +554,14 @@ surface; the issue carries no private message and is never treated as proof.
 ---
 
 *A [LoseyLabs](https://loseylabs.ai) project. Questions and bugs: [GitHub Issues](https://github.com/dadukhankevin/DarkMatter/issues).*
+
+### Collaborate across devices in the same repository
+
+Repo spaces add opt-in encrypted session mail on isolated mailbox branches of
+an existing shared Git remote. Agent handles, device endpoints, repo membership,
+and sessions are recorded separately. A persistent `darkmatter space run` worker
+keeps correspondence moving between agent turns; wake adapters are configured
+locally and disabled by default. Local and repo inboxes feed the existing session
+hooks, with explicit read/acknowledgment and preserved pause settings.
+
+See [repo-space setup, CI review, and wake support](docs/repo-spaces.md).
