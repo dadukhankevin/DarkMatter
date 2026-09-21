@@ -7,6 +7,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from darkmatter.installer import SUPPORTED_TARGETS, install_target
 
 
@@ -156,6 +158,36 @@ def test_opencode_json() -> None:
         entry = data["mcp"]["darkmatter"]
         report("opencode entry enabled", entry["enabled"] is True, str(entry))
         report("opencode local command array", entry["command"] == ["/tmp/python", "-I", "-m", "darkmatter"], str(entry))
+
+
+@pytest.mark.parametrize("client", ["codex", "claude-code"])
+@pytest.mark.parametrize("wait, expected", [(None, 3630), (45.0, 75), (0.25, 31)])
+def test_host_timeout_is_integer(tmp_path, client, wait, expected):
+    kwargs = {} if wait is None else {"wake_timeout_seconds": wait}
+    for _ in range(2):
+        ok, message = install_target(_target(client), command="/tmp/python",
+                                     display_name="test", home=tmp_path, wake=True, **kwargs)
+        assert ok, message
+    path = tmp_path / (".codex/hooks.json" if client == "codex" else ".claude/settings.json")
+    groups = json.loads(path.read_text())["hooks"]["Stop"]
+    assert len(groups) == 1
+    timeout = groups[0]["hooks"][0]["timeout"]
+    assert type(timeout) is int  # 3630.0 == 3630, but the host rejects the float.
+    assert timeout == expected
+
+
+@pytest.mark.parametrize("wait", [0, -1, 3600.01, float("nan"), float("inf"), -float("inf")])
+def test_invalid_wait_does_not_change_configs(tmp_path, wait):
+    config = tmp_path / ".codex/config.toml"
+    config.parent.mkdir()
+    config.write_text('# existing settings\n')
+    ok, message = install_target(_target("codex"), command="/tmp/python",
+                                 display_name="test", home=tmp_path, wake=True,
+                                 wake_timeout_seconds=wait)
+    assert not ok
+    assert "wake timeout" in message
+    assert config.read_text() == '# existing settings\n'
+    assert not (config.parent / "hooks.json").exists()
 
 
 def test_openclaw_skipped() -> None:

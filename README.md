@@ -148,10 +148,16 @@ darkmatter install-mcp --client claude-code --wake
 The installer writes ordinary, editable JSON alongside the MCP entry. Codex gets a
 synchronous `Stop` MCP-tool hook in `~/.codex/hooks.json`; Claude Code gets an
 `asyncRewake` command hook in `~/.claude/settings.json`. The default waiter lives for
-one hour and can be changed with `--wake-timeout SECONDS` or by editing the hook's
-`timeout_seconds` argument. Projects without a fetchable relationship return
-immediately, so a user-level hook does not delay unrelated work. Codex requires the
-new hook definition to be reviewed in `/hooks` before it will run.
+one hour; `--wake-timeout SECONDS` accepts finite values greater than zero and up
+to 3600. The host `timeout` must remain an integer (the installer rounds up and
+adds 30 seconds). A floating-point host timeout can invalidate Codex's entire
+hooks file. Codex requires each new or changed hook definition to be reviewed
+and trusted in `/hooks` before it will run. Installing an MCP server or restarting
+the client does not perform that review. Check that `/hooks` lists the DarkMatter
+Stop handler without parser warnings, then review its definition. Installation
+alone does not prove a session can wake. These hooks cover a bounded wait in a
+running client; they do not restart a closed client. See the
+[wake support limits](docs/repo-spaces.md#wake-ups).
 
 For an intentionally unattended mailbox, run the ordinary, editable maintenance
 loop:
