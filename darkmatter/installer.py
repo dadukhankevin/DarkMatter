@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -18,6 +19,14 @@ from darkmatter.store.local import atomic_write_text
 
 
 DEFAULT_WAKE_TIMEOUT = 3600.0
+
+
+def _wake_host_timeout(timeout_seconds: float) -> int:
+    if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= DEFAULT_WAKE_TIMEOUT:
+        raise ValueError("wake timeout must be finite and greater than zero, at most 3600 seconds")
+    # Codex rejects the entire hooks file if a handler timeout is a JSON float.
+    # Round up so fractional waiter durations retain the full shutdown allowance.
+    return math.ceil(timeout_seconds) + 30
 
 
 @dataclass(frozen=True)
@@ -190,7 +199,7 @@ def _install_claude_wake_hook(
             f"{timeout_seconds:g}",
         ],
         "asyncRewake": True,
-        "timeout": timeout_seconds + 30,
+        "timeout": _wake_host_timeout(timeout_seconds),
         "statusMessage": "Waiting for DarkMatter mail",
     }
     _merge_json_config(path, lambda config: _replace_darkmatter_stop_hook(config, handler))
@@ -203,7 +212,7 @@ def _install_codex_wake_hook(path: Path, timeout_seconds: float) -> None:
         "tool": "darkmatter_stop_hook",
         "input": {"timeout_seconds": timeout_seconds, "session_id": "${session_id}",
                   "project_dir": "${cwd}", "stop_hook_active": "${stop_hook_active}"},
-        "timeout": timeout_seconds + 30,
+        "timeout": _wake_host_timeout(timeout_seconds),
         "statusMessage": "Waiting for DarkMatter mail",
     }
     _merge_json_config(path, lambda config: _replace_darkmatter_stop_hook(config, handler))
@@ -293,6 +302,8 @@ def install_target(
 
     path = _expand(target.path, home)
     try:
+        if wake:
+            _wake_host_timeout(wake_timeout_seconds)
         if target.format == "mcpServers":
             _install_mcp_servers_json(path, command, target.client, display_name)
         elif target.format == "codex_toml":
@@ -319,6 +330,8 @@ def install_target(
         return False, f"{target.label}: failed to write {path} ({exc})"
 
     suffix = f" with wake hook at {wake_path}" if wake_path else ""
+    if wake_path and target.client == "codex":
+        suffix += "; review and trust the installed definition in Codex /hooks before it can run"
     return True, f"{target.label}: installed to {path}{suffix}"
 
 
@@ -360,8 +373,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.wake_timeout <= 0:
-        raise SystemExit("--wake-timeout must be greater than zero")
+    try:
+        _wake_host_timeout(args.wake_timeout)
+    except ValueError as exc:
+        raise SystemExit(f"--wake-timeout: {exc}") from exc
     home = Path(args.home).expanduser()
 
     if args.clients:
