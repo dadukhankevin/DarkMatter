@@ -575,4 +575,11 @@ keeps correspondence moving between agent turns; wake adapters are configured
 locally and disabled by default. Local and repo inboxes feed the existing session
 hooks, with explicit read/acknowledgment and preserved pause settings.
 
+Inbox checks use `darkmatter space fetch` followed by `read`; fetch never pushes
+or changes membership. Outgoing changes have a local `space preview` and a
+fingerprint-checked `space publish --expect-preview PREVIEW_ID`. `space connect`
+separately applies automatic membership after a recent successful publication.
+Dedicated MCP fetch/preview/publish/connect tools expose these same effects;
+`sync` remains the explicitly combined operation.
+
 See [repo-space setup, CI review, and wake support](docs/repo-spaces.md).

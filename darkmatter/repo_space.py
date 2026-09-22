@@ -32,6 +32,7 @@ MAX_BLOB = 8 * 1024 * 1024
 TTL = 7 * 86400
 MEMBERSHIP_POLICIES = ("repo-writers", "pinned")
 MAX_BLOCKED = 4096
+CONNECT_PROOF_TTL = 300
 
 
 def _json(value):
@@ -116,6 +117,7 @@ class RepoSpace:
             state = self._load()
             self._clear_auto_peers(state)
             state["membership"] = policy
+            state.pop("connect_proof", None)
             self._save(state)
         return {"membership": policy}
 
@@ -201,7 +203,10 @@ class RepoSpace:
         envelope = seal_envelope(state["private"], state["device"], recipient, kind, body,
                                  expires_at=datetime.fromtimestamp(expires, timezone.utc).isoformat())
         state["outbox"][envelope.id] = {"envelope": envelope.to_public_dict(),
-                                      "expires": expires, "status": "queued"}
+                                      "expires": expires, "status": "queued",
+                                      "summary": {label: body[key] for key, label in (
+                                          ("session", "target_session"), ("sender_session", "sender_session"),
+                                          ("id", "acknowledges")) if key in body}}
         return envelope.id
 
     def send(self, session: str, device: str, target: str, content: str):
@@ -265,17 +270,77 @@ class RepoSpace:
     def _branch(self, state, device):
         return PREFIX + state["space"] + "/" + device
 
-    def _publish(self, state):
+    @staticmethod
+    def _public_sessions(state):
+        return {sid: {f: member[f] for f in ("client", "agent", "paused", "availability", "seen")}
+                for sid, member in state["sessions"].items()}
+
+    def _publication_preview(self, state):
+        self._prune(state)
+        envelopes = {mid: item["envelope"] for mid, item in sorted(state["outbox"].items())}
+        sessions = self._public_sessions(state)
+        plan = {"remote": state["remote"], "branch": self._branch(state, state["device"]),
+                "space": state["space"], "device": state["device"],
+                "membership": state.get("membership", "pinned"),
+                "sessions": {sid: {k: v for k, v in member.items() if k != "seen"}
+                             for sid, member in sessions.items()}, "envelopes": envelopes}
+        fingerprint = hashlib.sha256(_json(plan).encode()).hexdigest()
+        prior = state.get("published_envelope_hashes")
+        outgoing = [{"id": mid, "kind": env["type"], "recipient_device": env["to"],
+                     "expires_at": env.get("expires_at"),
+                     "envelope_sha256": hashlib.sha256(_json(env).encode()).hexdigest(),
+                     "previously_published": None if prior is None else
+                     prior.get(mid) == hashlib.sha256(_json(env).encode()).hexdigest(),
+                     **state["outbox"][mid].get("summary", {})}
+                    for mid, env in envelopes.items()]
+        return {"success": True, "preview_id": fingerprint, "remote": state["remote"],
+                "branch": plan["branch"], "space": state["space"], "device": state["device"],
+                "presence": {"membership": plan["membership"], "sessions": sessions,
+                             "session_last_seen_may_refresh": True,
+                             "refresh_timestamp_and_nonce": plan["membership"] == "repo-writers"},
+                "outgoing": outgoing,
+                "removed_envelope_ids": sorted(set(prior or {}) - set(envelopes)),
+                "publication_effects": {"remote_write": True, "membership_change": False,
+                                        "wake_execution": False},
+                "ci_review_recorded": state["ci_reviewed"],
+                "note": "All retained envelopes are republished, including receipts and acknowledged mail. "
+                        "No message bodies or private keys are included in this preview. "
+                        "Session last-seen timestamps may refresh without changing the preview ID. "
+                        "Publication still checks current CI policy and Git permissions."}
+
+    def preview(self):
+        """Local-only inspection; no Git/network calls and no durable state changes."""
+        with self.lock.acquire():
+            return self._publication_preview(self._load())
+
+    def publish(self, expected_preview: str):
+        """Publish exactly the reviewed correspondence/presence, without enrollment."""
+        with self.lock.acquire():
+            state = self._load()
+            plan = self._publication_preview(state)
+            if not expected_preview or expected_preview != plan["preview_id"]:
+                return {"success": False, "error": "Publication changed or preview missing; run preview again"}
+            try:
+                self._publish(state, expected_preview=expected_preview)
+            except (GitError, ValueError, OSError) as exc:
+                self._save(state)
+                return {"success": False, "error": str(exc)}
+            self._save(state)
+        return {"success": True, "published": plan, "effects": plan["publication_effects"]}
+
+    def _publish(self, state, *, expected_preview=None):
+        state.pop("connect_proof", None)
         if not state["ci_reviewed"]:
             raise ValueError("Publication disabled until the owner reviews repository CI and runs ci-reviewed")
         if self._ci_tree(state) != state.get("ci_tree"):
             state["ci_reviewed"] = False
             raise ValueError("Default-branch workflows changed; review CI again before publishing")
         self._prune(state)
+        if expected_preview and self._publication_preview(state)["preview_id"] != expected_preview:
+            raise ValueError("Publication changed during preflight; run preview again")
         payload = {"version": 1, "space": state["space"], "device": state["device"],
                    "membership": state.get("membership", "pinned"),
-                   "sessions": {k: {f: v[f] for f in ("client", "agent", "paused", "availability", "seen")}
-                                for k, v in state["sessions"].items()},
+                   "sessions": self._public_sessions(state),
                    "envelopes": [v["envelope"] for v in state["outbox"].values()]}
         if payload["membership"] == "repo-writers":
             # Require a real push for automatic admission, even with no new mail.
@@ -291,6 +356,13 @@ class RepoSpace:
         if git(self.transport, "diff", "--cached", "--quiet", check=False).returncode:
             git(self.transport, "commit", "-m", "DarkMatter mailbox [skip ci] [skip actions]")
         git(self.transport, "push", state["remote"], "HEAD:refs/heads/" + self._branch(state, state["device"]))
+        state["published_envelope_hashes"] = {
+            mid: hashlib.sha256(_json(item["envelope"]).encode()).hexdigest()
+            for mid, item in state["outbox"].items()}
+        if payload["membership"] == "repo-writers":
+            state["connect_proof"] = {"time": time.time(), "remote": state["remote"],
+                                      "branch": self._branch(state, state["device"]),
+                                      "head": git(self.transport, "rev-parse", "HEAD").stdout.strip()}
 
     def _fetch(self, state, device):
         branch = "refs/heads/" + self._branch(state, device)
@@ -368,7 +440,7 @@ class RepoSpace:
                 or not time.time() - TTL <= published <= time.time() + 300):
             raise ValueError("Expired or invalid repository presence")
 
-    def _receive(self, state, device, payload):
+    def _receive(self, state, device, payload, *, receive_mail=True):
         # Validate complete snapshot before mutating durable state.
         incoming, receipts = [], []
         seen_ids = set()
@@ -404,16 +476,82 @@ class RepoSpace:
                     incoming.append((env, expires))
             else:
                 raise ValueError("Unsupported repo-space envelope type")
-        if len(state["inbox"]) + len(incoming) > MAX_ITEMS:
+        if receive_mail and len(state["inbox"]) + len(incoming) > MAX_ITEMS:
             raise ValueError("Inbox full; delivery deferred")
-        for env, expires in incoming:
-            state["inbox"][env.id] = {"envelope": env.to_public_dict(), "sender": device,
-                                     "expires": expires, "acknowledged": False}
-        for mid in receipts:
-            state["outbox"][mid]["status"] = "acknowledged"
+        if receive_mail:
+            for env, expires in incoming:
+                state["inbox"][env.id] = {"envelope": env.to_public_dict(), "sender": device,
+                                         "expires": expires, "acknowledged": False}
+            for mid in receipts:
+                state["outbox"][mid]["status"] = "acknowledged"
         state["peer_sessions"][device] = {
             sid: {k: member.get(k) for k in ("client", "agent", "paused", "availability", "seen")}
             for sid, member in payload["sessions"].items()}
+
+    def fetch(self):
+        """Fetch existing peers only. No push, discovery, enrollment, ack, or wake."""
+        with self.lock.acquire():
+            state = self._load()
+            self._prune(state)
+            errors = {}
+            for device in state["peers"]:
+                try:
+                    payload = self._fetch(state, device)
+                    if payload is not None:
+                        if device in state.get("auto_peers", []):
+                            self._validate_presence(payload)
+                        self._receive(state, device, payload)
+                except (GitError, ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+                    errors[device] = str(exc)
+            self._save(state)
+        return {"success": not errors, "errors": errors,
+                "effects": {"remote_write": False, "membership_change": False,
+                            "local_inbox_and_cache_update": True, "wake_execution": False}}
+
+    def connect(self):
+        """Apply automatic membership without publishing or receiving correspondence.
+
+        Consume a successful publication once, within five minutes, verifying its
+        ref still exists. New admission always requires another authorized push.
+        """
+        with self.lock.acquire():
+            state = self._load()
+            proof = state.pop("connect_proof", None)
+            before = set(state["peers"])
+            self._clear_auto_peers(state)
+            errors = {}
+            try:
+                if state.get("membership", "pinned") != "repo-writers":
+                    raise ValueError("Enable repo-writers membership locally first")
+                if (not proof or proof["remote"] != state["remote"]
+                        or proof["branch"] != self._branch(state, state["device"])
+                        or not 0 <= time.time() - proof["time"] <= CONNECT_PROOF_TTL):
+                    raise ValueError("Connect requires a new successful publish within five minutes")
+                tip = git(self.transport, "ls-remote", "--exit-code", state["remote"],
+                          "refs/heads/" + proof["branch"]).stdout.split()
+                if not tip or tip[0] != proof["head"]:
+                    raise ValueError("Published presence changed remotely; publish again before connecting")
+                for device in self._discover(state):
+                    try:
+                        payload = self._fetch(state, device)
+                        if payload is None or payload.get("membership") != "repo-writers":
+                            continue
+                        self._validate_presence(payload)
+                        if len(state["peers"]) >= MAX_PEERS:
+                            raise ValueError("Device enrollment limit reached")
+                        self._receive(state, device, payload, receive_mail=False)
+                        state["peers"].append(device)
+                        state["auto_peers"].append(device)
+                    except (GitError, ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+                        errors[device] = str(exc)
+            except (GitError, ValueError, OSError) as exc:
+                errors["connect"] = str(exc)
+            self._save(state)
+        return {"success": not errors, "errors": errors,
+                "added": sorted(set(state["peers"]) - before),
+                "removed": sorted(before - set(state["peers"])),
+                "effects": {"remote_write": False, "membership_change": True,
+                            "wake_execution": False}}
 
     def sync(self):
         with self.lock.acquire():
@@ -448,6 +586,7 @@ class RepoSpace:
                             state["auto_peers"].append(device)
                 except (GitError, ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
                     errors[device] = str(exc)
+            state.pop("connect_proof", None)  # Combined sync already used this publication for admission.
             self._save(state)
         return {"success": not errors, "errors": errors}
 

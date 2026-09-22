@@ -13,7 +13,9 @@ def main(argv=None):
     parser.add_argument("--state-dir", default=None,
                         help="Private device state; defaults to a per-repo directory under ~/.darkmatter/spaces")
     parser.add_argument("action", choices=("init", "enroll", "revoke", "register", "status", "send",
-                                            "read", "ack", "sync", "run", "wake", "retry-wake", "ci-reviewed", "membership"))
+                                            "read", "ack", "fetch", "preview", "publish", "connect", "sync", "run",
+                                            "wake", "retry-wake", "ci-reviewed", "membership"))
+    parser.add_argument("--expect-preview", help="Required for publish: exact preview_id from the local preview")
     parser.add_argument("--remote")
     parser.add_argument("--space")
     parser.add_argument("--membership", choices=MEMBERSHIP_POLICIES,
@@ -61,6 +63,16 @@ def main(argv=None):
             result = space.retry_wake(args.session)
         elif action == "ci-reviewed":
             result = space.review_ci()
+        elif action == "fetch":
+            result = space.fetch()
+        elif action == "preview":
+            result = space.preview()
+        elif action == "publish":
+            if not args.expect_preview:
+                parser.error("publish requires --expect-preview from space preview")
+            result = space.publish(args.expect_preview)
+        elif action == "connect":
+            result = space.connect()
         elif action == "sync":
             result = space.sync()
         elif action == "run":
