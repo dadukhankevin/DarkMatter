@@ -1,6 +1,6 @@
 # Shared-repo correspondence and optional wake-ups
 
-Repo spaces let enrolled devices exchange encrypted, session-addressed mail
+Repo spaces let devices exchange encrypted, session-addressed mail
 through the **same remote repository as the application**, without merging mail
 into application history. A small worker keeps mail moving even when no model
 turn is running. Existing Git mailbox relationships continue to work unchanged.
@@ -22,7 +22,8 @@ server to override this location. CLI `--state-dir` overrides only that invocati
 Do not put the state directory or its key in Git. It is private to the OS account;
 other processes under that account are not isolated from its keys or settings.
 
-Membership persists independently of recent activity. A session may be `busy`,
+Pinned membership persists independently of recent activity. Automatic membership
+is refreshed from signed presence on each successful sync. A session may be `busy`,
 `idle`, `stopped`, or `unknown`; an explicit pause is separate and persists across
 hook registration. Last-seen timestamps are observations, not proof that a process
 is alive. Crashes do not automatically turn a stale busy session into a safe
@@ -36,21 +37,54 @@ Run in your checkout, using the remote URL you already trust:
 python -m darkmatter space init --remote git@github.com:OWNER/REPO.git
 ```
 
-Share the returned **space ID and public device key** with your teammate through
-an existing trusted channel. They initialize their own checkout with the same
-space ID; they get their own independent device key:
+Both devices run that command against the same repository. New spaces default to
+`repo-writers` membership and the `shared` channel: **no device-key exchange or
+pairwise enrollment is needed**. After the one-time CI review below, each sync:
+
+1. Pushes new signed presence to its own mail branch using normal Git credentials.
+2. Discovers other device branches in the same channel on that exact remote.
+3. Verifies their signed, unexpired `repo-writers` presence and accepts messages.
+
+The first device discovers the second on its next sync; `space run` handles this
+continuously. A readable public clone is insufficient: if the local publication
+fails, automatic membership is cleared and no automatic discovery runs. A new
+publication ID forces a real update even when there is no new mail.
+
+This trusts the repository's **push ACL**, not a claimed account name or an
+arbitrary contact URL. It proves that a writer admitted the signed presence to
+this repository; it does not identify which human pushed it. A writer can relay
+another device's signed presence. Forks are separate remotes. Branch protections
+must allow updates to the selected `darkmatter/mail/**` namespace.
+
+Presence expires after seven days, with five minutes of clock skew allowed.
+Deleted, invalid, or expired automatic peers disappear on the next sync. Removing
+a collaborator's hosting permission does not delete their existing presence:
+delete their mail branch or locally revoke their key for immediate exclusion.
+Explicitly pinned peers retain their separate owner-granted membership.
+
+Existing installations retain pinned membership. Upgrade both sides to 3.10 or
+later and restart their MCP servers/workers, then opt into automatic connections
+without changing their space ID, identity, mail, or wake settings:
 
 ```sh
-python -m darkmatter space init --remote git@github.com:OWNER/REPO.git --space SPACE_ID
-python -m darkmatter space enroll --device OTHER_DEVICE_PUBLIC_KEY
+python -m darkmatter space membership --membership repo-writers
+python -m darkmatter space sync
 ```
 
-Both devices enroll the other's key. Knowing the remote URL or having repository
-access does not enroll an identity. Revocation is local:
+Peers must use a version that publishes `repo-writers` presence. New checkouts
+joining an older named space use `init --space SPACE_ID`. To require manually
+exchanged keys instead, use `init --membership pinned` (or `membership
+--membership pinned`), then enroll each other's keys with `space enroll --device
+PUBLIC_KEY`. Changing to pinned mode removes automatically admitted peers;
+explicit pins remain. Revocation is local and survives automatic rediscovery:
 
 ```sh
 python -m darkmatter space revoke --device OTHER_DEVICE_PUBLIC_KEY
 ```
+
+Only explicit `enroll` removes a local revocation. `status` distinguishes the
+membership policy, automatic peers, and blocked keys. Connection permits mail;
+it never imports remote sessions as local identities or enables a wake adapter.
 
 Review CI as described below, then register a session (installed collaboration
 hooks also register actual host sessions automatically):
@@ -171,7 +205,9 @@ python -m darkmatter space register --session MY_SESSION --client codex --resume
 
 ## Limits and evidence
 
-Protocol limits: 32 enrolled peers, 128 locally registered sessions, 128 retained
+Protocol limits: 32 enrolled peers, at most 32 advertised other devices per
+discovery pass, 16 KiB discovery ref output, 4096 locally blocked keys,
+128 locally registered sessions, 128 retained
 outgoing envelopes and 128 retained incoming messages, 16 KiB message text, 8 MiB
 snapshot blobs, and seven-day message retention. Capacity failures are explicit;
 messages are not silently acknowledged or evicted. Acknowledged incoming records
@@ -181,15 +217,16 @@ public to anyone who can read the repo, even though message bodies are encrypted
 
 Peer data is read through bounded Git blobs, never checked out; symlinks and
 unexpected blob types are rejected. Snapshots and envelopes are authenticated,
-space-bound, and checked against the owner's enrolled keys. Remote session
+space-bound, and checked against pinned keys or repository-admitted presence. Remote session
 advertisements never create local sessions or modify wake configuration. Git
-commands have 60-second timeouts and shallow fetches; Git pack transfer/storage
+commands have 60-second timeouts and shallow fetches; Git ref output capture and pack transfer/storage
 still needs host-level quotas for hostile repositories. Public Git hosting is a
 practical low-volume correspondence transport, not a high-throughput chat bus.
 
 Tests use two isolated device states and a temporary bare Git repo, including
 offline delivery/restart, encryption, explicit acknowledgments, untrusted device
-rejection, snapshot tampering, symlinks, workflow changes, paused/busy sessions,
+rejection in pinned mode, automatic two-device admission, failed pushes, expiry,
+durable revocation, snapshot tampering, symlinks, workflow changes, paused/busy sessions,
 wake deduplication, real subprocess adapters, and a real MCP stdio exchange.
 Live two-physical-device and unattended harness-resume validation remains a
 deployment check; those tests do not run paid agent turns.

@@ -1,7 +1,8 @@
 """Opt-in, encrypted session mail on isolated branches of a shared Git repo.
 
-Remote data never configures local execution. The owner pins device keys and
-registers sessions locally. No peer files are checked out, merged, or executed.
+Remote data never configures local execution. Membership is owner-selected:
+repository-writer discovery or pinned keys. Sessions are registered locally.
+No peer files are checked out, merged, or executed.
 """
 from __future__ import annotations
 
@@ -29,6 +30,8 @@ MAX_ITEMS = 128
 MAX_PEERS = 32
 MAX_BLOB = 8 * 1024 * 1024
 TTL = 7 * 86400
+MEMBERSHIP_POLICIES = ("repo-writers", "pinned")
+MAX_BLOCKED = 4096
 
 
 def _json(value):
@@ -74,9 +77,11 @@ class RepoSpace:
     def _save(self, state):
         atomic_write_text(self.path, _json(state) + "\n", mode=0o600)
 
-    def initialize(self, remote: str, space: str | None = None):
+    def initialize(self, remote: str, space: str | None = None, *, membership="repo-writers"):
+        if membership not in MEMBERSHIP_POLICIES:
+            raise ValueError("Unknown membership policy")
         remote = resolve_remote(remote)
-        space = space or uuid.uuid4().hex
+        space = space or ("shared" if membership == "repo-writers" else uuid.uuid4().hex)
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", space):
             raise ValueError("Space id must be 1-64 plain identifier characters")
         with self.lock.acquire():
@@ -90,22 +95,50 @@ class RepoSpace:
             git(self.transport, "config", "core.attributesFile", os.devnull)
             self._save({"version": 1, "space": space, "remote": remote,
                         "private": private, "device": device, "peers": [],
+                        "membership": membership, "auto_peers": [], "blocked_devices": [],
                         "sessions": {}, "outbox": {}, "inbox": {}, "peer_sessions": {},
                         "ci_reviewed": False, "wake": {}, "wake_attempts": {},
                         "wake_attempted": {}, "wake_history": {}})
-        return {"space": space, "device": device, "remote": remote}
+        return {"space": space, "device": device, "remote": remote, "membership": membership}
+
+    @staticmethod
+    def _clear_auto_peers(state):
+        for device in state.get("auto_peers", []):
+            state["peers"] = [p for p in state["peers"] if p != device]
+            state["peer_sessions"].pop(device, None)
+        state["auto_peers"] = []
+
+    def set_membership(self, policy):
+        """Local owner choice; never enabled by an advertisement or MCP argument."""
+        if policy not in MEMBERSHIP_POLICIES:
+            raise ValueError("Unknown membership policy")
+        with self.lock.acquire():
+            state = self._load()
+            self._clear_auto_peers(state)
+            state["membership"] = policy
+            self._save(state)
+        return {"membership": policy}
 
     def enroll(self, device: str, *, remove=False):
         _key(device)
         with self.lock.acquire():
             state = self._load()
+            blocked = state.setdefault("blocked_devices", [])
             if remove:
+                if device not in blocked:
+                    if len(blocked) >= MAX_BLOCKED:
+                        raise ValueError("Revoked device limit reached")
+                    blocked.append(device)
                 state["peers"] = [p for p in state["peers"] if p != device]
                 state["peer_sessions"].pop(device, None)
             elif device not in state["peers"]:
                 if len(state["peers"]) >= MAX_PEERS:
                     raise ValueError("Device enrollment limit reached")
                 state["peers"].append(device)
+            if not remove and device in blocked:
+                blocked.remove(device)
+            # Explicit enrollment pins the key; revocation must survive rediscovery.
+            state["auto_peers"] = [p for p in state.get("auto_peers", []) if p != device]
             self._save(state)
         return {"device": device, "enrolled": not remove}
 
@@ -221,6 +254,9 @@ class RepoSpace:
             state = self._load()
             self._prune(state)
             return {"space": state["space"], "device": state["device"],
+                    "membership": state.get("membership", "pinned"),
+                    "auto_peers": state.get("auto_peers", []),
+                    "blocked_devices": state.get("blocked_devices", []),
                     "sessions": state["sessions"], "peers": state["peers"],
                     "peer_sessions": state["peer_sessions"], "ci_reviewed": state["ci_reviewed"],
                     "delivery": {k: v["status"] for k, v in state["outbox"].items()},
@@ -237,9 +273,13 @@ class RepoSpace:
             raise ValueError("Default-branch workflows changed; review CI again before publishing")
         self._prune(state)
         payload = {"version": 1, "space": state["space"], "device": state["device"],
+                   "membership": state.get("membership", "pinned"),
                    "sessions": {k: {f: v[f] for f in ("client", "agent", "paused", "availability", "seen")}
                                 for k, v in state["sessions"].items()},
                    "envelopes": [v["envelope"] for v in state["outbox"].values()]}
+        if payload["membership"] == "repo-writers":
+            # Require a real push for automatic admission, even with no new mail.
+            payload.update(published_at=time.time(), publication_id=uuid.uuid4().hex)
         signed = {"payload": payload, "signature": sign_payload(state["private"], DOMAIN, _json(payload))}
         text = _json(signed)
         if len(text.encode()) > MAX_BLOB:
@@ -289,6 +329,44 @@ class RepoSpace:
             if type(member.get("paused")) is not bool:
                 raise ValueError("Invalid peer pause state")
         return payload
+
+    def _discover(self, state):
+        """Only refs advertised by the exact configured remote are admission evidence.
+
+        The remote ACL is the trust boundary: a writer can publish somebody else's
+        signed presence too. This is not proof of a GitHub account or live access.
+        """
+        prefix = "refs/heads/" + PREFIX + state["space"] + "/"
+        output = git(self.transport, "ls-remote", "--heads", state["remote"], prefix + "*").stdout
+        # Bound candidate processing before any per-peer fetch. Git pack/output
+        # resource isolation still belongs to the host, as for pinned transports.
+        if len(output) > 16384:
+            raise ValueError("Repository discovery advertisement exceeds limit")
+        devices = set()
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40,64}", fields[0]):
+                raise ValueError("Invalid repository discovery ref")
+            ref = fields[1]
+            if not ref.startswith(prefix):
+                continue
+            device = ref[len(prefix):]
+            if not re.fullmatch(r"[0-9a-f]{64}", device):
+                continue
+            if device != state["device"]:
+                devices.add(device)
+        if len(devices) > MAX_PEERS:
+            raise ValueError("Repository discovery device limit exceeded")
+        return sorted(devices - set(state["peers"]) - set(state.get("blocked_devices", [])))
+
+    @staticmethod
+    def _validate_presence(payload):
+        if payload.get("membership") != "repo-writers":
+            raise ValueError("Peer has not enabled repository-writer membership")
+        published = payload.get("published_at")
+        if (type(published) not in (float, int)
+                or not time.time() - TTL <= published <= time.time() + 300):
+            raise ValueError("Expired or invalid repository presence")
 
     def _receive(self, state, device, payload):
         # Validate complete snapshot before mutating durable state.
@@ -341,16 +419,33 @@ class RepoSpace:
         with self.lock.acquire():
             state = self._load()
             self._prune(state)
+            self._clear_auto_peers(state)
             errors = {}
+            candidates = []
             try:
                 self._publish(state)
+                if state.get("membership", "pinned") == "repo-writers":
+                    try:
+                        candidates = self._discover(state)
+                    except (GitError, ValueError, OSError) as exc:
+                        errors["discovery"] = str(exc)
             except (GitError, ValueError, OSError) as exc:
                 errors["publish"] = str(exc)
-            for device in state["peers"]:
+            pinned = list(state["peers"])
+            for device in pinned + candidates:
                 try:
                     payload = self._fetch(state, device)
                     if payload is not None:
+                        if device not in pinned:
+                            if payload.get("membership") != "repo-writers":
+                                continue  # Legacy/pinned peers have not opted in.
+                            self._validate_presence(payload)
+                            if len(state["peers"]) >= MAX_PEERS:
+                                raise ValueError("Device enrollment limit reached")
                         self._receive(state, device, payload)
+                        if device not in pinned:
+                            state["peers"].append(device)
+                            state["auto_peers"].append(device)
                 except (GitError, ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
                     errors[device] = str(exc)
             self._save(state)

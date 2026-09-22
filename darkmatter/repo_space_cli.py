@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from darkmatter.gitbox.gitutil import GitError
-from darkmatter.repo_space import RepoSpace, default_space_directory
+from darkmatter.repo_space import MEMBERSHIP_POLICIES, RepoSpace, default_space_directory
 
 
 def main(argv=None):
@@ -13,9 +13,11 @@ def main(argv=None):
     parser.add_argument("--state-dir", default=None,
                         help="Private device state; defaults to a per-repo directory under ~/.darkmatter/spaces")
     parser.add_argument("action", choices=("init", "enroll", "revoke", "register", "status", "send",
-                                            "read", "ack", "sync", "run", "wake", "retry-wake", "ci-reviewed"))
+                                            "read", "ack", "sync", "run", "wake", "retry-wake", "ci-reviewed", "membership"))
     parser.add_argument("--remote")
     parser.add_argument("--space")
+    parser.add_argument("--membership", choices=MEMBERSHIP_POLICIES,
+                        help="New spaces default to repo-writers; existing spaces retain their policy")
     parser.add_argument("--device")
     parser.add_argument("--session")
     parser.add_argument("--client", default="cli")
@@ -38,7 +40,11 @@ def main(argv=None):
         if action == "init":
             if not args.remote:
                 parser.error("init requires --remote")
-            result = space.initialize(args.remote, args.space)
+            result = space.initialize(args.remote, args.space, membership=args.membership or "repo-writers")
+        elif action == "membership":
+            if not args.membership:
+                parser.error("membership requires --membership repo-writers|pinned")
+            result = space.set_membership(args.membership)
         elif action in ("enroll", "revoke"):
             result = space.enroll(args.device, remove=action == "revoke")
         elif action == "register":
