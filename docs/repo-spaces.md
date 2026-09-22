@@ -46,8 +46,8 @@ pairwise enrollment is needed**. After the one-time CI review below, each sync:
 3. Verifies their signed, unexpired `repo-writers` presence and accepts messages.
 
 The first device discovers the second on its next sync; `space run` handles this
-continuously. A readable public clone is insufficient: if the local publication
-fails, automatic membership is cleared and no automatic discovery runs. A new
+continuously. A readable public clone is insufficient: if publication during a
+combined sync fails, automatic membership is cleared and no discovery runs. A new
 publication ID forces a real update even when there is no new mail.
 
 This trusts the repository's **push ACL**, not a claimed account name or an
@@ -100,13 +100,86 @@ supervisor. It survives agent turns, not an OS process kill. Default polling is
 30 seconds; `--interval` accepts 5–3600 seconds. It uses normal Git credentials,
 never enables permission bypass, and never installs a machine service implicitly.
 
-Agents can use the `darkmatter_repo` MCP tool for status/register/send/read/ack/sync.
-The CLI equivalent is:
+## Check, publish, and connect separately
+
+For **checking messages**, use `fetch` followed by `read`:
+
+```sh
+python -m darkmatter space fetch
+python -m darkmatter space read --session MY_SESSION
+```
+
+Fetch contacts only existing peers and updates local Git caches, inboxes, observed
+peer session metadata, and delivery receipts. It does not push, enroll or remove
+devices, queue acknowledgments, or execute wake adapters. Automatic peers' signed
+presence is still checked before accepting incoming mail. This operation works
+without new publication, including when the repository is currently read-only.
+
+For **outgoing publication**, inspect a local preview first:
+
+```sh
+python -m darkmatter space preview
+python -m darkmatter space publish --expect-preview PREVIEW_ID
+```
+
+The preview lists the destination repo/branch, envelope IDs, types, recipient
+devices, hashes, available sender/target session and receipt metadata, and the
+public presence to publish. It also lists removals since the last tracked
+publication. Legacy envelopes without locally recorded details are not guessed.
+Message bodies and private keys are not displayed. All retained envelopes are
+republished, including acknowledged mail and receipts; preview is not just a
+list of new messages. Timestamps/nonces for presence refresh are generated during
+publication and explicitly identified as such. Session last-seen timestamps may
+also refresh through host hooks; the preview explicitly allows this metadata-only
+change so ordinary tool calls do not invalidate a review.
+
+Publication requires the preview fingerprint. A changed recipient, envelope,
+destination, or session identity/availability/pause state invalidates it. The comparison is made
+under the state lock, with another check after CI preflight to catch expiry.
+Publication still needs normal Git/host permissions and CI review. It does not
+enroll devices, receive mail, or run wake commands. A preview is evidence of the
+planned operation, not permission to perform it or a guarantee of approval.
+
+For **automatic membership**, run `connect` after an authorized publication:
+
+```sh
+python -m darkmatter space connect
+```
+
+Connect reads remote presence and changes local automatic membership, including
+removals, without publishing or ingesting correspondence. It consumes a local
+proof of successful publication once, within five minutes, and verifies that
+the published ref still matches. Missing, consumed, changed, or expired proof
+requires another publication. This separates the operations without treating
+read-only repository access as permission to admit new peers. Permission removal
+between publication and connection is not observable through Git reads; the
+proof records the preceding authorized push, not a live hosting-account check.
+
+`sync` retains the combined publish/discover/connect/fetch behavior. `space run`
+still calls sync and the configured wake runner; neither is an inbox-only check.
+
+Dedicated MCP tools expose these same boundaries:
+
+| Tool | Effects |
+| --- | --- |
+| `darkmatter_repo_fetch` | Remote reads; local inbox/cache updates only |
+| `darkmatter_repo_preview` | Local preview; no network or durable state changes |
+| `darkmatter_repo_publish` | Reviewed remote publication; no enrollment |
+| `darkmatter_repo_connect` | Remote reads and local membership changes; no publication |
+
+Fetch honestly carries `readOnlyHint: false` because it updates local state.
+Only preview is marked read-only. The existing `darkmatter_repo` tool keeps
+status/register/send/read/ack/sync compatibility and recommends fetch for checks.
+
+Sending and acknowledging still change the local queue; explicit publication
+delivers those changes. For example:
 
 ```sh
 python -m darkmatter space send --session MY_SESSION \
   --device OTHER_DEVICE_PUBLIC_KEY --target THEIR_SESSION --content 'Please review commit abc123'
-python -m darkmatter space sync
+python -m darkmatter space preview
+python -m darkmatter space publish --expect-preview PREVIEW_ID
+python -m darkmatter space fetch
 python -m darkmatter space read --session MY_SESSION
 python -m darkmatter space ack --session MY_SESSION --id MESSAGE_ID
 ```
