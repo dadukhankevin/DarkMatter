@@ -20,8 +20,8 @@ def devices(tmp_path):
     git(app, "commit", "-m", "application")
     git(app, "push", str(remote), "HEAD:main")
     a, b = RepoSpace(tmp_path / "a"), RepoSpace(tmp_path / "b")
-    aid = a.initialize(str(remote), "team")["device"]
-    bid = b.initialize(str(remote), "team")["device"]
+    aid = a.initialize(str(remote), "team", membership="pinned")["device"]
+    bid = b.initialize(str(remote), "team", membership="pinned")["device"]
     a.enroll(bid)
     b.enroll(aid)
     a.register("codex-1", "codex")

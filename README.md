@@ -565,7 +565,12 @@ surface; the issue carries no private message and is never treated as proof.
 
 Repo spaces add opt-in encrypted session mail on isolated mailbox branches of
 an existing shared Git remote. Agent handles, device endpoints, repo membership,
-and sessions are recorded separately. A persistent `darkmatter space run` worker
+and sessions are recorded separately. New spaces automatically connect devices
+that publish signed presence to the same repo's `shared` mail channel: no manual
+key exchange. Sync requires a successful push before automatic admission, and
+revoked keys stay blocked. Existing spaces retain pinned membership until the
+owner selects `darkmatter space membership --membership repo-writers`.
+A persistent `darkmatter space run` worker
 keeps correspondence moving between agent turns; wake adapters are configured
 locally and disabled by default. Local and repo inboxes feed the existing session
 hooks, with explicit read/acknowledgment and preserved pause settings.
