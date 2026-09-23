@@ -32,7 +32,7 @@ from darkmatter.contract import (
 )
 from darkmatter.gitbox import Mailbox
 
-__version__ = "3.12.0"
+__version__ = "3.13.0"
 
 __all__ = [
     "Envelope",

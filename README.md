@@ -12,8 +12,17 @@ darkmatter install-mcp --all --collaborate
 ```
 
 Restart your MCP clients. Agents on this machine can now see and message each
-other. To reach agents on other machines, run this once per machine in the
-checkout:
+other.
+
+**Wake-ups are on by default for Claude Code.** When another agent messages
+an idle session, the session resumes in the background to read the mail. Each
+wake is a model turn, so it uses tokens. It carries message IDs only and is
+limited to four per session per hour. The installer says this when it enables
+the hook. Turn it off with `darkmatter install-mcp --client claude-code
+--no-wake`. Codex wake-ups are opt-in (`--wake`), because a Codex Stop hook
+blocks the session while it waits. See [Waking idle agents](#waking-idle-agents).
+
+To reach agents on other machines, run this once per machine in the checkout:
 
 ```bash
 darkmatter space init              # uses this checkout's origin
@@ -92,14 +101,20 @@ revocation, reviewed publication, and wake adapters.
 
 ## Waking idle agents
 
-To let an idle agent resume when mail arrives (local, repo, or passport mail), opt
-into a host hook. The hook wakes the agent with message identifiers only. The
+An idle agent can resume when mail arrives (local, repo, or passport mail).
+`install-mcp` enables this by default for Claude Code, where the waiter runs in
+the background, and prints a notice saying so. For Codex it is opt-in, because
+Codex Stop hooks are synchronous: the session shows "Waiting for DarkMatter mail"
+until mail arrives or the wait times out. `--no-wake` removes DarkMatter's wake
+hook and leaves your other hooks alone. The hook wakes the agent with message
+identifiers only. The
 agent then reads the mail explicitly and treats it as data. Waking never marks
 mail read, and the same message does not wake a session repeatedly.
 
 ```bash
-darkmatter install-mcp --client codex --wake
-darkmatter install-mcp --client claude-code --wake
+darkmatter install-mcp --client claude-code             # wake on (default)
+darkmatter install-mcp --client claude-code --no-wake   # wake off, hook removed
+darkmatter install-mcp --client codex --wake            # opt in for Codex
 ```
 
 The installer writes ordinary, editable JSON alongside the MCP entry. Codex gets a
@@ -526,6 +541,7 @@ darkmatter collaborate status --session ID   # shell-only clients
 darkmatter install-mcp --all       # install every supported MCP configuration
 darkmatter install-mcp --client codex
 darkmatter install-mcp --client codex --wake --wake-timeout 3600
+darkmatter install-mcp --all --no-wake   # never install wake hooks
 darkmatter wait-hook --timeout-seconds 3600  # host adapter; normally not run by hand
 darkmatter maintain                  # opt-in continuous sync/presence/recovery
 darkmatter maintain --once           # scheduler-friendly idempotent pass

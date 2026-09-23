@@ -245,7 +245,9 @@ and [skip directives](https://docs.github.com/en/actions/how-tos/manage-workflow
 
 ## Wake-ups
 
-Existing `install-mcp --wake` integrations watch session-addressed local and
+`install-mcp` enables the Claude Code wake hook by default and says so; Codex
+needs `--wake`, because its Stop hook blocks while waiting, and `--no-wake`
+removes the hook. These integrations watch session-addressed local and
 repo-space inboxes as well as passport (legacy Git) mail. Repo-space fetching is
 performed by MCP servers and `space run`. Hooks only inspect the local durable
 queue. Every wake carries bounded identifiers and a trust-boundary reminder,

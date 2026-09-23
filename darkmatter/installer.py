@@ -169,7 +169,8 @@ def _is_darkmatter_wake_handler(handler: object) -> bool:
     return any(words[i:i + 3] == ["-m", "darkmatter", "wait-hook"] for i in range(len(words)))
 
 
-def _replace_darkmatter_stop_hook(config: dict, handler: dict) -> None:
+def _replace_darkmatter_stop_hook(config: dict, handler: dict | None) -> None:
+    """Swap our wake handler in place (or remove it when handler is None)."""
     hooks = config.setdefault("hooks", {})
     stop_groups = hooks.setdefault("Stop", [])
     if not isinstance(stop_groups, list):
@@ -185,8 +186,12 @@ def _replace_darkmatter_stop_hook(config: dict, handler: dict) -> None:
             updated = dict(group)
             updated["hooks"] = kept_handlers
             kept_groups.append(updated)
-    kept_groups.append({"hooks": [handler]})
-    hooks["Stop"] = kept_groups
+    if handler is not None:
+        kept_groups.append({"hooks": [handler]})
+    if kept_groups:
+        hooks["Stop"] = kept_groups
+    else:
+        hooks.pop("Stop", None)
 
 
 def _install_claude_wake_hook(
@@ -340,6 +345,30 @@ def install_target(
     return True, f"{target.label}: installed to {path}{suffix}"
 
 
+# Hosts whose wake hook waits in the background. Codex Stop hooks are synchronous:
+# waiting there holds the session open, so Codex wake-ups stay opt-in.
+DEFAULT_WAKE_CLIENTS = ("claude-code",)
+WAKE_NOTICE = (
+    "Wake-ups are ON by default for Claude Code: when another agent messages an idle "
+    "session, the session resumes in the background to read it. Each wake is a model "
+    "turn (it uses tokens); it carries message ids only, never peer text, and is limited "
+    "to 4 per session per hour. Turn off: darkmatter install-mcp --client claude-code --no-wake"
+)
+CODEX_WAKE_NOTICE = (
+    "Codex wake-ups are opt-in (--wake): Codex Stop hooks block the session while "
+    "waiting for mail."
+)
+
+
+def remove_wake_hook(target: InstallTarget, home: Path) -> str | None:
+    """Remove only DarkMatter's wake handler, preserving every other hook."""
+    path = home / {"codex": ".codex/hooks.json", "claude-code": ".claude/settings.json"}.get(target.client, "")
+    if target.client not in ("codex", "claude-code") or not path.is_file():
+        return None
+    _merge_json_config(path, lambda config: _replace_darkmatter_stop_hook(config, None))
+    return f"{target.label}: wake hook removed from {path}"
+
+
 def _target_by_client(client: str) -> InstallTarget:
     for target in SUPPORTED_TARGETS:
         if target.client == client:
@@ -358,11 +387,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--home", default=str(Path.home()))
     parser.add_argument("--collaborate", action="store_true",
                         help="Install local session discovery and inbox notification hooks for Codex/Claude Code/Cursor.")
-    parser.add_argument(
-        "--wake",
-        action="store_true",
-        help="Install a Stop hook for Codex or Claude Code that waits for peer mail.",
+    wake = parser.add_mutually_exclusive_group()
+    wake.add_argument(
+        "--wake", action="store_const", const=True, dest="wake", default=None,
+        help="Install a Stop hook that resumes an idle session when mail arrives "
+             "(default for Claude Code; opt-in for Codex, whose Stop hooks block).",
     )
+    wake.add_argument("--no-wake", action="store_const", const=False, dest="wake",
+                      help="Do not install, and remove any existing, DarkMatter wake hook.")
     parser.add_argument(
         "--wake-timeout",
         type=float,
@@ -390,25 +422,41 @@ def main(argv: list[str] | None = None) -> int:
         targets = [target for target in SUPPORTED_TARGETS if target.supported]
 
     installed = 0
+    default_wakes, codex_without_wake = [], False
     for target in targets:
+        wake = args.wake if args.wake is not None else target.client in DEFAULT_WAKE_CLIENTS
         ok, message = install_target(
             target,
             command=args.python_cmd,
             display_name=args.display_name,
             home=home,
-            wake=args.wake,
+            wake=wake,
             wake_timeout_seconds=args.wake_timeout,
             collaborate=args.collaborate,
         )
         print(message)
         if ok:
             installed += 1
+            if args.wake is None and wake:
+                default_wakes.append(target)
+            codex_without_wake |= target.client == "codex" and args.wake is None
+        if ok and args.wake is False:
+            try:
+                removed = remove_wake_hook(target, home)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                removed = f"{target.label}: could not remove wake hook ({exc})"
+            if removed:
+                print(removed)
 
     skipped = [target.label for target in SUPPORTED_TARGETS if not target.supported]
     if skipped and not args.clients:
         print(f"Skipped: {', '.join(skipped)}")
 
     print(f"Installed DarkMatter MCP config for {installed} client(s).")
+    if default_wakes:
+        print(WAKE_NOTICE)
+    if codex_without_wake:
+        print(CODEX_WAKE_NOTICE)
     print(
         "After an agent publishes a public repository, it can optionally connect "
         "to DarkMatter One, the public echo agent."

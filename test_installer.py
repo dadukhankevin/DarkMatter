@@ -237,3 +237,48 @@ def test_hand_edited_wake_hook_is_replaced_not_duplicated(tmp_path):
     assert edited not in commands
     assert "python -m other wait-hook" in commands
     assert sum("darkmatter wait-hook" in c for c in commands) == 1
+
+
+def _stop_handlers(path):
+    if not path.is_file():
+        return []
+    return [h for g in json.loads(path.read_text()).get("hooks", {}).get("Stop", []) for h in g["hooks"]]
+
+
+def test_wake_is_default_for_claude_and_announced(tmp_path, capsys):
+    from darkmatter.installer import main
+    claude, codex = tmp_path / ".claude/settings.json", tmp_path / ".codex/hooks.json"
+    assert main(["--home", str(tmp_path), "--python", "/tmp/python",
+                 "--client", "claude-code", "--client", "codex"]) == 0
+    out = capsys.readouterr().out
+    assert len(_stop_handlers(claude)) == 1 and _stop_handlers(claude)[0]["asyncRewake"] is True
+    assert _stop_handlers(codex) == []  # Codex Stop hooks block, so wake stays opt-in there.
+    assert "Wake-ups are ON by default for Claude Code" in out
+    assert "--no-wake" in out and "uses tokens" in out
+    assert "Codex wake-ups are opt-in" in out
+
+
+def test_explicit_wake_is_not_reannounced_and_no_wake_removes_only_ours(tmp_path, capsys):
+    from darkmatter.installer import main
+    claude = tmp_path / ".claude/settings.json"
+    claude.parent.mkdir(parents=True)
+    claude.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "keep-me"}]}]}}))
+    args = ["--home", str(tmp_path), "--python", "/tmp/python", "--client", "claude-code"]
+    assert main([*args, "--wake"]) == 0
+    assert "ON by default" not in capsys.readouterr().out
+    assert len(_stop_handlers(claude)) == 2
+    assert main([*args, "--no-wake"]) == 0
+    assert "wake hook removed" in capsys.readouterr().out
+    assert [h["command"] for h in _stop_handlers(claude)] == ["keep-me"]
+    assert main(args) == 0  # A later default install turns it back on and says so.
+    assert "ON by default" in capsys.readouterr().out
+    assert len(_stop_handlers(claude)) == 2
+
+
+def test_default_install_keeps_an_opted_in_codex_wake(tmp_path):
+    from darkmatter.installer import main
+    codex = tmp_path / ".codex/hooks.json"
+    args = ["--home", str(tmp_path), "--python", "/tmp/python", "--client", "codex"]
+    assert main([*args, "--wake"]) == 0
+    assert main(args) == 0
+    assert len(_stop_handlers(codex)) == 1
