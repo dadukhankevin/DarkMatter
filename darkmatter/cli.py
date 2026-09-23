@@ -18,6 +18,7 @@ def _wait_hook(argv: list[str]) -> int:
         description="Wait for DarkMatter mail and signal a host hook when it arrives.",
     )
     parser.add_argument("--timeout-seconds", type=float, default=3600)
+    parser.add_argument("--client", choices=("claude-code", "codex"), default="claude-code")
     args = parser.parse_args(argv)
 
     hook_input: dict = {}
@@ -47,7 +48,7 @@ def _wait_hook(argv: list[str]) -> int:
         if not acquired:
             return 0
         message = wait_for_session_activity(
-            root, session_id, "claude-code", get_mailbox(root), args.timeout_seconds,
+            root, session_id, args.client, get_mailbox(root), args.timeout_seconds,
         )
     if not message:
         return 0

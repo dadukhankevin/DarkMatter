@@ -154,13 +154,19 @@ def _is_darkmatter_wake_handler(handler: object) -> bool:
         and handler.get("tool") == "darkmatter_stop_hook"
     ):
         return True
-    args = handler.get("args")
-    return (
-        handler.get("type") == "command"
-        and isinstance(args, list)
-        and "darkmatter" in args
-        and "wait-hook" in args
-    )
+    if handler.get("type") != "command":
+        return False
+    command, args = handler.get("command"), handler.get("args")
+    words = []
+    if isinstance(command, str):
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            pass
+    if isinstance(args, list):
+        words += [word for word in args if isinstance(word, str)]
+    # Recognize our waiter however its flags were reordered or edited by hand.
+    return any(words[i:i + 3] == ["-m", "darkmatter", "wait-hook"] for i in range(len(words)))
 
 
 def _replace_darkmatter_stop_hook(config: dict, handler: dict) -> None:
@@ -192,6 +198,7 @@ def _install_claude_wake_hook(
         "type": "command",
         "command": command,
         "args": [
+            "-I",
             "-m",
             "darkmatter",
             "wait-hook",
@@ -205,13 +212,11 @@ def _install_claude_wake_hook(
     _merge_json_config(path, lambda config: _replace_darkmatter_stop_hook(config, handler))
 
 
-def _install_codex_wake_hook(path: Path, timeout_seconds: float) -> None:
+def _install_codex_wake_hook(path: Path, command: str, timeout_seconds: float) -> None:
     handler = {
-        "type": "mcp_tool",
-        "server": "darkmatter",
-        "tool": "darkmatter_stop_hook",
-        "input": {"timeout_seconds": timeout_seconds, "session_id": "${session_id}",
-                  "project_dir": "${cwd}", "stop_hook_active": "${stop_hook_active}"},
+        "type": "command",
+        "command": shlex.join([command, "-I", "-m", "darkmatter", "wait-hook",
+                               "--client", "codex", "--timeout-seconds", f"{timeout_seconds:g}"]),
         "timeout": _wake_host_timeout(timeout_seconds),
         "statusMessage": "Waiting for DarkMatter mail",
     }
@@ -318,7 +323,7 @@ def install_target(
             _install_claude_wake_hook(wake_path, command, wake_timeout_seconds)
         elif wake and target.client == "codex":
             wake_path = home / ".codex/hooks.json"
-            _install_codex_wake_hook(wake_path, wake_timeout_seconds)
+            _install_codex_wake_hook(wake_path, command, wake_timeout_seconds)
         if collaborate and target.client == "cursor":
             _install_cursor_collaboration_hooks(home / ".cursor/hooks.json", command)
         if collaborate and target.client in ("codex", "claude-code"):

@@ -91,7 +91,9 @@ def test_wake_hooks() -> None:
         codex_hooks.parent.mkdir(parents=True, exist_ok=True)
         codex_hooks.write_text(json.dumps({
             "hooks": {
-                "Stop": [{"hooks": [{"type": "command", "command": "keep-me"}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "keep-me"},
+                                    {"type": "mcp_tool", "server": "darkmatter",
+                                     "tool": "darkmatter_stop_hook"}]}],
             },
         }))
         ok, message = install_target(
@@ -105,13 +107,12 @@ def test_wake_hooks() -> None:
         report("codex wake install succeeds", ok, message)
         data = json.loads(codex_hooks.read_text())
         handlers = [handler for group in data["hooks"]["Stop"] for handler in group["hooks"]]
-        wake = [handler for handler in handlers if handler.get("tool") == "darkmatter_stop_hook"]
+        wake = [handler for handler in handlers if handler.get("statusMessage") == "Waiting for DarkMatter mail"]
         report("codex preserves other Stop hooks", any(h.get("command") == "keep-me" for h in handlers), str(data))
-        report("codex adds MCP Stop hook", len(wake) == 1, str(data))
-        assert wake[0]["input"]["session_id"] == "${session_id}"
-        assert wake[0]["input"]["project_dir"] == "${cwd}"
-        assert wake[0]["input"]["stop_hook_active"] == "${stop_hook_active}"
-        report("codex wake timeout is editable", wake[0]["input"]["timeout_seconds"] == 45, str(wake))
+        report("codex adds command Stop hook", len(wake) == 1, str(data))
+        assert all(h["type"] != "mcp_tool" for h in handlers)
+        assert wake[0]["type"] == "command"
+        assert "-I -m darkmatter wait-hook --client codex --timeout-seconds 45" in wake[0]["command"]
 
         install_target(
             _target("codex"),
@@ -123,9 +124,9 @@ def test_wake_hooks() -> None:
         )
         data = json.loads(codex_hooks.read_text())
         handlers = [handler for group in data["hooks"]["Stop"] for handler in group["hooks"]]
-        wake = [handler for handler in handlers if handler.get("tool") == "darkmatter_stop_hook"]
+        wake = [handler for handler in handlers if handler.get("statusMessage") == "Waiting for DarkMatter mail"]
         report("codex wake install is idempotent", len(wake) == 1, str(data))
-        report("codex wake install updates timeout", wake[0]["input"]["timeout_seconds"] == 60, str(wake))
+        report("codex wake install updates timeout", wake[0]["command"].endswith("--timeout-seconds 60"), str(wake))
 
         ok, message = install_target(
             _target("claude-code"),
@@ -220,3 +221,19 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_hand_edited_wake_hook_is_replaced_not_duplicated(tmp_path):
+    path = tmp_path / ".codex/hooks.json"
+    path.parent.mkdir(parents=True)
+    edited = "'/my python' -I -m darkmatter wait-hook --timeout-seconds 30 --client codex"
+    path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": edited},
+        {"type": "command", "command": "python -m other wait-hook"},
+    ]}]}}))
+    assert install_target(_target("codex"), command="/tmp/python", display_name="t", home=tmp_path, wake=True)[0]
+    handlers = [h for g in json.loads(path.read_text())["hooks"]["Stop"] for h in g["hooks"]]
+    commands = [h["command"] for h in handlers]
+    assert edited not in commands
+    assert "python -m other wait-hook" in commands
+    assert sum("darkmatter wait-hook" in c for c in commands) == 1

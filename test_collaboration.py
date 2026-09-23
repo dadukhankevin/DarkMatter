@@ -250,8 +250,33 @@ def test_pretool_notification_never_grants_permission_or_injects_peer_text(board
     assert "pretool" in output
     assert "destructive commands" not in output and "overwrite files" not in output
     assert "private command" not in output
-    assert "--scope repo" in output
+    assert "--session" not in output  # CLI fallback is sent at session start, not every tool call.
     assert a.delivery("pretool")["delivery"] == "queued"
+    event["hook_event_name"] = "SessionStart"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["hook", "--client", "claude-code"]) == 0
+    start = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert "collaborate status --client claude-code --session b" in start
+    assert len(start) < 600
+
+
+def test_prompt_hook_repeats_only_while_mail_is_unread(boards, monkeypatch, capsys):
+    a, b = boards
+    event = {"cwd": str(b.root), "session_id": "b", "hook_event_name": "UserPromptSubmit"}
+
+    def prompt():
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+        assert main(["hook", "--client", "claude-code"]) == 0
+        return capsys.readouterr().out
+
+    prompt()
+    assert prompt() == ""  # Nothing changed: no context injected on every prompt.
+    sent = a.send(b.agent_id, "hello", "reminder")
+    assert "reminder" in prompt()
+    assert "reminder" in prompt()  # Still unread: remind again.
+    b.ack([sent["id"]])
+    prompt()
+    assert prompt() == ""
 
 
 @pytest.mark.parametrize("marker", [b"gitdir: bad\x00path", b"\xff"])
@@ -292,7 +317,7 @@ def test_cursor_native_hook_uses_stable_conversation_and_workspace(boards, monke
     output = json.loads(capsys.readouterr().out)
     assert set(output) == {"additional_context"}
     assert "cursor-message" in output["additional_context"]
-    assert cursor.agent_id in output["additional_context"]
+    assert "cursor-conversation" in output["additional_context"]
     assert "private output" not in output["additional_context"]
     assert "automatically inject" not in output["additional_context"]
     assert a.delivery("cursor-message")["delivery"] == "queued"

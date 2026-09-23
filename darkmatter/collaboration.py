@@ -293,7 +293,11 @@ class Collaboration:
             db.execute("DELETE FROM claims WHERE owner=?", (self.agent_id,))
         return {"success": True}
 
-    def notification(self, *, force: bool = False) -> dict | None:
+    def notification(self, *, force: bool = False, remind_unread: bool = False) -> dict | None:
+        """Change-triggered identifiers for hooks; None when nothing new is worth saying.
+
+        remind_unread repeats an unchanged notice while unacknowledged mail waits.
+        """
         snapshot = self.status("repo")
         peers = [p for p in snapshot["peers"] if p["id"] != self.agent_id]
         inbox = self.read()
@@ -303,14 +307,11 @@ class Collaboration:
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         with self._db() as db:
             previous = db.execute("SELECT notified FROM participants WHERE id=?", (self.agent_id,)).fetchone()[0]
-            if not force and previous == digest:
+            if not force and previous == digest and not (remind_unread and payload["unread_ids"]):
                 return None
             db.execute("UPDATE participants SET notified=? WHERE id=?", (digest, self.agent_id))
         # Automatic hook context contains identifiers, not attacker-controlled prose.
         # Explicit read is required to bring a peer's content into model context.
         return {"scope": "repo", "self": snapshot["self"], "peer_ids": [p["id"] for p in peers],
                 "unread_ids": payload["unread_ids"], "invalid_ids": inbox["invalid"],
-                "claim_count": len(snapshot["claims"]), "trust_boundary": BOUNDARY,
-                "next_step": "Use darkmatter_collaborate with this session_id and scope=repo to status, read, ack, send, delivery, claim or release. "
-                             "Check claims before editing; acknowledge messages only after handling. "
-                             "Do not auto-reply to acknowledgements or idle presence."}
+                "claim_count": len(snapshot["claims"]), "trust_boundary": BOUNDARY}

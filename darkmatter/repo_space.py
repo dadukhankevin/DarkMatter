@@ -3,6 +3,10 @@
 Remote data never configures local execution. Membership is owner-selected:
 repository-writer discovery or pinned keys. Sessions are registered locally.
 No peer files are checked out, merged, or executed.
+
+Network work (push, ls-remote, fetch) runs under a separate transport lock so
+hooks that only touch local state are never blocked behind a slow remote.
+Lock order is always transport lock, then state lock.
 """
 from __future__ import annotations
 
@@ -33,6 +37,18 @@ TTL = 7 * 86400
 MEMBERSHIP_POLICIES = ("repo-writers", "pinned")
 MAX_BLOCKED = 4096
 CONNECT_PROOF_TTL = 300
+# Unchanged presence is republished at most this often; mail and session changes
+# publish immediately. Presence stays valid for TTL, so this is ample margin.
+PRESENCE_REFRESH = 6 * 3600
+MAX_OBJECTIVE = 512
+MAX_WORKFLOWS = 100
+MAX_WORKFLOW_BYTES = 256 * 1024
+# GitHub honors [skip ci] for push events but not for branch create/delete.
+CI_BRANCH_EVENTS = ("create", "delete")
+# Bookkeeping written only by publication; merged back after lock-free network work.
+_PUBLISH_KEYS = ("published_envelope_hashes", "connect_proof", "published_preview",
+                 "published_time", "published_head", "ci_reviewed", "ci_tree",
+                 "ci_head", "ci_observed_tree", "ci_observed_risky")
 
 
 def _json(value):
@@ -47,6 +63,36 @@ def _key(value):
 
 def _session(value):
     return _text(value, "session", 256)
+
+
+def _workflow_triggers(text):
+    """Best-effort top-level `on:` event names; None when no trigger block is found."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"""^(?:on|"on"|'on'|true)\s*:\s*(.*?)\s*(?:#.*)?$""", line)
+        if not match:
+            continue
+        if match.group(1):
+            return set(re.findall(r"[A-Za-z_][\w-]*", match.group(1)))
+        events, indent = set(), None
+        for sub in lines[index + 1:]:
+            if not sub.strip() or sub.lstrip().startswith("#"):
+                continue
+            width = len(sub) - len(sub.lstrip())
+            if width == 0:
+                break
+            indent = width if indent is None else indent
+            name = re.match(r"(?:-\s*)?([A-Za-z_][\w-]*)", sub.strip())
+            if width == indent and name:
+                events.add(name.group(1))
+        return events
+    return None
+
+
+def workflow_needs_review(text):
+    """Conservative: unparseable triggers or branch create/delete events need a human."""
+    triggers = _workflow_triggers(text)
+    return triggers is None or bool(triggers & set(CI_BRANCH_EVENTS))
 
 
 def default_space_directory(root=None):
@@ -69,6 +115,7 @@ class RepoSpace:
         self.path = self.directory / "state.json"
         self.transport = self.directory / "transport"
         self.lock = ProjectLock(self.directory / "space.lock")
+        self.net_lock = ProjectLock(self.directory / "transport.lock")
 
     def _load(self):
         if not self.path.exists():
@@ -78,9 +125,13 @@ class RepoSpace:
     def _save(self, state):
         atomic_write_text(self.path, _json(state) + "\n", mode=0o600)
 
-    def initialize(self, remote: str, space: str | None = None, *, membership="repo-writers"):
+    def initialize(self, remote: str, space: str | None = None, *, membership="repo-writers",
+                   ci_review="manual"):
+        """Create a device identity. ci_review="auto" lets publication scan workflows itself."""
         if membership not in MEMBERSHIP_POLICIES:
             raise ValueError("Unknown membership policy")
+        if ci_review not in ("auto", "manual"):
+            raise ValueError("ci_review must be auto or manual")
         remote = resolve_remote(remote)
         space = space or ("shared" if membership == "repo-writers" else uuid.uuid4().hex)
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", space):
@@ -98,9 +149,10 @@ class RepoSpace:
                         "private": private, "device": device, "peers": [],
                         "membership": membership, "auto_peers": [], "blocked_devices": [],
                         "sessions": {}, "outbox": {}, "inbox": {}, "peer_sessions": {},
-                        "ci_reviewed": False, "wake": {}, "wake_attempts": {},
+                        "ci_reviewed": False, "ci_review": ci_review, "wake": {}, "wake_attempts": {},
                         "wake_attempted": {}, "wake_history": {}})
-        return {"space": space, "device": device, "remote": remote, "membership": membership}
+        return {"space": space, "device": device, "remote": remote, "membership": membership,
+                "ci_review": ci_review}
 
     @staticmethod
     def _clear_auto_peers(state):
@@ -144,12 +196,16 @@ class RepoSpace:
             self._save(state)
         return {"device": device, "enrolled": not remove}
 
-    def register(self, session: str, client: str, *, agent: str | None = None,
-                 paused: bool | None = None, availability: str | None = None):
+    def register(self, session: str, client: str | None, *, agent: str | None = None,
+                 paused: bool | None = None, availability: str | None = None,
+                 objective: str | None = None):
         _session(session)
+        if objective is not None:
+            _text(objective, "objective", MAX_OBJECTIVE, empty=True)
         if availability is not None and availability not in ("busy", "idle", "stopped", "unknown"):
             raise ValueError("Invalid session availability")
-        _text(client, "client", 80)
+        if client is not None:
+            _text(client, "client", 80)
         if agent is not None:
             _text(agent, "agent", 256)
         with self.lock.acquire():
@@ -158,50 +214,85 @@ class RepoSpace:
             if not old and len(state["sessions"]) >= MAX_ITEMS:
                 raise ValueError("Session limit reached")
             state["sessions"][session] = {
-                **old, "client": client, "agent": agent or old.get("agent") or uuid.uuid4().hex,
+                **old, "client": client or old.get("client") or "cli", "agent": agent or old.get("agent") or uuid.uuid4().hex,
                 "paused": old.get("paused", False) if paused is None else bool(paused),
-                "availability": availability or old.get("availability", "unknown"), "seen": time.time()}
+                "availability": availability or old.get("availability", "unknown"), "seen": time.time(),
+                "objective": old.get("objective", "") if objective is None else objective}
             self._save(state)
         return {"session": session, **state["sessions"][session]}
 
     def review_ci(self):
         """Record the owner's explicit review, never infer it from peer metadata."""
-        with self.lock.acquire():
+        with self.net_lock.acquire(), self.lock.acquire():
             state = self._load()
-            state["ci_tree"] = self._ci_tree(state)
+            state["ci_tree"], risky = self._ci_scan(state)
             state["ci_reviewed"] = True
             self._save(state)
-        return {"ci_reviewed": True}
+        return {"ci_reviewed": True, "workflows_triggered_by_new_branches": risky}
+
+    def scan_ci(self):
+        """Inspect default-branch workflows; auto-approve publication only if none react to mail branches."""
+        with self.net_lock.acquire(), self.lock.acquire():
+            state = self._load()
+            tree, risky = self._ci_scan(state)
+            if not risky:
+                state["ci_tree"], state["ci_reviewed"] = tree, True
+            self._save(state)
+        return {"ci_reviewed": state["ci_reviewed"], "workflows_needing_review": risky}
 
     def _ci_tree(self, state):
-        """Fingerprint current default-branch workflows without checking them out."""
+        return self._ci_scan(state)[0]
+
+    def _ci_scan(self, state):
+        """Fingerprint default-branch workflows and flag any that fire on branch creation.
+
+        Never checks out remote files; workflow YAML is read as bounded blobs.
+        """
         head = git(self.transport, "ls-remote", "--exit-code", state["remote"], "HEAD", check=False)
         if head.returncode == 2:
-            return "unborn"
+            return "unborn", []
         if head.returncode:
             raise GitError("Cannot inspect default branch for CI review")
         oid = head.stdout.split()[0]
         if not re.fullmatch(r"[0-9a-f]{40,64}", oid):
             raise ValueError("Invalid remote HEAD")
-        if state.get("ci_head") == oid:
-            return state["ci_observed_tree"]
+        if state.get("ci_head") == oid and "ci_observed_risky" in state:
+            return state["ci_observed_tree"], state["ci_observed_risky"]
         git(self.transport, "fetch", "--depth=1", "--no-tags", state["remote"], oid)
         tree = git(self.transport, "ls-tree", "FETCH_HEAD", "--", ".github/workflows").stdout
         fingerprint = hashlib.sha256(tree.encode()).hexdigest()
-        state["ci_head"], state["ci_observed_tree"] = oid, fingerprint
-        return fingerprint
+        risky = []
+        listing = git(self.transport, "ls-tree", "-r", "-l", "FETCH_HEAD", "--", ".github/workflows").stdout
+        entries = [line for line in listing.splitlines() if line.strip()]
+        if len(entries) > MAX_WORKFLOWS:
+            risky.append(".github/workflows (too many files to scan)")
+            entries = []
+        for line in entries:
+            header, path = line.split("\t", 1)
+            _mode, kind, blob, size = header.split()
+            if kind != "blob" or not path.endswith((".yml", ".yaml")):
+                continue
+            if size == "-" or int(size) > MAX_WORKFLOW_BYTES:
+                risky.append(path + " (too large to scan)")
+                continue
+            text = git(self.transport, "cat-file", "blob", blob).stdout
+            if workflow_needs_review(text):
+                risky.append(path)
+        state["ci_head"], state["ci_observed_tree"], state["ci_observed_risky"] = oid, fingerprint, risky
+        return fingerprint, risky
 
     def _prune(self, state):
         for bucket in ("outbox", "inbox"):
             state[bucket] = {k: v for k, v in state[bucket].items() if v["expires"] > time.time()}
 
-    def _queue(self, state, recipient, body, kind="message"):
+    def _queue(self, state, recipient, body, kind="message", envelope_id=None):
         self._prune(state)
         if len(state["outbox"]) >= MAX_ITEMS:
             raise ValueError("Outbox full; allow messages to expire before adding more")
         expires = time.time() + TTL
         envelope = seal_envelope(state["private"], state["device"], recipient, kind, body,
-                                 expires_at=datetime.fromtimestamp(expires, timezone.utc).isoformat())
+                                 expires_at=datetime.fromtimestamp(expires, timezone.utc).isoformat(),
+                                 **({"envelope_id": envelope_id} if envelope_id else {}))
         state["outbox"][envelope.id] = {"envelope": envelope.to_public_dict(),
                                       "expires": expires, "status": "queued",
                                       "summary": {label: body[key] for key, label in (
@@ -209,18 +300,29 @@ class RepoSpace:
                                           ("id", "acknowledges")) if key in body}}
         return envelope.id
 
-    def send(self, session: str, device: str, target: str, content: str):
+    def send(self, session: str, device: str, target: str, content: str, message_id: str | None = None):
         _key(device)
         _session(target)
         _text(content, "content", 16384)
+        if message_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", message_id):
+            raise ValueError("message_id must be a plain identifier")
         with self.lock.acquire():
             state = self._load()
             if session not in state["sessions"]:
                 raise ValueError("Register the sending session locally first")
             if device not in state["peers"]:
-                raise ValueError("Enroll the recipient device first")
+                raise ValueError("Unknown remote device; check status for connected peers")
+            digest = hashlib.sha256(_json([device, target, session, content]).encode()).hexdigest()
+            existing = state["outbox"].get(message_id) if message_id else None
+            if existing:
+                # Retrying the same id is safe only for the identical message.
+                if existing.get("digest") != digest:
+                    raise ValueError("message_id already belongs to another message")
+                return {"id": message_id, "status": existing["status"], "duplicate": True}
             mid = self._queue(state, device, {"space": state["space"], "session": target,
-                                             "sender_session": session, "content": content})
+                                             "sender_session": session, "content": content},
+                              envelope_id=message_id)
+            state["outbox"][mid]["digest"] = digest
             self._save(state)
         return {"id": mid, "status": "queued"}
 
@@ -254,6 +356,30 @@ class RepoSpace:
                 self._save(state)
         return {"id": message_id, "acknowledged": True}
 
+    def remote_sessions(self):
+        """Sessions advertised by admitted devices, addressed as device/session."""
+        with self.lock.acquire():
+            state = self._load()
+        found = []
+        for device, sessions in state["peer_sessions"].items():
+            if device not in state["peers"]:
+                continue
+            for sid, member in sessions.items():
+                found.append({"id": device + "/" + sid, "device": device, "session": sid,
+                              "client": member.get("client"), "availability": member.get("availability"),
+                              "paused": member.get("paused"), "objective": member.get("objective") or "",
+                              "seen": member.get("seen"), "where": "remote"})
+        return sorted(found, key=lambda item: -(item["seen"] or 0))[:100]
+
+    def has_incoming(self, message_id: str):
+        with self.lock.acquire():
+            return message_id in self._load()["inbox"]
+
+    def delivery(self, message_id: str):
+        with self.lock.acquire():
+            item = self._load()["outbox"].get(message_id)
+        return None if item is None else item["status"]
+
     def status(self):
         with self.lock.acquire():
             state = self._load()
@@ -272,8 +398,11 @@ class RepoSpace:
 
     @staticmethod
     def _public_sessions(state):
-        return {sid: {f: member[f] for f in ("client", "agent", "paused", "availability", "seen")}
-                for sid, member in state["sessions"].items()}
+        # Sessions unseen for the retention window are no longer advertised.
+        horizon = time.time() - TTL
+        return {sid: {**{f: member[f] for f in ("client", "agent", "paused", "availability", "seen")},
+                      "objective": member.get("objective", "")}
+                for sid, member in state["sessions"].items() if member.get("seen", 0) > horizon}
 
     def _publication_preview(self, state):
         self._prune(state)
@@ -315,7 +444,7 @@ class RepoSpace:
 
     def publish(self, expected_preview: str):
         """Publish exactly the reviewed correspondence/presence, without enrollment."""
-        with self.lock.acquire():
+        with self.net_lock.acquire(), self.lock.acquire():
             state = self._load()
             plan = self._publication_preview(state)
             if not expected_preview or expected_preview != plan["preview_id"]:
@@ -328,13 +457,28 @@ class RepoSpace:
             self._save(state)
         return {"success": True, "published": plan, "effects": plan["publication_effects"]}
 
+    def _needs_publish(self, state):
+        """Publish only when correspondence/presence changed or presence is due for refresh."""
+        return (state.get("published_preview") != self._publication_preview(state)["preview_id"]
+                or time.time() - state.get("published_time", 0) > PRESENCE_REFRESH)
+
     def _publish(self, state, *, expected_preview=None):
         state.pop("connect_proof", None)
-        if not state["ci_reviewed"]:
+        auto = state.get("ci_review") == "auto"
+        if not state["ci_reviewed"] and not auto:
             raise ValueError("Publication disabled until the owner reviews repository CI and runs ci-reviewed")
-        if self._ci_tree(state) != state.get("ci_tree"):
-            state["ci_reviewed"] = False
-            raise ValueError("Default-branch workflows changed; review CI again before publishing")
+        tree = self._ci_tree(state)
+        risky = [] if tree == "unborn" else state.get("ci_observed_risky", [])
+        if tree != state.get("ci_tree"):
+            if auto and not risky:
+                state["ci_tree"], state["ci_reviewed"] = tree, True
+            else:
+                state["ci_reviewed"] = False
+                detail = f" ({', '.join(risky)} may run on new mail branches; exclude darkmatter/mail/**)" if risky else ""
+                if state.get("ci_tree") is None:
+                    raise ValueError("Publication disabled until CI review" + detail
+                                     + "; then run `darkmatter space ci-reviewed`")
+                raise ValueError("Default-branch workflows changed; review CI again before publishing" + detail)
         self._prune(state)
         if expected_preview and self._publication_preview(state)["preview_id"] != expected_preview:
             raise ValueError("Publication changed during preflight; run preview again")
@@ -356,21 +500,24 @@ class RepoSpace:
         if git(self.transport, "diff", "--cached", "--quiet", check=False).returncode:
             git(self.transport, "commit", "-m", "DarkMatter mailbox [skip ci] [skip actions]")
         git(self.transport, "push", state["remote"], "HEAD:refs/heads/" + self._branch(state, state["device"]))
+        head = git(self.transport, "rev-parse", "HEAD").stdout.strip()
         state["published_envelope_hashes"] = {
             mid: hashlib.sha256(_json(item["envelope"]).encode()).hexdigest()
             for mid, item in state["outbox"].items()}
+        state["published_preview"] = self._publication_preview(state)["preview_id"]
+        state["published_time"], state["published_head"] = time.time(), head
         if payload["membership"] == "repo-writers":
             state["connect_proof"] = {"time": time.time(), "remote": state["remote"],
-                                      "branch": self._branch(state, state["device"]),
-                                      "head": git(self.transport, "rev-parse", "HEAD").stdout.strip()}
+                                      "branch": self._branch(state, state["device"]), "head": head}
 
-    def _fetch(self, state, device):
+    def _fetch(self, state, device, head=None):
         branch = "refs/heads/" + self._branch(state, device)
-        exists = git(self.transport, "ls-remote", "--exit-code", state["remote"], branch, check=False)
-        if exists.returncode == 2:
-            return None
-        if exists.returncode:
-            raise GitError("Could not query enrolled peer branch")
+        if head is None:
+            exists = git(self.transport, "ls-remote", "--exit-code", state["remote"], branch, check=False)
+            if exists.returncode == 2:
+                return None
+            if exists.returncode:
+                raise GitError("Could not query enrolled peer branch")
         git(self.transport, "fetch", "--depth=1", "--no-tags", state["remote"], branch)
         # Inspect only the one protocol blob. Never checkout remote files or filters.
         tree = git(self.transport, "ls-tree", "-l", "FETCH_HEAD", "--", "mail.json").stdout.strip()
@@ -400,33 +547,36 @@ class RepoSpace:
                 raise ValueError("Invalid peer availability")
             if type(member.get("paused")) is not bool:
                 raise ValueError("Invalid peer pause state")
+            if member.get("objective") is not None:
+                _text(member["objective"], "objective", MAX_OBJECTIVE, empty=True)
         return payload
 
-    def _discover(self, state):
-        """Only refs advertised by the exact configured remote are admission evidence.
-
-        The remote ACL is the trust boundary: a writer can publish somebody else's
-        signed presence too. This is not proof of a GitHub account or live access.
-        """
+    def _remote_heads(self, state):
+        """One ls-remote for every mail branch in this space: {device: commit}."""
         prefix = "refs/heads/" + PREFIX + state["space"] + "/"
         output = git(self.transport, "ls-remote", "--heads", state["remote"], prefix + "*").stdout
         # Bound candidate processing before any per-peer fetch. Git pack/output
         # resource isolation still belongs to the host, as for pinned transports.
         if len(output) > 16384:
             raise ValueError("Repository discovery advertisement exceeds limit")
-        devices = set()
+        heads = {}
         for line in output.splitlines():
             fields = line.split()
             if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40,64}", fields[0]):
                 raise ValueError("Invalid repository discovery ref")
             ref = fields[1]
-            if not ref.startswith(prefix):
-                continue
-            device = ref[len(prefix):]
-            if not re.fullmatch(r"[0-9a-f]{64}", device):
-                continue
-            if device != state["device"]:
-                devices.add(device)
+            if ref.startswith(prefix) and re.fullmatch(r"[0-9a-f]{64}", ref[len(prefix):]):
+                heads[ref[len(prefix):]] = fields[0]
+        return heads
+
+    def _discover(self, state, heads=None):
+        """Only refs advertised by the exact configured remote are admission evidence.
+
+        The remote ACL is the trust boundary: a writer can publish somebody else's
+        signed presence too. This is not proof of a GitHub account or live access.
+        """
+        heads = self._remote_heads(state) if heads is None else heads
+        devices = set(heads) - {state["device"]}
         if len(devices) > MAX_PEERS:
             raise ValueError("Repository discovery device limit exceeded")
         return sorted(devices - set(state["peers"]) - set(state.get("blocked_devices", [])))
@@ -485,28 +635,15 @@ class RepoSpace:
             for mid in receipts:
                 state["outbox"][mid]["status"] = "acknowledged"
         state["peer_sessions"][device] = {
-            sid: {k: member.get(k) for k in ("client", "agent", "paused", "availability", "seen")}
+            sid: {k: member.get(k) for k in ("client", "agent", "paused", "availability", "seen", "objective")}
             for sid, member in payload["sessions"].items()}
 
     def fetch(self):
         """Fetch existing peers only. No push, discovery, enrollment, ack, or wake."""
-        with self.lock.acquire():
-            state = self._load()
-            self._prune(state)
-            errors = {}
-            for device in state["peers"]:
-                try:
-                    payload = self._fetch(state, device)
-                    if payload is not None:
-                        if device in state.get("auto_peers", []):
-                            self._validate_presence(payload)
-                        self._receive(state, device, payload)
-                except (GitError, ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
-                    errors[device] = str(exc)
-            self._save(state)
-        return {"success": not errors, "errors": errors,
-                "effects": {"remote_write": False, "membership_change": False,
-                            "local_inbox_and_cache_update": True, "wake_execution": False}}
+        result = self._exchange(publish=False, discover=False)
+        result["effects"] = {"remote_write": False, "membership_change": False,
+                             "local_inbox_and_cache_update": True, "wake_execution": False}
+        return result
 
     def connect(self):
         """Apply automatic membership without publishing or receiving correspondence.
@@ -554,41 +691,141 @@ class RepoSpace:
                             "wake_execution": False}}
 
     def sync(self):
+        """Publish if needed, discover writers, and receive changed peer mailboxes."""
+        return self._exchange(publish=True, discover=True)
+
+    def sync_if_due(self, interval: float):
+        """Shared throttle so several local processes do not all poll the same remote."""
         with self.lock.acquire():
             state = self._load()
-            self._prune(state)
-            self._clear_auto_peers(state)
-            errors = {}
-            candidates = []
-            try:
-                self._publish(state)
-                if state.get("membership", "pinned") == "repo-writers":
-                    try:
-                        candidates = self._discover(state)
-                    except (GitError, ValueError, OSError) as exc:
-                        errors["discovery"] = str(exc)
-            except (GitError, ValueError, OSError) as exc:
-                errors["publish"] = str(exc)
-            pinned = list(state["peers"])
-            for device in pinned + candidates:
+            if time.time() - state.get("last_sync", 0) < interval:
+                return None
+            state["last_sync"] = time.time()
+            self._save(state)
+        return self.sync()
+
+    def _exchange(self, *, publish, discover):
+        """Network phase on a snapshot without the state lock; apply results under it.
+
+        A single ls-remote lists every mail branch. Branches whose commit and our
+        local session set are unchanged since the last successful receive are not
+        fetched again. Automatic admission requires that our own last publication
+        is still the tip of our branch; failed publication clears automatic peers.
+        """
+        with self.net_lock.acquire():
+            with self.lock.acquire():
+                snap = self._load()
+                self._prune(snap)
+            errors, attempted, failed = {}, False, False
+            auto = discover and snap.get("membership", "pinned") == "repo-writers"
+
+            def publish_now():
+                nonlocal attempted, failed
+                attempted = True
                 try:
-                    payload = self._fetch(state, device)
-                    if payload is not None:
-                        if device not in pinned:
-                            if payload.get("membership") != "repo-writers":
-                                continue  # Legacy/pinned peers have not opted in.
-                            self._validate_presence(payload)
-                            if len(state["peers"]) >= MAX_PEERS:
-                                raise ValueError("Device enrollment limit reached")
-                        self._receive(state, device, payload)
-                        if device not in pinned:
-                            state["peers"].append(device)
-                            state["auto_peers"].append(device)
+                    self._publish(snap)
+                except (GitError, ValueError, OSError) as exc:
+                    errors["publish"], failed = str(exc), True
+
+            if publish and self._needs_publish(snap):
+                publish_now()
+            auto_peers = set(snap.get("auto_peers", []))
+            pinned = [p for p in snap["peers"] if p not in auto_peers]
+            heads = None
+            if auto and not failed:
+                try:
+                    heads = self._remote_heads(snap)
+                    if publish and heads.get(snap["device"]) != snap.get("published_head"):
+                        publish_now()  # Our presence vanished or diverged: prove write access again.
+                        heads[snap["device"]] = snap.get("published_head")
+                    if not failed:
+                        self._discover(snap, heads)  # Enforce the device budget before any fetch.
+                except (GitError, ValueError, OSError) as exc:
+                    errors["discovery"], heads = str(exc), None
+            admit = auto and not failed and heads is not None
+            targets = list(pinned)
+            if admit:
+                blocked = set(snap.get("blocked_devices", []))
+                targets += sorted(d for d in heads if d != snap["device"] and d not in pinned and d not in blocked)
+            elif not discover:
+                targets += sorted(auto_peers)
+            if targets and heads is None and not (auto and failed):
+                try:
+                    heads = self._remote_heads(snap)
+                except (GitError, ValueError, OSError) as exc:
+                    errors["fetch"] = str(exc)
+            cache = snap.get("peer_heads", {})
+            sessions_key = hashlib.sha256(_json(sorted(snap["sessions"])).encode()).hexdigest()
+            fetched = {}
+            for device in targets:
+                head = (heads or {}).get(device)
+                if head is None:
+                    continue
+                entry = cache.get(device)
+                if entry and entry.get("head") == head and entry.get("sessions") == sessions_key:
+                    fetched[device] = (head, None)
+                    continue
+                try:
+                    fetched[device] = (head, self._fetch(snap, device, head))
                 except (GitError, ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
                     errors[device] = str(exc)
-            state.pop("connect_proof", None)  # Combined sync already used this publication for admission.
-            self._save(state)
+            with self.lock.acquire():
+                state = self._load()
+                self._prune(state)
+                if attempted:
+                    for key in _PUBLISH_KEYS:
+                        if key in snap:
+                            state[key] = snap[key]
+                        else:
+                            state.pop(key, None)
+                self._apply_exchange(state, fetched, errors, discover=discover,
+                                     admit=admit and state.get("membership", "pinned") == "repo-writers")
+                if discover:
+                    state.pop("connect_proof", None)  # Combined sync already used this publication.
+                state["last_sync"] = time.time()
+                self._save(state)
         return {"success": not errors, "errors": errors}
+
+    def _apply_exchange(self, state, fetched, errors, *, discover, admit):
+        auto_before = list(state.get("auto_peers", []))
+        pinned = [p for p in state["peers"] if p not in auto_before]
+        blocked = set(state.get("blocked_devices", []))
+        cache = state.setdefault("peer_heads", {})
+        sessions_key = hashlib.sha256(_json(sorted(state["sessions"])).encode()).hexdigest()
+        admitted = []
+        for device, (head, payload) in fetched.items():
+            automatic = device not in pinned
+            if automatic and (device in blocked or not (admit or (not discover and device in auto_before))):
+                continue
+            try:
+                if payload is None:
+                    if automatic:
+                        self._validate_presence({"membership": "repo-writers",
+                                                 "published_at": cache[device].get("published_at")})
+                else:
+                    if automatic:
+                        if payload.get("membership") != "repo-writers":
+                            continue  # Legacy/pinned peers have not opted in.
+                        self._validate_presence(payload)
+                    self._receive(state, device, payload)
+                    cache[device] = {"head": head, "sessions": sessions_key,
+                                     "published_at": payload.get("published_at")}
+                if automatic:
+                    admitted.append(device)
+            except (GitError, ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+                errors[device] = str(exc)
+                cache.pop(device, None)
+        if not discover:
+            return
+        room = max(0, MAX_PEERS - len(pinned))
+        if len(admitted) > room:
+            errors["discovery"] = "Device enrollment limit reached"
+            admitted = admitted[:room]
+        for device in set(auto_before) - set(admitted):
+            state["peer_sessions"].pop(device, None)
+            cache.pop(device, None)
+        state["peers"] = pinned + admitted
+        state["auto_peers"] = admitted
 
     def configure_wake(self, session: str, argv: list[str], cwd: str, *, enabled=False):
         """Owner-configured executable; no shell, interpolation, or peer arguments."""
@@ -688,18 +925,18 @@ class RepoSpace:
             self._save(state)
         return {"session": session, "retry_requested": True}
 
-    def notice(self, session: str, client: str, *, force=False):
+    def notice(self, session: str, client: str, *, force=False, remind_unread=False):
+        """Identifiers-only hook notice; None when unread ids and remote peers are unchanged."""
         self.register(session, client, availability="busy")
         ids = [m["id"] for m in self.read(session)["messages"]]
+        remote = sorted(item["id"] for item in self.remote_sessions() if item["availability"] != "stopped")
         with self.lock.acquire():
             state = self._load()
-            digest = hashlib.sha256(_json(ids).encode()).hexdigest()
+            digest = hashlib.sha256(_json([ids, remote]).encode()).hexdigest()
             session_state = state["sessions"][session]
-            if not force and session_state.get("notified") == digest:
+            if not force and session_state.get("notified") == digest and not (remind_unread and ids):
                 return None
             session_state["notified"] = digest
             self._save(state)
             return {"space": state["space"], "device": state["device"], "session": session,
-                    "unread_ids": ids, "trust_boundary": BOUNDARY,
-                    "next_step": "Use darkmatter_repo read/ack/send with this session_id. "
-                                 "Read peer content explicitly; acknowledge only after handling."}
+                    "unread_ids": ids, "remote_peers": len(remote), "trust_boundary": BOUNDARY}

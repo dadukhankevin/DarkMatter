@@ -4,8 +4,17 @@ import json
 import time
 from pathlib import Path
 
-from darkmatter.gitbox.gitutil import GitError
+from darkmatter.gitbox.gitutil import GitError, git
 from darkmatter.repo_space import MEMBERSHIP_POLICIES, RepoSpace, default_space_directory
+
+
+def _origin(cwd):
+    """The checkout's own origin URL; mail uses the host's existing push permissions."""
+    try:
+        result = git(cwd, "remote", "get-url", "origin", check=False)
+    except GitError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def main(argv=None):
@@ -16,7 +25,9 @@ def main(argv=None):
                                             "read", "ack", "fetch", "preview", "publish", "connect", "sync", "run",
                                             "wake", "retry-wake", "ci-reviewed", "membership"))
     parser.add_argument("--expect-preview", help="Required for publish: exact preview_id from the local preview")
-    parser.add_argument("--remote")
+    parser.add_argument("--remote", help="Defaults to this checkout's origin remote")
+    parser.add_argument("--manual-ci", action="store_true",
+                        help="Require an explicit ci-reviewed before every workflow change")
     parser.add_argument("--space")
     parser.add_argument("--membership", choices=MEMBERSHIP_POLICIES,
                         help="New spaces default to repo-writers; existing spaces retain their policy")
@@ -40,9 +51,17 @@ def main(argv=None):
         space = RepoSpace(args.state_dir or default_space_directory())
         action = args.action
         if action == "init":
-            if not args.remote:
-                parser.error("init requires --remote")
-            result = space.initialize(args.remote, args.space, membership=args.membership or "repo-writers")
+            remote = args.remote or _origin(Path.cwd())
+            if not remote:
+                parser.error("init requires --remote (this checkout has no origin remote)")
+            result = space.initialize(remote, args.space, membership=args.membership or "repo-writers",
+                                      ci_review="manual" if args.manual_ci else "auto")
+            if not args.manual_ci:
+                result["ci"] = space.scan_ci()
+                if result["ci"]["workflows_needing_review"]:
+                    result["next_step"] = ("These workflows may run when mail branches are created. Exclude "
+                                           "darkmatter/mail/** from them, or run `darkmatter space ci-reviewed` "
+                                           "to accept the current workflows.")
         elif action == "membership":
             if not args.membership:
                 parser.error("membership requires --membership repo-writers|pinned")

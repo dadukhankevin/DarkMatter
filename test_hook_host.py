@@ -79,8 +79,11 @@ def test_installed_hooks_parse_in_codex(tmp_path):
     after = _list_hooks(binary, home, workspace)
     assert not after["warnings"], after
     assert not after["errors"], after
-    assert len(after["hooks"]) == 6
+    assert {h["eventName"] for h in after["hooks"]} >= {
+        "stop", "sessionStart", "userPromptSubmit", "preToolUse", "postToolUse",
+    }
+    assert [h["eventName"] for h in after["hooks"]].count("stop") == 1
     stop = next(h for h in after["hooks"] if h["eventName"] == "stop")
-    assert stop["handlerType"] == "mcpTool"
+    assert stop["handlerType"] == "command"
     assert stop["timeoutSec"] == 3630
     assert stop["trustStatus"] == "untrusted"  # Installation must never approve itself.

@@ -220,6 +220,8 @@ def test_ci_change_stops_publication_until_reviewed(devices):
     git(app, "add", ".github")
     git(app, "commit", "-m", "new workflow")
     git(app, "push", str(remote), "HEAD:main")
+    # Unchanged presence is not republished; queue mail so publication is needed.
+    a.send("codex-1", devices[1].status()["device"], "claude-1", "after workflow change")
     result = a.sync()
     assert "workflows changed" in result["errors"]["publish"]
     assert not a.status()["ci_reviewed"]

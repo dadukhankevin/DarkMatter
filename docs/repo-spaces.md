@@ -2,8 +2,12 @@
 
 Repo spaces let devices exchange encrypted, session-addressed mail
 through the **same remote repository as the application**, without merging mail
-into application history. A small worker keeps mail moving even when no model
-turn is running. Existing Git mailbox relationships continue to work unchanged.
+into application history. Agents normally use them through
+`darkmatter_collaborate`, which lists remote sessions next to local ones and
+routes `send`, `read`, and `ack` automatically. Remote sessions are addressed as
+`<device>/<session>`. Each open MCP server runs a throttled background sync, and
+`darkmatter space run` keeps mail moving when no agent is open. Existing Git
+mailbox relationships continue to work unchanged.
 
 ## Identity and membership
 
@@ -31,10 +35,11 @@ resume target.
 
 ## Connect two devices
 
-Run in your checkout, using the remote URL you already trust:
+Run this in your checkout. It uses the checkout's `origin`; pass `--remote URL`
+to choose another remote you trust:
 
 ```sh
-python -m darkmatter space init --remote git@github.com:OWNER/REPO.git
+darkmatter space init
 ```
 
 Both devices run that command against the same repository. New spaces default to
@@ -45,10 +50,19 @@ pairwise enrollment is needed**. After the one-time CI review below, each sync:
 2. Discovers other device branches in the same channel on that exact remote.
 3. Verifies their signed, unexpired `repo-writers` presence and accepts messages.
 
-The first device discovers the second on its next sync; `space run` handles this
-continuously. A readable public clone is insufficient: if publication during a
-combined sync fails, automatic membership is cleared and no discovery runs. A new
-publication ID forces a real update even when there is no new mail.
+The first device discovers the second on its next sync. Open MCP servers and
+`space run` do this continuously. Each sync lists every mail branch in the space
+with one `ls-remote`. It fetches only branches whose commit (or this device's
+session set) changed since the last successful receive. It pushes only when mail,
+receipts, or advertised sessions changed, or when presence is six hours old.
+Idle devices therefore stop writing commits.
+
+A readable public clone is insufficient. Automatic admission requires that this
+device's own last publication is still the tip of its branch. If a needed
+publication fails, or the branch was deleted or diverged and republishing fails,
+automatic membership is cleared and no discovery runs. Each presence refresh is a
+real push with a new publication ID. It proves write access again at least every
+six hours.
 
 This trusts the repository's **push ACL**, not a claimed account name or an
 arbitrary contact URL. It proves that a writer admitted the signed presence to
@@ -86,14 +100,16 @@ Only explicit `enroll` removes a local revocation. `status` distinguishes the
 membership policy, automatic peers, and blocked keys. Connection permits mail;
 it never imports remote sessions as local identities or enables a wake adapter.
 
-Review CI as described below, then register a session (installed collaboration
-hooks also register actual host sessions automatically):
+`init` scans CI as described below. Installed collaboration hooks and
+`darkmatter_collaborate` register host sessions automatically. For an always-on
+worker that also runs wake adapters:
 
 ```sh
-python -m darkmatter space ci-reviewed
-python -m darkmatter space register --session MY_SESSION --client codex
-python -m darkmatter space run
+darkmatter space run
 ```
+
+Network operations run under a transport lock, separate from the state lock.
+Hooks and local reads never wait behind a slow remote.
 
 `run` is a foreground service suitable for an owner-configured launchd/systemd
 supervisor. It survives agent turns, not an OS process kill. Default polling is
@@ -203,8 +219,16 @@ It has an independent root commit and contains only `mail.json`, never workflows
 or application files. Pushes never touch `main`, open a pull request, or force
 update another writer. Mail commits contain `[skip ci] [skip actions]`.
 
-**Publication is disabled until `ci-reviewed` records a local review.** Before
-running that command, inspect the remote's default-branch workflows. Exclude
+**`space init` scans the default branch's workflows.** GitHub honors `[skip ci]`
+for push events but not for branch `create`/`delete` events. Publication is
+enabled automatically only if no workflow uses those triggers and every trigger
+block can be parsed. Otherwise `init` lists the workflows. Fix them, or record a
+manual review with `darkmatter space ci-reviewed`. When the workflows change
+later, the scan runs again before the next publication. If a risky trigger was
+added, publication stops until it is fixed or reviewed. `init --manual-ci` keeps
+the stricter behavior: every workflow change needs `ci-reviewed`.
+
+For a manual review, inspect the remote's default-branch workflows. Exclude
 `darkmatter/mail/**` from relevant push filters (or positively list application
 branches). Review `create` and `delete` events and third-party GitHub Apps too.
 Do not open PRs from mailbox branches. Skip directives do not suppress every
@@ -221,10 +245,13 @@ and [skip directives](https://docs.github.com/en/actions/how-tos/manage-workflow
 
 ## Wake-ups
 
-Existing `install-mcp --wake` integrations now watch session-addressed local and
-repo-space inboxes as well as legacy Git mail. Repo-space fetching is performed
-by `space run`; hooks only inspect the local durable queue. Hooks pass bounded
-identifiers and a trust-boundary reminder. Reading peer prose remains explicit.
+Existing `install-mcp --wake` integrations watch session-addressed local and
+repo-space inboxes as well as passport (legacy Git) mail. Repo-space fetching is
+performed by MCP servers and `space run`. Hooks only inspect the local durable
+queue. Every wake carries bounded identifiers and a trust-boundary reminder,
+never peer-written prose or metadata. It never consumes passport mail. (Before
+3.12 a passport message was consumed and its full text placed in the woken
+agent's context. That path now has a regression test.)
 
 - Claude Code's `asyncRewake` hook can wake an idle, still-running session. It
   cannot resurrect a terminated process.

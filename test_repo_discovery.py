@@ -73,10 +73,57 @@ def test_default_writers_discover_and_exchange_mail_without_key_enrollment(write
     assert git(remote, 'rev-parse', 'main').stdout == main
     assert git(remote, 'ls-tree', '--name-only', branch(a)).stdout.strip() == 'mail.json'
     assert 'hello from another device' not in git(remote, 'show', branch(a) + ':mail.json').stdout
-    # Even an unchanged inbox requires a new push, not an up-to-date no-op.
+    # Unchanged presence and mail are not republished on every poll...
     previous = git(remote, 'rev-parse', branch(a)).stdout
     assert a.sync()['success']
+    assert git(remote, 'rev-parse', branch(a)).stdout == previous
+    assert b.status()['device'] in a.status()['auto_peers']
+    # ...but presence is refreshed (a real push) once it is due.
+    state = a._load()
+    state['published_time'] = 0
+    a._save(state)
+    assert a.sync()['success']
     assert git(remote, 'rev-parse', branch(a)).stdout != previous
+
+
+def test_unchanged_peer_branches_are_not_refetched(writers, monkeypatch):
+    a, b, _ = writers
+    connect(a, b)
+    monkeypatch.setattr(a, '_fetch', lambda *args: pytest.fail('unchanged branch was fetched'))
+    assert a.sync()['success']
+    assert b.status()['device'] in a.status()['auto_peers']
+    monkeypatch.undo()
+    b.register('b2', 'test-client')  # Session change republishes b, so a fetches once.
+    assert b.sync()['success']
+    assert a.sync()['success']
+    assert 'b2' in a.status()['peer_sessions'][b.status()['device']]
+
+
+def test_sync_holds_state_lock_only_briefly(writers, monkeypatch):
+    """Hooks touching local state must not wait behind remote Git operations."""
+    import threading
+    import darkmatter.repo_space as module
+    a, b, _ = writers
+    connect(a, b)
+    real_git = module.git
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(cwd, *args, **kwargs):
+        if args[0] == 'ls-remote':
+            entered.set()
+            release.wait(10)
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(module, 'git', slow)
+    worker = threading.Thread(target=a.sync)
+    worker.start()
+    assert entered.wait(10)
+    done = threading.Event()
+    threading.Thread(target=lambda: (a.register('hook', 'claude-code'), done.set())).start()
+    assert done.wait(5), 'local registration blocked behind network sync'
+    release.set()
+    worker.join(10)
+    assert 'hook' in a.status()['sessions']
 
 
 def test_revoked_device_not_reenrolled_after_restart(writers):
@@ -111,6 +158,9 @@ def test_removed_branch_and_failed_publication_remove_automatic_membership(write
         return real_git(cwd, *args, **kwargs)
 
     monkeypatch.setattr(module, 'git', read_only)
+    state = a._load()
+    state['published_time'] = 0  # Presence refresh due: write access is proven again.
+    a._save(state)
     assert 'write access denied' in a.sync()['errors']['publish']
     assert a.status()['peers'] == []
     assert a.status()['peer_sessions'] == {}
@@ -273,3 +323,88 @@ def test_real_stdio_can_discover_send_and_read_without_enrollment(writers, monke
                 assert (await call(action='status'))['delivery'][sent['id']] == 'acknowledged'
 
     asyncio.run(exchange())
+
+
+@pytest.mark.parametrize('workflow, needs_review', [
+    ('on: push\njobs: {}\n', False),
+    ('on: [push, pull_request]\n', False),
+    ('on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n', False),
+    ('"on": create\n', True),
+    ('on: [push, create]\n', True),
+    ('on:\n  - push\n  - delete\n', True),
+    ('on:\n  create:\n  push:\n', True),
+    ('name: no trigger block\n', True),
+])
+def test_workflow_trigger_scan(workflow, needs_review):
+    from darkmatter.repo_space import workflow_needs_review
+    assert workflow_needs_review(workflow) is needs_review
+
+
+def test_cli_init_defaults_to_origin_and_auto_reviews_safe_workflows(tmp_path, capsys, monkeypatch):
+    from darkmatter.repo_space_cli import main
+    remote = tmp_path / 'remote.git'
+    init_repo(remote, bare=True)
+    app = tmp_path / 'app'
+    init_repo(app)
+    (app / '.github/workflows').mkdir(parents=True)
+    (app / '.github/workflows/test.yml').write_text('on:\n  push:\n    branches: [main]\n')
+    git(app, 'add', '.')
+    git(app, 'commit', '-m', 'app')
+    git(app, 'remote', 'add', 'origin', str(remote))
+    git(app, 'push', 'origin', 'HEAD:main')
+    monkeypatch.chdir(app)
+    state = ['--state-dir', str(tmp_path / 'state')]
+    assert main(['init', *state]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['remote'] == str(remote.resolve())
+    assert result['ci'] == {'ci_reviewed': True, 'workflows_needing_review': []}
+    space = RepoSpace(tmp_path / 'state')
+    space.register('s', 'test')
+    assert space.sync()['success']
+    # A later workflow that fires on branch creation stops publication automatically.
+    (app / '.github/workflows/tag.yml').write_text('on: create\n')
+    git(app, 'add', '.')
+    git(app, 'commit', '-m', 'create trigger')
+    git(app, 'push', 'origin', 'HEAD:main')
+    space.register('s', 'test', objective='changed presence')
+    error = space.sync()['errors']['publish']
+    assert 'tag.yml' in error and 'darkmatter/mail' in error
+    # Fixing the workflow resumes publication without another manual review.
+    (app / '.github/workflows/tag.yml').write_text('on:\n  push:\n    branches: [main]\n')
+    git(app, 'add', '.')
+    git(app, 'commit', '-m', 'fix trigger')
+    git(app, 'push', 'origin', 'HEAD:main')
+    assert space.sync()['success']
+
+
+def test_cli_init_flags_risky_workflows(tmp_path, capsys, monkeypatch):
+    from darkmatter.repo_space_cli import main
+    remote = tmp_path / 'remote.git'
+    init_repo(remote, bare=True)
+    app = tmp_path / 'app'
+    init_repo(app)
+    (app / '.github/workflows').mkdir(parents=True)
+    (app / '.github/workflows/branch.yml').write_text('on: [create]\n')
+    git(app, 'add', '.')
+    git(app, 'commit', '-m', 'app')
+    git(app, 'push', str(remote), 'HEAD:main')
+    monkeypatch.chdir(tmp_path)
+    assert main(['init', '--state-dir', str(tmp_path / 'state'), '--remote', str(remote)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['ci']['workflows_needing_review'] == ['.github/workflows/branch.yml']
+    assert 'ci-reviewed' in result['next_step']
+    space = RepoSpace(tmp_path / 'state')
+    space.register('s', 'test')
+    assert 'review' in space.sync()['errors']['publish']
+    assert git(remote, 'for-each-ref', 'refs/heads/darkmatter').stdout == ''
+
+
+def test_objective_is_advertised_and_bounded(writers):
+    a, b, _ = writers
+    b.register('b', 'test-client', objective='Refactor the parser')
+    connect(a, b)
+    remote = {item['session']: item for item in a.remote_sessions()}
+    assert remote['b']['objective'] == 'Refactor the parser'
+    assert remote['b']['id'] == b.status()['device'] + '/b'
+    with pytest.raises(ValueError):
+        a.register('a', 'test-client', objective='x' * 600)

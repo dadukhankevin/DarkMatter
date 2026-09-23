@@ -2,6 +2,8 @@
 
 import os
 import sys
+import threading
+import time
 
 import anyio
 from mcp.server.stdio import stdio_server
@@ -14,8 +16,44 @@ import darkmatter.mcp.tools  # noqa: F401
 _log = get_logger("app")
 
 
+def start_space_worker(root=None):
+    """Keep this checkout's repo space moving while any MCP session is open.
+
+    Several MCP processes share one throttle, so the remote is polled about once
+    per interval per device. Each poll is one ls-remote; changed branches are
+    fetched and a push happens only when mail, receipts, or presence changed.
+    DARKMATTER_SPACE_SYNC_SECONDS=0 disables it.
+    """
+    try:
+        interval = float(os.environ.get("DARKMATTER_SPACE_SYNC_SECONDS", "15"))
+    except ValueError:
+        interval = 15.0
+    if not interval > 0:
+        return None
+    interval = min(max(interval, 5.0), 3600.0)
+    root = root or os.environ.get("DARKMATTER_PROJECT_DIR") or os.getcwd()
+
+    def loop():
+        from darkmatter.collaboration_cli import repo_space
+        while True:
+            try:
+                space = repo_space(root)
+                if space is not None:
+                    result = space.sync_if_due(interval)
+                    if result and result["errors"]:
+                        _log.debug("repo space sync errors: %s", result["errors"])
+            except Exception as exc:  # Background transport must never take down the server.
+                _log.debug("repo space sync failed: %s", exc)
+            time.sleep(interval)
+
+    worker = threading.Thread(target=loop, name="darkmatter-space-sync", daemon=True)
+    worker.start()
+    return worker
+
+
 async def run_stdio() -> None:
     get_mailbox()
+    start_space_worker()
     async with stdio_server() as (read_stream, write_stream):
         await mcp._mcp_server.run(
             read_stream,
