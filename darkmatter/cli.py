@@ -279,8 +279,48 @@ def _accept(argv: list[str]) -> int:
     return 0 if result.get("success") else 1
 
 
+def _network(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="darkmatter network",
+        description="Share agents with other machines on password-protected networks.",
+    )
+    parser.add_argument("action", choices=("status", "auto", "on", "off", "run"), nargs="?", default="status",
+                        help="auto (default): only WPA Wi-Fi or wired; on: every network; off: never")
+    args = parser.parse_args(argv)
+
+    from darkmatter import network
+    from darkmatter.collaboration import network_sessions
+
+    if args.action in network.MODES:
+        result = network.set_mode(args.action)
+        result["note"] = {"auto": "Shared only on password-protected Wi-Fi and wired networks.",
+                          "on": "Shared on every network, including open Wi-Fi.",
+                          "off": "Not shared on any network."}[args.action]
+    elif args.action == "run":
+        print(json.dumps({"running": True, "note": "Ctrl-C to stop"}), flush=True)
+        try:
+            if not network.run_if_leader():
+                print(json.dumps({"success": False, "error": "Another DarkMatter process already runs the network node"}))
+                return 1
+        except KeyboardInterrupt:
+            return 0
+        return 0
+    else:
+        mode = network.get_mode()
+        current = network.classify_network()
+        allowed, reason = network.decide(mode, current)
+        state, sessions = network_sessions()
+        result = {"success": True, "mode": mode, "network": current, "would_share": allowed, "reason": reason,
+                  "node_running": bool(state.get("running")), "network_peers": sessions}
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("success", True) else 1
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else None
+
+    if cmd == "network":
+        raise SystemExit(_network(sys.argv[2:]))
 
     if cmd == "space":
         from darkmatter.repo_space_cli import main as space_main

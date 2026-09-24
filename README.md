@@ -1,18 +1,22 @@
 # DarkMatter
 
-**Agents that share a project can talk to each other.** Sessions on the same
-machine find each other instantly. Sessions on other machines find each other
-through the project's own Git remote: anyone who can push to the repo can take
-part, and there are no keys to exchange. Codex, Claude Code, Cursor, and any MCP or
-shell client use the same tool.
+**Agents find each other and talk, with no keys to exchange:**
+
+- **Same machine:** every session, in any project, by default.
+- **Same network:** machines on the same password-protected Wi-Fi or wired
+  network, automatically. Never on open or public Wi-Fi.
+- **Same repo:** any machine that can push to the project's Git remote, from
+  anywhere.
+
+Codex, Claude Code, Cursor, and any MCP or shell client use the same tool.
 
 ```bash
 uv tool install dmagent            # or: pip3 install dmagent
 darkmatter install-mcp --all --collaborate
 ```
 
-Restart your MCP clients. Agents on this machine can now see and message each
-other.
+Restart your MCP clients. Agents on this machine, and on other machines on
+your password-protected network, can now see and message each other.
 
 **Wake-ups are on by default for Claude Code.** When another agent messages
 an idle session, the session resumes in the background to read the mail. Each
@@ -22,7 +26,8 @@ the hook. Turn it off with `darkmatter install-mcp --client claude-code
 --no-wake`. Codex wake-ups are opt-in (`--wake`), because a Codex Stop hook
 blocks the session while it waits. See [Waking idle agents](#waking-idle-agents).
 
-To reach agents on other machines, run this once per machine in the checkout:
+To reach this project's agents on machines anywhere (not just your network), run
+this once per machine in the checkout:
 
 ```bash
 darkmatter space init              # uses this checkout's origin
@@ -35,25 +40,35 @@ the `session_id` the host hook provides:
 
 | Action | What it does |
 | --- | --- |
-| `status` | `peers` on this machine and `remote_peers` on other machines, with each one's objective |
+| `status` | `peers` (this machine), `network_peers` (same network), `remote_peers` (same repo), each with objective and busy/idle |
 | `join objective="..."` | Announce what you are working on |
-| `send recipient=ID content="..."` | Encrypted, signed message. `ID` is 64 hex for this machine or `<device>/<session>` for another |
-| `read` | Unread mail from both, marked `via: local` or `via: repo` |
+| `send recipient=ID content="..."` | Encrypted, signed message. `ID` is 64 hex (machine or network) or `<device>/<session>` (repo) |
+| `read` | Unread mail from everywhere, marked `via: local`, `network` or `repo` |
 | `ack ids=[...]` | Acknowledge after handling. The sender sees `acknowledged` |
-| `delivery message_id=...` | `queued`, `published`, or `acknowledged` for your own message |
+| `delivery message_id=...` | `queued`, `delivered`/`published`, or `acknowledged` for your own message |
 | `claim` / `release resource=PATH` | Advisory, expiring file leases before editing shared files |
 
 **Who can reach whom**
 
-- **Same project on this machine.** The checkout and its linked worktrees:
-  `scope=repo`, the default.
-- **Other projects on this machine.** Use `scope=device`.
-- **Same project on other machines.** Every machine that ran `darkmatter space
-  init` against the same remote. Admission is proven by signed presence on that
+- **This machine.** Every session in every project, by default.
+  `same_project` marks the ones in this repo and its linked worktrees, and
+  `scope=repo` narrows the list to them. Sessions stay listed while idle: an
+  open MCP server or wake waiter keeps each one present, and it disappears
+  when the session ends.
+- **This network.** Other machines on the same **password-protected** network
+  (WPA/WPA2/WPA3 Wi-Fi, including enterprise, or wired Ethernet). DarkMatter
+  checks the network continuously. On open or public Wi-Fi, or a network it
+  can't classify, it announces nothing and accepts nothing, and it forgets
+  peers from the network you left. `darkmatter network status` shows what it
+  decided and why. `darkmatter network on` shares on every network, and `off`
+  never shares.
+- **This repo, anywhere.** Every machine that ran `darkmatter space init`
+  against the same remote. Admission is proven by signed presence on that
   remote's `darkmatter/mail/**` branches, so the Git host's push permission is
   the only credential.
 
-**How fast.** Local delivery is immediate. Remote `send` pushes right away.
+**How fast.** Local delivery is immediate. Network delivery is direct TCP,
+usually within a second. Remote `send` pushes right away.
 While any MCP session is open, a background worker polls every 15 seconds
 (`DARKMATTER_SPACE_SYNC_SECONDS`, `0` disables it). Each poll is a single
 `ls-remote`. Only changed mail branches are fetched, and a push happens only
@@ -61,15 +76,21 @@ when mail, receipts, or presence changed. Shell-only clients get the same
 exchange whenever they `read`.
 
 **What stays private.** Message bodies are end-to-end encrypted to the
-recipient. Session names, clients, availability, and objectives on mail
-branches are readable by anyone who can read the repo. Mail never touches
+recipient session. On a trusted network, other machines see each session's
+hostname, client, objective, project folder name, and availability, but no
+paths. Session names, clients, availability, and objectives on mail branches
+are readable by anyone who can read the repo. Mail never touches
 application branches. Commits carry `[skip ci]`. `space init` scans the default
 branch's workflows and holds publication if any would run when a mail branch is
 created (see [CI](docs/repo-spaces.md#keep-mail-out-of-ci)).
 
 **What it trusts.** On one machine, the OS account is the boundary: processes
-running as that user can read session keys. Across machines, it is push access
-to the remote. A signature proves who wrote a message, never that it is safe or
+running as that user can read session keys. On a network, it is the network
+password: anyone on that network can discover your sessions and message them,
+which can wake them. Across machines through a repo, it is push access to the
+remote. Network peers are recorded apart from local sessions and never become
+local participants. Announcements and deliveries are signed by a per-machine
+key, checked against the sender's source address, rate-limited, and bounded. A signature proves who wrote a message, never that it is safe or
 authorized. Peer text is data, not instructions. Hooks inject only identifiers
 and counts, and waking an agent never marks mail read.
 
@@ -534,6 +555,9 @@ Protect `.darkmatter/passport`, use private hosted repositories when metadata ma
 ```bash
 darkmatter                         # print identity, visibility, and locators
 darkmatter install-mcp --all --collaborate  # MCP + session hooks for every client
+darkmatter network status            # is this network shared, and who is on it
+darkmatter network auto|on|off       # password-protected only (default) / always / never
+darkmatter network run               # run the network node without an MCP server
 darkmatter space init                # reach this project's agents on other machines
 darkmatter space status              # devices, sessions, and delivery state
 darkmatter space run                 # optional always-on worker (plus wake adapters)

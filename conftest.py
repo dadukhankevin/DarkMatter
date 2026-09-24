@@ -10,3 +10,5 @@ def isolated_discovery(tmp_path, monkeypatch):
     # Never touch a live repo space under ~/.darkmatter/spaces; tests opt in explicitly.
     monkeypatch.setenv("DARKMATTER_SPACE_DIR", str(tmp_path / "test-space"))
     monkeypatch.setenv("DARKMATTER_SPACE_SYNC_SECONDS", "0")
+    # Tests never announce on the real network; network tests run loopback nodes explicitly.
+    monkeypatch.setenv("DARKMATTER_NETWORK_MODE", "off")

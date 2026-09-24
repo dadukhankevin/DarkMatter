@@ -51,9 +51,26 @@ def start_space_worker(root=None):
     return worker
 
 
+def start_presence_heartbeat(interval: float = 60.0):
+    from darkmatter.mcp.tools import heartbeat_served_sessions
+
+    def loop():
+        while True:
+            time.sleep(interval)
+            heartbeat_served_sessions()
+
+    worker = threading.Thread(target=loop, name="darkmatter-presence", daemon=True)
+    worker.start()
+    return worker
+
+
 async def run_stdio() -> None:
     get_mailbox()
     start_space_worker()
+    start_presence_heartbeat()
+    if os.environ.get("DARKMATTER_NETWORK_MODE") != "off":
+        from darkmatter.network import start_background
+        start_background()
     async with stdio_server() as (read_stream, write_stream):
         await mcp._mcp_server.run(
             read_stream,

@@ -7,14 +7,15 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 MCP_INSTRUCTIONS = """\
-You are a DarkMatter agent. Agents that share a project can find and message each \
-other: sessions on this device directly, and sessions on other machines through \
-the project's own Git remote (whoever can push to it can take part; no key exchange).
+You are a DarkMatter agent. You can find and message other agents: every session on \
+this machine, sessions on other machines on the same password-protected network, and \
+sessions on any machine that can push to this project's Git remote. No key exchange.
 
 WORKING WITH OTHER AGENTS (darkmatter_collaborate, always with your hook's session_id):
-- action=status lists peers on this device and remote_peers on other machines.
+- action=status lists peers (this machine; same_project marks this repo), network_peers
+  (same trusted network) and remote_peers (same repo, other machines).
 - action=join objective="..." announces what you are doing (remote peers see it too).
-- action=send recipient=<peer id> content="..."; ids are 64 hex (this device) or <device>/<session>.
+- action=send recipient=<peer id> content="..."; ids are 64 hex (machine/network) or <device>/<session> (repo).
 - action=read returns your unread mail from both; action=ack ids=[...] only after handling it.
 - action=claim resource=<path> before editing shared files; release when done. Claims are advisory.
 - If status reports remote.configured=false, other machines are not reachable yet. Suggest

@@ -164,7 +164,7 @@ def session_mail_notice(root, session_id, client, git_ids=()):
     from darkmatter.collaboration import BOUNDARY, Collaboration
     from darkmatter.repo_space import RepoSpace, default_space_directory
     board = Collaboration(root, session_id, client)
-    board.join()
+    board.join(availability="idle")  # The waiter doubles as a presence heartbeat while idle.
     ids = [item["id"] for item in board.read()["messages"]]
     space_ids = []
     directory = default_space_directory(root)
