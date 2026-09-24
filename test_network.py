@@ -237,7 +237,7 @@ def test_idle_sessions_stay_discoverable_with_availability(tmp_path, monkeypatch
     import io
     from darkmatter.collaboration_cli import main
     from darkmatter.mcp import tools
-    from darkmatter.wakeup import session_mail_notice
+    from darkmatter.wakeup import session_mail_notice, wait_for_session_activity
     root = tmp_path / "app"
     board = Collaboration(root, "idle-one", "claude-code")
     observer = Collaboration(root, "observer", "codex")
@@ -246,7 +246,9 @@ def test_idle_sessions_stay_discoverable_with_availability(tmp_path, monkeypatch
     main(["hook", "--client", "claude-code"])
     peer = lambda: next(p for p in observer.status()["peers"] if p["id"] == board.agent_id)  # noqa: E731
     assert peer()["availability"] == "busy"
-    session_mail_notice(root, "idle-one", "claude-code")  # The wake waiter's poll.
+    wait_for_session_activity(root, "idle-one", "claude-code", None, 0)  # A wake waiter starts.
+    assert peer()["availability"] == "idle"
+    session_mail_notice(root, "idle-one", "claude-code")  # Its polls keep presence, not availability.
     assert peer()["availability"] == "idle"
     with open_database(board.directory) as db:
         db.execute("UPDATE participants SET seen=0 WHERE id=?", (board.agent_id,))
@@ -255,3 +257,36 @@ def test_idle_sessions_stay_discoverable_with_availability(tmp_path, monkeypatch
     tools.heartbeat_served_sessions()  # An open MCP server keeps its session visible.
     assert peer()["id"] == board.agent_id
     tools._served_sessions.clear()
+
+
+def test_stale_waiter_exits_when_session_works_again(tmp_path):
+    """Regression: an earlier turn's waiter kept marking a working session idle."""
+    import threading
+    from darkmatter.wakeup import wait_for_session_activity
+    root = tmp_path / "app"
+    board = Collaboration(root, "s", "claude-code")
+    sender = Collaboration(root, "sender", "codex")
+    result = {}
+    waiter = threading.Thread(target=lambda: result.update(
+        text=wait_for_session_activity(root, "s", "claude-code", None, 30)))
+    waiter.start()
+    _until(lambda: board.status()["self"] and next(
+        p for p in sender.status()["peers"] if p["id"] == board.agent_id)["availability"] == "idle")
+    board.join(availability="busy")  # The user's next prompt: a host hook fires.
+    waiter.join(10)
+    assert not waiter.is_alive() and result["text"] is None
+    sender.send(board.agent_id, "arrives while busy")
+    time.sleep(2.5)
+    peer = next(p for p in sender.status()["peers"] if p["id"] == board.agent_id)
+    assert peer["availability"] == "busy"  # Nothing flipped it back to idle.
+
+
+def test_waiter_does_not_mark_a_just_active_session_idle(tmp_path):
+    from darkmatter.wakeup import wait_for_session_activity
+    root = tmp_path / "app"
+    board = Collaboration(root, "s", "claude-code")
+    board.join(availability="busy")
+    started = time.time() - 5  # A waiter launched before the latest activity.
+    board.mark_idle(started)
+    assert board.active_since(started)
+    assert wait_for_session_activity(root, "s", "claude-code", None, 0) is None

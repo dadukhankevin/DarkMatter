@@ -164,7 +164,7 @@ def session_mail_notice(root, session_id, client, git_ids=()):
     from darkmatter.collaboration import BOUNDARY, Collaboration
     from darkmatter.repo_space import RepoSpace, default_space_directory
     board = Collaboration(root, session_id, client)
-    board.join(availability="idle")  # The waiter doubles as a presence heartbeat while idle.
+    board.join()  # The waiter doubles as a presence heartbeat while the session is idle.
     ids = [item["id"] for item in board.read()["messages"]]
     space_ids = []
     directory = default_space_directory(root)
@@ -217,8 +217,13 @@ def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds
     if not 0 <= timeout <= 3600:
         raise ValueError("Wait timeout must be between zero and 3600 seconds")
     deadline = time.monotonic() + timeout
+    from darkmatter.collaboration import Collaboration
+    board, started = Collaboration(root, session_id, client), time.time()
+    board.mark_idle(started)
     while True:
-        if session_is_paused(root, session_id):
+        # Hosts may keep an earlier turn's waiter alive into the next turn. Once
+        # the session is working again, this waiter is stale: stop, don't wake it.
+        if board.active_since(started) or session_is_paused(root, session_id):
             return None
         if mailbox is not None:
             mailbox.sync(True)

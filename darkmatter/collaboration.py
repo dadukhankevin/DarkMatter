@@ -63,6 +63,8 @@ def _ensure_schema(db) -> None:
     columns = {row[1] for row in db.execute("PRAGMA table_info(participants)")}
     if "availability" not in columns:
         db.execute("ALTER TABLE participants ADD COLUMN availability TEXT DEFAULT 'unknown'")
+    if "active_at" not in columns:  # Last time a host hook saw the session working.
+        db.execute("ALTER TABLE participants ADD COLUMN active_at REAL DEFAULT 0")
     columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
     # origin: local | network-in | network-out | network-receipt; route: peer device.
     for name, kind in (("origin", "TEXT DEFAULT 'local'"), ("route", "TEXT DEFAULT ''"),
@@ -208,8 +210,21 @@ class Collaboration:
                        "availability=COALESCE(?, participants.availability)",
                        (self.agent_id, self.identity, str(self.root), self.client,
                         objective or "", time.time(), availability or "unknown", objective, availability))
+            if availability == "busy":
+                db.execute("UPDATE participants SET active_at=? WHERE id=?", (time.time(), self.agent_id))
         return {"id": self.agent_id, "session_id": self.session_id,
                 "client": self.client, "workspace": str(self.root)}
+
+    def mark_idle(self, since: float) -> None:
+        """Mark idle unless a hook has seen the session working since `since`."""
+        with self._db() as db:
+            db.execute("UPDATE participants SET availability='idle', seen=? WHERE id=? "
+                       "AND COALESCE(active_at, 0) <= ?", (time.time(), self.agent_id, since))
+
+    def active_since(self, since: float) -> bool:
+        with self._db() as db:
+            row = db.execute("SELECT active_at FROM participants WHERE id=?", (self.agent_id,)).fetchone()
+        return bool(row and (row["active_at"] or 0) > since)
 
     def status(self, scope: str = "workspace") -> dict:
         if scope not in ("workspace", "repo", "device"):
