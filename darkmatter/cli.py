@@ -86,11 +86,8 @@ def _trust(argv: list[str]) -> int:
     else:
         current = classify_network()
         fingerprint = trust.network_fingerprint(current)
-        result = {"success": True, **trust.summary(directory),
-                  "network_verdict": trust.network_verdict(directory, fingerprint),
-                  "network": {"kind": current.get("kind"), "detail": current.get("detail")}}
-        if result["network_verdict"] == "unjudged":
-            result["judge"] = trust.JUDGE_NETWORK
+        result = {"success": True, **trust.summary(directory, fingerprint),
+                  "current_network": {"kind": current.get("kind"), "detail": current.get("detail")}}
     print(json.dumps(result, indent=2))
     return 0 if result.get("success") else 1
 

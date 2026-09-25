@@ -154,10 +154,14 @@ def current_fingerprint(directory) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def summary(directory) -> dict:
-    """What this machine currently trusts, for status output and hooks."""
+def summary(directory, fingerprint: str | None = None) -> dict:
+    """What this machine currently trusts, for status output and hooks.
+
+    Without a fingerprint, the running network node's last report identifies
+    the network.
+    """
     data = load(directory)
-    fingerprint = current_fingerprint(directory)
+    fingerprint = fingerprint or current_fingerprint(directory)
     verdict = network_verdict(directory, fingerprint)
     result = {
         "local": data["local"],
