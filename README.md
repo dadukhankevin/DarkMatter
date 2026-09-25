@@ -99,8 +99,12 @@ is `--match host=mac-mini --mode any`.
   remote's `darkmatter/mail/**` branches, so the Git host's push permission is
   the only credential.
 
-**How fast.** Local delivery is immediate. Network delivery is direct TCP,
-usually within a second. Remote `send` pushes right away.
+**How fast.** Local delivery is immediate. Network `send` opens a TCP connection
+to the other machine right away and returns `delivered`, or `queued` with the
+exact error (the node keeps retrying). Each delivery carries the sender's signed
+session list, so it doesn't depend on the other machine having heard a
+broadcast first. Discovery uses multicast plus subnet broadcast, because many
+routers drop one of them. Remote `send` pushes right away.
 While any MCP session is open, a background worker polls every 15 seconds
 (`DARKMATTER_SPACE_SYNC_SECONDS`, `0` disables it). Each poll is a single
 `ls-remote`. Only changed mail branches are fetched, and a push happens only
@@ -145,8 +149,8 @@ run.
 
 Local state lives in `~/.darkmatter/local` (`DARKMATTER_LOCAL_DIR`), and
 per-repo device state in `~/.darkmatter/spaces` (`DARKMATTER_SPACE_DIR`), both
-private to the OS account. Local presence expires after ten minutes without
-activity. Messages expire after seven days. Limits: 128 pending messages per
+private to the OS account. Sessions stay listed until they end, or after four
+hours with no activity. Messages expire after seven days. Limits: 128 pending messages per
 recipient, 16 KiB per message, and 32 devices per repo. Installation never
 rewrites client configuration on its own, and `space init` never runs
 implicitly. See [repo spaces](docs/repo-spaces.md) for membership policies,
@@ -588,6 +592,7 @@ Protect `.darkmatter/passport`, use private hosted repositories when metadata ma
 darkmatter                         # print identity, visibility, and locators
 darkmatter install-mcp --all --collaborate  # MCP + session hooks for every client
 darkmatter network status            # is this network shared, and who is on it
+darkmatter network doctor            # test every peer (UDP + TCP) and show why queued mail waits
 darkmatter network auto|on|off       # password-protected only (default) / always / never
 darkmatter network run               # run the network node without an MCP server
 darkmatter space init                # reach this project's agents on other machines

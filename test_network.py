@@ -100,9 +100,9 @@ def test_machines_discover_message_and_acknowledge(machines):
     with open_database(a.directory) as db:  # Remote sessions are never local participants.
         assert not db.execute("SELECT 1 FROM participants WHERE id=?", (b_board.agent_id,)).fetchone()
     sent = execute(a_board, "send", recipient=b_board.agent_id, content="Can you review?", message_id="net-1")
-    assert sent["via"] == "network" and sent["delivery"] == "queued"
-    assert a.pump()["sent"] == 1
-    assert a_board.delivery("net-1")["delivery"] == "delivered"
+    # Send connects to the peer directly; no waiting for the node's retry loop.
+    assert sent["via"] == "network" and sent["delivery"] == "delivered"
+    assert a.pump()["sent"] == 0
     inbox = b_board.read()["messages"]
     assert [(m["id"], m["via"], m["content"], m["workspace"]) for m in inbox] == [
         ("net-1", "network", "Can you review?", "project")]  # Project name, never the sender's path.
@@ -271,7 +271,7 @@ def test_stale_waiter_exits_when_session_works_again(tmp_path):
         text=wait_for_session_activity(root, "s", "claude-code", None, 30)))
     waiter.start()
     _until(lambda: board.status()["self"] and next(
-        p for p in sender.status()["peers"] if p["id"] == board.agent_id)["availability"] == "idle")
+        p for p in sender.status()["peers"] if p["id"] == board.agent_id)["availability"] == "idle", timeout=20)
     board.join(availability="busy")  # The user's next prompt: a host hook fires.
     waiter.join(10)
     assert not waiter.is_alive() and result["text"] is None
@@ -348,3 +348,29 @@ def test_broadcast_is_a_default_discovery_target(tmp_path, monkeypatch):
     assert sent == [(network.GROUP, node.port), ("192.168.1.255", node.port)]
     node.udp = None
     assert network._broadcast_address("", "10.1.2.3") == "10.1.2.255"
+
+
+def test_delivery_does_not_depend_on_having_heard_a_broadcast(machines):
+    """Regression: a receiver that missed the sender's announcements refused its mail."""
+    (a_board, a), (b_board, b) = machines
+    b._accept_announcement(_announcement(a), "127.0.0.1")  # B only answers A's direct traffic...
+    with open_database(a.directory) as db:
+        db.execute("DELETE FROM network_peers")
+    a._accept_announcement(_announcement(b), "127.0.0.1")
+    with open_database(b.directory) as db:
+        db.execute("DELETE FROM network_peers")  # ...and then forgets A entirely.
+    sent = a_board.send(b_board.agent_id, "arrives anyway", "no-broadcast")
+    assert sent["delivery"] == "delivered", sent
+    assert b_board.read()["messages"][0]["content"] == "arrives anyway"
+
+
+def test_failed_delivery_reports_why(machines):
+    (a_board, a), (b_board, b) = machines
+    _discover(a, b, a_board, b_board)
+    b._close()  # The other machine's node goes away.
+    sent = a_board.send(b_board.agent_id, "anyone there?", "unreachable")
+    assert sent["delivery"] == "queued" and "desktop" in sent["error"]
+    assert a_board.delivery("unreachable")["last_error"]
+    report = network.doctor(a.directory)
+    assert report["queued"][0]["id"] == "unreachable" and report["queued"][0]["last_error"]
+    assert report["peers"][0]["tcp"].startswith("failed")

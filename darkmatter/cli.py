@@ -284,7 +284,7 @@ def _network(argv: list[str]) -> int:
         prog="darkmatter network",
         description="Share agents with other machines on password-protected networks.",
     )
-    parser.add_argument("action", choices=("status", "auto", "on", "off", "run"), nargs="?", default="status",
+    parser.add_argument("action", choices=("status", "doctor", "auto", "on", "off", "run"), nargs="?", default="status",
                         help="auto (default): only WPA Wi-Fi or wired; on: every network; off: never")
     args = parser.parse_args(argv)
 
@@ -296,6 +296,8 @@ def _network(argv: list[str]) -> int:
         result["note"] = {"auto": "Shared only on password-protected Wi-Fi and wired networks.",
                           "on": "Shared on every network, including open Wi-Fi.",
                           "off": "Not shared on any network."}[args.action]
+    elif args.action == "doctor":
+        result = network.doctor()
     elif args.action == "run":
         print(json.dumps({"running": True, "note": "Ctrl-C to stop"}), flush=True)
         try:

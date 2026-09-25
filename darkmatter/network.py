@@ -275,7 +275,141 @@ class _RateLimiter:
 
 # ------------------------------------------------------------------------- node
 
-class NetworkNode:
+class _Endpoint:
+    """This machine's signed identity on the network: roster, announcements, deliveries.
+
+    Any process can use it (a sender delivering immediately); the node adds sockets.
+    """
+
+    def __init__(self, directory=None):
+        self.directory = local_directory(directory)
+        self.private, self.device = device_key(self.directory)
+        self.host = host_name()[:128]
+        state = read_state(self.directory)
+        self.tcp_port = state.get("tcp_port", 0) if state.get("running") else 0
+
+    def _roster(self) -> list[dict]:
+        with open_database(self.directory) as db:
+            rows = db.execute("SELECT id, workspace, client, objective, objective_at, availability, facts "
+                              "FROM participants "
+                              "WHERE seen > ? ORDER BY seen DESC LIMIT ?",
+                              (time.time() - PRESENCE_SECONDS, MAX_SESSIONS)).fetchall()
+        return [{"id": row["id"], "client": (row["client"] or "")[:80],
+                 "objective": (row["objective"] or "")[:512], "project": Path(row["workspace"]).name[:128],
+                 "availability": row["availability"] if row["availability"] in ("busy", "idle") else "unknown",
+                 "objective_at": row["objective_at"] or 0, "facts": self._facts(row["facts"])}
+                for row in rows]
+
+    @staticmethod
+    def _facts(raw: str) -> dict:
+        try:
+            facts = json.loads(raw or "{}")
+        except ValueError:
+            return {}
+        return facts if valid_facts(facts) else {}
+
+    def _announcement(self) -> bytes:
+        sessions = self._roster()
+        while True:
+            payload = {"p": PROTOCOL, "t": "announce", "device": self.device, "host": self.host,
+                       "port": self.tcp_port, "ts": time.time(), "nonce": uuid.uuid4().hex,
+                       "sessions": sessions}
+            payload["sig"] = sign_payload(self.private, ANNOUNCE_DOMAIN, _json(payload))
+            raw = _json(payload).encode()
+            if len(raw) <= MAX_PACKET or not sessions:
+                return raw
+            sessions = sessions[:-1]
+
+    def _request(self, address: str, port: int, items: list) -> dict:
+        request = {"p": PROTOCOL, "t": "deliver", "device": self.device, "ts": time.time(),
+                   "nonce": uuid.uuid4().hex, "items": items}
+        if self.tcp_port:
+            # Carry our signed roster so the receiver never depends on having heard a broadcast.
+            request["announcement"] = json.loads(self._announcement())
+        request["sig"] = sign_payload(self.private, DELIVER_DOMAIN, _json(request))
+        with socket.create_connection((address, port), timeout=3) as conn:
+            conn.settimeout(5)
+            conn.sendall(_json(request).encode() + b"\n")
+            data = b""
+            while b"\n" not in data and len(data) <= 65536:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        response = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+        if not isinstance(response, dict) or response.get("p") != PROTOCOL or not response.get("ok"):
+            raise ValueError(str(response.get("error") if isinstance(response, dict) else "bad response"))
+        return response
+
+
+
+
+def deliver_pending(endpoint, *, route: str | None = None, backoff: dict | None = None) -> dict:
+    """Deliver queued network mail and receipts, recording the exact error on failure."""
+    with open_database(endpoint.directory) as db:
+        query = ("SELECT * FROM messages WHERE origin IN ('network-out', 'network-receipt') "
+                 "AND delivered=0 AND acknowledged=0 AND expires>?")
+        args: list = [time.time()]
+        if route:
+            query, args = query + " AND route=?", args + [route]
+        rows = db.execute(query + " ORDER BY created LIMIT 256", args).fetchall()
+        peers = {row["device"]: row for row in db.execute(
+            "SELECT * FROM network_peers WHERE seen > ?", (time.time() - PEER_SECONDS,))}
+    routes: dict[str, list] = {}
+    for row in rows:
+        routes.setdefault(row["route"], []).append(row)
+    sent, errors = 0, {}
+    for device, batch in routes.items():
+        batch = batch[:MAX_ITEMS]
+        peer = peers.get(device)
+        retry_at, delay = (backoff or {}).get(device, (0.0, 1.0))
+        if backoff is not None and time.monotonic() < retry_at:
+            continue
+        error = None
+        if peer is None:
+            error = "that machine has not been heard on this network in the last 45 seconds"
+        else:
+            items = [{"kind": "receipt", "id": json.loads(row["envelope"])["message_id"], "from": row["sender"]}
+                     if row["origin"] == "network-receipt"
+                     else {"kind": "message", "envelope": json.loads(row["envelope"])["envelope"]}
+                     for row in batch]
+            try:
+                response = endpoint._request(peer["address"], peer["port"], items)
+            except (OSError, ValueError) as exc:
+                error = f"{peer['host']} ({peer['address']}:{peer['port']}): {exc or type(exc).__name__}"
+        if error:
+            errors[device] = error
+            if backoff is not None:
+                backoff[device] = (time.monotonic() + delay, min(delay * 2, 60.0))
+            with open_database(endpoint.directory) as db:
+                db.executemany("UPDATE messages SET last_error=? WHERE id=?", [(error, row["id"]) for row in batch])
+            continue
+        if backoff is not None:
+            backoff.pop(device, None)
+        accepted, rejected = set(response.get("accepted", [])), response.get("rejected", {})
+        with open_database(endpoint.directory) as db:
+            for row in batch:
+                if row["origin"] == "network-receipt":
+                    # Receipts are best effort: delivered or refused, never retried forever.
+                    db.execute("DELETE FROM messages WHERE id=?", (row["id"],))
+                elif row["id"] in accepted:
+                    db.execute("UPDATE messages SET delivered=1, last_error='' WHERE id=?", (row["id"],))
+                    sent += 1
+                elif row["id"] in rejected:
+                    db.execute("UPDATE messages SET delivered=2, last_error=? WHERE id=?",
+                               (str(rejected[row["id"]])[:200], row["id"]))
+    return {"sent": sent, "errors": errors}
+
+
+def deliver_now(directory=None, route: str | None = None) -> dict:
+    """Called right after a send: connect to the peer directly instead of waiting for the node."""
+    state = read_state(directory)
+    if not state.get("running") or not state.get("trusted"):
+        return {"sent": 0, "errors": {"network": state.get("reason") or "network sharing is not active"}}
+    return deliver_pending(_Endpoint(directory), route=route)
+
+
+class NetworkNode(_Endpoint):
     """Announce local sessions, learn peers, and move mail on a trusted network."""
 
     def __init__(self, directory=None, *, classify=classify_network, group=GROUP, port=PORT,
@@ -396,39 +530,6 @@ class NetworkNode:
         self.udp = self.tcp = None
         self.address, self._threads, self.tcp_port = None, [], 0
 
-    # -- discovery
-    def _roster(self) -> list[dict]:
-        with open_database(self.directory) as db:
-            rows = db.execute("SELECT id, workspace, client, objective, objective_at, availability, facts "
-                              "FROM participants "
-                              "WHERE seen > ? ORDER BY seen DESC LIMIT ?",
-                              (time.time() - PRESENCE_SECONDS, MAX_SESSIONS)).fetchall()
-        return [{"id": row["id"], "client": (row["client"] or "")[:80],
-                 "objective": (row["objective"] or "")[:512], "project": Path(row["workspace"]).name[:128],
-                 "availability": row["availability"] if row["availability"] in ("busy", "idle") else "unknown",
-                 "objective_at": row["objective_at"] or 0, "facts": self._facts(row["facts"])}
-                for row in rows]
-
-    @staticmethod
-    def _facts(raw: str) -> dict:
-        try:
-            facts = json.loads(raw or "{}")
-        except ValueError:
-            return {}
-        return facts if valid_facts(facts) else {}
-
-    def _announcement(self) -> bytes:
-        sessions = self._roster()
-        while True:
-            payload = {"p": PROTOCOL, "t": "announce", "device": self.device, "host": self.host,
-                       "port": self.tcp_port, "ts": time.time(), "nonce": uuid.uuid4().hex,
-                       "sessions": sessions}
-            payload["sig"] = sign_payload(self.private, ANNOUNCE_DOMAIN, _json(payload))
-            raw = _json(payload).encode()
-            if len(raw) <= MAX_PACKET or not sessions:
-                return raw
-            sessions = sessions[:-1]
-
     def _send(self, message: dict | bytes, targets=None) -> None:
         if self.udp is None:
             return
@@ -546,6 +647,9 @@ class NetworkNode:
         unsigned = {k: v for k, v in request.items() if k != "sig"}
         if not verify_signed_payload(device, request.get("sig", ""), DELIVER_DOMAIN, _json(unsigned)):
             return {**refuse, "error": "bad signature"}
+        announcement = request.get("announcement")
+        if isinstance(announcement, dict) and announcement.get("device") == device:
+            self._accept_announcement(announcement, address)  # Validated and signature-checked there.
         accepted, receipts, rejected = [], [], {}
         with open_database(self.directory) as db:
             peer = db.execute("SELECT * FROM network_peers WHERE device=? AND seen > ?",
@@ -604,62 +708,51 @@ class NetworkNode:
 
     # -- delivery (sending side)
     def pump(self) -> dict:
-        """Deliver queued network mail and receipts; failures back off per device."""
-        with open_database(self.directory) as db:
-            rows = db.execute("SELECT * FROM messages WHERE origin IN ('network-out', 'network-receipt') "
-                              "AND delivered=0 AND acknowledged=0 AND expires>? ORDER BY created LIMIT 256",
-                              (time.time(),)).fetchall()
-            peers = {row["device"]: row for row in db.execute(
-                "SELECT * FROM network_peers WHERE seen > ?", (time.time() - PEER_SECONDS,))}
-        routes: dict[str, list] = {}
-        for row in rows:
-            routes.setdefault(row["route"], []).append(row)
-        sent = 0
-        for device, batch in routes.items():
-            peer, (retry_at, delay) = peers.get(device), self.backoff.get(device, (0.0, 1.0))
-            if peer is None or time.monotonic() < retry_at:
-                continue
-            batch = batch[:MAX_ITEMS]
-            items = [{"kind": "receipt", "id": json.loads(row["envelope"])["message_id"], "from": row["sender"]}
-                     if row["origin"] == "network-receipt"
-                     else {"kind": "message", "envelope": json.loads(row["envelope"])["envelope"]}
-                     for row in batch]
-            try:
-                response = self._request(peer["address"], peer["port"], items)
-            except (OSError, ValueError):
-                self.backoff[device] = (time.monotonic() + delay, min(delay * 2, 60.0))
-                continue
-            self.backoff.pop(device, None)
-            accepted, rejected = set(response.get("accepted", [])), response.get("rejected", {})
-            with open_database(self.directory) as db:
-                for row in batch:
-                    if row["origin"] == "network-receipt":
-                        # Receipts are best effort: delivered or refused, never retried forever.
-                        db.execute("DELETE FROM messages WHERE id=?", (row["id"],))
-                    elif row["id"] in accepted:
-                        db.execute("UPDATE messages SET delivered=1 WHERE id=?", (row["id"],))
-                        sent += 1
-                    elif row["id"] in rejected:
-                        db.execute("UPDATE messages SET delivered=2 WHERE id=?", (row["id"],))
-        return {"sent": sent}
+        """Retry queued network mail; failures back off per device and record their error."""
+        return deliver_pending(self, backoff=self.backoff)
 
-    def _request(self, address: str, port: int, items: list) -> dict:
-        request = {"p": PROTOCOL, "t": "deliver", "device": self.device, "ts": time.time(),
-                   "nonce": uuid.uuid4().hex, "items": items}
-        request["sig"] = sign_payload(self.private, DELIVER_DOMAIN, _json(request))
-        with socket.create_connection((address, port), timeout=3) as conn:
-            conn.settimeout(5)
-            conn.sendall(_json(request).encode() + b"\n")
-            data = b""
-            while b"\n" not in data and len(data) <= 65536:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-        response = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
-        if not isinstance(response, dict) or response.get("p") != PROTOCOL or not response.get("ok"):
-            raise ValueError(str(response.get("error") if isinstance(response, dict) else "bad response"))
-        return response
+
+def doctor(directory=None) -> dict:
+    """Check every step directly: policy, local node, each peer (UDP + TCP), queued mail."""
+    mode, current = get_mode(directory), classify_network()
+    allowed, reason = decide(mode, current)
+    state = read_state(directory)
+    report = {"mode": mode, "network": current, "sharing": allowed, "reason": reason,
+              "node": {"running": bool(state.get("running")), "address": state.get("address"),
+                       "tcp_port": state.get("tcp_port")},
+              "peers": [], "queued": []}
+    with open_database(directory) as db:
+        peers = [dict(r) for r in db.execute("SELECT device, host, address, port, seen FROM network_peers")]
+        queued = [dict(r) for r in db.execute(
+            "SELECT id, route, last_error, created FROM messages WHERE origin='network-out' AND delivered=0 "
+            "AND acknowledged=0 AND expires>? ORDER BY created LIMIT 20", (time.time(),))]
+    for peer in peers:
+        entry = {"host": peer["host"], "address": f"{peer['address']}:{peer['port']}",
+                 "last_heard_seconds": round(time.time() - peer["seen"])}
+        try:
+            with socket.create_connection((peer["address"], peer["port"]), timeout=2):
+                entry["tcp"] = "ok"
+        except OSError as exc:
+            entry["tcp"] = f"failed: {exc}"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.settimeout(2)
+                probe.sendto(_json({"p": PROTOCOL, "t": "probe", "device": "0" * 64}).encode(),
+                             (peer["address"], PORT))
+                probe.recvfrom(MAX_PACKET)
+            entry["udp_probe"] = "answered"
+        except OSError as exc:
+            entry["udp_probe"] = f"no answer: {exc or 'timeout'}"
+        report["peers"].append(entry)
+    hosts = {p["device"]: p["host"] for p in peers}
+    for row in queued:
+        report["queued"].append({"id": row["id"], "to_machine": hosts.get(row["route"], row["route"][:12]),
+                                 "waiting_seconds": round(time.time() - row["created"]),
+                                 "last_error": row["last_error"] or "not attempted yet"})
+    if not report["peers"]:
+        report["hint"] = ("No machines heard. The other machine needs DarkMatter 3.14+ with an MCP client or "
+                          "`darkmatter network run` running; run `darkmatter network doctor` there too.")
+    return report
 
 
 def run_if_leader(directory=None, stop: threading.Event | None = None, **options) -> bool:
