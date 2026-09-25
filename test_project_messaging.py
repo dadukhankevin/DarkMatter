@@ -182,3 +182,22 @@ def test_selector_reaches_repo_peers_and_file_churn_does_not_push(machines, monk
     desk._save(state)
     message = execute(reviewer, 'read')['messages'][0]
     assert message['addressed']['mode'] == 'any' and message['addressed']['match'] == {'branch': 'review'}
+
+
+def test_repo_peers_on_old_versions_are_flagged(machines, monkeypatch):
+    laptop, desktop = machines['laptop'], machines['desktop']
+    _use(monkeypatch, desktop)
+    desk = RepoSpace(desktop['space'])
+    desk.register('old', 'cursor')
+    desk.sync()
+    import darkmatter.repo_space as module
+    _use(monkeypatch, laptop)
+    lap = RepoSpace(laptop['space'])
+    lap.sync()
+    state = lap._load()
+    for sessions in state['peer_sessions'].values():
+        for member in sessions.values():
+            member.pop('host', None)  # What a pre-3.15 machine publishes.
+    lap._save(state)
+    assert 'older than 3.15' in lap.remote_sessions()[0]['outdated']
+    assert module.project_name('x.git') == 'x'

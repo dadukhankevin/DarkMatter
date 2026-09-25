@@ -34,6 +34,9 @@ def repo_space(root):
     return RepoSpace(directory) if (directory / "state.json").is_file() else None
 
 
+NETWORK_HINT = ("No other machines found on this network. Each machine needs DarkMatter 3.14 or later "
+                "with an MCP client (or `darkmatter network run`) running; check `darkmatter network status` "
+                "on it. macOS may need Local Network permission for Python. No connection request is needed.")
 MATCH_KEYS = ("host", "project", "client", "branch", "session")
 MAX_FANOUT = 16
 _TIER = {"local": 0, "network": 1, "remote": 2}
@@ -93,8 +96,10 @@ def execute(board, action, *, scope="device", objective=None, recipient=None,
         if scope != "workspace":
             state, lan = network_sessions(board.directory)
             result["network_peers"] = lan
-            result["network"] = {"active": bool(state.get("running") and state.get("trusted")),
-                                 "reason": state.get("reason"), "mode": state.get("mode", "auto")}
+            active = bool(state.get("running") and state.get("trusted"))
+            result["network"] = {"active": active, "reason": state.get("reason"), "mode": state.get("mode", "auto")}
+            if active and not lan:
+                result["network"]["hint"] = NETWORK_HINT
             if space is None:
                 result["remote"] = {"configured": False, "hint": REMOTE_HINT}
             else:

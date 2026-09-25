@@ -180,7 +180,7 @@ def _wallet_ctx(result: dict, network: str) -> str:
     },
 )
 async def connection(params: ConnectionInput, ctx: Context) -> str:
-    """Introduce, accept, ignore, or close a relationship using signed contact cards."""
+    """Independent agents only (passport mail). Agents on this machine, your network, or this repo need no connection: use darkmatter_collaborate. Introduce, accept, ignore, or close a passport relationship using signed contact cards."""
     track_session(ctx)
     mb = get_mailbox()
 
@@ -319,7 +319,7 @@ async def public_agent(params: PublicInput, ctx: Context) -> str:
     },
 )
 async def send_message(params: SendMessageInput, ctx: Context) -> str:
-    """Send a sealed message to a peer you have an active relationship with."""
+    """Independent agents only (passport mail). Agents on this machine, your network, or this repo need no connection: use darkmatter_collaborate. Send a sealed message to a passport peer you have an active relationship with."""
     track_session(ctx)
     mb = get_mailbox()
     targets: list[str] = []
@@ -435,12 +435,19 @@ async def maintain(params: MaintainInput, ctx: Context) -> str:
     },
 )
 async def nearby(timeout_seconds: float = 1.0, ctx: Context = None) -> str:
-    """Find signed contact cards on this machine and LAN without connecting."""
+    """Independent agents only (passport mail). Agents on this machine, your network, or this repo need no connection: use darkmatter_collaborate. Find signed passport contact cards on this machine and LAN without connecting."""
     if ctx is not None:
         track_session(ctx)
     if timeout_seconds < 0 or timeout_seconds > 5:
         return _ctx({"success": False, "error": "timeout_seconds must be between 0 and 5"})
     result = await asyncio.to_thread(get_mailbox().nearby, timeout_seconds)
+    from darkmatter.collaboration import network_sessions
+    _, sessions = await asyncio.to_thread(network_sessions)
+    # Agents looking for machines on their network belong in collaborate, not passport flows.
+    result["network_sessions"] = [{"id": c["id"], "label": c["label"]} for c in sessions]
+    result["note"] = ("network_sessions are reachable now with darkmatter_collaborate action=send; "
+                      "no introduction or connection request is needed. Passport cards above are "
+                      "for independent agents only.")
     return _ctx(result)
 
 
@@ -794,7 +801,7 @@ async def update_bio(params: UpdateBioInput, ctx: Context) -> str:
     },
 )
 async def contact_card(ctx: Context) -> str:
-    """Return your signed contact card and available mailbox locators."""
+    """Independent agents only (passport mail). Agents on this machine, your network, or this repo need no connection: use darkmatter_collaborate. Return your signed passport contact card and available mailbox locators."""
     track_session(ctx)
     mb = get_mailbox()
     loc = mb.locators()
@@ -817,7 +824,7 @@ async def contact_card(ctx: Context) -> str:
     },
 )
 async def list_connections(ctx: Context) -> str:
-    """List relationships (peer id, locator, state, trust). Syncs mailboxes first."""
+    """Independent agents only (passport mail). Agents on this machine, your network, or this repo need no connection: use darkmatter_collaborate. List passport relationships (peer id, locator, state, trust). Syncs mailboxes first."""
     track_session(ctx)
     mb = get_mailbox()
     sync = await asyncio.to_thread(mb.sync)
@@ -849,7 +856,7 @@ async def wait_for_message(
     timeout_seconds: float = 3600,
     ctx: Context = None,
 ) -> str:
-    """Fetch remotes until a new inbox message arrives, then consume it."""
+    """Independent agents only (passport mail). Agents on this machine, your network, or this repo need no connection: use darkmatter_collaborate. Fetch passport remotes until a new inbox message arrives, then consume it."""
     if ctx is not None:
         track_session(ctx)
     mb = get_mailbox()

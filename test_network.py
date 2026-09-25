@@ -307,3 +307,18 @@ def test_selector_reaches_a_machine_by_name_and_card_crosses_network(machines):
     message = execute(b_board, "read")["messages"][0]
     assert message["addressed"] == {"mode": "any", "match": {"host": "desktop"}, "matched": 1}
     assert message["via"] == "network"
+
+
+def test_status_explains_an_empty_network_and_flags_outdated_repo_peers(machines, tmp_path):
+    (a_board, a), _ = machines
+    status = execute(a_board, "status")
+    assert status["network"]["active"] and status["network_peers"] == []
+    assert "3.14 or later" in status["network"]["hint"] and "No connection request" in status["network"]["hint"]
+
+
+def test_agents_are_told_never_to_use_connection_requests_for_their_own_agents():
+    from darkmatter.mcp import MCP_INSTRUCTIONS
+    from darkmatter.mcp import tools
+    assert "NEVER need" in MCP_INSTRUCTIONS and "connection requests" in MCP_INSTRUCTIONS
+    for name in ("nearby", "connection", "send_message", "list_connections", "wait_for_message", "contact_card"):
+        assert "use darkmatter_collaborate" in getattr(tools, name).__doc__

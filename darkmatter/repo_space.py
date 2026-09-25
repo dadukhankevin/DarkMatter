@@ -389,7 +389,10 @@ class RepoSpace:
                                     "objective_at": member.get("objective_at") or 0,
                                     "facts": member.get("facts") or {}, "host": member.get("host") or "",
                                     "project": project_name(state["remote"]),
-                                    "seen": member.get("seen"), "where": "remote"}))
+                                    "seen": member.get("seen"), "where": "remote",
+                                    **({} if "host" in member and member["host"] is not None else
+                                       {"outdated": "That machine runs DarkMatter older than 3.15: no cards, "
+                                                    "and no network discovery before 3.14. Upgrade it."})}))
         return sorted(found, key=lambda item: -(item["seen"] or 0))[:100]
 
     def has_incoming(self, message_id: str):
