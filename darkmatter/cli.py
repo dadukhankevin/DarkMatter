@@ -56,6 +56,45 @@ def _wait_hook(argv: list[str]) -> int:
     return 2
 
 
+def _trust(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="darkmatter trust",
+        description="Choose which agents act with the user's authority: this machine's, and this network's.",
+    )
+    sub = parser.add_subparsers(dest="scope")
+    sub.add_parser("status", help="Show what this machine trusts")
+    local = sub.add_parser("local", help="Trust agents on this machine (on by default)")
+    local.add_argument("setting", choices=("on", "off"))
+    network = sub.add_parser("network", help="Judge the current network")
+    network.add_argument("verdict", choices=("home", "public"))
+    args = parser.parse_args(argv)
+
+    from darkmatter import trust
+    from darkmatter.collaboration import local_directory
+    from darkmatter.network import classify_network
+
+    directory = local_directory()
+    if args.scope == "local":
+        result = trust.set_local(directory, args.setting == "on")
+    elif args.scope == "network":
+        current = classify_network()
+        result = trust.set_network_verdict(
+            directory, args.verdict, current, trust.network_fingerprint(current),
+        )
+        if result.get("success"):
+            result["note"] = "The running network node applies this within a few seconds."
+    else:
+        current = classify_network()
+        fingerprint = trust.network_fingerprint(current)
+        result = {"success": True, **trust.summary(directory),
+                  "network_verdict": trust.network_verdict(directory, fingerprint),
+                  "network": {"kind": current.get("kind"), "detail": current.get("detail")}}
+        if result["network_verdict"] == "unjudged":
+            result["judge"] = trust.JUDGE_NETWORK
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("success") else 1
+
+
 def _maintain(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="darkmatter maintain",
@@ -360,6 +399,9 @@ def main() -> None:
                   if args.mode == "status" else declare_commitment(mb, args.mode, args.note))
         print(json.dumps(result, indent=2))
         raise SystemExit(0)
+
+    if cmd == "trust":
+        raise SystemExit(_trust(sys.argv[2:]))
 
     if cmd == "install-mcp":
         from darkmatter.installer import main as installer_main

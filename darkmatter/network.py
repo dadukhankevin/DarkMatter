@@ -196,13 +196,15 @@ def set_mode(mode: str, directory=None) -> dict:
     return {"success": True, "mode": mode}
 
 
-def decide(mode: str, network: dict) -> tuple[bool, str]:
+def decide(mode: str, network: dict, verdict: str = "unjudged") -> tuple[bool, str]:
     if mode == "off":
         return False, "network sharing is off (`darkmatter network auto` re-enables it)"
     if not network.get("address"):
         return False, "no local network address"
     if mode == "on":
         return True, "network sharing forced on for every network"
+    if verdict == "public":
+        return False, "this network was judged public (`darkmatter trust network home` to change)"
     if network["kind"] == "wifi-secured":
         return True, f"password-protected Wi-Fi ({network['detail']})"
     if network["kind"] == "wired":
@@ -422,6 +424,7 @@ class NetworkNode(_Endpoint):
         self.host = (host or host_name())[:128]
         self.udp = self.tcp = None
         self.address, self.trusted, self.reason, self.network = None, False, "starting", {}
+        self.fingerprint = None
         self.udp_port = self.tcp_port = 0
         self.rate = _RateLimiter()
         self.slots = threading.Semaphore(MAX_CONNECTIONS)
@@ -463,7 +466,12 @@ class NetworkNode(_Endpoint):
             self.network = self.classify()
         except Exception as exc:  # A classifier failure must fail closed.
             self.network = {"kind": "unknown", "detail": f"classification failed: {type(exc).__name__}", "address": None}
-        trusted, self.reason = decide(mode, self.network)
+        from darkmatter import trust
+        try:
+            self.fingerprint = trust.network_fingerprint(self.network)
+        except Exception:  # An unidentifiable network is simply unjudged.
+            self.fingerprint = None
+        trusted, self.reason = decide(mode, self.network, trust.network_verdict(self.directory, self.fingerprint))
         address = self.network.get("address")
         if trusted and (not self.trusted or address != self.address):
             self._close()
@@ -484,6 +492,7 @@ class NetworkNode(_Endpoint):
         state = {"device": self.device, "host": self.host, "trusted": self.trusted and running,
                  "reason": self.reason, "kind": self.network.get("kind"), "address": self.address,
                  "tcp_port": self.tcp_port, "mode": mode or get_mode(self.directory),
+                 "fingerprint": self.fingerprint,
                  "pid": os.getpid(), "updated": time.time() if running else 0}
         atomic_write_text(self.directory / "network_state.json", _json(state) + "\n", mode=0o600)
 

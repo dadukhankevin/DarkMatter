@@ -327,3 +327,49 @@ def test_cursor_native_hook_uses_stable_conversation_and_workspace(boards, monke
     assert main(["hook", "--client", "cursor"]) == 0
     assert capsys.readouterr().out == ""
     assert not any(c["owner"] == cursor.agent_id for c in a.status()["claims"])
+
+
+def test_local_mail_carries_owner_authority_by_default(boards):
+    from darkmatter.trust import OWNER_BOUNDARY
+    a, b = boards
+    a.send(b.agent_id, "please run the tests", "owner-1")
+    result = b.read()
+    assert result["messages"][0]["authority"] == "owner"
+    assert result["owner_authority"] == OWNER_BOUNDARY
+    assert "trust_boundary" in result  # Non-owner rules are still stated.
+
+
+def test_turning_local_trust_off_demotes_mail_to_peer(boards):
+    from darkmatter import trust
+    a, b = boards
+    trust.set_local(b.directory, False)
+    a.send(b.agent_id, "please run the tests", "peer-1")
+    result = b.read()
+    assert result["messages"][0]["authority"] == "peer"
+    assert "owner_authority" not in result
+
+
+def test_owner_authority_never_covers_destructive_money_secret_or_security_actions():
+    from darkmatter.trust import OWNER_BOUNDARY
+    for phrase in ("deleting data", "spending money", "secrets", "security"):
+        assert phrase in OWNER_BOUNDARY
+    assert "stays untrusted" in OWNER_BOUNDARY
+
+
+def test_repo_and_passport_mail_is_never_owner(tmp_path):
+    from darkmatter import trust
+    state = {"local": True, "network": True, "network_verdict": "home"}
+    assert trust.authority(tmp_path, "repo", state) == "peer"
+    assert trust.authority(tmp_path, "passport", state) == "peer"
+
+
+def test_hook_text_says_owner_mail_is_authorized_only_when_trust_is_on(boards):
+    from darkmatter import trust
+    from darkmatter.collaboration_cli import NOTE, trust_note
+    a, _ = boards
+    assert "authority=owner" in trust_note(a.directory)
+    trust.set_local(a.directory, False)
+    trust.set_network_verdict(a.directory, "public", {"kind": "wired"}, "net-a")
+    import json as _json
+    (a.directory / "network_state.json").write_text(_json.dumps({"fingerprint": "net-a"}))
+    assert trust_note(a.directory) == NOTE

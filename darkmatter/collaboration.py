@@ -307,8 +307,9 @@ class Collaboration:
                 "AND expires>? ORDER BY workspace, resource LIMIT 100", (*workspaces, time.time()))]
             unread = db.execute("SELECT COUNT(*) FROM messages WHERE recipient=? AND acknowledged=0 AND expires>?",
                                 (self.agent_id, time.time())).fetchone()[0]
+        from darkmatter import trust
         return {"success": True, "self": me, "peers": peers, "claims": claims,
-                "unread": unread, "trust_boundary": BOUNDARY,
+                "unread": unread, "trust_boundary": BOUNDARY, "trust": trust.summary(self.directory),
                 "presence_seconds": PRESENCE_SECONDS, "claims_are_advisory": True}
 
     def send(self, recipient: str, content: str, message_id: str | None = None,
@@ -390,6 +391,8 @@ class Collaboration:
             rows = db.execute("SELECT * FROM messages WHERE recipient=? AND acknowledged=0 AND expires>? "
                               "AND origin IN ('local', 'network-in') ORDER BY created, id LIMIT ?",
                               (self.agent_id, time.time(), limit)).fetchall()
+        from darkmatter import trust
+        trusted = trust.summary(self.directory)
         messages, invalid = [], []
         for row in rows:
             try:
@@ -401,11 +404,15 @@ class Collaboration:
                         "addressed": _addressed(env.body.get("addressed"))}
                 if row["origin"] == "network-in":
                     item["via"] = "network"
+                item["authority"] = trust.authority(self.directory, row["origin"], trusted)
                 messages.append(item)
             except (ValueError, KeyError, TypeError):
                 invalid.append(row["id"])
-        return {"success": True, "messages": messages, "invalid": invalid,
-                "ack_required": True, "trust_boundary": BOUNDARY}
+        result = {"success": True, "messages": messages, "invalid": invalid,
+                  "ack_required": True, "trust_boundary": BOUNDARY}
+        if any(item["authority"] == "owner" for item in messages):
+            result["owner_authority"] = trust.OWNER_BOUNDARY
+        return result
 
     def ack(self, ids: list[str]) -> dict:
         if not isinstance(ids, list) or len(ids) > MAX_PENDING or any(not isinstance(i, str) for i in ids):

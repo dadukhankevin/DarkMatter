@@ -203,8 +203,9 @@ def session_mail_notice(root, session_id, client, git_ids=()):
         saved["ids"].update({key: now + 7 * 86400 for key in new})
         saved["attempts"].append(now)
         atomic_write_text(path, json.dumps(saved), mode=0o600)
+    from darkmatter import trust
     notice = {"session_id": session_id, "client": client, "unread_ids": ids + space_ids,
-              "trust_boundary": BOUNDARY,
+              "trust_boundary": BOUNDARY, "trust": trust.summary(board.directory),
               "next_step": "Read with darkmatter_collaborate action=read using this session_id; "
                            "acknowledge only after handling."}
     if git_ids:

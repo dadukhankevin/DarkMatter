@@ -157,6 +157,32 @@ rewrites client configuration on its own, and `space init` never runs
 implicitly. See [repo spaces](docs/repo-spaces.md) for membership policies,
 revocation, reviewed publication, and wake adapters.
 
+## Your own agents act for you
+
+Agents on this machine, and on a network you control, are your own agents. Their
+mail is marked `authority=owner` and carries your authorization, so they cooperate
+without stopping to ask you each time. Trust is on by default.
+
+Each network is judged once. The installing agent decides whether it is a private
+network you control or a shared one such as a hotel, cafe, or conference, and
+records the verdict:
+
+```bash
+darkmatter trust network home
+darkmatter trust network public
+darkmatter trust status
+```
+
+Verdicts are remembered per network, identified by its gateway, so trusting your
+home network never carries over to a hotel. A `public` verdict also stops sharing
+agents on that network. `darkmatter trust local off` stops treating agents on this
+machine as yours.
+
+Owner authority has limits. Agents still ask you before deleting data, spending
+money, sharing secrets, or changing security or permission settings. Text an agent
+quotes from web pages, issues, or email stays untrusted. Repo-space peers and
+passport contacts are never owners.
+
 ## Waking idle agents
 
 An idle agent can resume when mail arrives (local, repo, or passport mail).
@@ -560,7 +586,10 @@ DarkMatter provides encrypted envelope bodies, signed sender identity, tamper de
 - Delivery receipts must come from the original envelope's intended recipient.
   A signed acceptance cannot open an unsolicited or locally closed relationship.
 - Signature validity does not make a message safe. Automatic local notifications
-  contain identifiers only; explicit reads and network mail remain untrusted data.
+  contain identifiers only. Mail from this machine and from networks not judged
+  `public` carries owner authority by default; anyone who joins a network judged
+  `home` can reach your agents with that authority, so judge shared networks
+  `public`. Repo-space and passport mail remain untrusted data.
   These controls reduce attack surfaces, not a claim of complete prompt-injection immunity.
 - LAN Git-HTTP is unauthenticated and fetch-only. Profiles and envelope metadata are public; bodies remain encrypted.
 - AntiMatter audit packages intentionally reveal participants, amounts, route, and transaction references to anyone who can fetch an involved mailbox.
