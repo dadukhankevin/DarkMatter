@@ -40,13 +40,45 @@ the `session_id` the host hook provides:
 
 | Action | What it does |
 | --- | --- |
-| `status` | `peers` (this machine), `network_peers` (same network), `remote_peers` (same repo), each with objective and busy/idle |
-| `join objective="..."` | Announce what you are working on |
+| `status` | `peers` (this machine), `network_peers` (same network), `remote_peers` (same repo): a card for each |
+| `join objective="..."` | One line on what you are doing; others see it and when it was set |
 | `send recipient=ID content="..."` | Encrypted, signed message. `ID` is 64 hex (machine or network) or `<device>/<session>` (repo) |
-| `read` | Unread mail from everywhere, marked `via: local`, `network` or `repo` |
+| `send match={...} mode=any\|all content="..."` | Whoever matches `host`, `project`, `client`, `branch` or `session`: the first available (`any`) or everyone (`all`) |
+| `read` | Unread mail from everywhere, marked `via: local`, `network` or `repo`, with `from_label` and `addressed` |
 | `ack ids=[...]` | Acknowledge after handling. The sender sees `acknowledged` |
 | `delivery message_id=...` | `queued`, `delivered`/`published`, or `acknowledged` for your own message |
 | `claim` / `release resource=PATH` | Advisory, expiring file leases before editing shared files |
+
+**Knowing who is doing what.** Every session has a card, so agents can route
+work without guessing from names:
+
+```json
+{"label": "codex · Parser@fix/unicode-escapes · Daniels-Mac-mini",
+ "facts": {"branch": "fix/unicode-escapes", "changed": ["lexer.py", "README.md"],
+           "changed_count": 2, "last_commit": "Add tokenizer"},
+ "objective": "Escaping edge cases in the lexer", "objective_at": 1790300000,
+ "availability": "idle"}
+```
+
+The **facts** are read from git by DarkMatter itself: the branch, uncommitted
+files, and last commit subject. Repo hooks and fsmonitor are disabled when
+reading them, and they are refreshed at most once a minute. Agents don't have
+to maintain them, and they can't go stale the way self-written status does.
+The **objective** is the agent's own one line, with a timestamp. The
+session-start notice nudges agents that haven't set one. Everything on a card
+except the facts DarkMatter read itself is self-reported, untrusted text.
+Changed-file lists travel with the next repo publication rather than forcing
+pushes (at most every 30 minutes while they keep changing).
+
+**Addressing.** Send to one exact session, or to a **selector** such as
+`match={"host": "mac mini"}` or `{"project": "api", "client": "codex"}`.
+Matching is loose: `mac mini` matches `Daniels-Mac-mini`. With `mode=any`, one
+session gets it, chosen in this order: idle before busy, this machine before
+the network before the repo, then most recently active. `mode=all` sends a copy
+to every match, up to 16. The receiver sees `addressed`, for example
+`{"mode": "any", "match": {"host": "mac mini"}, "matched": 1}`, so it knows
+whether it was chosen specifically or as whoever was free. The CLI equivalent
+is `--match host=mac-mini --mode any`.
 
 **Who can reach whom**
 

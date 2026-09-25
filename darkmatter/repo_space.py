@@ -22,6 +22,7 @@ from pathlib import Path
 
 from darkmatter.collaboration import BOUNDARY, _private_directory, _text
 from darkmatter.contract.envelope import is_expired, open_envelope, seal_envelope
+from darkmatter.facts import host_name, valid_facts
 from darkmatter.filelock import ProjectLock
 from darkmatter.gitbox.gitutil import GitError, git, init_repo, resolve_remote
 from darkmatter.identity import generate_keypair
@@ -40,13 +41,16 @@ CONNECT_PROOF_TTL = 300
 # Unchanged presence is republished at most this often; mail and session changes
 # publish immediately. Presence stays valid for TTL, so this is ample margin.
 PRESENCE_REFRESH = 6 * 3600
+# Changed-file lists alone never force a push; they ride along with the next
+# publication, or refresh presence after this long while they keep changing.
+FACTS_REFRESH = 1800
 MAX_OBJECTIVE = 512
 MAX_WORKFLOWS = 100
 MAX_WORKFLOW_BYTES = 256 * 1024
 # GitHub honors [skip ci] for push events but not for branch create/delete.
 CI_BRANCH_EVENTS = ("create", "delete")
 # Bookkeeping written only by publication; merged back after lock-free network work.
-_PUBLISH_KEYS = ("published_envelope_hashes", "connect_proof", "published_preview",
+_PUBLISH_KEYS = ("published_envelope_hashes", "connect_proof", "published_preview", "published_facts",
                  "published_time", "published_head", "ci_reviewed", "ci_tree",
                  "ci_head", "ci_observed_tree", "ci_observed_risky")
 
@@ -93,6 +97,12 @@ def workflow_needs_review(text):
     """Conservative: unparseable triggers or branch create/delete events need a human."""
     triggers = _workflow_triggers(text)
     return triggers is None or bool(triggers & set(CI_BRANCH_EVENTS))
+
+
+def project_name(remote: str) -> str:
+    """'git@github.com:owner/DarkMatter.git' -> 'DarkMatter'."""
+    tail = re.split(r"[/:]", remote.rstrip("/"))[-1]
+    return re.sub(r"\.git$", "", tail)[:128] or "repo"
 
 
 def default_space_directory(root=None):
@@ -198,10 +208,12 @@ class RepoSpace:
 
     def register(self, session: str, client: str | None, *, agent: str | None = None,
                  paused: bool | None = None, availability: str | None = None,
-                 objective: str | None = None):
+                 objective: str | None = None, facts: dict | None = None):
         _session(session)
         if objective is not None:
             _text(objective, "objective", MAX_OBJECTIVE, empty=True)
+        if facts is not None and not valid_facts(facts):
+            raise ValueError("Invalid session facts")
         if availability is not None and availability not in ("busy", "idle", "stopped", "unknown"):
             raise ValueError("Invalid session availability")
         if client is not None:
@@ -217,7 +229,9 @@ class RepoSpace:
                 **old, "client": client or old.get("client") or "cli", "agent": agent or old.get("agent") or uuid.uuid4().hex,
                 "paused": old.get("paused", False) if paused is None else bool(paused),
                 "availability": availability or old.get("availability", "unknown"), "seen": time.time(),
-                "objective": old.get("objective", "") if objective is None else objective}
+                "objective": old.get("objective", "") if objective is None else objective,
+                "objective_at": old.get("objective_at", 0) if objective is None else time.time(),
+                "facts": old.get("facts", {}) if facts is None else facts}
             self._save(state)
         return {"session": session, **state["sessions"][session]}
 
@@ -300,7 +314,8 @@ class RepoSpace:
                                           ("id", "acknowledges")) if key in body}}
         return envelope.id
 
-    def send(self, session: str, device: str, target: str, content: str, message_id: str | None = None):
+    def send(self, session: str, device: str, target: str, content: str, message_id: str | None = None,
+             addressed: dict | None = None):
         _key(device)
         _session(target)
         _text(content, "content", 16384)
@@ -319,9 +334,10 @@ class RepoSpace:
                 if existing.get("digest") != digest:
                     raise ValueError("message_id already belongs to another message")
                 return {"id": message_id, "status": existing["status"], "duplicate": True}
-            mid = self._queue(state, device, {"space": state["space"], "session": target,
-                                             "sender_session": session, "content": content},
-                              envelope_id=message_id)
+            body = {"space": state["space"], "session": target, "sender_session": session, "content": content}
+            if addressed is not None:
+                body["addressed"] = addressed
+            mid = self._queue(state, device, body, envelope_id=message_id)
             state["outbox"][mid]["digest"] = digest
             self._save(state)
         return {"id": mid, "status": "queued"}
@@ -337,7 +353,8 @@ class RepoSpace:
                 env = open_envelope(item["envelope"], state["private"])
                 if env.body["session"] == session:
                     result.append({"id": mid, "device": env.from_id,
-                                   **{k: env.body[k] for k in ("space", "session", "sender_session", "content")}})
+                                   **{k: env.body[k] for k in ("space", "session", "sender_session", "content")},
+                                   "addressed": env.body.get("addressed") or {"mode": "direct"}})
         return {"messages": result, "trust_boundary": BOUNDARY}
 
     def ack(self, session: str, message_id: str):
@@ -360,15 +377,19 @@ class RepoSpace:
         """Sessions advertised by admitted devices, addressed as device/session."""
         with self.lock.acquire():
             state = self._load()
+        from darkmatter.collaboration import _card
         found = []
         for device, sessions in state["peer_sessions"].items():
             if device not in state["peers"]:
                 continue
             for sid, member in sessions.items():
-                found.append({"id": device + "/" + sid, "device": device, "session": sid,
-                              "client": member.get("client"), "availability": member.get("availability"),
-                              "paused": member.get("paused"), "objective": member.get("objective") or "",
-                              "seen": member.get("seen"), "where": "remote"})
+                found.append(_card({"id": device + "/" + sid, "device": device, "session": sid,
+                                    "client": member.get("client"), "availability": member.get("availability"),
+                                    "paused": member.get("paused"), "objective": member.get("objective") or "",
+                                    "objective_at": member.get("objective_at") or 0,
+                                    "facts": member.get("facts") or {}, "host": member.get("host") or "",
+                                    "project": project_name(state["remote"]),
+                                    "seen": member.get("seen"), "where": "remote"}))
         return sorted(found, key=lambda item: -(item["seen"] or 0))[:100]
 
     def has_incoming(self, message_id: str):
@@ -401,7 +422,8 @@ class RepoSpace:
         # Sessions unseen for the retention window are no longer advertised.
         horizon = time.time() - TTL
         return {sid: {**{f: member[f] for f in ("client", "agent", "paused", "availability", "seen")},
-                      "objective": member.get("objective", "")}
+                      "objective": member.get("objective", ""), "objective_at": member.get("objective_at", 0),
+                      "facts": member.get("facts", {}), "host": host_name()}
                 for sid, member in state["sessions"].items() if member.get("seen", 0) > horizon}
 
     def _publication_preview(self, state):
@@ -411,7 +433,8 @@ class RepoSpace:
         plan = {"remote": state["remote"], "branch": self._branch(state, state["device"]),
                 "space": state["space"], "device": state["device"],
                 "membership": state.get("membership", "pinned"),
-                "sessions": {sid: {k: v for k, v in member.items() if k != "seen"}
+                # Heartbeat timestamps and changing file lists are not reasons to push.
+                "sessions": {sid: {k: v for k, v in member.items() if k not in ("seen", "facts")}
                              for sid, member in sessions.items()}, "envelopes": envelopes}
         fingerprint = hashlib.sha256(_json(plan).encode()).hexdigest()
         prior = state.get("published_envelope_hashes")
@@ -459,8 +482,13 @@ class RepoSpace:
 
     def _needs_publish(self, state):
         """Publish only when correspondence/presence changed or presence is due for refresh."""
+        age = time.time() - state.get("published_time", 0)
         return (state.get("published_preview") != self._publication_preview(state)["preview_id"]
-                or time.time() - state.get("published_time", 0) > PRESENCE_REFRESH)
+                or age > PRESENCE_REFRESH
+                or (age > FACTS_REFRESH and state.get("published_facts") != self._facts_digest(state)))
+
+    def _facts_digest(self, state):
+        return hashlib.sha256(_json({sid: m.get("facts", {}) for sid, m in state["sessions"].items()}).encode()).hexdigest()
 
     def _publish(self, state, *, expected_preview=None):
         state.pop("connect_proof", None)
@@ -506,6 +534,7 @@ class RepoSpace:
             for mid, item in state["outbox"].items()}
         state["published_preview"] = self._publication_preview(state)["preview_id"]
         state["published_time"], state["published_head"] = time.time(), head
+        state["published_facts"] = self._facts_digest(state)
         if payload["membership"] == "repo-writers":
             state["connect_proof"] = {"time": time.time(), "remote": state["remote"],
                                       "branch": self._branch(state, state["device"]), "head": head}
@@ -549,6 +578,10 @@ class RepoSpace:
                 raise ValueError("Invalid peer pause state")
             if member.get("objective") is not None:
                 _text(member["objective"], "objective", MAX_OBJECTIVE, empty=True)
+            if not valid_facts(member.get("facts")) or type(member.get("objective_at", 0)) not in (int, float):
+                raise ValueError("Invalid peer session facts")
+            if member.get("host") is not None:
+                _text(member["host"], "host", 128, empty=True)
         return payload
 
     def _remote_heads(self, state):
@@ -622,6 +655,9 @@ class RepoSpace:
                 _session(env.body.get("session"))
                 _session(env.body.get("sender_session"))
                 _text(env.body.get("content"), "content", 16384)
+                if "addressed" in env.body and (not isinstance(env.body["addressed"], dict)
+                                                or len(_json(env.body["addressed"])) > 1024):
+                    raise ValueError("Invalid addressing metadata")
                 if env.body["session"] in state["sessions"] and env.id not in state["inbox"]:
                     incoming.append((env, expires))
             else:
@@ -635,7 +671,8 @@ class RepoSpace:
             for mid in receipts:
                 state["outbox"][mid]["status"] = "acknowledged"
         state["peer_sessions"][device] = {
-            sid: {k: member.get(k) for k in ("client", "agent", "paused", "availability", "seen", "objective")}
+            sid: {k: member.get(k) for k in ("client", "agent", "paused", "availability", "seen", "objective",
+                                             "objective_at", "facts", "host")}
             for sid, member in payload["sessions"].items()}
 
     def fetch(self):
@@ -925,9 +962,9 @@ class RepoSpace:
             self._save(state)
         return {"session": session, "retry_requested": True}
 
-    def notice(self, session: str, client: str, *, force=False, remind_unread=False):
+    def notice(self, session: str, client: str, *, force=False, remind_unread=False, facts=None):
         """Identifiers-only hook notice; None when unread ids and remote peers are unchanged."""
-        self.register(session, client, availability="busy")
+        self.register(session, client, availability="busy", facts=facts)
         ids = [m["id"] for m in self.read(session)["messages"]]
         remote = sorted(item["id"] for item in self.remote_sessions() if item["availability"] != "stopped")
         with self.lock.acquire():

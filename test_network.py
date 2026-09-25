@@ -290,3 +290,20 @@ def test_waiter_does_not_mark_a_just_active_session_idle(tmp_path):
     board.mark_idle(started)
     assert board.active_since(started)
     assert wait_for_session_activity(root, "s", "claude-code", None, 0) is None
+
+
+def test_selector_reaches_a_machine_by_name_and_card_crosses_network(machines):
+    (a_board, a), (b_board, b) = machines
+    with open_database(b.directory) as db:
+        db.execute("UPDATE participants SET facts=? WHERE id=?",
+                   (json.dumps({"branch": "feature/export", "changed": ["export.py"], "changed_count": 1,
+                                "last_commit": "Add CSV export"}), b_board.agent_id))
+    _discover(a, b, a_board, b_board)
+    card = execute(a_board, "status")["network_peers"][0]
+    assert card["facts"]["branch"] == "feature/export" and card["label"] == "claude-code · project@feature/export · desktop"
+    result = execute(a_board, "send", match={"host": "desktop"}, content="Whoever is free on the desktop")
+    assert result["sent"][0]["via"] == "network"
+    a.pump()
+    message = execute(b_board, "read")["messages"][0]
+    assert message["addressed"] == {"mode": "any", "match": {"host": "desktop"}, "matched": 1}
+    assert message["via"] == "network"

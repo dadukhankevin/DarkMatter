@@ -14,8 +14,12 @@ sessions on any machine that can push to this project's Git remote. No key excha
 WORKING WITH OTHER AGENTS (darkmatter_collaborate, always with your hook's session_id):
 - action=status lists peers (this machine; same_project marks this repo), network_peers
   (same trusted network) and remote_peers (same repo, other machines).
-- action=join objective="..." announces what you are doing (remote peers see it too).
+- Each peer has a card: label (client · project@branch · host), facts read from git (branch,
+  changed files, last commit), busy/idle, and a self-reported objective. Route by the card.
+- action=join objective="..." says in one line what you are doing; update it when that changes.
 - action=send recipient=<peer id> content="..."; ids are 64 hex (machine/network) or <device>/<session> (repo).
+- Or send match={"host": "mac-mini"} (host/project/client/branch/session) with mode="any" (first
+  available) or "all". Received mail says how it was `addressed` and who sent it (`from_label`).
 - action=read returns your unread mail from both; action=ack ids=[...] only after handling it.
 - action=claim resource=<path> before editing shared files; release when done. Claims are advisory.
 - If status reports remote.configured=false, other machines are not reachable yet. Suggest

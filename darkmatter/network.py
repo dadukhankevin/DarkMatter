@@ -10,7 +10,8 @@ One node runs per OS account (whichever MCP server or `darkmatter network run`
 takes the lock first). It announces a signed roster over UDP multicast (TTL 1)
 and accepts device-signed deliveries over TCP on the LAN interface address.
 Message bodies are sealed end to end to recipient session keys; rosters
-(hostname, client, objective, project name, availability) are visible to other
+(hostname, client, objective, project name, git branch, uncommitted file names,
+last commit subject, availability) are visible to other
 machines on the same trusted network. Remote sessions are recorded only in
 network_peers, never as local participants, and their text is untrusted data.
 """
@@ -30,6 +31,7 @@ from pathlib import Path
 
 from darkmatter.collaboration import MAX_PENDING, MESSAGE_SECONDS, PRESENCE_SECONDS, local_directory, open_database
 from darkmatter.contract.envelope import validate_envelope_id, verify_envelope_signature
+from darkmatter.facts import host_name, valid_facts
 from darkmatter.identity import derive_public_key_hex, generate_keypair
 from darkmatter.security import sign_payload, verify_signed_payload
 from darkmatter.store.local import atomic_write_text
@@ -230,6 +232,7 @@ def _valid_roster(sessions) -> bool:
     return all(isinstance(m, dict) and isinstance(m.get("id"), str) and _HEX64.fullmatch(m["id"])
                and _text(m.get("client"), 80) and _text(m.get("objective", ""), 512)
                and _text(m.get("project", ""), 128) and m.get("availability") in ("busy", "idle", "unknown")
+               and type(m.get("objective_at", 0)) in (int, float) and valid_facts(m.get("facts"))
                for m in sessions)
 
 
@@ -266,7 +269,7 @@ class NetworkNode:
         self.classify, self.group, self.port = classify, group, port
         self.extra_targets = list(extra_targets)  # Unicast targets, e.g. for tests.
         self.multicast = multicast
-        self.host = (host or socket.gethostname())[:128]
+        self.host = (host or host_name())[:128]
         self.udp = self.tcp = None
         self.address, self.trusted, self.reason, self.network = None, False, "starting", {}
         self.udp_port = self.tcp_port = 0
@@ -373,13 +376,23 @@ class NetworkNode:
     # -- discovery
     def _roster(self) -> list[dict]:
         with open_database(self.directory) as db:
-            rows = db.execute("SELECT id, workspace, client, objective, availability FROM participants "
+            rows = db.execute("SELECT id, workspace, client, objective, objective_at, availability, facts "
+                              "FROM participants "
                               "WHERE seen > ? ORDER BY seen DESC LIMIT ?",
                               (time.time() - PRESENCE_SECONDS, MAX_SESSIONS)).fetchall()
         return [{"id": row["id"], "client": (row["client"] or "")[:80],
                  "objective": (row["objective"] or "")[:512], "project": Path(row["workspace"]).name[:128],
-                 "availability": row["availability"] if row["availability"] in ("busy", "idle") else "unknown"}
+                 "availability": row["availability"] if row["availability"] in ("busy", "idle") else "unknown",
+                 "objective_at": row["objective_at"] or 0, "facts": self._facts(row["facts"])}
                 for row in rows]
+
+    @staticmethod
+    def _facts(raw: str) -> dict:
+        try:
+            facts = json.loads(raw or "{}")
+        except ValueError:
+            return {}
+        return facts if valid_facts(facts) else {}
 
     def _announcement(self) -> bytes:
         sessions = self._roster()

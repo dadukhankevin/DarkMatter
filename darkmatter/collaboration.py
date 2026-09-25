@@ -65,6 +65,12 @@ def _ensure_schema(db) -> None:
         db.execute("ALTER TABLE participants ADD COLUMN availability TEXT DEFAULT 'unknown'")
     if "active_at" not in columns:  # Last time a host hook saw the session working.
         db.execute("ALTER TABLE participants ADD COLUMN active_at REAL DEFAULT 0")
+    # facts: machine-read git state (darkmatter.facts); objective_at: when the
+    # self-reported "doing" line was last set, so readers can judge staleness.
+    for name, kind in (("facts", "TEXT DEFAULT ''"), ("facts_at", "REAL DEFAULT 0"),
+                       ("objective_at", "REAL DEFAULT 0")):
+        if name not in columns:
+            db.execute(f"ALTER TABLE participants ADD COLUMN {name} {kind}")
     columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
     # origin: local | network-in | network-out | network-receipt; route: peer device.
     for name, kind in (("origin", "TEXT DEFAULT 'local'"), ("route", "TEXT DEFAULT ''"),
@@ -97,6 +103,22 @@ def open_database(directory: str | Path | None = None):
         db.close()
 
 
+def _card(card: dict) -> dict:
+    from darkmatter.facts import label
+    card["label"] = label(card)
+    return card
+
+
+def _addressed(value) -> dict:
+    """How a message was addressed: direct, or any/all sessions matching a filter."""
+    if value is None:
+        return {"mode": "direct"}
+    if (not isinstance(value, dict) or value.get("mode") not in ("direct", "any", "all")
+            or len(json.dumps(value)) > 1024):
+        raise ValueError("Invalid addressing metadata")
+    return value
+
+
 def network_sessions(directory: str | Path | None = None) -> tuple[dict, list[dict]]:
     """The network node's last reported state and sessions it currently sees."""
     from darkmatter.network import PEER_SECONDS, read_state
@@ -109,10 +131,12 @@ def network_sessions(directory: str | Path | None = None) -> tuple[dict, list[di
                           (time.time() - PEER_SECONDS,)).fetchall()
     for row in rows:
         for member in json.loads(row["sessions"]):
-            found.append({"id": member["id"], "client": member.get("client"),
-                          "objective": member.get("objective", ""), "project": member.get("project", ""),
-                          "availability": member.get("availability", "unknown"),
-                          "host": row["host"], "device": row["device"], "where": "network"})
+            found.append(_card({"id": member["id"], "client": member.get("client"),
+                                "objective": member.get("objective", ""),
+                                "objective_at": member.get("objective_at", 0),
+                                "project": member.get("project", ""), "facts": member.get("facts") or {},
+                                "availability": member.get("availability", "unknown"),
+                                "host": row["host"], "device": row["device"], "where": "network"}))
     return state, found
 
 
@@ -210,10 +234,34 @@ class Collaboration:
                        "availability=COALESCE(?, participants.availability)",
                        (self.agent_id, self.identity, str(self.root), self.client,
                         objective or "", time.time(), availability or "unknown", objective, availability))
+            if objective is not None:
+                db.execute("UPDATE participants SET objective_at=? WHERE id=?", (time.time(), self.agent_id))
             if availability == "busy":
                 db.execute("UPDATE participants SET active_at=? WHERE id=?", (time.time(), self.agent_id))
         return {"id": self.agent_id, "session_id": self.session_id,
                 "client": self.client, "workspace": str(self.root)}
+
+    def refresh_facts(self, max_age: float = 60.0) -> None:
+        """Re-read git state at most every max_age seconds (hooks call this cheaply)."""
+        from darkmatter.facts import workspace_facts
+        with self._db() as db:
+            row = db.execute("SELECT facts_at FROM participants WHERE id=?", (self.agent_id,)).fetchone()
+        if row is not None and time.time() - (row["facts_at"] or 0) < max_age:
+            return
+        facts = workspace_facts(self.root)  # Outside the transaction: git may take a moment.
+        with self._db() as db:
+            db.execute("UPDATE participants SET facts=?, facts_at=? WHERE id=?",
+                       (json.dumps(facts), time.time(), self.agent_id))
+
+    def facts(self) -> dict:
+        with self._db() as db:
+            row = db.execute("SELECT facts FROM participants WHERE id=?", (self.agent_id,)).fetchone()
+        return json.loads(row["facts"] or "{}") if row else {}
+
+    def objective(self) -> str:
+        with self._db() as db:
+            row = db.execute("SELECT objective FROM participants WHERE id=?", (self.agent_id,)).fetchone()
+        return (row["objective"] or "") if row else ""
 
     def mark_idle(self, since: float) -> None:
         """Mark idle unless a hook has seen the session working since `since`."""
@@ -231,15 +279,21 @@ class Collaboration:
             raise ValueError("scope must be workspace, repo or device")
         me = self.join()
         with self._db() as db:
-            query = "SELECT id, workspace, client, objective, availability, seen FROM participants WHERE seen > ?"
+            query = ("SELECT id, workspace, client, objective, objective_at, availability, seen, facts "
+                     "FROM participants WHERE seen > ?")
             args = [time.time() - PRESENCE_SECONDS]
             if scope == "workspace":
                 query += " AND workspace = ?"
                 args.append(str(self.root))
             peers = [dict(r) for r in db.execute(query + " ORDER BY id LIMIT 100", args)]
             common = repository_root(self.root)
+            from darkmatter.facts import host_name
+            host = host_name()
             for peer in peers:
                 peer["same_project"] = repository_root(peer["workspace"]) == common
+                peer.update(host=host, project=Path(peer["workspace"]).name, where="local",
+                            facts=json.loads(peer["facts"] or "{}"))
+                _card(peer)
             if scope == "repo":
                 peers = [p for p in peers if p["same_project"]]
             # Claims that matter to you are this project's (including linked worktrees).
@@ -254,8 +308,10 @@ class Collaboration:
                 "unread": unread, "trust_boundary": BOUNDARY,
                 "presence_seconds": PRESENCE_SECONDS, "claims_are_advisory": True}
 
-    def send(self, recipient: str, content: str, message_id: str | None = None) -> dict:
+    def send(self, recipient: str, content: str, message_id: str | None = None,
+             addressed: dict | None = None) -> dict:
         _text(content, "content", MAX_CONTENT)
+        addressed = _addressed(addressed)
         message_id = _text(message_id or uuid.uuid4().hex, "message_id", 128)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", message_id):
             raise ValueError("message_id must be a plain identifier")
@@ -285,7 +341,8 @@ class Collaboration:
             if count >= MAX_PENDING:
                 raise ValueError("Recipient inbox is full; wait for acknowledgement")
             env = seal_envelope(self.private_key, self.agent_id, recipient, "message",
-                                {"content": content, "workspace": workspace}, envelope_id=message_id)
+                                {"content": content, "workspace": workspace, "addressed": addressed},
+                                envelope_id=message_id)
             record = {"envelope": env.to_public_dict(),
                       "content_digest": hmac.new(bytes.fromhex(self.private_key), content.encode(), "sha256").hexdigest()}
             db.execute("INSERT INTO messages(id,sender,recipient,envelope,created,expires,origin,route) "
@@ -324,7 +381,8 @@ class Collaboration:
                 if env.id != row["id"] or env.from_id != row["sender"] or env.to_id != self.agent_id:
                     raise ValueError("Envelope and index disagree")
                 item = {"id": env.id, "from": env.from_id, "type": env.type,
-                        "content": env.body["content"], "workspace": env.body["workspace"]}
+                        "content": env.body["content"], "workspace": env.body["workspace"],
+                        "addressed": _addressed(env.body.get("addressed"))}
                 if row["origin"] == "network-in":
                     item["via"] = "network"
                 messages.append(item)

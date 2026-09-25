@@ -152,3 +152,33 @@ def test_tool_calls_do_not_churn_hook_registration(machines, monkeypatch):
     execute(board, 'read')
     assert space.status()['sessions']['s']['client'] == 'claude-code'
     assert space.preview()['preview_id'] == preview  # Nothing new to publish.
+
+
+def test_selector_reaches_repo_peers_and_file_churn_does_not_push(machines, monkeypatch):
+    laptop, desktop = machines['laptop'], machines['desktop']
+    _use(monkeypatch, desktop)
+    reviewer = Collaboration(desktop['checkout'], 'reviewer', 'codex')
+    execute(reviewer, 'join', objective='Reviewing')
+    desk = RepoSpace(desktop['space'])
+    desk.register('reviewer', None, facts={'branch': 'review/api', 'changed': [], 'changed_count': 0,
+                                           'last_commit': 'Tidy'})
+    desk.sync()
+    head = desk._load()['published_head']
+    desk.register('reviewer', None, facts={'branch': 'review/api', 'changed': ['a.py'], 'changed_count': 1,
+                                           'last_commit': 'Tidy'})
+    assert not desk._needs_publish(desk._load())  # Edits alone never push immediately.
+    desk.sync()
+    assert desk._load()['published_head'] == head
+    _use(monkeypatch, laptop)
+    author = Collaboration(laptop['checkout'], 'author', 'claude-code')
+    RepoSpace(laptop['space']).sync()
+    card = next(p for p in execute(author, 'status')['remote_peers'] if p['session'] == 'reviewer')
+    assert card['facts']['branch'] == 'review/api' and card['project'] == 'origin'
+    sent = execute(author, 'send', match={'branch': 'review'}, content='Ready when you are')
+    assert sent['sent'][0]['via'] == 'repo'
+    _use(monkeypatch, desktop)
+    state = desk._load()
+    state['last_sync'] = 0
+    desk._save(state)
+    message = execute(reviewer, 'read')['messages'][0]
+    assert message['addressed']['mode'] == 'any' and message['addressed']['match'] == {'branch': 'review'}
