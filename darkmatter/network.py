@@ -149,6 +149,21 @@ def _interface_address(interface: str) -> str | None:
     return None if address.startswith("127.") else address
 
 
+def _broadcast_address(interface: str, address: str | None) -> str | None:
+    """Subnet broadcast: many routers and mesh systems drop multicast but pass this."""
+    if not address:
+        return None
+    if interface and sys.platform == "darwin":
+        match = re.search(r"broadcast (\d+\.\d+\.\d+\.\d+)", _run(["ifconfig", interface]))
+        if match:
+            return match.group(1)
+    if interface and sys.platform.startswith("linux"):
+        match = re.search(r"brd (\d+\.\d+\.\d+\.\d+)", _run(["ip", "-4", "-o", "addr", "show", "dev", interface]))
+        if match:
+            return match.group(1)
+    return address.rsplit(".", 1)[0] + ".255"  # Typical home /24 when the mask is unknown.
+
+
 def classify_network() -> dict:
     if sys.platform == "darwin":
         kind, interface, detail = _darwin()
@@ -158,8 +173,9 @@ def classify_network() -> dict:
         kind, interface, detail = _windows()
     else:
         kind, interface, detail = "unknown", "", "unsupported platform"
-    return {"kind": kind, "interface": interface, "detail": detail,
-            "address": _interface_address(interface) if kind != "none" else None}
+    address = _interface_address(interface) if kind != "none" else None
+    return {"kind": kind, "interface": interface, "detail": detail, "address": address,
+            "broadcast": _broadcast_address(interface, address)}
 
 
 def get_mode(directory=None) -> str:
@@ -282,6 +298,7 @@ class NetworkNode:
     # -- lifecycle
     def run(self) -> None:
         next_policy = next_announce = 0.0
+        cycle = 0
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
@@ -290,6 +307,10 @@ class NetworkNode:
                     next_policy = now + POLICY_SECONDS
                 if self.trusted and now >= next_announce:
                     self.announce()
+                    if cycle % 3 == 0:
+                        # Periodic probes also find nodes whose own announcements cannot reach us.
+                        self._send({"p": PROTOCOL, "t": "probe", "device": self.device})
+                    cycle += 1
                     self._expire_peers()
                     next_announce = now + ANNOUNCE_SECONDS
                 if self.trusted:
@@ -345,6 +366,7 @@ class NetworkNode:
                 udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except OSError:
                 pass
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         udp.bind(("", self.port))
         if self.multicast:
             udp.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
@@ -354,6 +376,7 @@ class NetworkNode:
         udp.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
         udp.settimeout(0.5)
         self.tcp, self.udp, self.address = tcp, udp, address
+        self.broadcast = self.network.get("broadcast") if self.multicast else None
         self.tcp_port, self.udp_port = tcp.getsockname()[1], udp.getsockname()[1]
         self._threads = [threading.Thread(target=self._serve_udp, args=(udp,), daemon=True),
                          threading.Thread(target=self._serve_tcp, args=(tcp,), daemon=True)]
@@ -410,7 +433,10 @@ class NetworkNode:
         if self.udp is None:
             return
         raw = message if isinstance(message, bytes) else _json(message).encode()
+        # Multicast plus subnet broadcast: networks that filter one usually pass the other.
         default = [(self.group, self.port)] if self.multicast else []
+        if getattr(self, "broadcast", None):
+            default.append((self.broadcast, self.port))
         for target in targets or [*default, *self.extra_targets]:
             try:
                 self.udp.sendto(raw, target)
@@ -437,11 +463,14 @@ class NetworkNode:
                 if message.get("t") == "probe" and message.get("device") != self.device:
                     self.announce([(address, source_port)])
                 elif message.get("t") == "announce":
-                    self._accept_announcement(message, address)
+                    if self._accept_announcement(message, address):
+                        # New machine: answer directly, so one working direction suffices.
+                        self.announce([(address, source_port)])
             except (ValueError, TypeError, KeyError, UnicodeDecodeError, OSError):
                 continue
 
-    def _accept_announcement(self, message: dict, address: str) -> None:
+    def _accept_announcement(self, message: dict, address: str) -> bool:
+        """Store a valid roster; True when the machine was not known before."""
         device = message.get("device")
         if not isinstance(device, str) or not _HEX64.fullmatch(device) or device == self.device:
             return
@@ -456,7 +485,7 @@ class NetworkNode:
         with open_database(self.directory) as db:
             row = db.execute("SELECT ts FROM network_peers WHERE device=?", (device,)).fetchone()
             if row is not None and row["ts"] is not None and ts <= row["ts"]:
-                return  # Replayed or reordered roster.
+                return False  # Replayed or reordered roster.
             if row is None and db.execute("SELECT COUNT(*) FROM network_peers").fetchone()[0] >= MAX_NETWORK_PEERS:
                 return
             # The packet's source address, not a claimed one, is where mail goes.
@@ -465,6 +494,7 @@ class NetworkNode:
                        "address=excluded.address, port=excluded.port, sessions=excluded.sessions, "
                        "seen=excluded.seen, ts=excluded.ts",
                        (device, host, address, port, _json(message["sessions"]), time.time(), ts))
+        return row is None
 
     def _expire_peers(self) -> None:
         with open_database(self.directory) as db:

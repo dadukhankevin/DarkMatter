@@ -322,3 +322,29 @@ def test_agents_are_told_never_to_use_connection_requests_for_their_own_agents()
     assert "NEVER need" in MCP_INSTRUCTIONS and "connection requests" in MCP_INSTRUCTIONS
     for name in ("nearby", "connection", "send_message", "list_connections", "wait_for_message", "contact_card"):
         assert "use darkmatter_collaborate" in getattr(tools, name).__doc__
+
+
+def test_one_way_reachability_is_enough_to_discover_each_other(machines):
+    """Regression: routers that drop one direction (or multicast) left machines invisible."""
+    (a_board, a), (b_board, b) = machines
+    b.extra_targets = []  # b's announcements reach nobody; only a's reach b.
+    a.announce()
+    _until(lambda: network_sessions(a.directory)[1] and network_sessions(b.directory)[1])
+    assert network_sessions(a.directory)[1][0]["id"] == b_board.agent_id
+
+
+def test_broadcast_is_a_default_discovery_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("DARKMATTER_NETWORK_MODE", "auto")
+    sent = []
+    node = NetworkNode(tmp_path / "n", classify=lambda: {**WIRED, "broadcast": "127.255.255.255"}, port=0)
+    node.network = {**WIRED, "broadcast": "192.168.1.255"}
+    node.broadcast = "192.168.1.255"
+
+    class Recorder:
+        def sendto(self, raw, target):
+            sent.append(target)
+    node.udp = Recorder()
+    node.announce()
+    assert sent == [(network.GROUP, node.port), ("192.168.1.255", node.port)]
+    node.udp = None
+    assert network._broadcast_address("", "10.1.2.3") == "10.1.2.255"
