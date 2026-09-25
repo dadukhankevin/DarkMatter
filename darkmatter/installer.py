@@ -18,12 +18,18 @@ from typing import Callable
 from darkmatter.store.local import atomic_write_text
 
 
-DEFAULT_WAKE_TIMEOUT = 3600.0
+DEFAULT_WAKE_TIMEOUT = 3600.0  # Codex: its Stop hook blocks the session while waiting.
+CLAUDE_WAKE_TIMEOUT = 86400.0  # Claude Code waits in the background, so listen for a day.
+MAX_WAKE_TIMEOUT = 7 * 86400.0
+
+
+def default_wake_timeout(client: str) -> float:
+    return CLAUDE_WAKE_TIMEOUT if client == "claude-code" else DEFAULT_WAKE_TIMEOUT
 
 
 def _wake_host_timeout(timeout_seconds: float) -> int:
-    if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= DEFAULT_WAKE_TIMEOUT:
-        raise ValueError("wake timeout must be finite and greater than zero, at most 3600 seconds")
+    if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= MAX_WAKE_TIMEOUT:
+        raise ValueError("wake timeout must be finite and greater than zero, at most seven days")
     # Codex rejects the entire hooks file if a handler timeout is a JSON float.
     # Round up so fractional waiter durations retain the full shutdown allowance.
     return math.ceil(timeout_seconds) + 30
@@ -304,7 +310,7 @@ def install_target(
     display_name: str,
     home: Path,
     wake: bool = False,
-    wake_timeout_seconds: float = DEFAULT_WAKE_TIMEOUT,
+    wake_timeout_seconds: float | None = None,
     collaborate: bool = False,
 ) -> tuple[bool, str]:
     if not target.supported:
@@ -313,6 +319,8 @@ def install_target(
     path = _expand(target.path, home)
     try:
         if wake:
+            if wake_timeout_seconds is None:
+                wake_timeout_seconds = default_wake_timeout(target.client)
             _wake_host_timeout(wake_timeout_seconds)
         if target.format == "mcpServers":
             _install_mcp_servers_json(path, command, target.client, display_name)
@@ -351,8 +359,8 @@ DEFAULT_WAKE_CLIENTS = ("claude-code",)
 WAKE_NOTICE = (
     "Wake-ups are ON by default for Claude Code: when another agent messages an idle "
     "session, the session resumes in the background to read it. Each wake is a model "
-    "turn (it uses tokens); it carries message ids only, never peer text, and is limited "
-    "to 4 per session per hour. Turn off: darkmatter install-mcp --client claude-code --no-wake"
+    "turn (it uses tokens); it carries message ids only, never peer text, and every new "
+    "message wakes it (no cooldown, up to 255 wakes an hour). Turn off: darkmatter install-mcp --client claude-code --no-wake"
 )
 CODEX_WAKE_NOTICE = (
     "Codex wake-ups are opt-in (--wake): Codex Stop hooks block the session while "
@@ -398,9 +406,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wake-timeout",
         type=float,
-        default=DEFAULT_WAKE_TIMEOUT,
+        default=None,
         metavar="SECONDS",
-        help=f"How long each wake waiter remains active (default: {DEFAULT_WAKE_TIMEOUT:g}).",
+        help="How long each wake waiter listens after a turn (default: 86400 for Claude Code, "
+             "3600 for Codex; at most 604800).",
     )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--client", action="append", dest="clients", choices=client_names)
@@ -411,7 +420,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        _wake_host_timeout(args.wake_timeout)
+        if args.wake_timeout is not None:
+            _wake_host_timeout(args.wake_timeout)
     except ValueError as exc:
         raise SystemExit(f"--wake-timeout: {exc}") from exc
     home = Path(args.home).expanduser()

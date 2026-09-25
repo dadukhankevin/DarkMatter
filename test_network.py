@@ -204,7 +204,7 @@ def test_only_the_routed_machine_can_acknowledge(machines, tmp_path):
 
 def test_rate_limiter_bounds_each_source():
     limiter = network._RateLimiter()
-    assert sum(limiter.allow("10.0.0.5") for _ in range(100)) == network.RATE_LIMIT
+    assert sum(limiter.allow("10.0.0.5") for _ in range(network.RATE_LIMIT + 50)) == network.RATE_LIMIT
     assert limiter.allow("10.0.0.6")
 
 

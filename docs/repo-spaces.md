@@ -265,8 +265,9 @@ agent's context. That path now has a regression test.)
 - Stop-hook continuations do not recursively continue an already continued turn.
   Native notification attempts are also persisted separately from acknowledgment:
   the same message does not repeatedly wake an agent even if the host omits the
-  continuation flag. Native notifications have a five-minute cooldown and a
-  four-per-hour limit, and retain at most 4096 notified IDs for seven days.
+  continuation flag. There is no cooldown: every new message wakes the session,
+  up to 255 wakes per session per hour. Claude Code waiters listen for 24 hours
+  after each turn (Codex: one hour, because its Stop hook blocks).
   A crash after reserving a notification can lose the wake attempt, but the mail
   remains readable and visible through lifecycle notices.
 
@@ -292,10 +293,9 @@ commands or message prose. `adapter_accepted` means exit status zero only.
 
 Wake defaults off; omit `--enable` when reconfiguring to disable it. Only explicitly
 idle/stopped sessions are eligible. Each pending message receives at most one
-automatic adapter attempt, with at least five minutes between attempts and at
-most four per session per hour. An attempt is persisted before launch. Failed or
+automatic adapter attempt, with no cooldown and at most 255 per session per hour. An attempt is persisted before launch. Failed or
 crash-uncertain attempts need an explicit `retry-wake --session MY_SESSION`;
-this does not reset the hourly budget. Adapter execution has a 60-second timeout
+this does not reset the hourly cap. Adapter execution has a 60-second timeout
 and discards stdout/stderr. The adapter must manage any descendants it launches.
 
 Pause/resume without deleting the inbox:

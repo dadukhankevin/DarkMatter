@@ -38,7 +38,7 @@ NETWORK_HINT = ("No other machines found on this network. Each machine needs Dar
                 "with an MCP client (or `darkmatter network run`) running; check `darkmatter network status` "
                 "on it. macOS may need Local Network permission for Python. No connection request is needed.")
 MATCH_KEYS = ("host", "project", "client", "branch", "session")
-MAX_FANOUT = 16
+MAX_FANOUT = 64
 _TIER = {"local": 0, "network": 1, "remote": 2}
 
 

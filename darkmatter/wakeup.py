@@ -12,6 +12,10 @@ from typing import Iterator, Optional
 
 from darkmatter.contract.types import REL_CLOSED
 
+# Per session. High enough never to get in the way of agents talking; it only
+# stops a runaway loop. There is no cooldown between wakes.
+WAKES_PER_HOUR = 255
+
 
 def has_fetchable_relationships(mailbox) -> bool:
     """Return whether this project has any peer mailbox that can be fetched."""
@@ -184,16 +188,18 @@ def session_mail_notice(root, session_id, client, git_ids=()):
         raise ValueError("Wake notification state must not be a symlink")
     with ProjectLock(lock_path).acquire():
         now = time.time()
-        saved = json.loads(path.read_text()) if path.exists() else {"ids": {}, "attempts": []}
+        saved = json.loads(path.read_text()) if path.exists() else {"ids": {}}
         saved["ids"] = {k: v for k, v in saved["ids"].items() if v > now}
-        saved["attempts"] = [t for t in saved["attempts"] if now - t < 3600]
+        saved["attempts"] = [t for t in saved.get("attempts", []) if now - t < 3600]
         keys = (["local:" + mid for mid in ids] + ["repo:" + mid for mid in space_ids]
                 + ["git:" + mid for mid in git_ids])
+        # Every new message wakes the session, with no cooldown, up to WAKES_PER_HOUR.
+        # A message that already woke it once is skipped (no wake loops on old mail).
         new = [key for key in keys if key not in saved["ids"]]
-        if not new or len(saved["attempts"]) >= 4 or len(saved["ids"]) + len(new) > 4096:
+        if not new or len(saved["attempts"]) >= WAKES_PER_HOUR:
             return None
-        if saved["attempts"] and now - saved["attempts"][-1] < 300:
-            return None
+        if len(saved["ids"]) + len(new) > 65536:
+            saved["ids"] = dict(sorted(saved["ids"].items(), key=lambda kv: kv[1])[-32768:])
         saved["ids"].update({key: now + 7 * 86400 for key in new})
         saved["attempts"].append(now)
         atomic_write_text(path, json.dumps(saved), mode=0o600)
@@ -214,8 +220,8 @@ def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds
     context; the woken agent reads explicitly and treats content as data.
     """
     timeout = float(timeout_seconds)
-    if not 0 <= timeout <= 3600:
-        raise ValueError("Wait timeout must be between zero and 3600 seconds")
+    if not 0 <= timeout <= 7 * 86400:
+        raise ValueError("Wait timeout must be between zero and seven days")
     deadline = time.monotonic() + timeout
     from darkmatter.collaboration import Collaboration
     board, started = Collaboration(root, session_id, client), time.time()

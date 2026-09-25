@@ -162,8 +162,10 @@ def test_opencode_json() -> None:
 
 
 @pytest.mark.parametrize("client", ["codex", "claude-code"])
-@pytest.mark.parametrize("wait, expected", [(None, 3630), (45.0, 75), (0.25, 31)])
+@pytest.mark.parametrize("wait, expected", [(None, None), (45.0, 75), (0.25, 31)])
 def test_host_timeout_is_integer(tmp_path, client, wait, expected):
+    if expected is None:  # Claude listens for a day in the background; Codex blocks, so an hour.
+        expected = 86430 if client == "claude-code" else 3630
     kwargs = {} if wait is None else {"wake_timeout_seconds": wait}
     for _ in range(2):
         ok, message = install_target(_target(client), command="/tmp/python",
@@ -177,7 +179,7 @@ def test_host_timeout_is_integer(tmp_path, client, wait, expected):
     assert timeout == expected
 
 
-@pytest.mark.parametrize("wait", [0, -1, 3600.01, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("wait", [0, -1, 7 * 86400 + 0.01, float("nan"), float("inf"), -float("inf")])
 def test_invalid_wait_does_not_change_configs(tmp_path, wait):
     config = tmp_path / ".codex/config.toml"
     config.parent.mkdir()

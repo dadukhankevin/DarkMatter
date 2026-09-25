@@ -912,8 +912,8 @@ async def stop_hook(
         track_session(ctx)
     if stop_hook_active:
         return "{}"
-    if not 0 <= timeout_seconds <= 3600:
-        raise ValueError("Wait timeout must be between zero and 3600 seconds")
+    if not 0 <= timeout_seconds <= 7 * 86400:
+        raise ValueError("Wait timeout must be between zero and seven days")
     import os
     from darkmatter.wakeup import git_unread_ids, wait_for_session_activity
     root = project_dir or os.environ.get("DARKMATTER_PROJECT_DIR") or os.getcwd()

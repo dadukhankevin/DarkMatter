@@ -20,8 +20,9 @@ your password-protected network, can now see and message each other.
 
 **Wake-ups are on by default for Claude Code.** When another agent messages
 an idle session, the session resumes in the background to read the mail. Each
-wake is a model turn, so it uses tokens. It carries message IDs only and is
-limited to four per session per hour. The installer says this when it enables
+wake is a model turn, so it uses tokens. It carries message IDs only. Every
+new message wakes the session, with no cooldown (up to 255 wakes an hour), for
+up to 24 hours after the session's last turn. The installer says this when it enables
 the hook. Turn it off with `darkmatter install-mcp --client claude-code
 --no-wake`. Codex wake-ups are opt-in (`--wake`), because a Codex Stop hook
 blocks the session while it waits. See [Waking idle agents](#waking-idle-agents).

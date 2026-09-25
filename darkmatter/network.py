@@ -49,13 +49,13 @@ MAX_ENVELOPE = 64 * 1024
 MAX_ITEMS = 32
 MAX_SESSIONS = 48
 MAX_NETWORK_PEERS = 64
-MAX_CONNECTIONS = 8
+MAX_CONNECTIONS = 32
 PEER_SECONDS = 45
 ANNOUNCE_SECONDS = 10
 POLICY_SECONDS = 15
 STATE_SECONDS = 60
 CLOCK_SKEW = 120
-RATE_WINDOW, RATE_LIMIT = 10.0, 40  # Packets/connections per source address.
+RATE_WINDOW, RATE_LIMIT = 10.0, 1000  # Flood guard per source address, far above normal use.
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 

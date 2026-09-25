@@ -17,7 +17,7 @@ def _wait_hook(argv: list[str]) -> int:
         prog="darkmatter wait-hook",
         description="Wait for DarkMatter mail and signal a host hook when it arrives.",
     )
-    parser.add_argument("--timeout-seconds", type=float, default=3600)
+    parser.add_argument("--timeout-seconds", type=float, default=86400)
     parser.add_argument("--client", choices=("claude-code", "codex"), default="claude-code")
     args = parser.parse_args(argv)
 
@@ -38,8 +38,8 @@ def _wait_hook(argv: list[str]) -> int:
     session_id = hook_input.get("session_id")
     if not isinstance(session_id, str) or not session_id or hook_input.get("stop_hook_active"):
         return 0
-    if not 0 <= args.timeout_seconds <= 3600:
-        parser.error("--timeout-seconds must be between zero and 3600")
+    if not 0 <= args.timeout_seconds <= 7 * 86400:
+        parser.error("--timeout-seconds must be between zero and seven days")
 
     from darkmatter.gitbox.mailbox import get_mailbox
     from darkmatter.wakeup import wait_for_session_activity, wake_lease

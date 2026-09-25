@@ -23,6 +23,7 @@ from pathlib import Path
 from darkmatter.collaboration import BOUNDARY, _private_directory, _text
 from darkmatter.contract.envelope import is_expired, open_envelope, seal_envelope
 from darkmatter.facts import host_name, valid_facts
+from darkmatter.wakeup import WAKES_PER_HOUR
 from darkmatter.filelock import ProjectLock
 from darkmatter.gitbox.gitutil import GitError, git, init_repo, resolve_remote
 from darkmatter.identity import generate_keypair
@@ -31,9 +32,9 @@ from darkmatter.store.local import atomic_write_text
 
 DOMAIN = "darkmatter.repo-space.v1"
 PREFIX = "darkmatter/mail/v1/"
-MAX_ITEMS = 128
+MAX_ITEMS = 512
 MAX_PEERS = 32
-MAX_BLOB = 8 * 1024 * 1024
+MAX_BLOB = 32 * 1024 * 1024
 TTL = 7 * 86400
 MEMBERSHIP_POLICIES = ("repo-writers", "pinned")
 MAX_BLOCKED = 4096
@@ -911,12 +912,12 @@ class RepoSpace:
                 if not ids or all(mid in state["wake_attempted"] for mid in ids):
                     continue
                 history = [t for t in state["wake_history"].get(session, []) if time.time() - t < 3600]
-                if len(history) >= 4:
+                if len(history) >= WAKES_PER_HOUR:
                     continue
                 digest = hashlib.sha256(_json(sorted(ids)).encode()).hexdigest()
                 previous = state["wake_attempts"].get(session, {})
-                if (previous.get("batch") == digest or previous.get("status") == "attempting"
-                        or time.time() - previous.get("time", 0) < 300):
+                # No cooldown: each new batch wakes. Never run two at once.
+                if previous.get("batch") == digest or previous.get("status") == "attempting":
                     continue
                 state["wake_attempts"][session] = {"batch": digest, "time": time.time(), "status": "attempting"}
                 state["wake_history"][session] = history + [time.time()]

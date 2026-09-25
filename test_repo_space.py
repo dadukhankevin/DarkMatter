@@ -310,10 +310,11 @@ def test_adapter_hourly_budget_survives_new_messages(devices, tmp_path, monkeypa
     a, b, _ = devices
     now = time.time()
     monkeypatch.setattr(module.time, "time", lambda: now)
+    monkeypatch.setattr(module, "WAKES_PER_HOUR", 3)  # The real cap is 255; exercise it small.
     b.configure_wake("claude-1", [sys.executable, "-c", "pass"], str(tmp_path), enabled=True)
-    for index in range(5):
-        now += 301
+    for index in range(4):
+        now += 1  # No cooldown: back-to-back messages each wake.
         a.send("codex-1", b.status()["device"], "claude-1", str(index))
         a.sync()
         b.sync()
-        assert b.wake_once()["attempted"] == (1 if index < 4 else 0)
+        assert b.wake_once()["attempted"] == (1 if index < 3 else 0)

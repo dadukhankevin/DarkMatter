@@ -35,7 +35,7 @@ BOUNDARY = (
 # hook, heartbeat, or tool call; cards show when each was last active.
 PRESENCE_SECONDS = 4 * 3600
 MESSAGE_SECONDS = 7 * 86400
-MAX_PENDING = 128
+MAX_PENDING = 1000
 MAX_CONTENT = 16384
 AVAILABILITY = ("busy", "idle", "unknown")
 _PROCESS_SESSION = "process-" + uuid.uuid4().hex
@@ -267,6 +267,7 @@ class Collaboration:
 
     def mark_idle(self, since: float) -> None:
         """Mark idle unless a hook has seen the session working since `since`."""
+        self.join()  # The waiter can start before any hook registered the session.
         with self._db() as db:
             db.execute("UPDATE participants SET availability='idle', seen=? WHERE id=? "
                        "AND COALESCE(active_at, 0) <= ?", (time.time(), self.agent_id, since))
