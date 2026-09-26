@@ -130,14 +130,41 @@ def _unlock(handle) -> None:
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-@contextmanager
-def wake_lease(root: str | Path, session_id: str) -> Iterator[bool]:
-    """Allow only one background waiter per project and host session."""
+def _lease_paths(root: str | Path, session_id: str) -> tuple[Path, Path]:
     digest = hashlib.sha256((session_id or "default").encode()).hexdigest()[:24]
-    path = Path(root) / ".darkmatter" / f"wake-{digest}.lock"
+    base = Path(root) / ".darkmatter"
+    return base / f"wake-{digest}.lock", base / f"wake-{digest}.gen"
+
+
+def current_generation(root: str | Path, session_id: str) -> str:
+    try:
+        return _lease_paths(root, session_id)[1].read_text().strip()
+    except OSError:
+        return ""
+
+
+@contextmanager
+def wake_lease(root: str | Path, session_id: str, takeover_seconds: float = 0.0,
+               generation: str = "") -> Iterator[bool]:
+    """Allow only one background waiter per project and host session.
+
+    With a generation, a newer waiter announces itself and waits up to
+    takeover_seconds for the older one to notice and step aside. The newest
+    Stop hook always ends up listening, instead of quitting because an older
+    waiter (possibly one that will never wake anyone) still holds the lock.
+    """
+    path, gen_path = _lease_paths(root, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if generation:
+        from darkmatter.store.local import atomic_write_text
+        if not gen_path.is_symlink():
+            atomic_write_text(gen_path, generation, mode=0o600)
     handle = path.open("a+b")
     acquired = _try_lock(handle)
+    deadline = time.monotonic() + max(0.0, takeover_seconds)
+    while not acquired and time.monotonic() < deadline:
+        time.sleep(0.2)
+        acquired = _try_lock(handle)
     try:
         yield acquired
     finally:
@@ -152,6 +179,7 @@ __all__ = [
     "git_unread_ids",
     "has_fetchable_relationships",
     "wait_for_messages_sync",
+    "current_generation",
     "wake_lease",
 ]
 
@@ -214,7 +242,14 @@ def session_mail_notice(root, session_id, client, git_ids=()):
     return notice
 
 
-def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds):
+# A waiter that saw the session working stays alive with wakes paused. If the
+# session then goes this long without activity and no newer waiter has taken
+# over, the turn ended without a Stop hook (an interrupt, a background
+# subagent's hooks): resume waking instead of leaving the session deaf.
+QUIET_SECONDS = 900.0
+
+
+def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds, generation=""):
     """Watch session queues and passport mail, boundedly. Returns identifiers only.
 
     Automatic wake-ups never consume mail or place peer-written prose in model
@@ -227,20 +262,47 @@ def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds
     from darkmatter.collaboration import Collaboration
     board, started = Collaboration(root, session_id, client), time.time()
     board.mark_idle(started)
-    failures = 0
+    log = _WaitLog(board)
+    log.event("start", generation=generation, timeout=timeout)
+    try:
+        return _wait_loop(root, session_id, client, mailbox, deadline, generation, board, started, log)
+    except (SystemExit, KeyboardInterrupt) as exc:
+        log.event("killed", code=getattr(exc, "code", None))
+        raise
+
+
+def _wait_loop(root, session_id, client, mailbox, deadline, generation, board, started, log):
+    failures, busy = 0, False
     while True:
         pause = 2.0
         try:
-            # Hosts may keep an earlier turn's waiter alive into the next turn. Once
-            # the session is working again, this waiter is stale: stop, don't wake it.
-            if board.active_since(started) or session_is_paused(root, session_id):
+            if generation and current_generation(root, session_id) != generation:
+                log.event("superseded")
                 return None
+            if session_is_paused(root, session_id):
+                log.event("paused")
+                return None
+            # Hosts may keep an earlier turn's waiter alive into the next turn.
+            # While the session works, don't wake it and don't mark it idle.
+            active_at = board.active_at()
+            if active_at > started:
+                if time.time() - active_at < QUIET_SECONDS:
+                    if not busy:
+                        log.event("busy")
+                    busy = True
+                    raise _Skip
+                log.event("resumed", quiet_since=active_at)
+                started, busy = active_at, False
+                board.mark_idle(started)
             if mailbox is not None:
                 mailbox.sync(True)
             notice = session_mail_notice(root, session_id, client, git_unread_ids(mailbox))
             if notice:
+                log.event("wake")
                 return "DarkMatter mail available (identifiers only):\n" + json.dumps(notice)
             failures = 0
+        except _Skip:
+            pass
         except Exception as exc:  # noqa: BLE001
             # A waiter that dies stays dead until a human types, so the session goes
             # deaf. Transient faults over a long idle (sleep, Wi-Fi loss, a busy
@@ -248,10 +310,42 @@ def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds
             failures += 1
             pause = min(60.0, 2.0 * 2 ** min(failures, 5))
             _record_wait_error(board, exc)
+            log.event("error", error=type(exc).__name__)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            log.event("timeout")
             return None
         time.sleep(min(pause, remaining))
+
+
+class _Skip(Exception):
+    pass
+
+
+class _WaitLog:
+    """Last few waiter lifecycle events per session, for diagnosing a deaf session."""
+
+    KEEP = 60
+
+    def __init__(self, board):
+        import os
+        self.path = board.directory / (board.identity + ".wake-log.json")
+        self.pid = os.getpid()
+
+    def event(self, name, **extra):
+        try:
+            from darkmatter.store.local import atomic_write_text
+            if self.path.is_symlink():
+                return
+            try:
+                items = json.loads(self.path.read_text())
+                items = items if isinstance(items, list) else []
+            except (OSError, ValueError):
+                items = []
+            items.append({"at": round(time.time(), 3), "pid": self.pid, "event": name, **extra})
+            atomic_write_text(self.path, json.dumps(items[-self.KEEP:]), mode=0o600)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _record_wait_error(board, exc) -> None:

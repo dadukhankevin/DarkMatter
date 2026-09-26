@@ -272,10 +272,13 @@ class Collaboration:
             db.execute("UPDATE participants SET availability='idle', seen=? WHERE id=? "
                        "AND COALESCE(active_at, 0) <= ?", (time.time(), self.agent_id, since))
 
-    def active_since(self, since: float) -> bool:
+    def active_at(self) -> float:
         with self._db() as db:
             row = db.execute("SELECT active_at FROM participants WHERE id=?", (self.agent_id,)).fetchone()
-        return bool(row and (row["active_at"] or 0) > since)
+        return float(row["active_at"] or 0) if row else 0.0
+
+    def active_since(self, since: float) -> bool:
+        return self.active_at() > since
 
     def status(self, scope: str = "workspace") -> dict:
         if scope not in ("workspace", "repo", "device"):

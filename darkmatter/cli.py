@@ -45,14 +45,23 @@ def _wait_hook(argv: list[str]) -> int:
     if not 0 <= args.timeout_seconds <= 7 * 86400:
         parser.error("--timeout-seconds must be between zero and seven days")
 
+    import signal
+    import uuid
+
     from darkmatter.gitbox.mailbox import get_mailbox
     from darkmatter.wakeup import wait_for_session_activity, wake_lease
 
-    with wake_lease(root, session_id) as acquired:
+    def _terminated(signum, frame):
+        raise SystemExit(128 + signum)
+
+    # A host that kills the waiter should leave a trace in the wake log.
+    signal.signal(signal.SIGTERM, _terminated)
+    generation = f"{time.time():.6f}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    with wake_lease(root, session_id, takeover_seconds=15, generation=generation) as acquired:
         if not acquired:
             return 0
         message = wait_for_session_activity(
-            root, session_id, args.client, get_mailbox(root), args.timeout_seconds,
+            root, session_id, args.client, get_mailbox(root), args.timeout_seconds, generation,
         )
     if not message:
         return 0

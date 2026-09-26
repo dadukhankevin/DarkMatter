@@ -259,26 +259,67 @@ def test_idle_sessions_stay_discoverable_with_availability(tmp_path, monkeypatch
     tools._served_sessions.clear()
 
 
-def test_stale_waiter_exits_when_session_works_again(tmp_path):
+def test_stale_waiter_stays_quiet_while_the_session_works(tmp_path):
     """Regression: an earlier turn's waiter kept marking a working session idle."""
     import threading
-    from darkmatter.wakeup import wait_for_session_activity
+    from darkmatter import wakeup
     root = tmp_path / "app"
     board = Collaboration(root, "s", "claude-code")
     sender = Collaboration(root, "sender", "codex")
     result = {}
     waiter = threading.Thread(target=lambda: result.update(
-        text=wait_for_session_activity(root, "s", "claude-code", None, 30)))
-    waiter.start()
-    _until(lambda: board.status()["self"] and next(
-        p for p in sender.status()["peers"] if p["id"] == board.agent_id)["availability"] == "idle", timeout=20)
-    board.join(availability="busy")  # The user's next prompt: a host hook fires.
-    waiter.join(10)
-    assert not waiter.is_alive() and result["text"] is None
-    sender.send(board.agent_id, "arrives while busy")
-    time.sleep(2.5)
-    peer = next(p for p in sender.status()["peers"] if p["id"] == board.agent_id)
-    assert peer["availability"] == "busy"  # Nothing flipped it back to idle.
+        text=wakeup.wait_for_session_activity(root, "s", "claude-code", None, 30, "gen-1")))
+    with wakeup.wake_lease(root, "s", generation="gen-1"):
+        waiter.start()
+        _until(lambda: board.status()["self"] and next(
+            p for p in sender.status()["peers"] if p["id"] == board.agent_id)["availability"] == "idle", timeout=20)
+        board.join(availability="busy")  # The user's next prompt: a host hook fires.
+        time.sleep(2.5)
+        sender.send(board.agent_id, "arrives while busy")
+        time.sleep(2.5)
+        assert "text" not in result  # No wake while the session works.
+        peer = next(p for p in sender.status()["peers"] if p["id"] == board.agent_id)
+        assert peer["availability"] == "busy"  # Nothing flipped it back to idle.
+    # The turn's Stop hook starts a newer waiter; the old one steps aside.
+    with wakeup.wake_lease(root, "s", takeover_seconds=15, generation="gen-2") as acquired:
+        waiter.join(10)
+        assert acquired and not waiter.is_alive() and result["text"] is None
+    events = [e["event"] for e in json.loads((board.directory / (board.identity + ".wake-log.json")).read_text())]
+    assert events[-3:] == ["start", "busy", "superseded"]
+
+
+def test_waiter_resumes_when_a_turn_ends_without_a_stop_hook(tmp_path, monkeypatch):
+    """Regression: activity with no following Stop (an interrupt, a background
+    subagent's hooks) retired the waiter, and mail never woke the session again."""
+    import threading
+    from darkmatter import wakeup
+    monkeypatch.setattr(wakeup, "QUIET_SECONDS", 3.0)
+    root = tmp_path / "app"
+    board = Collaboration(root, "s", "claude-code")
+    sender = Collaboration(root, "sender", "codex")
+    result = {}
+    waiter = threading.Thread(target=lambda: result.update(
+        text=wakeup.wait_for_session_activity(root, "s", "claude-code", None, 60, "gen-1")))
+    with wakeup.wake_lease(root, "s", generation="gen-1"):
+        waiter.start()
+        time.sleep(1)
+        board.join(availability="busy")  # Activity, then no Stop hook ever fires.
+        time.sleep(1)
+        sender.send(board.agent_id, "arrives after the interrupted turn")
+        waiter.join(20)
+    assert not waiter.is_alive() and "DarkMatter mail available" in result["text"]
+    events = [e["event"] for e in json.loads((board.directory / (board.identity + ".wake-log.json")).read_text())]
+    assert events[-4:] == ["start", "busy", "resumed", "wake"]
+
+
+def test_newest_waiter_takes_over_the_lease(tmp_path):
+    from darkmatter import wakeup
+    with wakeup.wake_lease(tmp_path, "s", generation="old") as first:
+        assert first
+        assert wakeup.current_generation(tmp_path, "s") == "old"
+        with wakeup.wake_lease(tmp_path, "s", takeover_seconds=0.5, generation="new") as second:
+            assert not second  # The old waiter still holds it...
+        assert wakeup.current_generation(tmp_path, "s") == "new"  # ...but has been told to go.
 
 
 def test_waiter_does_not_mark_a_just_active_session_idle(tmp_path):
