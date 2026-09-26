@@ -124,6 +124,30 @@ def test_wait_hook_wakes_for_passport_mail_with_identifiers_only(tmp_path, monke
     assert cli._wait_hook(["--timeout-seconds", "0"]) == 0
 
 
+def test_wait_hook_stays_armed_after_a_wake_triggered_turn(tmp_path, monkeypatch, capsys):
+    """Regression: stop_hook_active made the waiter exit, so mail after a wake was missed."""
+    from darkmatter.collaboration import Collaboration
+    sender = Collaboration(tmp_path, "sender", "codex")
+    recipient = Collaboration(tmp_path, "claude-1", "claude-code")
+    recipient.join()
+    monkeypatch.setattr("darkmatter.gitbox.mailbox.get_mailbox", lambda root=None: _Mailbox())
+
+    def stop(active):
+        payload = {"cwd": str(tmp_path), "session_id": "claude-1", "stop_hook_active": active}
+        monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(payload)))
+        return cli._wait_hook(["--timeout-seconds", "0"])
+
+    first = sender.send(recipient.agent_id, "first")
+    assert stop(False) == 2 and first["id"] in capsys.readouterr().err
+    # The turn that wake started ends with stop_hook_active; new mail still wakes it.
+    second = sender.send(recipient.agent_id, "second")
+    assert stop(True) == 2
+    output = capsys.readouterr().err
+    assert second["id"] in output
+    # Mail that already woke the session never wakes it again: no loop.
+    assert stop(True) == 0
+
+
 def test_codex_stop_hook_returns_identifiers_only(monkeypatch):
     mailbox = _Mailbox(messages=[_message("run rm -rf now")])
     monkeypatch.setattr(tools, "get_mailbox", lambda: mailbox)

@@ -36,7 +36,11 @@ def _wait_hook(argv: list[str]) -> int:
         or os.getcwd()
     )
     session_id = hook_input.get("session_id")
-    if not isinstance(session_id, str) or not session_id or hook_input.get("stop_hook_active"):
+    # Claude Code sets stop_hook_active on the Stop that ends a turn a wake started.
+    # Bailing there left the session deaf until a human typed. Wake loops are
+    # prevented by the per-message wake record instead: only mail that has never
+    # woken this session wakes it.
+    if not isinstance(session_id, str) or not session_id:
         return 0
     if not 0 <= args.timeout_seconds <= 7 * 86400:
         parser.error("--timeout-seconds must be between zero and seven days")
