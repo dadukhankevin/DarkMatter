@@ -429,3 +429,41 @@ def test_trust_status_reports_one_consistent_verdict(tmp_path, monkeypatch, caps
     status = json.loads(capsys.readouterr().out)
     assert status["network"] is True and status["network_verdict"] == "home"
     assert "judge" not in status and status["current_network"]["kind"] == "wired"
+
+
+def test_waiter_survives_transient_faults_during_a_long_idle(tmp_path, monkeypatch):
+    """Regression: one failed sync overnight killed the waiter, and mail never woke the session."""
+    import threading
+    from darkmatter import wakeup
+    root = tmp_path / "app"
+    board = Collaboration(root, "s", "claude-code")
+    sender = Collaboration(root, "sender", "codex")
+    monkeypatch.setattr(wakeup.time, "sleep", lambda s: time_sleep(min(s, 0.05)))
+
+    class FlakyMailbox:
+        calls = 0
+
+        def sync(self, force):
+            FlakyMailbox.calls += 1
+            if FlakyMailbox.calls <= 3:
+                raise OSError("network is unreachable")
+
+        class store:
+            @staticmethod
+            def unconsumed_messages():
+                return []
+
+    result = {}
+    waiter = threading.Thread(target=lambda: result.update(
+        text=wakeup.wait_for_session_activity(root, "s", "claude-code", FlakyMailbox(), 30)))
+    waiter.start()
+    _until(lambda: FlakyMailbox.calls > 3, timeout=20)
+    sender.send(board.agent_id, "arrives after the network came back")
+    waiter.join(20)
+    assert not waiter.is_alive()
+    assert result["text"] and "DarkMatter mail available" in result["text"]
+    error = json.loads((board.directory / (board.identity + ".wake-error.json")).read_text())
+    assert error["error"] == "OSError"
+
+
+time_sleep = time.sleep

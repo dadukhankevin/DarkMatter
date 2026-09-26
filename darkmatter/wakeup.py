@@ -227,20 +227,44 @@ def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds
     from darkmatter.collaboration import Collaboration
     board, started = Collaboration(root, session_id, client), time.time()
     board.mark_idle(started)
+    failures = 0
     while True:
-        # Hosts may keep an earlier turn's waiter alive into the next turn. Once
-        # the session is working again, this waiter is stale: stop, don't wake it.
-        if board.active_since(started) or session_is_paused(root, session_id):
-            return None
-        if mailbox is not None:
-            mailbox.sync(True)
-        notice = session_mail_notice(root, session_id, client, git_unread_ids(mailbox))
-        if notice:
-            return "DarkMatter mail available (identifiers only):\n" + json.dumps(notice)
+        pause = 2.0
+        try:
+            # Hosts may keep an earlier turn's waiter alive into the next turn. Once
+            # the session is working again, this waiter is stale: stop, don't wake it.
+            if board.active_since(started) or session_is_paused(root, session_id):
+                return None
+            if mailbox is not None:
+                mailbox.sync(True)
+            notice = session_mail_notice(root, session_id, client, git_unread_ids(mailbox))
+            if notice:
+                return "DarkMatter mail available (identifiers only):\n" + json.dumps(notice)
+            failures = 0
+        except Exception as exc:  # noqa: BLE001
+            # A waiter that dies stays dead until a human types, so the session goes
+            # deaf. Transient faults over a long idle (sleep, Wi-Fi loss, a busy
+            # database, a failed fetch) must not end it: record, back off, retry.
+            failures += 1
+            pause = min(60.0, 2.0 * 2 ** min(failures, 5))
+            _record_wait_error(board, exc)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
-        time.sleep(min(2, remaining))
+        time.sleep(min(pause, remaining))
+
+
+def _record_wait_error(board, exc) -> None:
+    """Keep the latest waiter fault next to the wake state, for diagnosis."""
+    try:
+        from darkmatter.store.local import atomic_write_text
+        path = board.directory / (board.identity + ".wake-error.json")
+        if path.is_symlink():
+            return
+        atomic_write_text(path, json.dumps({"at": time.time(), "error": type(exc).__name__,
+                                            "detail": str(exc)[:500]}), mode=0o600)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def session_is_paused(root, session_id):
