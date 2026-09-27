@@ -508,3 +508,52 @@ def test_waiter_survives_transient_faults_during_a_long_idle(tmp_path, monkeypat
 
 
 time_sleep = time.sleep
+
+
+def test_background_subagent_hooks_do_not_deafen_an_idle_session(tmp_path, monkeypatch):
+    """Regression: a background subagent's tool hooks kept an idle session marked
+    busy, so its waiter paused and mail never woke it."""
+    import io
+    import threading
+    from darkmatter import wakeup
+    from darkmatter.collaboration_cli import main as collab_main
+    root = tmp_path / "app"
+    board = Collaboration(root, "s", "claude-code")
+    sender = Collaboration(root, "sender", "codex")
+
+    def hook(name):
+        event = {"cwd": str(root), "session_id": "s", "hook_event_name": name}
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+        collab_main(["hook", "--client", "claude-code"])
+
+    hook("UserPromptSubmit")  # A main turn...
+    hook("PostToolUse")
+    assert board.active_at() > 0
+    result = {}
+    waiter = threading.Thread(target=lambda: result.update(
+        text=wakeup.wait_for_session_activity(root, "s", "claude-code", None, 30, "gen-1")))
+    with wakeup.wake_lease(root, "s", generation="gen-1"):
+        waiter.start()  # ...ends: the Stop hook arms the waiter.
+        _until(lambda: next(p for p in sender.status()["peers"] if p["id"] == board.agent_id)["availability"] == "idle",
+               timeout=20)
+        for _ in range(3):  # A background subagent keeps working.
+            hook("PreToolUse")
+            hook("PostToolUse")
+        sender.send(board.agent_id, "arrives while only the subagent works")
+        waiter.join(15)
+    assert not waiter.is_alive() and "DarkMatter mail available" in result["text"]
+    events = [e["event"] for e in json.loads((board.directory / (board.identity + ".wake-log.json")).read_text())]
+    assert "busy" not in events[-3:] and events[-1] == "wake"
+
+
+def test_main_turn_tool_hooks_still_keep_the_session_busy(tmp_path):
+    board = Collaboration(tmp_path / "app", "s", "claude-code")
+    board.join(availability="busy")
+    first = board.active_at()
+    time.sleep(0.01)
+    board.tool_activity()  # Mid-turn tool call: still working.
+    assert board.active_at() > first
+    board.mark_idle(time.time())
+    before = board.active_at()
+    board.tool_activity()  # After Stop: only a background subagent.
+    assert board.active_at() == before

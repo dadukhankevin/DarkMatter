@@ -262,7 +262,10 @@ def main(argv=None):
             if name == "SessionEnd":
                 execute(board, "leave")
                 return 0
-            board.join(availability="busy")
+            if name in ("SessionStart", "UserPromptSubmit") or cursor:
+                board.join(availability="busy")  # A main turn starts.
+            else:
+                board.tool_activity()
             board.refresh_facts()  # At most once a minute; cheap otherwise.
             force, remind = name == "SessionStart", name == "UserPromptSubmit"
             note = board.notification(force=force, remind_unread=remind)

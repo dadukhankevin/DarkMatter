@@ -265,6 +265,16 @@ class Collaboration:
             row = db.execute("SELECT objective FROM participants WHERE id=?", (self.agent_id,)).fetchone()
         return (row["objective"] or "") if row else ""
 
+    def tool_activity(self) -> None:
+        """A tool hook fired. After the main turn's Stop (availability idle), tool
+        hooks can only come from background subagents or tasks: refresh presence,
+        but don't mark the session working, so its wake waiter keeps listening.
+        Hooks carry no field that tells a subagent's call from the main thread's."""
+        self.join()
+        with self._db() as db:
+            db.execute("UPDATE participants SET availability='busy', active_at=? "
+                       "WHERE id=? AND availability != 'idle'", (time.time(), self.agent_id))
+
     def mark_idle(self, since: float) -> None:
         """Mark idle unless a hook has seen the session working since `since`."""
         self.join()  # The waiter can start before any hook registered the session.

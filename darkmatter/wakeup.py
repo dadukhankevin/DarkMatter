@@ -244,8 +244,9 @@ def session_mail_notice(root, session_id, client, git_ids=()):
 
 # A waiter that saw the session working stays alive with wakes paused. If the
 # session then goes this long without activity and no newer waiter has taken
-# over, the turn ended without a Stop hook (an interrupt, a background
-# subagent's hooks): resume waking instead of leaving the session deaf.
+# over, the turn ended without a Stop hook (an interrupt): resume waking
+# instead of leaving the session deaf. Background subagents' tool hooks don't
+# count as activity once the main turn has stopped (Collaboration.tool_activity).
 QUIET_SECONDS = 900.0
 
 
@@ -299,6 +300,7 @@ def _wait_loop(root, session_id, client, mailbox, deadline, generation, board, s
             notice = session_mail_notice(root, session_id, client, git_unread_ids(mailbox))
             if notice:
                 log.event("wake")
+                board.join(availability="busy")  # The wake starts a main turn.
                 return "DarkMatter mail available (identifiers only):\n" + json.dumps(notice)
             failures = 0
         except _Skip:
