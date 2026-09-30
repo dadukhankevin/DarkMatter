@@ -47,6 +47,8 @@ MAX_PACKET = 16 * 1024  # Largest roster we accept.
 # Largest roster we send. macOS refuses UDP datagrams over 9216 bytes by default
 # (net.inet.udp.maxdgram), and a bigger roster failed to send at all.
 MAX_DATAGRAM = 8192
+# macOS will not fragment a broadcast: anything over one Ethernet/Wi-Fi frame is refused.
+MAX_BROADCAST = 1472
 # The full roster travels over TCP (deliveries, heartbeats and their replies). 48
 # sessions of the largest valid cards stay well under this; beyond it we compact.
 MAX_ROSTER = 256 * 1024
@@ -710,11 +712,18 @@ class NetworkNode(_Endpoint):
         default = [(self.group, self.port)] if self.multicast else []
         if getattr(self, "broadcast", None):
             default.append((self.broadcast, self.port))
+        probe = None
         for target in targets or [*default, *self.extra_targets]:
+            payload = raw
+            if target[0] == getattr(self, "broadcast", None) and len(raw) > MAX_BROADCAST:
+                # Too big to broadcast: a probe instead. Every node that hears it answers
+                # with its roster by unicast, and we then reach it by unicast and TCP.
+                probe = probe or _json({"p": PROTOCOL, "t": "probe", "device": self.device}).encode()
+                payload = probe
             try:
-                self.udp.sendto(raw, target)
+                self.udp.sendto(payload, target)
             except OSError as exc:
-                self.send_error = (time.time(), f"{type(exc).__name__}: {exc} ({len(raw)} bytes to {target[0]})")
+                self.send_error = (time.time(), f"{type(exc).__name__}: {exc} ({len(payload)} bytes to {target[0]})")
                 self._log("UDP send failed: " + self.send_error[1], key=f"udp {target} {exc}")
 
     def announce(self, targets=None) -> None:

@@ -870,3 +870,31 @@ def test_send_errors_are_logged_and_shown_in_status_and_doctor(machines, monkeyp
     os.symlink(elsewhere, log)
     network.log_event(a.directory, "must not follow the link")
     assert elsewhere.read_text() == "keep\n" and network.read_log(a.directory) == []
+
+
+def test_broadcast_carries_a_probe_when_the_roster_is_too_big_for_one_frame(tmp_path, monkeypatch):
+    """Regression: macOS refuses to broadcast anything over one frame (1472 bytes), so
+    every roster of more than a few sessions failed on the broadcast path."""
+    monkeypatch.setenv("DARKMATTER_NETWORK_MODE", "auto")
+    sent = []
+    node = NetworkNode(tmp_path / "n", classify=lambda: dict(WIRED), port=0)
+    node.broadcast = "192.168.1.255"
+
+    class Recorder:
+        def sendto(self, raw, target):
+            if target[0] == "192.168.1.255" and len(raw) > network.MAX_BROADCAST:
+                raise OSError(40, "Message too long")
+            sent.append((target, json.loads(raw)["t"], len(raw)))
+
+    node.udp = Recorder()
+    node.announce(targets=None)  # A small roster still goes out whole everywhere.
+    assert [t for (_, t, _) in sent] == ["announce", "announce"]
+    sent.clear()
+    for i in range(12):
+        Collaboration(tmp_path / f"p{i}", f"s{i}", "claude-code", directory=tmp_path / "n").join(
+            "A long objective that makes this roster far bigger than one frame " * 3, availability="busy")
+    node.announce()
+    assert sent[0][1] == "announce" and sent[0][2] > network.MAX_BROADCAST  # Multicast: the roster.
+    assert sent[1][0] == ("192.168.1.255", node.port) and sent[1][1] == "probe"  # Broadcast: a probe.
+    assert node.send_error is None
+    node.udp = None
