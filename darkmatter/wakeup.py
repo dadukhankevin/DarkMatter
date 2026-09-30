@@ -235,7 +235,9 @@ def session_mail_notice(root, session_id, client, git_ids=()):
     notice = {"session_id": session_id, "client": client, "unread_ids": ids + space_ids,
               "trust_boundary": BOUNDARY, "trust": trust.summary(board.directory),
               "next_step": "Read with darkmatter_collaborate action=read using this session_id; "
-                           "acknowledge only after handling."}
+                           "acknowledge only after handling. Answer quick asks now; for substantial "
+                           "work, acknowledge with an estimate and delegate to a background "
+                           "sub-agent so this session stays free (see handling when read)."}
     if git_ids:
         notice["passport_unread_ids"] = git_ids
         notice["next_step"] += " Passport mail: darkmatter_wait_for_message timeout_seconds=0."

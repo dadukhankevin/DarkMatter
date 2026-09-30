@@ -204,6 +204,9 @@ def hook_text(note, repo_note, board, *, include_cli, nudge=False):
         body["remote_peers"] = repo_note["remote_peers"]
         body["unread_ids"] = body.get("unread_ids", []) + repo_note["unread_ids"]
     body["tool"] = "darkmatter_collaborate"
+    if body.get("unread_ids"):
+        body["handling"] = ("Quick asks: answer now. Substantial work: acknowledge with an estimate, "
+                            "delegate to a background sub-agent, send the result when done.")
     if nudge:
         body["tip"] = ("Other agents see your branch and changed files. Add one line on what you are "
                        "doing: action=join objective=\"...\"")

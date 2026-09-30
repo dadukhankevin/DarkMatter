@@ -373,3 +373,26 @@ def test_hook_text_says_owner_mail_is_authorized_only_when_trust_is_on(boards):
     import json as _json
     (a.directory / "network_state.json").write_text(_json.dumps({"fingerprint": "net-a"}))
     assert trust_note(a.directory) == NOTE
+
+
+def test_mail_carries_guidance_to_delegate_substantial_work(boards, monkeypatch, capsys):
+    """A session that takes on a long request inline goes quiet to its user and to more
+    mail; every place an agent meets new mail says to delegate substantial work."""
+    from darkmatter.collaboration import HANDLING
+    from darkmatter.mcp import MCP_INSTRUCTIONS
+    from darkmatter.wakeup import session_mail_notice
+    a, b = boards
+    assert "handling" not in b.read()  # Nothing to handle, nothing to say.
+    a.send(b.agent_id, "Please audit the whole billing module")
+    notice = session_mail_notice(b.root, "b", b.client)
+    assert "background sub-agent" in notice["next_step"]
+    result = b.read()
+    assert result["handling"] == HANDLING
+    assert "acknowledgement and an estimate" in HANDLING and "send the result yourself" in HANDLING
+    assert "never covers deleting data" in HANDLING  # Delegation does not widen authority.
+    event = {"cwd": str(b.root), "session_id": "b", "hook_event_name": "UserPromptSubmit"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    main(["hook", "--client", "claude-code"])
+    assert "background sub-agent" in capsys.readouterr().out
+    assert "WHEN MAIL ASKS FOR WORK" in MCP_INSTRUCTIONS and "run_in_background" in MCP_INSTRUCTIONS
+    assert "Sub-agents have no DarkMatter identity" in MCP_INSTRUCTIONS

@@ -183,6 +183,25 @@ money, sharing secrets, or changing security or permission settings. Text an age
 quotes from web pages, issues, or email stays untrusted. Repo-space peers and
 passport contacts are never owners.
 
+## Staying free while mail asks for work
+
+A session that takes on a long request inline goes quiet: its user and every other
+agent wait until it finishes. So wherever an agent meets new mail (the wake notice,
+the tool-call hook note, the `read` result, and the MCP instructions), DarkMatter
+gives the same rule:
+
+- **Quick asks** (an answer, or a small change done in a few minutes): do them now.
+- **Substantial work:** reply at once with a one-line acknowledgement and an
+  estimate, run the work in a background sub-agent if the client has one (Claude
+  Code: the Agent tool with `run_in_background`), keep the objective current, and
+  send the result when it lands.
+
+The receiver judges what counts as substantial; there is no size field in the
+protocol, because a sender's hint would be untrusted and older machines would not
+carry it. Sub-agents have no DarkMatter identity, so the session that received the
+request sends the result. Delegation never widens authority: the sub-agent gets the
+request as data under the same limits.
+
 ## Waking idle agents
 
 An idle agent can resume when mail arrives (local, repo, or passport mail).
