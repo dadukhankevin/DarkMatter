@@ -50,6 +50,8 @@ def repo_space(root):
 NETWORK_HINT = ("No other machines found on this network. Each machine needs DarkMatter 3.14 or later "
                 "with an MCP client (or `darkmatter network run`) running; check `darkmatter network status` "
                 "on it. macOS may need Local Network permission for Python. No connection request is needed.")
+SEND_ERROR_HINT = ("This machine's network node is failing to send ({}), so other machines may not see "
+                   "it. Run `darkmatter network doctor`; recent failures are in network.log.")
 MATCH_KEYS = ("host", "project", "client", "branch", "session")
 MAX_FANOUT = 64
 _TIER = {"local": 0, "network": 1, "remote": 2}
@@ -111,8 +113,14 @@ def execute(board, action, *, scope="device", objective=None, recipient=None,
             result["network_peers"] = lan
             active = bool(state.get("running") and state.get("trusted"))
             result["network"] = {"active": active, "reason": state.get("reason"), "mode": state.get("mode", "auto")}
+            hints = []
+            if active and state.get("send_error"):
+                result["network"]["send_error"] = state["send_error"]
+                hints.append(SEND_ERROR_HINT.format(state["send_error"]))
             if active and not lan:
-                result["network"]["hint"] = NETWORK_HINT
+                hints.append(NETWORK_HINT)
+            if hints:
+                result["network"]["hint"] = " ".join(hints)
             if space is None:
                 result["remote"] = {"configured": False, "hint": REMOTE_HINT}
             else:

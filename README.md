@@ -105,7 +105,13 @@ to the other machine right away and returns `delivered`, or `queued` with the
 exact error (the node keeps retrying). Each delivery carries the sender's signed
 session list, so it doesn't depend on the other machine having heard a
 broadcast first. Discovery uses multicast plus subnet broadcast, because many
-routers drop one of them. Remote `send` pushes right away.
+routers drop one of them. A datagram carries a compact session list, small
+enough for every OS to send; the full list travels over TCP. Known machines that
+UDP hasn't refreshed lately get a TCP heartbeat, and each side answers with its
+full list, so machines stay listed even when every datagram is lost. Send and
+heartbeat failures are never silent: they appear in `darkmatter network doctor`
+and the `collaborate status` network hint, and in `network.log`. Remote `send`
+pushes right away.
 While any MCP session is open, a background worker polls every 15 seconds
 (`DARKMATTER_SPACE_SYNC_SECONDS`, `0` disables it). Each poll is a single
 `ls-remote`. Only changed mail branches are fetched, and a push happens only

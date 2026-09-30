@@ -681,3 +681,192 @@ def test_send_failures_are_recorded_not_swallowed(machines):
         a.udp = real
     a._write_state(running=True)
     assert "Message too long" in network.read_state(a.directory)["send_error"]
+
+
+_GOAL = "Refactor the billing pipeline end to end and keep every test green " * 8
+
+
+def _crowd(node, count):
+    """Give a machine `count` extra sessions with long objectives and full change lists."""
+    boards = []
+    for i in range(count):
+        board = Collaboration(node.directory.parent / f"crowd{i}", f"c{i}", "claude-code", directory=node.directory)
+        board.join(f"{i:02d} " + _GOAL[:490], availability="busy")
+        with open_database(node.directory) as db:
+            db.execute("UPDATE participants SET facts=? WHERE id=?", (json.dumps({
+                "branch": f"feature/a-rather-long-branch-name-{i}", "changed_count": 40,
+                "changed": [f"src/package_{j}/deeply/nested/module/file_{j}_{i}.py" for j in range(6)],
+                "last_commit": "A fairly long last commit subject line for this session"}), board.agent_id))
+        boards.append(board)
+    return boards
+
+
+def _seen_from(node, device):
+    return [s for s in network_sessions(node.directory)[1] if s["device"] == device]
+
+
+def test_machines_stay_listed_with_full_rosters_over_tcp_when_every_datagram_is_lost(machines, monkeypatch):
+    """Regression: a roster over macOS's 9216-byte datagram limit could not be sent at
+    all, and with UDP lost nothing else kept the machines listed. Now a TCP heartbeat
+    keeps them, and the full roster travels over TCP."""
+    import threading
+    (a_board, a), (b_board, b) = machines
+    crowd = _crowd(a, 32)
+    assert len(network._json(a._roster())) > 9216  # The full roster could never be one datagram.
+    _discover(a, b, a_board, b_board)  # One initial exchange, then every UDP path is lost.
+    for node in (a, b):
+        monkeypatch.setattr(node, "_send", lambda *args, **kwargs: None)
+    monkeypatch.setattr(network, "ANNOUNCE_SECONDS", 0.2)
+    monkeypatch.setattr(network, "HEARTBEAT_SECONDS", 0.5, raising=False)
+    monkeypatch.setattr(network, "PEER_SECONDS", 2.5)
+    for node in (a, b):
+        threading.Thread(target=node.run, daemon=True).start()
+    deadline = time.monotonic() + 3 * network.PEER_SECONDS
+    while time.monotonic() < deadline:
+        assert _seen_from(b, a.device) and _seen_from(a, b.device)
+        time.sleep(0.25)
+    sessions = _seen_from(b, a.device)
+    assert {s["id"] for s in sessions} == {a_board.agent_id, *(c.agent_id for c in crowd)}
+    detailed = [s for s in sessions if s["id"] != a_board.agent_id]
+    assert all(len(s["objective"]) > 400 and len(s["facts"]["changed"]) == 6 for s in detailed)
+
+
+def test_a_heartbeat_to_an_unreachable_machine_backs_off_without_blocking(machines, monkeypatch):
+    import threading
+    (a_board, a), _ = machines
+    a.extra_targets = []  # Only the unreachable machine is known.
+    monkeypatch.setattr(network, "HEARTBEAT_SECONDS", 0.1, raising=False)
+    monkeypatch.setattr(network, "PEER_SECONDS", 1000)
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()  # Nothing listens there: connections are refused.
+    gone = "d" * 64
+    with open_database(a.directory) as db:
+        db.execute("INSERT INTO network_peers(device, host, address, port, sessions, seen, ts) VALUES(?,?,?,?,?,?,?)",
+                   (gone, "gone", "127.0.0.1", port, "[]", time.time() - 60, 0))
+
+    def attempt():
+        a._heartbeats()
+        a.heartbeat_threads[gone].join(10)
+
+    attempt()
+    retry_at, delay = a.heartbeat_backoff[gone]
+    assert retry_at > time.monotonic() and delay == 2 * network.HEARTBEAT_RETRY
+    assert "TCP heartbeat to gone" in "".join(network.read_log(a.directory))
+    first = a.heartbeat_threads[gone]
+    a._heartbeats()  # Backing off: no new attempt.
+    assert a.heartbeat_threads[gone] is first
+    a.heartbeat_backoff[gone], a.heartbeat_at[gone] = (0.0, 400.0), -1e18
+    attempt()
+    assert a.heartbeat_backoff[gone][1] == network.HEARTBEAT_BACKOFF_MAX  # Capped.
+
+    # A machine that accepts but never answers ties up one thread, never the loop.
+    release, calls = threading.Event(), []
+    monkeypatch.setattr(a, "_request", lambda *args: (calls.append(args), release.wait(30)) and {})
+    announced = []
+    monkeypatch.setattr(a, "announce", lambda targets=None: announced.append(targets))
+    a.heartbeat_backoff.clear()
+    monkeypatch.setattr(network, "ANNOUNCE_SECONDS", 0.2)
+    threading.Thread(target=a.run, daemon=True).start()
+    _until(lambda: len(announced) >= 8, timeout=15)  # Four cycles while the heartbeat hangs.
+    assert len(calls) == 1  # At most one in flight per machine.
+    release.set()
+
+
+def test_a_delivery_reply_carries_the_receivers_roster(machines):
+    (a_board, a), (b_board, b) = machines
+    b._accept_announcement(_announcement(a), "127.0.0.1")
+    response = b.handle_request(_deliver(a, []), "127.0.0.1")  # An empty delivery is a heartbeat.
+    assert response["ok"] and response["announcement"]["device"] == b.device
+    assert [s["id"] for s in response["announcement"]["sessions"]] == [b_board.agent_id]
+    _discover(a, b, a_board, b_board)
+    b_board.join("A new objective nobody broadcast")
+    a_board.send(b_board.agent_id, "hello", "reply-1")  # Delivered over TCP; no UDP since.
+    assert _seen_from(a, b.device)[0]["objective"] == "A new objective nobody broadcast"
+    with open_database(a.directory) as db:  # Still never a local participant.
+        assert not db.execute("SELECT 1 FROM participants WHERE id=?", (b_board.agent_id,)).fetchone()
+
+
+def test_forged_or_unsigned_rosters_in_a_tcp_reply_are_ignored(machines, tmp_path):
+    import threading
+    (a_board, a), (b_board, b) = machines
+    a._accept_announcement(_announcement(b), "127.0.0.1")
+    third = NetworkNode(tmp_path / "third", classify=lambda: dict(WIRED), port=0, multicast=False)
+    third.tcp_port = 9
+    forged = _announcement(b, host="evil")
+    unsigned = {k: v for k, v in _announcement(b, host="evil").items() if k != "sig"}
+    for reply in (forged, unsigned, _announcement(third), "not a roster"):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+
+        def answer(server=server, reply=reply):
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(1 << 20)
+                conn.sendall(network._json({"p": network.PROTOCOL, "ok": True, "announcement": reply}).encode() + b"\n")
+        thread = threading.Thread(target=answer, daemon=True)
+        thread.start()
+        a._send_heartbeat(b.device, "desktop", "127.0.0.1", server.getsockname()[1])
+        thread.join(5)
+        server.close()
+    peers = network_sessions(a.directory)[1]
+    assert [(p["device"], p["host"]) for p in peers] == [(b.device, "desktop")]  # Third not enrolled.
+
+
+def test_a_cut_roster_is_marked_and_the_full_one_fetched_over_tcp(machines):
+    (a_board, a), (b_board, b) = machines
+    crowd = _crowd(a, 32)
+    raw = a._announcement()
+    cut = json.loads(raw)
+    assert len(raw) <= network.MAX_DATAGRAM and cut["complete"] is False and cut["total"] == 33
+    full = json.loads(a._announcement(network.MAX_ROSTER))
+    assert "complete" not in full and len(full["sessions"]) == 33
+    lying = dict(cut, complete=True)  # The marker is signed.
+    assert b._accept_announcement(lying, "127.0.0.1") is None
+    a.announce([("127.0.0.1", b.udp_port)])  # B hears only the cut datagram...
+    _until(lambda: len(_seen_from(b, a.device)) == 33
+           and all(len(s["objective"]) > 400 for s in _seen_from(b, a.device) if s["id"] != a_board.agent_id))
+    later = json.loads(a._announcement())  # ...and a later one does not erase the detail.
+    assert b._accept_announcement(later, "127.0.0.1") is False
+    sessions = _seen_from(b, a.device)
+    assert len(sessions) == 33 and min(len(s["objective"]) for s in sessions if s["id"] in
+                                       {c.agent_id for c in crowd}) > 400
+
+
+def test_send_errors_are_logged_and_shown_in_status_and_doctor(machines, monkeypatch):
+    import os
+    import stat
+    (a_board, a), _ = machines
+
+    class Refuses:
+        def sendto(self, raw, target):
+            raise OSError(40, "Message too long")
+
+    real, a.udp = a.udp, Refuses()
+    try:
+        a.announce([("127.0.0.1", 1)])
+        a.announce([("127.0.0.1", 1)])  # The same failure again: logged once a minute, not per packet.
+    finally:
+        a.udp = real
+    a._write_state(running=True)
+    log = a.directory / "network.log"
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    assert sum("Message too long" in line for line in network.read_log(a.directory)) == 1
+    status = execute(a_board, "status")["network"]
+    assert "Message too long" in status["send_error"] and "network doctor" in status["hint"]
+    monkeypatch.setattr(network, "classify_network", lambda: dict(WIRED))
+    report = network.doctor(a.directory)
+    assert "Message too long" in report["node"]["send_error"] and "Message too long" in report["hint"]
+    assert any("Message too long" in line for line in report["log"])
+    for i in range(network.LOG_LINES + 50):
+        network.log_event(a.directory, f"event {i}")
+    lines = log.read_text().splitlines()
+    assert len(lines) == network.LOG_LINES and lines[-1].endswith(f"event {network.LOG_LINES + 49}")
+    elsewhere = a.directory / "elsewhere.txt"
+    elsewhere.write_text("keep\n")
+    log.unlink()
+    os.symlink(elsewhere, log)
+    network.log_event(a.directory, "must not follow the link")
+    assert elsewhere.read_text() == "keep\n" and network.read_log(a.directory) == []

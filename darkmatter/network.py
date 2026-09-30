@@ -47,6 +47,9 @@ MAX_PACKET = 16 * 1024  # Largest roster we accept.
 # Largest roster we send. macOS refuses UDP datagrams over 9216 bytes by default
 # (net.inet.udp.maxdgram), and a bigger roster failed to send at all.
 MAX_DATAGRAM = 8192
+# The full roster travels over TCP (deliveries, heartbeats and their replies). 48
+# sessions of the largest valid cards stay well under this; beyond it we compact.
+MAX_ROSTER = 256 * 1024
 MAX_REQUEST = 512 * 1024
 MAX_ENVELOPE = 64 * 1024
 MAX_ITEMS = 32
@@ -57,6 +60,12 @@ MAX_CONNECTIONS = 32
 # lost packet or two (Wi-Fi drops group traffic readily) never hides a machine.
 PEER_SECONDS = 90
 ANNOUNCE_SECONDS = 10
+# A known machine UDP has not refreshed this long gets a TCP heartbeat, so machines
+# stay listed when every datagram is lost. Failures back off per machine up to the cap.
+HEARTBEAT_SECONDS = 25
+HEARTBEAT_RETRY, HEARTBEAT_BACKOFF_MAX = 5.0, 300.0
+LOG_LINES = 200  # network.log keeps only the most recent lines.
+LOG_REPEAT_SECONDS = 60  # The same error is logged at most once a minute.
 POLICY_SECONDS = 15
 STATE_SECONDS = 60
 CLOCK_SKEW = 120
@@ -243,6 +252,35 @@ def device_key(directory=None) -> tuple[str, str]:
     return private, derive_public_key_hex(private)
 
 
+_log_lock = threading.Lock()
+
+
+def log_event(directory, text: str) -> None:
+    """Append one line to network.log (bounded, owner-only). Never raises: logging
+    must not take the node down, and a failure here is not worth hiding a send."""
+    path = local_directory(directory) / "network.log"
+    line = time.strftime("%Y-%m-%dT%H:%M:%S") + " " + " ".join(str(text).split())[:500]
+    with _log_lock:
+        try:
+            if path.is_symlink():
+                return
+            try:
+                lines = path.read_text(errors="replace").splitlines()[-(LOG_LINES - 1):]
+            except FileNotFoundError:
+                lines = []
+            atomic_write_text(path, "\n".join([*lines, line]) + "\n", mode=0o600)
+        except OSError:
+            pass
+
+
+def read_log(directory=None, lines: int = 10) -> list[str]:
+    path = local_directory(directory) / "network.log"
+    try:
+        return [] if path.is_symlink() else path.read_text(errors="replace").splitlines()[-lines:]
+    except OSError:
+        return []
+
+
 # ------------------------------------------------------------------- validation
 
 def _text(value, maximum: int) -> bool:
@@ -293,6 +331,22 @@ def _compact(sessions: list[dict], objective: int) -> list[dict]:
     return out
 
 
+def _merge(compact: list[dict], full: list[dict], total) -> list[dict]:
+    """A cut-down datagram roster from a machine whose full roster we fetched recently.
+    Its cards say who is present and available now; the full cards keep their detail
+    while the objective is unchanged, and sessions cut only for size stay listed."""
+    detailed = {card["id"]: card for card in full}
+    merged = []
+    for card in compact:
+        known = detailed.get(card["id"])
+        same = known is not None and known.get("objective_at") == card.get("objective_at")
+        merged.append(dict(known, availability=card["availability"]) if same else card)
+    if type(total) is int and total > len(compact):
+        present = {card["id"] for card in compact}
+        merged += [card for card in full if card["id"] not in present][:total - len(compact)]
+    return merged[:MAX_SESSIONS]
+
+
 # ------------------------------------------------------------------------- node
 
 class _Endpoint:
@@ -307,6 +361,7 @@ class _Endpoint:
         self.host = host_name()[:128]
         state = read_state(self.directory)
         self.tcp_port = state.get("tcp_port", 0) if state.get("running") else 0
+        self.full_at: dict[str, float] = {}  # When each machine's full roster last arrived.
 
     def _roster(self) -> list[dict]:
         with open_database(self.directory) as db:
@@ -328,25 +383,28 @@ class _Endpoint:
             return {}
         return facts if valid_facts(facts) else {}
 
-    def _announcement(self) -> bytes:
-        """The signed roster, in one datagram every OS will send. Compact before dropping
-        anyone: first changed-file lists, then long objectives; only then the least
-        recently seen sessions."""
+    def _announcement(self, limit: int = MAX_DATAGRAM) -> bytes:
+        """The signed roster within `limit` bytes: one datagram every OS will send for UDP,
+        MAX_ROSTER over TCP. Compact before dropping anyone: first changed-file lists,
+        then long objectives; only then the least recently seen sessions. A roster cut
+        to fit says so (`complete: false`), so newer receivers fetch the full one over TCP."""
         full = self._roster()
 
         def build(sessions):
             payload = {"p": PROTOCOL, "t": "announce", "device": self.device, "host": self.host,
                        "port": self.tcp_port, "ts": time.time(), "nonce": uuid.uuid4().hex,
                        "sessions": sessions}
+            if sessions is not full:
+                payload["complete"], payload["total"] = False, len(full)
             payload["sig"] = sign_payload(self.private, ANNOUNCE_DOMAIN, _json(payload))
             return _json(payload).encode()
 
         for objective in (None, 512, 160, 48, 0):
             sessions = full if objective is None else _compact(full, objective)
             raw = build(sessions)
-            if len(raw) <= MAX_DATAGRAM:
+            if len(raw) <= limit:
                 return raw
-        while sessions and len(raw) > MAX_DATAGRAM:
+        while sessions and len(raw) > limit:
             sessions = sessions[:-1]
             raw = build(sessions)
         return raw
@@ -355,14 +413,14 @@ class _Endpoint:
         request = {"p": PROTOCOL, "t": "deliver", "device": self.device, "ts": time.time(),
                    "nonce": uuid.uuid4().hex, "items": items}
         if self.tcp_port:
-            # Carry our signed roster so the receiver never depends on having heard a broadcast.
-            request["announcement"] = json.loads(self._announcement())
+            # Carry our full signed roster so the receiver never depends on having heard a broadcast.
+            request["announcement"] = json.loads(self._announcement(MAX_ROSTER))
         request["sig"] = sign_payload(self.private, DELIVER_DOMAIN, _json(request))
         with socket.create_connection((address, port), timeout=3) as conn:
             conn.settimeout(5)
             conn.sendall(_json(request).encode() + b"\n")
             data = b""
-            while b"\n" not in data and len(data) <= 65536:
+            while b"\n" not in data and len(data) <= MAX_REQUEST:
                 chunk = conn.recv(65536)
                 if not chunk:
                     break
@@ -372,7 +430,51 @@ class _Endpoint:
             raise ValueError(str(response.get("error") if isinstance(response, dict) else "bad response"))
         return response
 
+    def _accept_reply(self, response: dict, device: str, address: str) -> None:
+        """Newer receivers answer with their own full roster: one round trip refreshes both
+        sides. Only the machine we contacted, at the address we contacted, and signed."""
+        announcement = response.get("announcement")
+        if isinstance(announcement, dict) and announcement.get("device") == device:
+            try:
+                self._accept_announcement(announcement, address)
+            except (ValueError, TypeError, KeyError):
+                pass
 
+    def _accept_announcement(self, message: dict, address: str) -> bool:
+        """Store a valid roster; True when the machine was new, False when known, None when ignored."""
+        device = message.get("device")
+        if not isinstance(device, str) or not _HEX64.fullmatch(device) or device == self.device:
+            return
+        port, host, ts = message.get("port"), message.get("host"), message.get("ts")
+        if type(port) is not int or not 0 < port < 65536 or not _text(host, 128) or not _fresh(ts):
+            return
+        if not _valid_roster(message.get("sessions")) or not isinstance(message.get("nonce"), str):
+            return
+        complete, total = message.get("complete", True), message.get("total", 0)
+        if type(complete) is not bool or type(total) is not int:
+            return
+        unsigned = {k: v for k, v in message.items() if k != "sig"}
+        if not verify_signed_payload(device, message.get("sig", ""), ANNOUNCE_DOMAIN, _json(unsigned)):
+            return
+        sessions = message["sessions"]
+        with open_database(self.directory) as db:
+            row = db.execute("SELECT ts, sessions FROM network_peers WHERE device=?", (device,)).fetchone()
+            if row is not None and row["ts"] is not None and ts <= row["ts"]:
+                return None  # Replayed or reordered roster: ignored, like any invalid one.
+            if row is None and db.execute("SELECT COUNT(*) FROM network_peers").fetchone()[0] >= MAX_NETWORK_PEERS:
+                return
+            if complete:
+                self.full_at[device] = time.monotonic()
+            elif row is not None and time.monotonic() - self.full_at.get(device, -1e18) < 2 * HEARTBEAT_SECONDS:
+                # A datagram cut for size must not erase the detail a TCP roster just brought.
+                sessions = _merge(sessions, json.loads(row["sessions"]), total)
+            # The packet's source address, not a claimed one, is where mail goes.
+            db.execute("INSERT INTO network_peers(device, host, address, port, sessions, seen, ts) "
+                       "VALUES(?,?,?,?,?,?,?) ON CONFLICT(device) DO UPDATE SET host=excluded.host, "
+                       "address=excluded.address, port=excluded.port, sessions=excluded.sessions, "
+                       "seen=excluded.seen, ts=excluded.ts",
+                       (device, host, address, port, _json(sessions), time.time(), ts))
+        return row is None
 
 
 def deliver_pending(endpoint, *, route: str | None = None, backoff: dict | None = None) -> dict:
@@ -417,6 +519,7 @@ def deliver_pending(endpoint, *, route: str | None = None, backoff: dict | None 
             continue
         if backoff is not None:
             backoff.pop(device, None)
+        endpoint._accept_reply(response, device, peer["address"])
         accepted, rejected = set(response.get("accepted", [])), response.get("rejected", {})
         with open_database(endpoint.directory) as db:
             for row in batch:
@@ -462,7 +565,16 @@ class NetworkNode(_Endpoint):
         # traffic (multicast, broadcast) unreliably, often in bursts minutes apart, but
         # acknowledges and retries unicast; so known machines also get unicast rosters.
         self.known: dict[str, tuple[str, int]] = {}
-        self.send_error: tuple[float, str] | None = None  # Shown by doctor; never silent.
+        self.send_error: tuple[float, str] | None = None  # Shown by doctor and status; never silent.
+        self.heartbeat_error: tuple[float, str] | None = None
+        self.full_at: dict[str, float] = {}
+        # TCP heartbeats: at most one in flight per machine, each on its own daemon
+        # thread so a dead machine never stalls this loop; failures back off.
+        self.heartbeat_lock = threading.Lock()
+        self.heartbeat_threads: dict[str, threading.Thread] = {}
+        self.heartbeat_at: dict[str, float] = {}
+        self.heartbeat_backoff: dict[str, tuple[float, float]] = {}
+        self._logged: dict[str, float] = {}
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -484,6 +596,7 @@ class NetworkNode(_Endpoint):
                         self._send({"p": PROTOCOL, "t": "probe", "device": self.device})
                     cycle += 1
                     self._expire_peers()
+                    self._heartbeats()
                     next_announce = now + ANNOUNCE_SECONDS
                 if self.trusted:
                     self.pump()
@@ -528,9 +641,23 @@ class NetworkNode(_Endpoint):
                  "reason": self.reason, "kind": self.network.get("kind"), "address": self.address,
                  "tcp_port": self.tcp_port, "mode": mode or get_mode(self.directory),
                  "fingerprint": self.fingerprint,
-                 "send_error": self.send_error[1] if self.send_error and time.time() - self.send_error[0] < 300 else None,
+                 "send_error": self._recent(self.send_error), "heartbeat_error": self._recent(self.heartbeat_error),
                  "pid": os.getpid(), "updated": time.time() if running else 0}
         atomic_write_text(self.directory / "network_state.json", _json(state) + "\n", mode=0o600)
+
+    @staticmethod
+    def _recent(error: tuple[float, str] | None) -> str | None:
+        return error[1] if error and time.time() - error[0] < 300 else None
+
+    def _log(self, text: str, key: str | None = None) -> None:
+        """Record a failure in network.log; a repeating one (same `key`) at most once a minute."""
+        now, key = time.monotonic(), key or text
+        if now - self._logged.get(key, -1e18) < LOG_REPEAT_SECONDS:
+            return
+        if len(self._logged) > 256:
+            self._logged.clear()
+        self._logged[key] = now
+        log_event(self.directory, text)
 
     def _open(self, address: str) -> None:
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -588,6 +715,7 @@ class NetworkNode(_Endpoint):
                 self.udp.sendto(raw, target)
             except OSError as exc:
                 self.send_error = (time.time(), f"{type(exc).__name__}: {exc} ({len(raw)} bytes to {target[0]})")
+                self._log("UDP send failed: " + self.send_error[1], key=f"udp {target} {exc}")
 
     def announce(self, targets=None) -> None:
         self._send(self._announcement(), targets)
@@ -615,35 +743,10 @@ class NetworkNode(_Endpoint):
                     if accepted:
                         # New machine: answer directly, so one working direction suffices.
                         self.announce([(address, source_port)])
+                    if accepted is not None and message.get("complete") is False:
+                        self._fetch_roster(message["device"])  # Cut to fit a datagram.
             except (ValueError, TypeError, KeyError, UnicodeDecodeError, OSError):
                 continue
-
-    def _accept_announcement(self, message: dict, address: str) -> bool:
-        """Store a valid roster; True when the machine was new, False when known, None when ignored."""
-        device = message.get("device")
-        if not isinstance(device, str) or not _HEX64.fullmatch(device) or device == self.device:
-            return
-        port, host, ts = message.get("port"), message.get("host"), message.get("ts")
-        if type(port) is not int or not 0 < port < 65536 or not _text(host, 128) or not _fresh(ts):
-            return
-        if not _valid_roster(message.get("sessions")) or not isinstance(message.get("nonce"), str):
-            return
-        unsigned = {k: v for k, v in message.items() if k != "sig"}
-        if not verify_signed_payload(device, message.get("sig", ""), ANNOUNCE_DOMAIN, _json(unsigned)):
-            return
-        with open_database(self.directory) as db:
-            row = db.execute("SELECT ts FROM network_peers WHERE device=?", (device,)).fetchone()
-            if row is not None and row["ts"] is not None and ts <= row["ts"]:
-                return None  # Replayed or reordered roster: ignored, like any invalid one.
-            if row is None and db.execute("SELECT COUNT(*) FROM network_peers").fetchone()[0] >= MAX_NETWORK_PEERS:
-                return
-            # The packet's source address, not a claimed one, is where mail goes.
-            db.execute("INSERT INTO network_peers(device, host, address, port, sessions, seen, ts) "
-                       "VALUES(?,?,?,?,?,?,?) ON CONFLICT(device) DO UPDATE SET host=excluded.host, "
-                       "address=excluded.address, port=excluded.port, sessions=excluded.sessions, "
-                       "seen=excluded.seen, ts=excluded.ts",
-                       (device, host, address, port, _json(message["sessions"]), time.time(), ts))
-        return row is None
 
     def _known_targets(self) -> list[tuple[str, int]]:
         """Unicast destinations for machines still on the roster; forget the rest."""
@@ -657,6 +760,69 @@ class NetworkNode(_Endpoint):
     def _expire_peers(self) -> None:
         with open_database(self.directory) as db:
             db.execute("DELETE FROM network_peers WHERE seen <= ?", (time.time() - PEER_SECONDS,))
+
+    # -- TCP heartbeat: known machines stay listed, with full rosters, when UDP fails
+    def _heartbeats(self) -> None:
+        """Heartbeat each known machine UDP has not refreshed lately. Only machines
+        already in network_peers, at their stored address; nothing new is enrolled."""
+        with open_database(self.directory) as db:
+            peers = [dict(row) for row in db.execute("SELECT device, host, address, port, seen FROM network_peers")]
+        present = {peer["device"] for peer in peers}
+        with self.heartbeat_lock:
+            for table in (self.heartbeat_backoff, self.heartbeat_at, self.heartbeat_threads, self.full_at):
+                for device in [d for d in table if d not in present]:
+                    table.pop(device, None)
+        for peer in peers:
+            if time.time() - peer["seen"] >= HEARTBEAT_SECONDS:
+                self._heartbeat(peer)
+
+    def _fetch_roster(self, device: str) -> None:
+        """A machine's datagram roster was cut to fit: fetch the full one over TCP,
+        unless it arrived recently."""
+        if time.monotonic() - self.full_at.get(device, -1e18) < HEARTBEAT_SECONDS:
+            return
+        with open_database(self.directory) as db:
+            row = db.execute("SELECT device, host, address, port FROM network_peers WHERE device=?",
+                             (device,)).fetchone()
+        if row is not None:
+            self._heartbeat(dict(row))
+
+    def _heartbeat(self, peer: dict) -> bool:
+        """Start one heartbeat unless one is in flight, backing off, or just sent."""
+        device, now = peer["device"], time.monotonic()
+        with self.heartbeat_lock:
+            running = self.heartbeat_threads.get(device)
+            if not self.trusted or (running is not None and running.is_alive()):
+                return False
+            if now < self.heartbeat_backoff.get(device, (0.0, 0.0))[0]:
+                return False
+            if now - self.heartbeat_at.get(device, -1e18) < min(HEARTBEAT_SECONDS, ANNOUNCE_SECONDS):
+                return False
+            self.heartbeat_at[device] = now
+            thread = threading.Thread(target=self._send_heartbeat, name="darkmatter-heartbeat", daemon=True,
+                                      args=(device, peer["host"], peer["address"], peer["port"]))
+            self.heartbeat_threads[device] = thread
+        thread.start()
+        return True
+
+    def _send_heartbeat(self, device: str, host: str, address: str, port: int) -> None:
+        if not self.trusted or self._stop.is_set():
+            return
+        try:
+            # An empty delivery: it carries our full signed roster, and newer machines
+            # answer with theirs. Older ones accept it too and simply refresh us.
+            response = self._request(address, port, [])
+        except (OSError, ValueError) as exc:
+            with self.heartbeat_lock:
+                delay = min(self.heartbeat_backoff.get(device, (0.0, HEARTBEAT_RETRY))[1], HEARTBEAT_BACKOFF_MAX)
+                self.heartbeat_backoff[device] = (time.monotonic() + delay, min(delay * 2, HEARTBEAT_BACKOFF_MAX))
+            self.heartbeat_error = (time.time(), f"{host} ({address}:{port}): {exc or type(exc).__name__}")
+            self._log(f"TCP heartbeat to {self.heartbeat_error[1]}; retry in {delay:.0f}s",
+                      key=f"heartbeat {device} {exc}")
+            return
+        with self.heartbeat_lock:
+            self.heartbeat_backoff.pop(device, None)
+        self._accept_reply(response, device, address)
 
     # -- delivery (receiving side)
     def _serve_tcp(self, tcp) -> None:
@@ -732,7 +898,12 @@ class NetworkNode(_Endpoint):
                     rejected[mid] = reason
                 else:
                     accepted.append(mid)
-        return {"p": PROTOCOL, "ok": True, "accepted": accepted, "receipts": receipts, "rejected": rejected}
+        response = {"p": PROTOCOL, "ok": True, "accepted": accepted, "receipts": receipts, "rejected": rejected}
+        if self.tcp_port:
+            # Our full roster back: one round trip refreshes both machines, even with all
+            # UDP lost. Older senders ignore the field.
+            response["announcement"] = json.loads(self._announcement(MAX_ROSTER))
+        return response
 
     @staticmethod
     def _accept_message(db, raw, device: str, roster: set) -> tuple[str, str | None]:
@@ -776,8 +947,9 @@ def doctor(directory=None) -> dict:
     state = read_state(directory)
     report = {"mode": mode, "network": current, "sharing": allowed, "reason": reason,
               "node": {"running": bool(state.get("running")), "address": state.get("address"),
-                       "tcp_port": state.get("tcp_port"), "send_error": state.get("send_error")},
-              "peers": [], "queued": []}
+                       "tcp_port": state.get("tcp_port"), "send_error": state.get("send_error"),
+                       "heartbeat_error": state.get("heartbeat_error")},
+              "log": read_log(directory), "peers": [], "queued": []}
     with open_database(directory) as db:
         peers = [dict(r) for r in db.execute("SELECT device, host, address, port, seen FROM network_peers")]
         queued = [dict(r) for r in db.execute(
@@ -806,7 +978,10 @@ def doctor(directory=None) -> dict:
         report["queued"].append({"id": row["id"], "to_machine": hosts.get(row["route"], row["route"][:12]),
                                  "waiting_seconds": round(time.time() - row["created"]),
                                  "last_error": row["last_error"] or "not attempted yet"})
-    if not report["peers"]:
+    if state.get("send_error"):
+        report["hint"] = (f"This machine failed to send network traffic: {state['send_error']}. "
+                          "Recent failures are in network.log (see `log`).")
+    elif not report["peers"]:
         report["hint"] = ("No machines heard. The other machine needs DarkMatter 3.14+ with an MCP client or "
                           "`darkmatter network run` running; run `darkmatter network doctor` there too.")
     return report
