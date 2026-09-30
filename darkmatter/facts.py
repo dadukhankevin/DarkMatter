@@ -89,6 +89,17 @@ def label(card: dict) -> str:
     return " · ".join(part for part in (card.get("client") or "agent", where, card.get("host") or "") if part)
 
 
+# Bonjour renames a machine on a name clash: 'Name' becomes 'Name-2' (host) or 'Name (2)'
+# (computer name), and the number can change again later. Machines are keyed by device
+# id; for matching, a clash suffix must not decide which machine a name means.
+_CLASH_SUFFIX = re.compile(r"(-\d+| \(\d+\))$")
+
+
+def base_host(value: str) -> str:
+    """'Daniels-MacBook-Pro-192' -> 'Daniels-MacBook-Pro'; other names unchanged."""
+    return _CLASH_SUFFIX.sub("", re.sub(r"\.(local|lan|home)$", "", str(value), flags=re.I))
+
+
 def matches(card: dict, match: dict) -> bool:
     """Every given field must loosely match: host, project, client, branch, or session id prefix."""
     fields = {"host": card.get("host"), "project": card.get("project"), "client": card.get("client"),
@@ -99,9 +110,13 @@ def matches(card: dict, match: dict) -> bool:
             names = [n for n in (have, card.get("session")) if isinstance(n, str)]
             if not (isinstance(wanted, str) and wanted and any(n.startswith(wanted) for n in names)):
                 return False
+        elif key == "host" and have and normalize(wanted) and (
+                normalize(wanted) in normalize(have)
+                or normalize(base_host(wanted)) in normalize(base_host(have))):
+            continue  # A renamed machine still answers to its earlier clash-numbered name.
         elif not have or not normalize(wanted) or normalize(wanted) not in normalize(have):
             return False
     return True
 
 
-__all__ = ["host_name", "label", "matches", "normalize", "valid_facts", "workspace_facts"]
+__all__ = ["base_host", "host_name", "label", "matches", "normalize", "valid_facts", "workspace_facts"]

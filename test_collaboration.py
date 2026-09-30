@@ -396,3 +396,18 @@ def test_mail_carries_guidance_to_delegate_substantial_work(boards, monkeypatch,
     assert "background sub-agent" in capsys.readouterr().out
     assert "WHEN MAIL ASKS FOR WORK" in MCP_INSTRUCTIONS and "run_in_background" in MCP_INSTRUCTIONS
     assert "Sub-agents have no DarkMatter identity" in MCP_INSTRUCTIONS
+
+
+def test_host_match_survives_a_bonjour_clash_rename():
+    """Regression: macOS renamed Daniels-MacBook-Pro-130 to -192 on a name clash, and a
+    send addressed by the old host name matched nothing."""
+    from darkmatter.facts import base_host, matches
+    renamed = {"host": "Daniels-MacBook-Pro-192", "project": "DarkMatter", "client": "claude-code", "id": "a" * 64}
+    assert matches(renamed, {"host": "Daniels-MacBook-Pro-130"})
+    assert matches(renamed, {"host": "Daniels-MacBook-Pro-192.local"})
+    assert matches(renamed, {"host": "MacBook"}) and matches(renamed, {"host": "macbook pro"})
+    assert matches({**renamed, "host": "Daniel’s MacBook Pro (7)"}, {"host": "Daniel's MacBook Pro"})
+    assert not matches(renamed, {"host": "Daniels-Mac-mini"})
+    assert not matches({**renamed, "host": "Daniels-Mac-mini"}, {"host": "Daniels-MacBook-Pro-130"})
+    assert base_host("Daniels-MacBook-Pro-192.local") == "Daniels-MacBook-Pro"
+    assert base_host("build-server") == "build-server"
