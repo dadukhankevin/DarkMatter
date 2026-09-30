@@ -88,7 +88,11 @@ def open_database(directory: str | Path | None = None):
     for candidate in (path, Path(str(path) + "-journal")):
         if candidate.is_symlink():
             raise ValueError("Local collaboration database must not be a symlink")
-        if candidate.exists() and not stat.S_ISREG(candidate.stat().st_mode):
+        try:
+            mode = candidate.stat().st_mode
+        except FileNotFoundError:
+            continue  # SQLite creates and deletes its journal at will.
+        if not stat.S_ISREG(mode):
             raise ValueError("Local collaboration database must be a regular file")
     db = sqlite3.connect(path, timeout=5)
     db.row_factory = sqlite3.Row

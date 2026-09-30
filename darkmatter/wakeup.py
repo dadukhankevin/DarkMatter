@@ -317,11 +317,29 @@ def _wait_loop(root, session_id, client, mailbox, deadline, generation, board, s
         if remaining <= 0:
             log.event("timeout")
             return None
-        time.sleep(min(pause, remaining))
+        # Sleep in short steps even while backing off, so a newer waiter waiting to
+        # take over is never left waiting longer than it will wait.
+        left = min(pause, remaining)
+        while left > 0:
+            step = min(1.0, left)
+            time.sleep(step)
+            left -= step
+            if generation and current_generation(root, session_id) != generation:
+                log.event("superseded")
+                return None
 
 
 class _Skip(Exception):
     pass
+
+
+def log_wait_event(root, session_id, client, name, **extra) -> None:
+    """Record a waiter lifecycle event from outside the wait loop."""
+    try:
+        from darkmatter.collaboration import Collaboration
+        _WaitLog(Collaboration(root, session_id, client)).event(name, **extra)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class _WaitLog:

@@ -30,11 +30,15 @@ def _wait_hook(argv: list[str]) -> int:
         except json.JSONDecodeError:
             pass
 
-    root = Path(
+    from darkmatter.collaboration import workspace_root
+
+    # The project, not the current subdirectory: the lease must be the same file
+    # from every Stop of this session, or an old waiter is never taken over.
+    root = workspace_root(Path(
         os.environ.get("DARKMATTER_PROJECT_DIR")
         or hook_input.get("cwd")
         or os.getcwd()
-    )
+    ))
     session_id = hook_input.get("session_id")
     # Claude Code sets stop_hook_active on the Stop that ends a turn a wake started.
     # Bailing there left the session deaf until a human typed. Wake loops are
@@ -49,7 +53,7 @@ def _wait_hook(argv: list[str]) -> int:
     import uuid
 
     from darkmatter.gitbox.mailbox import get_mailbox
-    from darkmatter.wakeup import wait_for_session_activity, wake_lease
+    from darkmatter.wakeup import log_wait_event, wait_for_session_activity, wake_lease
 
     def _terminated(signum, frame):
         raise SystemExit(128 + signum)
@@ -57,8 +61,9 @@ def _wait_hook(argv: list[str]) -> int:
     # A host that kills the waiter should leave a trace in the wake log.
     signal.signal(signal.SIGTERM, _terminated)
     generation = f"{time.time():.6f}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    with wake_lease(root, session_id, takeover_seconds=15, generation=generation) as acquired:
+    with wake_lease(root, session_id, takeover_seconds=60, generation=generation) as acquired:
         if not acquired:
+            log_wait_event(root, session_id, args.client, "lease-busy", generation=generation)
             return 0
         message = wait_for_session_activity(
             root, session_id, args.client, get_mailbox(root), args.timeout_seconds, generation,

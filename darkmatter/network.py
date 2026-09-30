@@ -50,7 +50,9 @@ MAX_ITEMS = 32
 MAX_SESSIONS = 48
 MAX_NETWORK_PEERS = 64
 MAX_CONNECTIONS = 32
-PEER_SECONDS = 45
+# Missing this long, a machine drops off the roster. Several announce periods, so a
+# lost packet or two (Wi-Fi drops group traffic readily) never hides a machine.
+PEER_SECONDS = 90
 ANNOUNCE_SECONDS = 10
 POLICY_SECONDS = 15
 STATE_SECONDS = 60
@@ -429,6 +431,10 @@ class NetworkNode(_Endpoint):
         self.rate = _RateLimiter()
         self.slots = threading.Semaphore(MAX_CONNECTIONS)
         self.backoff: dict[str, tuple[float, float]] = {}
+        # Where each known machine's announcements come from. Wi-Fi delivers group
+        # traffic (multicast, broadcast) unreliably, often in bursts minutes apart, but
+        # acknowledges and retries unicast; so known machines also get unicast rosters.
+        self.known: dict[str, tuple[str, int]] = {}
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -444,6 +450,7 @@ class NetworkNode(_Endpoint):
                     next_policy = now + POLICY_SECONDS
                 if self.trusted and now >= next_announce:
                     self.announce()
+                    self.announce(self._known_targets())
                     if cycle % 3 == 0:
                         # Periodic probes also find nodes whose own announcements cannot reach us.
                         self._send({"p": PROTOCOL, "t": "probe", "device": self.device})
@@ -573,14 +580,17 @@ class NetworkNode(_Endpoint):
                 if message.get("t") == "probe" and message.get("device") != self.device:
                     self.announce([(address, source_port)])
                 elif message.get("t") == "announce":
-                    if self._accept_announcement(message, address):
+                    accepted = self._accept_announcement(message, address)
+                    if accepted is not None:
+                        self.known[message["device"]] = (address, source_port)
+                    if accepted:
                         # New machine: answer directly, so one working direction suffices.
                         self.announce([(address, source_port)])
             except (ValueError, TypeError, KeyError, UnicodeDecodeError, OSError):
                 continue
 
     def _accept_announcement(self, message: dict, address: str) -> bool:
-        """Store a valid roster; True when the machine was not known before."""
+        """Store a valid roster; True when the machine was new, False when known, None when ignored."""
         device = message.get("device")
         if not isinstance(device, str) or not _HEX64.fullmatch(device) or device == self.device:
             return
@@ -595,7 +605,7 @@ class NetworkNode(_Endpoint):
         with open_database(self.directory) as db:
             row = db.execute("SELECT ts FROM network_peers WHERE device=?", (device,)).fetchone()
             if row is not None and row["ts"] is not None and ts <= row["ts"]:
-                return False  # Replayed or reordered roster.
+                return None  # Replayed or reordered roster: ignored, like any invalid one.
             if row is None and db.execute("SELECT COUNT(*) FROM network_peers").fetchone()[0] >= MAX_NETWORK_PEERS:
                 return
             # The packet's source address, not a claimed one, is where mail goes.
@@ -605,6 +615,15 @@ class NetworkNode(_Endpoint):
                        "seen=excluded.seen, ts=excluded.ts",
                        (device, host, address, port, _json(message["sessions"]), time.time(), ts))
         return row is None
+
+    def _known_targets(self) -> list[tuple[str, int]]:
+        """Unicast destinations for machines still on the roster; forget the rest."""
+        with open_database(self.directory) as db:
+            present = {row["device"] for row in db.execute("SELECT device FROM network_peers")}
+        for device in list(self.known):
+            if device not in present:
+                self.known.pop(device, None)
+        return [target for device, target in list(self.known.items()) if device in present]
 
     def _expire_peers(self) -> None:
         with open_database(self.directory) as db:

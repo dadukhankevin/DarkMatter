@@ -557,3 +557,78 @@ def test_main_turn_tool_hooks_still_keep_the_session_busy(tmp_path):
     before = board.active_at()
     board.tool_activity()  # After Stop: only a background subagent.
     assert board.active_at() == before
+
+
+def test_known_machines_stay_listed_when_wifi_drops_group_traffic(machines, monkeypatch):
+    """Regression: Wi-Fi delivered multicast/broadcast rosters in bursts minutes apart,
+    so whole machines dropped off the roster while awake."""
+    import threading
+    (a_board, a), (b_board, b) = machines
+    monkeypatch.setattr(network, "ANNOUNCE_SECONDS", 0.2)
+    monkeypatch.setattr(network, "PEER_SECONDS", 1.0)
+    a.announce()
+    b.announce()
+    _until(lambda: network_sessions(a.directory)[1] and network_sessions(b.directory)[1])
+    a.extra_targets, b.extra_targets = [], []  # From now on, group traffic is lost.
+    threads = [threading.Thread(target=node.run, daemon=True) for node in (a, b)]
+    for thread in threads:
+        thread.start()
+    time.sleep(3.0)  # Three peer lifetimes.
+    assert network_sessions(a.directory)[1][0]["id"] == b_board.agent_id
+    assert network_sessions(b.directory)[1][0]["id"] == a_board.agent_id
+
+
+def test_a_vanishing_sqlite_journal_is_not_an_error(tmp_path, monkeypatch):
+    """Regression: SQLite deleted its journal between our check and stat, and hooks,
+    tools, and waiters failed with FileNotFoundError."""
+    import pathlib
+    from darkmatter.collaboration import open_database
+    real_stat = pathlib.Path.stat
+
+    def racing_stat(self, *args, **kwargs):
+        if str(self).endswith("-journal") and kwargs.get("follow_symlinks", True):
+            raise FileNotFoundError(str(self))
+        return real_stat(self, *args, **kwargs)
+
+    real_exists = pathlib.Path.exists
+    monkeypatch.setattr(pathlib.Path, "exists",
+                        lambda self, *a, **k: True if str(self).endswith("-journal") else real_exists(self, *a, **k))
+    monkeypatch.setattr(pathlib.Path, "stat", racing_stat)
+    Collaboration(tmp_path / "app", "s", "claude-code", directory=tmp_path / "local")
+    with open_database(tmp_path / "local") as db:
+        db.execute("SELECT 1")
+
+
+def test_newer_waiter_takes_over_one_that_is_backing_off(tmp_path):
+    """Regression: an old waiter asleep in error back-off outlasted the new waiter's
+    takeover wait; the new one gave up, the old one then stepped aside, and nobody listened."""
+    import threading
+    from darkmatter import wakeup
+    root = tmp_path / "app"
+    board = Collaboration(root, "s", "claude-code")
+
+    class Broken:
+        calls = 0
+
+        def sync(self, force):
+            Broken.calls += 1
+            raise OSError("network is unreachable")
+
+        class store:
+            @staticmethod
+            def unconsumed_messages():
+                return []
+
+    def old_waiter():  # Holds the lease exactly as the wait-hook does.
+        with wakeup.wake_lease(root, "s", generation="gen-old"):
+            wakeup.wait_for_session_activity(root, "s", "claude-code", Broken(), 60, "gen-old")
+
+    old = threading.Thread(target=old_waiter)
+    old.start()
+    _until(lambda: Broken.calls >= 2, timeout=15)  # Now sleeping 8 s between tries.
+    with wakeup.wake_lease(root, "s", takeover_seconds=4, generation="gen-new") as acquired:
+        assert acquired  # The old waiter noticed within a second, not after 8.
+    old.join(5)
+    assert not old.is_alive()
+    events = [e["event"] for e in json.loads((board.directory / (board.identity + ".wake-log.json")).read_text())]
+    assert events[-1] == "superseded"
