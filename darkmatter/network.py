@@ -43,7 +43,10 @@ GROUP = "239.255.42.100"
 PORT = 8743
 MODES = ("auto", "on", "off")
 TRUSTED_KINDS = ("wifi-secured", "wired")
-MAX_PACKET = 16 * 1024
+MAX_PACKET = 16 * 1024  # Largest roster we accept.
+# Largest roster we send. macOS refuses UDP datagrams over 9216 bytes by default
+# (net.inet.udp.maxdgram), and a bigger roster failed to send at all.
+MAX_DATAGRAM = 8192
 MAX_REQUEST = 512 * 1024
 MAX_ENVELOPE = 64 * 1024
 MAX_ITEMS = 32
@@ -277,6 +280,19 @@ class _RateLimiter:
             return True
 
 
+def _compact(sessions: list[dict], objective: int) -> list[dict]:
+    """Smaller cards that still validate on older receivers: no changed-file list, and
+    the objective cut to `objective` characters. At 0, bare cards: no objective or facts."""
+    out = []
+    for card in sessions:
+        card = dict(card, objective=card.get("objective", "")[:objective])
+        facts = {} if objective == 0 else dict(card.get("facts") or {})
+        facts.pop("changed", None)
+        card["facts"] = facts
+        out.append(card)
+    return out
+
+
 # ------------------------------------------------------------------------- node
 
 class _Endpoint:
@@ -313,16 +329,27 @@ class _Endpoint:
         return facts if valid_facts(facts) else {}
 
     def _announcement(self) -> bytes:
-        sessions = self._roster()
-        while True:
+        """The signed roster, in one datagram every OS will send. Compact before dropping
+        anyone: first changed-file lists, then long objectives; only then the least
+        recently seen sessions."""
+        full = self._roster()
+
+        def build(sessions):
             payload = {"p": PROTOCOL, "t": "announce", "device": self.device, "host": self.host,
                        "port": self.tcp_port, "ts": time.time(), "nonce": uuid.uuid4().hex,
                        "sessions": sessions}
             payload["sig"] = sign_payload(self.private, ANNOUNCE_DOMAIN, _json(payload))
-            raw = _json(payload).encode()
-            if len(raw) <= MAX_PACKET or not sessions:
+            return _json(payload).encode()
+
+        for objective in (None, 512, 160, 48, 0):
+            sessions = full if objective is None else _compact(full, objective)
+            raw = build(sessions)
+            if len(raw) <= MAX_DATAGRAM:
                 return raw
+        while sessions and len(raw) > MAX_DATAGRAM:
             sessions = sessions[:-1]
+            raw = build(sessions)
+        return raw
 
     def _request(self, address: str, port: int, items: list) -> dict:
         request = {"p": PROTOCOL, "t": "deliver", "device": self.device, "ts": time.time(),
@@ -435,6 +462,7 @@ class NetworkNode(_Endpoint):
         # traffic (multicast, broadcast) unreliably, often in bursts minutes apart, but
         # acknowledges and retries unicast; so known machines also get unicast rosters.
         self.known: dict[str, tuple[str, int]] = {}
+        self.send_error: tuple[float, str] | None = None  # Shown by doctor; never silent.
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -500,6 +528,7 @@ class NetworkNode(_Endpoint):
                  "reason": self.reason, "kind": self.network.get("kind"), "address": self.address,
                  "tcp_port": self.tcp_port, "mode": mode or get_mode(self.directory),
                  "fingerprint": self.fingerprint,
+                 "send_error": self.send_error[1] if self.send_error and time.time() - self.send_error[0] < 300 else None,
                  "pid": os.getpid(), "updated": time.time() if running else 0}
         atomic_write_text(self.directory / "network_state.json", _json(state) + "\n", mode=0o600)
 
@@ -557,8 +586,8 @@ class NetworkNode(_Endpoint):
         for target in targets or [*default, *self.extra_targets]:
             try:
                 self.udp.sendto(raw, target)
-            except OSError:
-                pass
+            except OSError as exc:
+                self.send_error = (time.time(), f"{type(exc).__name__}: {exc} ({len(raw)} bytes to {target[0]})")
 
     def announce(self, targets=None) -> None:
         self._send(self._announcement(), targets)
@@ -747,7 +776,7 @@ def doctor(directory=None) -> dict:
     state = read_state(directory)
     report = {"mode": mode, "network": current, "sharing": allowed, "reason": reason,
               "node": {"running": bool(state.get("running")), "address": state.get("address"),
-                       "tcp_port": state.get("tcp_port")},
+                       "tcp_port": state.get("tcp_port"), "send_error": state.get("send_error")},
               "peers": [], "queued": []}
     with open_database(directory) as db:
         peers = [dict(r) for r in db.execute("SELECT device, host, address, port, seen FROM network_peers")]

@@ -632,3 +632,52 @@ def test_newer_waiter_takes_over_one_that_is_backing_off(tmp_path):
     assert not old.is_alive()
     events = [e["event"] for e in json.loads((board.directory / (board.identity + ".wake-log.json")).read_text())]
     assert events[-1] == "superseded"
+
+
+def test_a_busy_machines_roster_fits_one_sendable_datagram(machines):
+    """Regression: with 19 sessions the MacBook's roster grew past 9216 bytes, macOS
+    refused to send it (EMSGSIZE, swallowed), and the machine vanished from the network."""
+    import socket as _socket
+    (a_board, a), (b_board, b) = machines
+    long_goal = "Refactor the billing pipeline end to end and keep every test green " * 7
+    def add(i):
+        board = Collaboration(a.directory.parent / f"proj{i}", f"s{i}", "claude-code", directory=a.directory)
+        board.join(long_goal[:500], availability="busy")
+        with open_database(a.directory) as db:
+            db.execute("UPDATE participants SET facts=? WHERE id=?", (json.dumps({
+                "branch": "feature/very-long-branch-name-" + str(i), "changed_count": 20,
+                "changed": [f"src/module_{j}/deeply/nested/file_{j}.py" for j in range(20)],
+                "last_commit": "A fairly long last commit subject line for this session"}), board.agent_id))
+        return board
+
+    for i in range(30):
+        add(i)
+    raw = a._announcement()
+    assert len(raw) <= network.MAX_DATAGRAM < 9216
+    probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    probe.sendto(raw, ("127.0.0.1", 9))  # macOS would raise EMSGSIZE above 9216 bytes.
+    message = json.loads(raw)
+    assert len(message["sessions"]) == 31  # Compacted, nobody dropped.
+    assert b._accept_announcement(message, "127.0.0.1") is True  # Still valid for any receiver.
+    for i in range(30, 60):
+        newest = add(i)
+    raw = a._announcement()
+    sessions = json.loads(raw)["sessions"]
+    assert len(raw) <= network.MAX_DATAGRAM  # Past what fits, the least recently seen go.
+    assert sessions[0]["id"] == newest.agent_id and len(sessions) >= 35
+
+
+def test_send_failures_are_recorded_not_swallowed(machines):
+    (a_board, a), _ = machines
+
+    class Refuses:
+        def sendto(self, raw, target):
+            raise OSError(40, "Message too long")
+
+    real, a.udp = a.udp, Refuses()
+    try:
+        a.announce([("127.0.0.1", 1)])
+    finally:
+        a.udp = real
+    a._write_state(running=True)
+    assert "Message too long" in network.read_state(a.directory)["send_error"]
