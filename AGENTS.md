@@ -51,10 +51,11 @@ a security boundary, and do not claim complete prompt-injection resistance.
 Reviving a stopped session is a written recipe, in the MCP instructions and the
 README ("Reviving a session"), not a tool. Keep its limits when changing it:
 owner-authority mail only, same machine only, read-only by default, one revive
-per session per 10 minutes, and the revived session answers over DarkMatter as
-itself. The wake hook must exit at once under `DARKMATTER_REVIVE=1`, so a headless
-`claude -p --resume` run can end; `test_wait_hook_lets_a_revived_headless_run_end`
-guards it.
+per session per 10 minutes, never a second live copy, and the revived session
+answers over DarkMatter as itself. A revived session stays up and decides what
+to do next; the wake hook exits at once only for an explicit one-shot revive
+(`DARKMATTER_REVIVE=once`). `test_a_revived_session_stays_up_unless_one_shot`
+guards both.
 
 ## AntiMatter
 

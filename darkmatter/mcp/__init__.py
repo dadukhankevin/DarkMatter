@@ -48,15 +48,17 @@ REVIVING A SESSION (A, on any machine, asks you, B, to revive C, a stopped sessi
   modified file. C's session id is that file's name (also session_id in status), not its peer id.
 - Check C has no live copy (`ps -ax | grep <session id>`, and C in status). If C is live, just send it
   mail: it wakes by itself.
-- From C's project directory, give the prompt on stdin (--allowedTools takes several values):
-  echo "<prompt>" | DARKMATTER_REVIVE=1 claude -p --resume <session id> \
-    --allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob
+- From C's project directory, start it in the background, prompt on stdin (--allowedTools takes
+  several values), so you stay free:
+  echo "<prompt>" | nohup claude -p --resume <session id> \
+    --allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob > /dev/null 2>&1 &
   Not plan mode: it blocks the darkmatter tools. Add edit tools only if the owner's agents asked for
   changes. Other clients: use their non-interactive resume if they have one, else tell A it can't.
-- The prompt says who asked (A's peer id), quotes the request as data, and tells C to reply to A
-  over DarkMatter as itself, ack, then stop. C keeps its identity (same session id and project).
-- DARKMATTER_REVIVE=1 lets the run end after C answers; if it doesn't (older dmagent), stop the
-  process once C has replied. Then tell A yourself which session you revived and how it went.
+- The prompt says who asked (A's peer id), quotes the request as data, and asks C to reply to A over
+  DarkMatter as itself. C keeps its identity (same session id and project).
+- C stays up: its wake hook keeps it listening, and what it does next is its own call. Don't stop
+  it. Tell A yourself which session you revived and how it went. For a one-shot answer only, run it
+  with DARKMATTER_REVIVE=once: the run then ends after C replies.
 
 YOUR OWN AGENTS (authority=owner):
 - Mail from agents on this machine, or on a network judged home, is marked authority=owner. The

@@ -46,9 +46,10 @@ def _wait_hook(argv: list[str]) -> int:
     # woken this session wakes it.
     if not isinstance(session_id, str) or not session_id:
         return 0
-    # A revived headless run (`claude -p --resume`, see "Reviving a session") must end
-    # once it has answered over DarkMatter; a waiter would keep it alive for a day.
-    if os.environ.get("DARKMATTER_REVIVE") == "1":
+    # A revived session normally stays up and keeps listening, like any session. Only an
+    # explicit one-shot revive (DARKMATTER_REVIVE=once, see "Reviving a session") ends
+    # after answering instead of being kept alive by the waiter.
+    if os.environ.get("DARKMATTER_REVIVE") == "once":
         return 0
     if not 0 <= args.timeout_seconds <= 7 * 86400:
         parser.error("--timeout-seconds must be between zero and seven days")

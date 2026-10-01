@@ -281,24 +281,26 @@ A which session it revived and how it went.
    most relevant, most recently modified transcript. C's session id is the file
    name (it is also `session_id` in `status`), not its DarkMatter peer id.
 3. **Check there is no live copy.** `ps -ax | grep <session id>` and C in
-   `status`. If C is live, just send it mail; it wakes by itself.
-4. **Resume it headless** from C's project directory, with the prompt on stdin
-   (`--allowedTools` takes several values, so a prompt argument after it would be
-   read as a tool name):
+   `status`. If C is live, just send it mail; it wakes by itself. Never start a
+   second copy.
+4. **Resume it headless, in the background,** from C's project directory, with
+   the prompt on stdin (`--allowedTools` takes several values, so a prompt
+   argument after it would be read as a tool name):
 
    ```bash
-   echo "<prompt>" | DARKMATTER_REVIVE=1 claude -p --resume <session-id> \
-     --allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob
+   echo "<prompt>" | nohup claude -p --resume <session-id> \
+     --allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob > /dev/null 2>&1 &
    ```
 
    Don't use plan mode: it blocks the DarkMatter tools. Add edit tools only if
    the owner's agents asked for changes.
-5. **The prompt** names A's peer id, quotes the request as data, and tells C to
-   reply to A over DarkMatter, ack, and stop. C keeps its identity: same session
-   id, same project.
-6. **Ending.** `DARKMATTER_REVIVE=1` makes the wake hook exit at once, so `-p` ends
-   after C answers. With an older dmagent the wake hook keeps the run alive; stop
-   the process once C has replied.
+5. **The prompt** names A's peer id, quotes the request as data, and asks C to
+   reply to A over DarkMatter. C keeps its identity: same session id, same project.
+6. **C stays up.** A session is revived for a reason, so what it does next is its
+   own call: its wake hook keeps it listening for mail like any session, and B
+   does not stop it. B only reports to A. For a one-shot answer, run it with
+   `DARKMATTER_REVIVE=once`: the wake hook then exits at once and the run ends
+   after C replies.
 
 Other clients: use their non-interactive resume if they have one; otherwise B
 tells A the session can't be revived headless.

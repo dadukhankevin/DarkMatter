@@ -221,31 +221,40 @@ def test_native_wait_rejects_symlink_notification_state(tmp_path):
     assert victim.read_text() == "original"
 
 
-def test_wait_hook_lets_a_revived_headless_run_end(tmp_path, monkeypatch, capsys):
-    """Regression: a session revived with `claude -p --resume` never exited, because its
-    Stop hook armed a day-long mail waiter and kept waking it."""
+def test_a_revived_session_stays_up_unless_one_shot(tmp_path, monkeypatch, capsys):
+    """A revived session keeps listening like any session (Daniel: it was revived for a
+    reason, so what it does next is its call). Only DARKMATTER_REVIVE=once ends the
+    headless run after it answers, instead of a day-long waiter keeping it alive."""
     from darkmatter.collaboration import Collaboration
     sender = Collaboration(tmp_path, "sender", "codex")
     revived = Collaboration(tmp_path, "claude-1", "claude-code")
     revived.join()
-    sender.send(revived.agent_id, "pending mail that would otherwise wake it")
+    sender.send(revived.agent_id, "pending mail")
     monkeypatch.setattr("darkmatter.gitbox.mailbox.get_mailbox", lambda root=None: _Mailbox())
     payload = {"cwd": str(tmp_path), "session_id": "claude-1"}
-    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(payload)))
-    monkeypatch.setenv("DARKMATTER_REVIVE", "1")
+
+    def stop(env, timeout):
+        monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(payload)))
+        if env is None:
+            monkeypatch.delenv("DARKMATTER_REVIVE", raising=False)
+        else:
+            monkeypatch.setenv("DARKMATTER_REVIVE", env)
+        return cli._wait_hook(["--timeout-seconds", timeout])
+
     started = time.monotonic()
-    assert cli._wait_hook(["--timeout-seconds", "86400"]) == 0
+    assert stop("once", "86400") == 0  # One-shot: ends at once, with mail waiting.
     assert time.monotonic() - started < 2 and capsys.readouterr().err == ""
-    monkeypatch.delenv("DARKMATTER_REVIVE")
-    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(payload)))
-    assert cli._wait_hook(["--timeout-seconds", "0"]) == 2  # Normal sessions still wake.
+    assert stop("1", "0") == 2  # Any other value: a normal session that wakes for mail.
+    sender.send(revived.agent_id, "more mail")
+    assert stop(None, "0") == 2
 
 
 def test_agents_are_given_the_revive_recipe():
     from darkmatter.mcp import MCP_INSTRUCTIONS
     assert "REVIVING A SESSION" in MCP_INSTRUCTIONS
-    for needle in ("~/.claude/projects/*/*.jsonl", "not its peer id", "DARKMATTER_REVIVE=1 claude -p --resume",
+    for needle in ("~/.claude/projects/*/*.jsonl", "not its peer id", "nohup claude -p --resume",
                    "--allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob", "on stdin",
                    "Not plan mode", "never untrusted mail", "one revive per session per 10 minutes",
-                   "own machine"):
+                   "own machine", "C stays up", "Don't stop", "DARKMATTER_REVIVE=once"):
         assert needle in MCP_INSTRUCTIONS, needle
+    assert "DARKMATTER_REVIVE=1" not in MCP_INSTRUCTIONS
