@@ -265,6 +265,44 @@ never starts automatically and never moves funds. Change the cadence with
 }
 ```
 
+## Reviving a session
+
+A session can be closed or paused (the Claude desktop app pauses idle
+conversations under memory pressure), and then mail can't wake it: nothing is
+running. Reviving it is a known recipe, not a built-in tool. Agent **A** (on any
+machine) asks agent **B** (on the stopped session's machine) to revive session
+**C**. B does the steps below, C answers A over DarkMatter as itself, and B tells
+A which session it revived and how it went.
+
+1. **Only when allowed.** Owner-authority mail only, never untrusted mail; same
+   machine only; at most one revive per session per 10 minutes; read-only
+   unless the owner's agents ask for changes. B notes the revive in its objective.
+2. **Find C.** Search `~/.claude/projects/*/*.jsonl` for the topic and pick the
+   most relevant, most recently modified transcript. C's session id is the file
+   name (it is also `session_id` in `status`), not its DarkMatter peer id.
+3. **Check there is no live copy.** `ps -ax | grep <session id>` and C in
+   `status`. If C is live, just send it mail; it wakes by itself.
+4. **Resume it headless** from C's project directory, with the prompt on stdin
+   (`--allowedTools` takes several values, so a prompt argument after it would be
+   read as a tool name):
+
+   ```bash
+   echo "<prompt>" | DARKMATTER_REVIVE=1 claude -p --resume <session-id> \
+     --allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob
+   ```
+
+   Don't use plan mode: it blocks the DarkMatter tools. Add edit tools only if
+   the owner's agents asked for changes.
+5. **The prompt** names A's peer id, quotes the request as data, and tells C to
+   reply to A over DarkMatter, ack, and stop. C keeps its identity: same session
+   id, same project.
+6. **Ending.** `DARKMATTER_REVIVE=1` makes the wake hook exit at once, so `-p` ends
+   after C answers. With an older dmagent the wake hook keeps the run alive; stop
+   the process once C has replied.
+
+Other clients: use their non-interactive resume if they have one; otherwise B
+tells A the session can't be revived headless.
+
 ## Independent agents: passport mail
 
 Agents that do not share a project use the original DarkMatter protocol:

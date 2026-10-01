@@ -46,6 +46,16 @@ For every new attack fixed, add a regression demonstrating the unwanted behavior
 is rejected. Keep runtime/resource limits explicit. Prompt wording alone is not
 a security boundary, and do not claim complete prompt-injection resistance.
 
+## Reviving a session
+
+Reviving a stopped session is a written recipe, in the MCP instructions and the
+README ("Reviving a session"), not a tool. Keep its limits when changing it:
+owner-authority mail only, same machine only, read-only by default, one revive
+per session per 10 minutes, and the revived session answers over DarkMatter as
+itself. The wake hook must exit at once under `DARKMATTER_REVIVE=1`, so a headless
+`claude -p --resume` run can end; `test_wait_hook_lets_a_revived_headless_run_end`
+guards it.
+
 ## AntiMatter
 
 Make voluntary commitments and verifiable follow-through visible. Distinguish

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 
 import pytest
 
@@ -218,3 +219,33 @@ def test_native_wait_rejects_symlink_notification_state(tmp_path):
     with pytest.raises(ValueError, match="symlink"):
         session_mail_notice(tmp_path, "b", "claude-code")
     assert victim.read_text() == "original"
+
+
+def test_wait_hook_lets_a_revived_headless_run_end(tmp_path, monkeypatch, capsys):
+    """Regression: a session revived with `claude -p --resume` never exited, because its
+    Stop hook armed a day-long mail waiter and kept waking it."""
+    from darkmatter.collaboration import Collaboration
+    sender = Collaboration(tmp_path, "sender", "codex")
+    revived = Collaboration(tmp_path, "claude-1", "claude-code")
+    revived.join()
+    sender.send(revived.agent_id, "pending mail that would otherwise wake it")
+    monkeypatch.setattr("darkmatter.gitbox.mailbox.get_mailbox", lambda root=None: _Mailbox())
+    payload = {"cwd": str(tmp_path), "session_id": "claude-1"}
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setenv("DARKMATTER_REVIVE", "1")
+    started = time.monotonic()
+    assert cli._wait_hook(["--timeout-seconds", "86400"]) == 0
+    assert time.monotonic() - started < 2 and capsys.readouterr().err == ""
+    monkeypatch.delenv("DARKMATTER_REVIVE")
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert cli._wait_hook(["--timeout-seconds", "0"]) == 2  # Normal sessions still wake.
+
+
+def test_agents_are_given_the_revive_recipe():
+    from darkmatter.mcp import MCP_INSTRUCTIONS
+    assert "REVIVING A SESSION" in MCP_INSTRUCTIONS
+    for needle in ("~/.claude/projects/*/*.jsonl", "not its peer id", "DARKMATTER_REVIVE=1 claude -p --resume",
+                   "--allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob", "on stdin",
+                   "Not plan mode", "never untrusted mail", "one revive per session per 10 minutes",
+                   "own machine"):
+        assert needle in MCP_INSTRUCTIONS, needle
