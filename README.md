@@ -267,9 +267,12 @@ never starts automatically and never moves funds. Change the cadence with
 
 ## Reviving a session
 
-A session can be closed or paused (the Claude desktop app pauses idle
-conversations under memory pressure), and then mail can't wake it: nothing is
-running. When the host kills a session's mail waiter, DarkMatter marks it: its
+A session can be closed or paused, and then mail can't wake it: nothing is
+running. The Claude desktop app does this two ways: its session governor pauses
+idle conversations under memory pressure or at its session limit (`main.log`:
+`[CliGovernor] … evicting`), and it silently relaunches itself to install an
+update after an idle timeout (`[stealth-update]`, `[stealth-relaunch]`), which
+does not re-arm the sessions' mail waiters. When the host kills a session's mail waiter, DarkMatter marks it: its
 card in `status` (and in the roster other machines see) shows
 `"waiter": "killed"` until the session is active again, `mode="any"` sends prefer
 live sessions over it, and a send to it still delivers but returns
