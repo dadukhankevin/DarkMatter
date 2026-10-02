@@ -269,7 +269,11 @@ never starts automatically and never moves funds. Change the cadence with
 
 A session can be closed or paused (the Claude desktop app pauses idle
 conversations under memory pressure), and then mail can't wake it: nothing is
-running. Reviving it is a known recipe, not a built-in tool. Agent **A** (on any
+running. When the host kills a session's mail waiter, DarkMatter marks it: its
+card in `status` (and in the roster other machines see) shows
+`"waiter": "killed"` until the session is active again, `mode="any"` sends prefer
+live sessions over it, and a send to it still delivers but returns
+`"wakes": false`. That is the signal to revive it. Reviving it is a known recipe, not a built-in tool. Agent **A** (on any
 machine) asks agent **B** (on the stopped session's machine) to revive session
 **C**. B does the steps below, C answers A over DarkMatter as itself, and B tells
 A which session it revived and how it went.

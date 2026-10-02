@@ -271,6 +271,10 @@ def wait_for_session_activity(root, session_id, client, mailbox, timeout_seconds
         return _wait_loop(root, session_id, client, mailbox, deadline, generation, board, started, log)
     except (SystemExit, KeyboardInterrupt) as exc:
         log.event("killed", code=getattr(exc, "code", None))
+        try:
+            board.mark_waiter_killed()
+        except Exception:  # noqa: BLE001
+            pass
         raise
 
 

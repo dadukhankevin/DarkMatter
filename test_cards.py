@@ -140,3 +140,40 @@ def test_any_prefers_a_live_session_over_its_dead_predecessor(tmp_path):
                      content="hand-off")
     assert [s["to"] for s in result["sent"]] == [new.agent_id]
     assert new.read()["messages"] and old.read()["messages"] == []
+
+
+def test_a_session_whose_waiter_was_killed_says_so_until_it_is_active_again(tmp_path, monkeypatch):
+    """Regression: the Claude app SIGTERMed an idle session's mail waiter, and for 1.5 hours
+    senders saw an 'idle' session that could not be woken. Now status, rosters, routing,
+    and send results say the waiter was killed, until the session is active again."""
+    from darkmatter import wakeup
+    from darkmatter.network import _Endpoint
+    sender = Collaboration(tmp_path / "Web", "listen", "listen")
+    jeeves = Collaboration(tmp_path / "Phoenix", "jeeves", "claude-code")
+    other = Collaboration(tmp_path / "Phoenix", "helper", "claude-code")
+    other.join(availability="busy")
+
+    def killed(*args, **kwargs):  # What the SIGTERM handler raises inside the wait loop.
+        raise SystemExit(143)
+
+    monkeypatch.setattr(wakeup, "session_mail_notice", killed)
+    with pytest.raises(SystemExit):
+        wakeup.wait_for_session_activity(tmp_path / "Phoenix", "jeeves", "claude-code", None, 30)
+
+    def card(board):
+        return next(p for p in sender.status("device")["peers"] if p["id"] == board.agent_id)
+
+    assert card(jeeves)["waiter"] == "killed" and "waiter" not in card(other)
+    roster = {m["id"]: m for m in _Endpoint(jeeves.directory)._roster()}
+    assert roster[jeeves.agent_id]["waiter"] == "killed" and "waiter" not in roster[other.agent_id]
+    picked = execute(sender, "send", match={"project": "phoenix", "client": "claude-code"}, mode="any", content="hi")
+    assert [s["to"] for s in picked["sent"]] == [other.agent_id]  # The busy but live one, first.
+    direct = execute(sender, "send", recipient=jeeves.agent_id, content="for you")
+    assert direct["success"] and direct["wakes"] is False and "revived" in direct["note"]
+    assert jeeves.read()["messages"]  # Still delivered: it waits for the session.
+    time.sleep(0.01)
+    jeeves.join(availability="busy")  # Opened again: a new turn's hook fires.
+    assert "waiter" not in card(jeeves)
+    jeeves.mark_waiter_killed()
+    jeeves.mark_idle(time.time())  # A new waiter starting also clears it.
+    assert "waiter" not in card(jeeves)

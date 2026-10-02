@@ -83,8 +83,11 @@ def _ensure_schema(db) -> None:
         db.execute("ALTER TABLE participants ADD COLUMN active_at REAL DEFAULT 0")
     # facts: machine-read git state (darkmatter.facts); objective_at: when the
     # self-reported "doing" line was last set, so readers can judge staleness.
+    # waiter_killed_at: when the session's mail waiter was killed (SIGTERM) by its host,
+    # for example the Claude app pausing an idle session. Until the session is active
+    # again or a new waiter starts, mail to it waits: nothing will wake it.
     for name, kind in (("facts", "TEXT DEFAULT ''"), ("facts_at", "REAL DEFAULT 0"),
-                       ("objective_at", "REAL DEFAULT 0")):
+                       ("objective_at", "REAL DEFAULT 0"), ("waiter_killed_at", "REAL DEFAULT 0")):
         if name not in columns:
             db.execute(f"ALTER TABLE participants ADD COLUMN {name} {kind}")
     columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
@@ -129,6 +132,15 @@ def _card(card: dict) -> dict:
     return card
 
 
+def _waiter_state(row) -> dict:
+    """{"waiter": "killed", "waiter_killed_at": t} while a killed waiter has not been
+    followed by any activity or a new waiter; otherwise nothing."""
+    killed = float(row.get("waiter_killed_at") or 0)
+    if killed and killed > float(row.get("active_at") or 0):
+        return {"waiter": "killed", "waiter_killed_at": killed}
+    return {}
+
+
 def _addressed(value) -> dict:
     """How a message was addressed: direct, or any/all sessions matching a filter."""
     if value is None:
@@ -156,6 +168,7 @@ def network_sessions(directory: str | Path | None = None) -> tuple[dict, list[di
                                 "objective_at": member.get("objective_at", 0),
                                 "project": member.get("project", ""), "facts": member.get("facts") or {},
                                 "availability": member.get("availability", "unknown"),
+                                **({"waiter": "killed"} if member.get("waiter") == "killed" else {}),
                                 "host": row["host"], "device": row["device"], "where": "network"}))
     return state, found
 
@@ -299,6 +312,13 @@ class Collaboration:
         with self._db() as db:
             db.execute("UPDATE participants SET availability='idle', seen=? WHERE id=? "
                        "AND COALESCE(active_at, 0) <= ?", (time.time(), self.agent_id, since))
+            db.execute("UPDATE participants SET waiter_killed_at=0 WHERE id=?", (self.agent_id,))
+
+    def mark_waiter_killed(self) -> None:
+        """The host killed this session's mail waiter: until it is active again or a new
+        waiter starts, status and rosters say so, and mail to it waits."""
+        with self._db() as db:
+            db.execute("UPDATE participants SET waiter_killed_at=? WHERE id=?", (time.time(), self.agent_id))
 
     def active_at(self) -> float:
         with self._db() as db:
@@ -313,8 +333,8 @@ class Collaboration:
             raise ValueError("scope must be workspace, repo or device")
         me = self.join()
         with self._db() as db:
-            query = ("SELECT id, workspace, client, objective, objective_at, availability, seen, facts "
-                     "FROM participants WHERE seen > ?")
+            query = ("SELECT id, workspace, client, objective, objective_at, availability, seen, facts, "
+                     "active_at, waiter_killed_at FROM participants WHERE seen > ?")
             args = [time.time() - PRESENCE_SECONDS]
             if scope == "workspace":
                 query += " AND workspace = ?"
@@ -327,6 +347,9 @@ class Collaboration:
                 peer["same_project"] = repository_root(peer["workspace"]) == common
                 peer.update(host=host, project=Path(peer["workspace"]).name, where="local",
                             facts=json.loads(peer["facts"] or "{}"))
+                state = _waiter_state(peer)
+                del peer["active_at"], peer["waiter_killed_at"]
+                peer.update(state)
                 _card(peer)
             if scope == "repo":
                 peers = [p for p in peers if p["same_project"]]

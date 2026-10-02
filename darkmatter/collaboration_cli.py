@@ -53,6 +53,9 @@ NETWORK_HINT = ("No other machines found on this network. Each machine needs Dar
                 "on it. macOS may need Local Network permission for Python. No connection request is needed.")
 SEND_ERROR_HINT = ("This machine's network node is failing to send ({}), so other machines may not see "
                    "it. Run `darkmatter network doctor`; recent failures are in network.log.")
+WAITER_KILLED_NOTE = ("Delivered, but this session's host stopped its mail waiter (for example the Claude "
+                      "app paused it), so it will not wake until it is opened or revived (see 'Reviving a "
+                      "session').")
 MATCH_KEYS = ("host", "project", "client", "branch", "session")
 MAX_FANOUT = 64
 _TIER = {"local": 0, "network": 1, "remote": 2}
@@ -96,7 +99,9 @@ def _pick(cards):
     now = time.time()
 
     def stale(card):
-        return card.get("where") == "local" and now - (card.get("seen") or 0) > LIVE_SECONDS
+        # A killed waiter (the host paused the session) can't wake it: mail waits.
+        return card.get("waiter") == "killed" or (
+            card.get("where") == "local" and now - (card.get("seen") or 0) > LIVE_SECONDS)
 
     return sorted(usable, key=lambda c: (stale(c), c.get("availability") != "idle",
                                          _TIER.get(c.get("where"), 3), -(c.get("seen") or 0)))
@@ -172,7 +177,8 @@ def execute(board, action, *, scope="device", objective=None, recipient=None,
             for index, card in enumerate(chosen):
                 mid = base if len(chosen) == 1 else f"{base[:120]}-{index}"
                 sent.append({**_send_to(board, space, card, content, mid, addressed),
-                             "to": card["id"], "label": card["label"]})
+                             "to": card["id"], "label": card["label"],
+                             **({"wakes": False, "note": WAITER_KILLED_NOTE} if card.get("waiter") == "killed" else {})})
             if space is not None and any(item["via"] == "repo" for item in sent):
                 space.sync()
             return {"success": True, "mode": mode, "match": match, "sent": sent}
@@ -185,7 +191,11 @@ def execute(board, action, *, scope="device", objective=None, recipient=None,
             return {"success": True, "id": sent["id"], "recipient": recipient,
                     "delivery": "published" if "publish" not in synced["errors"] else "queued",
                     **({"sync_errors": synced["errors"]} if synced["errors"] else {})}
-        return board.send(recipient, content, message_id)
+        result = board.send(recipient, content, message_id)
+        card = next((c for c in _cards(board, space) if c["id"] == recipient), None)
+        if card is not None and card.get("waiter") == "killed":
+            result.update(wakes=False, note=WAITER_KILLED_NOTE)
+        return result
     if action == "delivery":
         result = board.delivery(message_id)
         if not result["success"] and space is not None and space.delivery(message_id):

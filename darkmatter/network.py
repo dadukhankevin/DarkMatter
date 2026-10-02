@@ -367,14 +367,16 @@ class _Endpoint:
 
     def _roster(self) -> list[dict]:
         with open_database(self.directory) as db:
-            rows = db.execute("SELECT id, workspace, client, objective, objective_at, availability, facts "
-                              "FROM participants "
+            rows = db.execute("SELECT id, workspace, client, objective, objective_at, availability, facts, "
+                              "active_at, waiter_killed_at FROM participants "
                               "WHERE seen > ? ORDER BY seen DESC LIMIT ?",
                               (time.time() - PRESENCE_SECONDS, MAX_SESSIONS)).fetchall()
         return [{"id": row["id"], "client": (row["client"] or "")[:80],
                  "objective": (row["objective"] or "")[:512], "project": Path(row["workspace"]).name[:128],
                  "availability": row["availability"] if row["availability"] in ("busy", "idle") else "unknown",
-                 "objective_at": row["objective_at"] or 0, "facts": self._facts(row["facts"])}
+                 "objective_at": row["objective_at"] or 0, "facts": self._facts(row["facts"]),
+                 # An extra key older receivers ignore: this session can't be woken right now.
+                 **({"waiter": "killed"} if (row["waiter_killed_at"] or 0) > (row["active_at"] or 0) else {})}
                 for row in rows]
 
     @staticmethod
