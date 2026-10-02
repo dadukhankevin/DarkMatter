@@ -17,6 +17,7 @@ import os
 import shlex
 import sqlite3
 import sys
+import time
 
 from darkmatter.collaboration import Collaboration, _addressed, network_sessions
 from darkmatter.facts import matches
@@ -81,11 +82,24 @@ def _validate_match(match) -> dict:
     return dict(match)
 
 
+# A local session is live if it was seen this recently: an idle one's mail waiter
+# refreshes presence every few seconds, a busy one's hooks on every tool call. One
+# whose app process stopped keeps reading "idle" for hours, but can't be woken.
+LIVE_SECONDS = 300
+
+
 def _pick(cards):
-    """First available: idle before busy, this machine before network before repo, then most recent."""
+    """First available: live before stale, idle before busy, this machine before network
+    before repo, then most recent. Without the liveness rank, a session restarted with a
+    new id lost its mail to its own dead predecessor, which still read "idle"."""
     usable = [c for c in cards if c.get("availability") != "stopped" and not c.get("paused")]
-    return sorted(usable, key=lambda c: (c.get("availability") != "idle", _TIER.get(c.get("where"), 3),
-                                         -(c.get("seen") or 0)))
+    now = time.time()
+
+    def stale(card):
+        return card.get("where") == "local" and now - (card.get("seen") or 0) > LIVE_SECONDS
+
+    return sorted(usable, key=lambda c: (stale(c), c.get("availability") != "idle",
+                                         _TIER.get(c.get("where"), 3), -(c.get("seen") or 0)))
 
 
 def _send_to(board, space, card, content, message_id, addressed):

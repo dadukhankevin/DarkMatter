@@ -122,3 +122,21 @@ def test_forged_addressing_from_a_peer_is_marked_not_trusted(tmp_path):
     target.join()
     with pytest.raises(ValueError):
         sender.send(target.agent_id, "hi", addressed={"mode": "admin"})
+
+
+def test_any_prefers_a_live_session_over_its_dead_predecessor(tmp_path):
+    """Regression: a session restarted with a new id (for example to pick up an env
+    change) lost its mail, because mode=any preferred its dead predecessor, which still
+    read "idle" for hours, over the live but busy restart."""
+    from darkmatter.collaboration import open_database
+    sender = Collaboration(tmp_path / "Web", "listen", "listen")
+    old = Collaboration(tmp_path / "Phoenix", "jeeves-old", "claude-code")
+    new = Collaboration(tmp_path / "Phoenix", "jeeves-new", "claude-code")
+    old.join(availability="idle")
+    new.join(availability="busy")
+    with open_database(old.directory) as db:  # The old app process stopped 20 minutes ago.
+        db.execute("UPDATE participants SET seen=? WHERE id=?", (time.time() - 1200, old.agent_id))
+    result = execute(sender, "send", match={"project": "phoenix", "client": "claude-code"}, mode="any",
+                     content="hand-off")
+    assert [s["to"] for s in result["sent"]] == [new.agent_id]
+    assert new.read()["messages"] and old.read()["messages"] == []
