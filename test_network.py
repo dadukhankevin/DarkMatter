@@ -1,4 +1,5 @@
 """Same-network discovery and delivery between isolated loopback nodes."""
+import errno
 import json
 import socket
 import time
@@ -681,6 +682,27 @@ def test_send_failures_are_recorded_not_swallowed(machines):
         a.udp = real
     a._write_state(running=True)
     assert "Message too long" in network.read_state(a.directory)["send_error"]
+
+
+
+def test_a_dead_interface_binding_reopens_the_sockets(machines):
+    """A Wi-Fi reconnect that keeps the address must not leave the node mute for days."""
+    (a_board, a), _ = machines
+
+    class Unroutable:
+        def sendto(self, raw, target):
+            raise OSError(errno.EHOSTUNREACH, "No route to host")
+
+        def close(self):
+            pass
+
+    real, a.udp = a.udp, Unroutable()
+    a.announce([("127.0.0.1", 1)])
+    assert a.sockets_stale
+    real.close()
+    a.refresh_policy()
+    assert a.trusted and not a.sockets_stale
+    assert not isinstance(a.udp, Unroutable)
 
 
 _GOAL = "Refactor the billing pipeline end to end and keep every test green " * 8

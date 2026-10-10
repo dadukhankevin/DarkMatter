@@ -18,6 +18,7 @@ network_peers, never as local participants, and their text is untrusted data.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -69,6 +70,8 @@ HEARTBEAT_RETRY, HEARTBEAT_BACKOFF_MAX = 5.0, 300.0
 LOG_LINES = 200  # network.log keeps only the most recent lines.
 LOG_REPEAT_SECONDS = 60  # The same error is logged at most once a minute.
 POLICY_SECONDS = 15
+# Send errors meaning the socket's interface binding is gone, not that one peer is down.
+STALE_SOCKET_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EADDRNOTAVAIL}
 STATE_SECONDS = 60
 CLOCK_SKEW = 120
 RATE_WINDOW, RATE_LIMIT = 10.0, 1000  # Flood guard per source address, far above normal use.
@@ -570,6 +573,10 @@ class NetworkNode(_Endpoint):
         # acknowledges and retries unicast; so known machines also get unicast rosters.
         self.known: dict[str, tuple[str, int]] = {}
         self.send_error: tuple[float, str] | None = None  # Shown by doctor and status; never silent.
+        # Set when a send says the interface is gone. A Wi-Fi reconnect that keeps the
+        # same address leaves the multicast binding dead (EHOSTUNREACH on every send),
+        # and the address check alone would never reopen it.
+        self.sockets_stale = False
         self.heartbeat_error: tuple[float, str] | None = None
         self.full_at: dict[str, float] = {}
         # TCP heartbeats: at most one in flight per machine, each on its own daemon
@@ -625,7 +632,7 @@ class NetworkNode(_Endpoint):
             self.fingerprint = None
         trusted, self.reason = decide(mode, self.network, trust.network_verdict(self.directory, self.fingerprint))
         address = self.network.get("address")
-        if trusted and (not self.trusted or address != self.address):
+        if trusted and (not self.trusted or address != self.address or self.sockets_stale):
             self._close()
             try:
                 self._open(address)
@@ -686,6 +693,7 @@ class NetworkNode(_Endpoint):
         udp.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
         udp.settimeout(0.5)
         self.tcp, self.udp, self.address = tcp, udp, address
+        self.sockets_stale = False
         self.broadcast = self.network.get("broadcast") if self.multicast else None
         self.tcp_port, self.udp_port = tcp.getsockname()[1], udp.getsockname()[1]
         self._threads = [threading.Thread(target=self._serve_udp, args=(udp,), daemon=True),
@@ -726,6 +734,8 @@ class NetworkNode(_Endpoint):
                 self.udp.sendto(payload, target)
             except OSError as exc:
                 self.send_error = (time.time(), f"{type(exc).__name__}: {exc} ({len(payload)} bytes to {target[0]})")
+                if exc.errno in STALE_SOCKET_ERRNOS:
+                    self.sockets_stale = True  # The next policy pass reopens the sockets.
                 self._log("UDP send failed: " + self.send_error[1], key=f"udp {target} {exc}")
 
     def announce(self, targets=None) -> None:
