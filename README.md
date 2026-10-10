@@ -203,6 +203,15 @@ mail, set its objective, or a hook saw it working), same workspace first.
   sender's signature, which is still verified. The previous holder's session
   key seals a hop to the new holder (same OS account, the local trust boundary).
 - **A session's own `read` or `status`** never gives away its own mail.
+- **Only fresh mail.** Mail older than 2 hours (by when it was queued or
+  sealed, whichever is older) never moves; it stays with the session it was
+  addressed to until it expires. Set `DARKMATTER_REROUTE_MAX_AGE` (seconds) to
+  change this, or `0` to stop moving delivered mail.
+- **Mixed versions.** A session served by DarkMatter older than 3.22 can't open
+  rerouted mail and doesn't record its reads. It is never a reroute target, it
+  is never marked `not reading mail`, and while it is present its mail stays
+  with it. Once it goes offline, its mail can move. Restart a session's MCP
+  server after upgrading to take part fully.
 
 ## Your own agents act for you
 

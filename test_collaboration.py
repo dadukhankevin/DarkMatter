@@ -438,6 +438,7 @@ def tracker(tmp_path, monkeypatch):
     (tmp_path / "Coordinator").mkdir()
     stale = Collaboration(root, "84eb1193", "claude-code")
     stale.join("A day-old objective", availability="busy")
+    stale.mark_reader()  # Served by a 3.22+ MCP server, which heartbeats but no turn reads.
     live = Collaboration(root, "2d2bdf00", "claude-code")
     live.join(availability="busy")
     live.read()  # The user's session reads its mail.
@@ -590,3 +591,74 @@ def test_mode_all_copies_and_tampered_reroutes_are_never_taken_as_fresh(tracker)
         db.execute("UPDATE messages SET envelope=? WHERE id='t1'", (json.dumps(record),))
     inbox = live.read()
     assert "t1" in inbox["invalid"] and all(m["id"] != "t1" for m in inbox["messages"])
+
+
+def test_mail_older_than_the_reroute_cutoff_stays_put(tracker, monkeypatch):
+    """3.22.0 moved day-old, long-handled hand-offs from a dead session to a live one as
+    fresh work. Mail older than REROUTE_MAX_AGE (configurable) never reroutes."""
+    import time as _time
+    from darkmatter.collaboration import REROUTE_MAX_AGE, open_database, reroute_arrival, reroute_stale
+    sender, stale, live = tracker
+    assert REROUTE_MAX_AGE == 7200
+    sender.send(stale.agent_id, "a hand-off from yesterday", "ancient")
+    _age(stale, mail=86400, seen=86400)  # Dead for a day, mail unread since.
+    assert reroute_stale(stale.directory) == [] and live.read()["messages"] == []
+    monkeypatch.setenv("DARKMATTER_REROUTE_MAX_AGE", str(2 * 86400))  # Configurable.
+    assert [m["id"] for m in reroute_stale(stale.directory)] == ["ancient"]
+    # Judged by when the sender sealed it too: mail queued long ago that arrives now is as old.
+    monkeypatch.setenv("DARKMATTER_REROUTE_MAX_AGE", "1")
+    stale.join()  # Looked live when it was sent.
+    sender.send(stale.agent_id, "queued on the sender's side", "late")
+    _time.sleep(1.2)
+    _age(stale, seen=1200)
+    with open_database(stale.directory) as db:
+        db.execute("UPDATE messages SET origin='network-in', created=? WHERE id='late'", (_time.time(),))
+        assert reroute_arrival(db, stale.directory, "late") is None
+        assert db.execute("SELECT recipient, pinned FROM messages WHERE id='late'").fetchone()[:] == (stale.agent_id, 1)
+
+
+def test_pre_322_readers_never_receive_rerouted_mail_or_lose_mail_they_may_have_read(tracker):
+    """A 3.21 MCP server can't open rerouted mail (it reported all of it invalid) and
+    doesn't record its reads, so it is never a reroute target, and while it is present
+    its unread-looking mail stays with it."""
+    from darkmatter.collaboration import REROUTE_SECONDS, Collaboration, open_database, reroute_stale
+    from darkmatter.collaboration_cli import execute
+    sender, stale, live = tracker
+    with open_database(live.directory) as db:  # The live sibling is served by a pre-3.22 server.
+        db.execute("UPDATE participants SET rerouting_at=0 WHERE id=?", (live.agent_id,))
+    sender.send(stale.agent_id, "for tracker", "v1")
+    _age(stale, mail=REROUTE_SECONDS + 1)
+    stale.join()
+    assert reroute_stale(stale.directory) == []  # Nowhere it could be read: it stays put.
+    sent = execute(sender, "send", recipient=stale.agent_id, content="again", message_id="v2")
+    assert "rerouted" not in sent and sent["recipient"] == stale.agent_id
+    # The other way round: a present pre-3.22 holder keeps its mail and isn't called stale.
+    old = Collaboration(stale.root, "old-server", "claude-code")
+    old.join(availability="busy")
+    sender.send(old.agent_id, "to the old reader", "v3")
+    _age(old, mail=REROUTE_SECONDS + 1)
+    old.join()
+    live.read()  # The sibling now reads with 3.22+.
+    cards = {p["id"]: p for p in execute(sender, "status")["peers"]}
+    assert "stale" not in cards[old.agent_id]
+    assert all(m["id"] != "v3" for m in reroute_stale(stale.directory))
+    # Once it is offline, its mail may move to a 3.22+ reader.
+    _age(old, seen=1200)
+    assert any(m["id"] == "v3" and m["to"] == live.agent_id for m in reroute_stale(stale.directory))
+    assert any(m["id"] == "v3" for m in live.read()["messages"])
+
+
+def test_a_sweep_is_not_blocked_by_mail_that_cannot_move(tracker):
+    """Unmovable mail (no target yet) is skipped, not a wall in front of movable mail."""
+    from darkmatter.collaboration import REROUTE_BATCH, REROUTE_SECONDS, Collaboration, reroute_stale
+    sender, stale, live = tracker
+    lonely = Collaboration(sender.root.parent / "Lonely", "lonely", "claude-code")
+    (sender.root.parent / "Lonely").mkdir(exist_ok=True)
+    lonely.join()
+    lonely.mark_reader()
+    for i in range(REROUTE_BATCH + 5):
+        sender.send(lonely.agent_id, f"nobody else here {i}", f"stuck-{i}")
+    _age(lonely, mail=REROUTE_SECONDS + 10)
+    sender.send(stale.agent_id, "movable", "movable")
+    _age(stale, mail=REROUTE_SECONDS + 1)
+    assert [m["id"] for m in reroute_stale(stale.directory)] == ["movable"]

@@ -98,6 +98,8 @@ async def collaborate(action: str = "status", session_id: Optional[str] = None,
     def run():
         board = Collaboration(os.environ.get("DARKMATTER_PROJECT_DIR") or os.getcwd(), session_id)
         _served_sessions[board.identity] = board  # This process heartbeats it while alive.
+        board.join()
+        board.mark_reader()  # This server reads its mail, rerouted mail included.
         return execute(board, action, scope=scope, objective=objective, recipient=recipient,
                        content=content, message_id=message_id, ids=ids, resource=resource, seconds=seconds,
                        match=match, mode=mode, strict=strict)
@@ -115,6 +117,7 @@ def heartbeat_served_sessions() -> None:
     for board in list(_served_sessions.values()):
         try:
             board.join()
+            board.mark_reader()
         except (ValueError, OSError):
             pass
 

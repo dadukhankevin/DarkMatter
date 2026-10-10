@@ -986,7 +986,8 @@ def test_network_mail_left_unread_moves_on_the_receiving_machine(machines):
     sent = execute(a_board, "send", recipient=b_board.agent_id, content="Are you there?", message_id="nr-2")
     assert sent["delivery"] == "delivered" and "rerouted" not in sent  # It looked live.
     _age(b_board, mail=600)
-    b_board.join()  # Its MCP server keeps heartbeating; no turn reads.
+    b_board.join()  # Its (3.22+) MCP server keeps heartbeating; no turn reads.
+    b_board.mark_reader()
     network.reroute_stale(b.directory)  # What the node's loop does every announce period.
     assert b_board.read(mark=False)["messages"] == []
     assert newer.read()["messages"][0]["rerouted"]["from"] == b_board.agent_id

@@ -21,7 +21,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from darkmatter.contract.envelope import open_envelope, seal_envelope, verify_envelope_signature
+from darkmatter.contract.envelope import _parse_datetime, open_envelope, seal_envelope, verify_envelope_signature
 from darkmatter.identity import derive_public_key_hex, generate_keypair
 from darkmatter.store.local import atomic_write_text
 
@@ -62,11 +62,30 @@ UNREAD_SECONDS = 300
 # active live session of the same project on this machine. Never across projects,
 # machines, or OS accounts; never for strict or mode=all mail; at most MAX_REROUTES hops.
 REROUTE_SECONDS = UNREAD_SECONDS
+# Mail older than this never reroutes: long-unread mail to a dead session stays put
+# (and expires) instead of landing on a sibling as fresh work. DARKMATTER_REROUTE_MAX_AGE
+# (seconds) overrides it; 0 turns rerouting of delivered mail off.
+REROUTE_MAX_AGE = 7200
 MAX_REROUTES = 3
 REROUTE_BATCH = 32  # Messages moved per sweep; the next sweep continues.
 REROUTED_NOTE = ("Addressed to another session of this project on this machine that was not reading "
                  "its mail; delivered to you instead. Handle it as yours. The sender and authority are unchanged.")
 _PROCESS_SESSION = "process-" + uuid.uuid4().hex
+
+
+def _age(timestamp: str, now: float) -> float:
+    """Seconds since an envelope timestamp; 0 when it can't be read."""
+    try:
+        return now - _parse_datetime(timestamp).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def reroute_max_age() -> float:
+    try:
+        return max(0.0, float(os.environ.get("DARKMATTER_REROUTE_MAX_AGE", REROUTE_MAX_AGE)))
+    except ValueError:
+        return float(REROUTE_MAX_AGE)
 
 
 def local_directory(directory: str | Path | None = None) -> Path:
@@ -102,7 +121,7 @@ def _ensure_schema(db) -> None:
     # again or a new waiter starts, mail to it waits: nothing will wake it.
     for name, kind in (("facts", "TEXT DEFAULT ''"), ("facts_at", "REAL DEFAULT 0"),
                        ("objective_at", "REAL DEFAULT 0"), ("waiter_killed_at", "REAL DEFAULT 0"),
-                       ("read_at", "REAL DEFAULT 0")):
+                       ("read_at", "REAL DEFAULT 0"), ("rerouting_at", "REAL DEFAULT 0")):
         if name not in columns:
             db.execute(f"ALTER TABLE participants ADD COLUMN {name} {kind}")
     columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
@@ -220,11 +239,26 @@ def _last_active(row) -> float:
     return max(float(row["read_at"] or 0), float(row["objective_at"] or 0), float(row["active_at"] or 0))
 
 
+# Served by code that records its reads and can open rerouted mail (3.22+): its MCP
+# server heartbeats or an explicit read/ack marked rerouting_at at least as recently as
+# anything else kept it present. Hooks and waiters may run newer code than a long-lived
+# MCP server, so they never mark it. A pre-3.22 reader neither records reads nor opens
+# rerouted mail: its unread mail proves nothing, and rerouted mail would be invalid there.
+_READS_REROUTED = "rerouting_at > 0 AND rerouting_at >= seen - ?"
+
+
+def _reads_rerouted(row) -> bool:
+    at = float(row["rerouting_at"] or 0)
+    return at > 0 and at >= float(row["seen"] or 0) - LIVE_SECONDS
+
+
 def _backlogged(db, now: float, recipient: str | None = None) -> set[str]:
-    """Sessions holding mail they have not read for UNREAD_SECONDS: not live."""
+    """Sessions holding mail they have not read for UNREAD_SECONDS: not live. Only
+    sessions whose reader records reads (see _READS_REROUTED) can be judged so."""
     query = ("SELECT DISTINCT recipient FROM messages WHERE acknowledged=0 AND read_at=0 AND expires>? "
-             "AND origin IN ('local', 'network-in') AND MAX(created, held_at) < ?")
-    args: list = [now, now - UNREAD_SECONDS]
+             "AND origin IN ('local', 'network-in') AND MAX(created, held_at) < ? AND recipient IN "
+             f"(SELECT id FROM participants WHERE {_READS_REROUTED})")
+    args: list = [now, now - UNREAD_SECONDS, LIVE_SECONDS]
     if recipient is not None:
         query, args = query + " AND recipient=?", args + [recipient]
     return {row[0] for row in db.execute(query, args)}
@@ -257,7 +291,7 @@ def _live_sessions(db, holder, now: float, exclude=(), cache: dict | None = None
         rows = db.execute("SELECT * FROM participants WHERE seen > ? AND id != ?",
                           (now - LIVE_SECONDS, holder["id"])).fetchall()
         live = [row for row in rows if row["id"] not in stale and not _waiter_state(dict(row))
-                and root(row["workspace"]) == common]
+                and _reads_rerouted(row) and root(row["workspace"]) == common]
         cache[holder["id"]] = sorted(live, key=lambda row: (row["workspace"] != holder["workspace"],
                                                             -_last_active(row)))
     return [row for row in cache[holder["id"]] if row["id"] not in exclude]
@@ -308,6 +342,10 @@ def _reroute(db, directory: Path, row, now: float, *, force: bool = False, cache
     holder = db.execute("SELECT * FROM participants WHERE id=?", (row["recipient"],)).fetchone()
     if holder is None or (not force and _not_live(db, holder, now) is None):
         return None
+    if float(holder["seen"] or 0) > now - LIVE_SECONDS and not _reads_rerouted(holder):
+        return None  # A present pre-3.22 reader may have read it without recording that.
+    if row["created"] < now - reroute_max_age():
+        return None  # Too old to be fresh work; it stays put.
     record = json.loads(row["envelope"])
     held = record.get("held_by") or []
     targets = [t for t in _live_sessions(db, holder, now, exclude={row["sender"], *held}, cache=cache)
@@ -319,6 +357,11 @@ def _reroute(db, directory: Path, row, now: float, *, force: bool = False, cache
         key = _session_key(directory, holder)
         body, first = _open_record(record, key, holder["id"], row["id"], row["sender"])
         addressed = _addressed(body.get("addressed"))
+        sent = verify_envelope_signature(record["envelope"]).timestamp
+        if sent and _age(sent, now) > reroute_max_age():
+            # Queued long ago on the sender's side: as old, whenever it arrived. Stays put.
+            db.execute("UPDATE messages SET pinned=1 WHERE id=?", (row["id"],))
+            return None
     except (OSError, ValueError, KeyError, TypeError):
         db.execute("UPDATE messages SET pinned=1 WHERE id=?", (row["id"],))  # The holder sees it invalid.
         return None
@@ -347,15 +390,20 @@ def reroute_stale(directory: str | Path | None = None, keep: str | None = None) 
     directory = local_directory(directory)
     now, moved = time.time(), []
     with open_database(directory) as db:
+        # Holders that are offline, or present and served by a reader that records reads.
         rows = db.execute("SELECT * FROM messages WHERE acknowledged=0 AND read_at=0 AND pinned=0 AND expires>? "
-                          "AND origin IN ('local', 'network-in') AND MAX(created, held_at) < ? AND recipient != ? "
-                          "ORDER BY created LIMIT ?",
-                          (now, now - REROUTE_SECONDS, keep or "", REROUTE_BATCH)).fetchall()
+                          "AND origin IN ('local', 'network-in') AND MAX(created, held_at) < ? AND created > ? "
+                          "AND recipient != ? AND recipient IN (SELECT id FROM participants WHERE seen <= ? "
+                          f"OR ({_READS_REROUTED})) ORDER BY created LIMIT ?",
+                          (now, now - REROUTE_SECONDS, now - reroute_max_age(), keep or "", now - LIVE_SECONDS,
+                           LIVE_SECONDS, MAX_PENDING)).fetchall()
         cache: dict = {}
-        for row in rows:
+        for row in rows:  # Mail with nowhere to go yet is skipped, not a block on the rest.
             target = _reroute(db, directory, row, now, force=True, cache=cache)
             if target:
                 moved.append({"id": row["id"], "from": row["recipient"], "to": target})
+                if len(moved) >= REROUTE_BATCH:
+                    break
     return moved
 
 
@@ -467,6 +515,13 @@ class Collaboration:
                 db.execute("UPDATE participants SET active_at=? WHERE id=?", (time.time(), self.agent_id))
         return {"id": self.agent_id, "session_id": self.session_id,
                 "client": self.client, "workspace": str(self.root)}
+
+    def mark_reader(self) -> None:
+        """This process reads this session's mail and can open rerouted mail. MCP servers
+        (on each heartbeat and tool call) and explicit read/ack call it; hooks and wake
+        waiters don't, since they may run newer code than the session's MCP server."""
+        with self._db() as db:
+            db.execute("UPDATE participants SET rerouting_at=? WHERE id=?", (time.time(), self.agent_id))
 
     def refresh_facts(self, max_age: float = 60.0) -> None:
         """Re-read git state at most every max_age seconds (hooks call this cheaply)."""
@@ -678,7 +733,7 @@ class Collaboration:
                               (self.agent_id, time.time(), limit)).fetchall()
             if mark:
                 now = time.time()
-                db.execute("UPDATE participants SET read_at=? WHERE id=?", (now, self.agent_id))
+                db.execute("UPDATE participants SET read_at=?, rerouting_at=? WHERE id=?", (now, now, self.agent_id))
                 db.executemany("UPDATE messages SET read_at=? WHERE id=? AND recipient=? AND read_at=0",
                                [(now, row["id"], self.agent_id) for row in rows])
         from darkmatter import trust
@@ -714,7 +769,8 @@ class Collaboration:
             raise ValueError("ids must be a bounded list of message ids")
         with self._db() as db:
             if ids:
-                db.execute("UPDATE participants SET read_at=? WHERE id=?", (time.time(), self.agent_id))
+                db.execute("UPDATE participants SET read_at=?, rerouting_at=? WHERE id=?",
+                           (time.time(), time.time(), self.agent_id))
             for message_id in ids:
                 row = db.execute("SELECT sender, origin, route, acknowledged FROM messages WHERE id=? AND recipient=?",
                                  (message_id, self.agent_id)).fetchone()
