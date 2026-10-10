@@ -193,11 +193,14 @@ def git_unread_ids(mailbox) -> list[str]:
 
 def session_mail_notice(root, session_id, client, git_ids=()):
     """Inspect local, repo-space, and passport inboxes without consuming messages."""
-    from darkmatter.collaboration import BOUNDARY, Collaboration
+    from darkmatter.collaboration import BOUNDARY, Collaboration, reroute_stale
     from darkmatter.repo_space import RepoSpace, default_space_directory
     board = Collaboration(root, session_id, client)
     board.join()  # The waiter doubles as a presence heartbeat while the session is idle.
-    ids = [item["id"] for item in board.read()["messages"]]
+    # Mail a sibling of this project left unread moves here (or this session's, elsewhere).
+    reroute_stale(board.directory)
+    # A peek: only the session's own explicit read counts as reading its mail.
+    ids = [item["id"] for item in board.read(mark=False)["messages"]]
     space_ids = []
     directory = default_space_directory(root)
     if (directory / "state.json").is_file():

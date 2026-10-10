@@ -894,9 +894,12 @@ def test_send_errors_are_logged_and_shown_in_status_and_doctor(machines, monkeyp
     assert elsewhere.read_text() == "keep\n" and network.read_log(a.directory) == []
 
 
-def test_broadcast_carries_a_probe_when_the_roster_is_too_big_for_one_frame(tmp_path, monkeypatch):
+def test_broadcast_carries_a_roster_cut_to_one_frame_when_the_full_one_is_too_big(tmp_path, monkeypatch):
     """Regression: macOS refuses to broadcast anything over one frame (1472 bytes), so
-    every roster of more than a few sessions failed on the broadcast path."""
+    every roster of more than a few sessions failed on the broadcast path. At 1654 bytes
+    a machine whose multicast was blocked became invisible. The broadcast now carries
+    the roster cut to fit, marked incomplete, so hearers list the machine at once and
+    fetch the full roster over TCP."""
     monkeypatch.setenv("DARKMATTER_NETWORK_MODE", "auto")
     sent = []
     node = NetworkNode(tmp_path / "n", classify=lambda: dict(WIRED), port=0)
@@ -917,6 +920,180 @@ def test_broadcast_carries_a_probe_when_the_roster_is_too_big_for_one_frame(tmp_
             "A long objective that makes this roster far bigger than one frame " * 3, availability="busy")
     node.announce()
     assert sent[0][1] == "announce" and sent[0][2] > network.MAX_BROADCAST  # Multicast: the roster.
-    assert sent[1][0] == ("192.168.1.255", node.port) and sent[1][1] == "probe"  # Broadcast: a probe.
-    assert node.send_error is None
+    assert sent[1][0] == ("192.168.1.255", node.port) and sent[1][1] == "announce"
+    assert sent[1][2] <= network.MAX_BROADCAST
+    sent.clear()
+    raw = []
+    node.udp = type("Keep", (), {"sendto": lambda self, data, target: raw.append((target, data))})()
+    node.tcp_port = 40000  # As if open: receivers need a TCP port to fetch the rest from.
+    node.announce()
+    cut = json.loads(raw[1][1])
+    assert cut["complete"] is False and cut["total"] == 12 and 0 < len(cut["sessions"]) < 12
+    receiver = NetworkNode(tmp_path / "r", classify=lambda: dict(WIRED), port=0)
+    assert receiver._accept_announcement(cut, "192.168.1.20") is True  # Valid for any receiver.
+    assert node.send_error is None and node.path_summary()["reachable"] == ["broadcast", "multicast"]
     node.udp = None
+
+
+# ------------------------------------------------- rerouting across the network
+# Incident: network mail to a session whose MCP server heartbeated but never read mail
+# reported "delivered" for a day while the user's newer session got nothing.
+
+def _sibling(board, node, session="newer"):
+    """A second session of the same project on that machine, which reads its mail."""
+    sibling = Collaboration(board.root, session, "claude-code", directory=node.directory)
+    sibling.join(availability="busy")
+    sibling.read()
+    return sibling
+
+
+def _age(board, *, seen=None, mail=None):
+    with open_database(board.directory) as db:
+        if seen is not None:
+            db.execute("UPDATE participants SET seen=? WHERE id=?", (time.time() - seen, board.agent_id))
+        if mail is not None:
+            db.execute("UPDATE messages SET created=?, held_at=0 WHERE recipient=?", (time.time() - mail, board.agent_id))
+
+
+def test_network_mail_for_an_offline_session_goes_to_a_live_one_and_the_sender_is_told(machines):
+    (a_board, a), (b_board, b) = machines
+    newer = _sibling(b_board, b)
+    _age(b_board, seen=1200)  # Still on the roster (presence lasts hours), but its process is gone.
+    _discover(a, b, a_board, b_board)
+    sent = execute(a_board, "send", recipient=b_board.agent_id, content="Fix the streak bug", message_id="nr-1")
+    assert sent["delivery"] == "delivered" and sent["recipient"] == newer.agent_id
+    assert sent["rerouted"] == {"from": b_board.agent_id, "to": newer.agent_id}
+    [item] = newer.read()["messages"]
+    assert (item["from"], item["via"], item["rerouted"]["from"]) == (a_board.agent_id, "network", b_board.agent_id)
+    assert item["authority"] == "owner"  # Unchanged: the same as the addressee would have seen.
+    assert b_board.read()["messages"] == []
+    # A retry of the same delivery (a lost reply) is the same message, not a conflict.
+    from darkmatter.network import deliver_pending
+    with open_database(a.directory) as db:
+        db.execute("UPDATE messages SET delivered=0 WHERE id='nr-1'")
+    assert deliver_pending(a, route=b.device)["sent"] == 1
+    assert [m["id"] for m in newer.read()["messages"]] == ["nr-1"]
+    newer.ack(["nr-1"])
+    b.pump()
+    receipt = execute(a_board, "delivery", message_id="nr-1")
+    assert receipt["delivery"] == "acknowledged" and receipt["rerouted"]["to"] == newer.agent_id
+
+
+def test_network_mail_left_unread_moves_on_the_receiving_machine(machines):
+    (a_board, a), (b_board, b) = machines
+    newer = _sibling(b_board, b)
+    _discover(a, b, a_board, b_board)
+    sent = execute(a_board, "send", recipient=b_board.agent_id, content="Are you there?", message_id="nr-2")
+    assert sent["delivery"] == "delivered" and "rerouted" not in sent  # It looked live.
+    _age(b_board, mail=600)
+    b_board.join()  # Its MCP server keeps heartbeating; no turn reads.
+    network.reroute_stale(b.directory)  # What the node's loop does every announce period.
+    assert b_board.read(mark=False)["messages"] == []
+    assert newer.read()["messages"][0]["rerouted"]["from"] == b_board.agent_id
+    newer.ack(["nr-2"])
+    b.pump()
+    receipt = a_board.delivery("nr-2")
+    assert receipt["delivery"] == "acknowledged"
+    assert receipt["rerouted"] == {"from": b_board.agent_id, "to": newer.agent_id}
+
+
+def test_strict_network_mail_is_never_rerouted(machines):
+    (a_board, a), (b_board, b) = machines
+    newer = _sibling(b_board, b)
+    _age(b_board, seen=1200)
+    _discover(a, b, a_board, b_board)
+    sent = execute(a_board, "send", recipient=b_board.agent_id, content="only you", message_id="ns-1", strict=True)
+    assert "rerouted" not in sent and sent["recipient"] == b_board.agent_id
+    _age(b_board, mail=3600)
+    assert network.reroute_stale(b.directory) == []
+    assert newer.read()["messages"] == [] and b_board.read()["messages"][0]["id"] == "ns-1"
+
+
+def test_a_receipt_from_another_session_counts_only_from_the_routed_machine(machines, tmp_path):
+    (a_board, a), (b_board, b) = machines
+    _discover(a, b, a_board, b_board)
+    a_board.send(b_board.agent_id, "hello", "nr-3")
+    third = NetworkNode(tmp_path / "third", classify=lambda: dict(WIRED), port=0, multicast=False)
+    stranger = Collaboration(tmp_path / "third" / "p", "x", "codex", directory=tmp_path / "third")
+    stranger.join()
+    a._accept_announcement(_announcement(third), "127.0.0.1")
+    a.handle_request(_deliver(third, [{"kind": "receipt", "id": "nr-3", "from": stranger.agent_id}]), "127.0.0.1")
+    assert a_board.delivery("nr-3")["delivery"] == "delivered" and "rerouted" not in a_board.delivery("nr-3")
+
+
+def test_roster_cards_carry_last_read_and_staleness(machines):
+    (a_board, a), (b_board, b) = machines
+    b_board.read()
+    _discover(a, b, a_board, b_board)
+    card = next(c for c in execute(a_board, "status")["network_peers"] if c["id"] == b_board.agent_id)
+    assert card["last_read"] > 0 and "stale" not in card
+    a_board.send(b_board.agent_id, "ping", "nr-4")
+    _age(b_board, mail=600)
+    roster = {m["id"]: m for m in b._roster()}
+    assert roster[b_board.agent_id]["stale"] == "not reading mail"
+    assert network._valid_roster(list(roster.values()))
+    assert not network._valid_roster([dict(roster[b_board.agent_id], last_read="soon")])
+
+
+def test_a_machine_with_no_sessions_reads_as_up_not_unreachable(machines):
+    (a_board, a), (b_board, b) = machines
+    _discover(a, b, a_board, b_board)
+    b_board.leave()  # Every session on the desktop closed; its node stays up.
+    b.announce()
+    _until(lambda: not network_sessions(a.directory)[1])
+    status = execute(a_board, "status")
+    assert status["network_peers"] == []
+    [machine] = status["network"]["machines"]
+    assert (machine["host"], machine["sessions"], machine["state"]) == ("desktop", 0, "machine up, 0 sessions")
+    assert "no open sessions: desktop" in status["network"]["hint"]
+    with pytest.raises(ValueError, match=r"desktop \(0 sessions\)"):
+        a_board.send(b_board.agent_id, "anyone?")
+
+
+def test_blocked_multicast_with_working_broadcast_is_not_reported_as_failing(machines, monkeypatch):
+    """Incident: EHOSTUNREACH on every multicast send while broadcast worked. Status led
+    with the multicast error, and reopening the sockets every pass churned the TCP port."""
+    (a_board, a), (b_board, b) = machines
+    _discover(a, b, a_board, b_board)
+    real = a.udp
+
+    class MulticastBlocked:
+        def sendto(self, raw, target):
+            if target[0] == network.GROUP:
+                raise OSError(errno.EHOSTUNREACH, "No route to host")
+            return len(raw)
+
+    a.multicast, a.broadcast, a.udp = True, "192.168.1.255", MulticastBlocked()
+    try:
+        a.announce()
+        assert a.sockets_stale  # The first time, it may be a dead binding: reopen once.
+        a.sockets_stale, a.reopened_at = False, time.monotonic()
+        a.announce()
+        assert not a.sockets_stale  # Again soon after: multicast is blocked; don't churn.
+    finally:
+        a.udp, a.multicast, a.broadcast = real, False, None
+    assert a.path_summary()["failing"] == ["multicast"] and "broadcast" in a.path_summary()["reachable"]
+    a._write_state(running=True)
+    status = execute(a_board, "status")["network"]
+    assert "send_error" not in status and "broadcast" in status["udp_paths"]["reachable"]
+    assert status["hint"].startswith("Multicast is blocked on this network, but broadcast")
+    monkeypatch.setattr(network, "classify_network", lambda: dict(WIRED))
+    report = network.doctor(a.directory)
+    assert report["hint"].startswith("Peers are reachable") and "multicast" in report["hint"]
+    assert report["machines"][0]["sessions"] == 1
+    port = a.tcp_port
+    a.sockets_stale = True
+    a.refresh_policy()  # A reopen on the same address keeps the TCP port peers have on file.
+    assert a.trusted and a.tcp_port == port
+
+
+def test_machines_heard_only_over_tcp_still_get_unicast_rosters(tmp_path, monkeypatch):
+    monkeypatch.setenv("DARKMATTER_NETWORK_MODE", "auto")
+    node = NetworkNode(tmp_path / "n", classify=lambda: dict(WIRED), port=0)
+    node.port = network.PORT  # A real node; tests otherwise bind ephemeral ports.
+    with open_database(node.directory) as db:
+        db.execute("INSERT INTO network_peers(device, host, address, port, sessions, seen, ts) "
+                   "VALUES(?,?,?,?,?,?,?)", ("d" * 64, "mini", "192.168.1.9", 50000, "[]", time.time(), time.time()))
+    assert node._known_targets() == [("192.168.1.9", network.PORT)]
+    node.known["d" * 64] = ("192.168.1.9", 40001)
+    assert node._known_targets() == [("192.168.1.9", 40001)]

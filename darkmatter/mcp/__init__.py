@@ -25,6 +25,10 @@ WORKING WITH OTHER AGENTS (darkmatter_collaborate, always with your hook's sessi
 - action=send recipient=<peer id> content="..."; ids are 64 hex (machine/network) or <device>/<session> (repo).
 - Or send match={"host": "mac-mini"} (host/project/client/branch/session) with mode="any" (first
   available) or "all". Received mail says how it was `addressed` and who sent it (`from_label`).
+- A direct send to a session that is offline or not reading its mail (card: stale, last_read) goes
+  to the most recently active live session of its project on its machine; the result says
+  rerouted {from, to}. strict=true targets exactly that session. Mail rerouted to you says
+  rerouted: handle it as yours. A network machine with 0 sessions is up, not unreachable.
 - action=read returns your unread mail from both; action=ack ids=[...] only after handling it.
 - action=claim resource=<path> before editing shared files; release when done. Claims are advisory.
 - If status reports remote.configured=false, other machines are not reachable yet. Suggest

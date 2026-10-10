@@ -43,11 +43,11 @@ the `session_id` the host hook provides:
 | --- | --- |
 | `status` | `peers` (this machine), `network_peers` (same network), `remote_peers` (same repo): a card for each |
 | `join objective="..."` | One line on what you are doing; others see it and when it was set |
-| `send recipient=ID content="..."` | Encrypted, signed message. `ID` is 64 hex (machine or network) or `<device>/<session>` (repo) |
+| `send recipient=ID content="..."` | Encrypted, signed message. `ID` is 64 hex (machine or network) or `<device>/<session>` (repo). `strict=true` disables [rerouting](#mail-reaches-a-session-that-reads-it) |
 | `send match={...} mode=any\|all content="..."` | Whoever matches `host`, `project`, `client`, `branch` or `session`: the first available (`any`) or everyone (`all`) |
 | `read` | Unread mail from everywhere, marked `via: local`, `network` or `repo`, with `from_label` and `addressed` |
 | `ack ids=[...]` | Acknowledge after handling. The sender sees `acknowledged` |
-| `delivery message_id=...` | `queued`, `delivered`/`published`, or `acknowledged` for your own message |
+| `delivery message_id=...` | `queued`, `delivered`/`published`, or `acknowledged` for your own message, plus `rerouted` (`from`, `to`) if another session got it |
 | `claim` / `release resource=PATH` | Advisory, expiring file leases before editing shared files |
 
 **Knowing who is doing what.** Every session has a card, so agents can route
@@ -108,10 +108,18 @@ broadcast first. Discovery uses multicast plus subnet broadcast, because many
 routers drop one of them. A datagram carries a compact session list, small
 enough for every OS to send; the full list travels over TCP. Known machines that
 UDP hasn't refreshed lately get a TCP heartbeat, and each side answers with its
-full list, so machines stay listed even when every datagram is lost. Send and
+full list, so machines stay listed even when every datagram is lost. A broadcast
+can't exceed one frame (1472 bytes), so it carries the session list cut to fit,
+marked incomplete, and receivers fetch the rest over TCP. Machines heard only
+over TCP get the list by unicast too. Send and
 heartbeat failures are never silent: they appear in `darkmatter network doctor`
-and the `collaborate status` network hint, and in `network.log`. Remote `send`
-pushes right away.
+and the `collaborate status` network hint, and in `network.log`. When only one
+path fails, for example a network that blocks multicast while broadcast works,
+both say that (`udp_paths`) instead of reporting the node as failing, and the
+sockets are reopened at most every 5 minutes, keeping their TCP port. `status`
+also lists `network.machines`: a machine whose sessions all closed shows
+`machine up, 0 sessions`, which is different from a machine that can't be
+reached. Remote `send` pushes right away.
 While any MCP session is open, a background worker polls every 15 seconds
 (`DARKMATTER_SPACE_SYNC_SECONDS`, `0` disables it). Each poll is a single
 `ls-remote`. Only changed mail branches are fetched, and a push happens only
@@ -162,6 +170,39 @@ recipient, 16 KiB per message, and 32 devices per repo. Installation never
 rewrites client configuration on its own, and `space init` never runs
 implicitly. See [repo spaces](docs/repo-spaces.md) for membership policies,
 revocation, reviewed publication, and wake adapters.
+
+### Mail reaches a session that reads it
+
+A session can look present (its MCP server still heartbeats, its card says
+`busy`) while no turn ever reads its mail. Each card therefore shows
+`last_read`, when the session last read or acknowledged mail (0: never), and
+`stale`: `offline` (nothing has heartbeated for 5 minutes) or `not reading
+mail` (it holds mail it hasn't read for 5 minutes). Cards on other machines
+carry both too.
+
+Mail for such a session goes to a live session of the **same project on the
+same machine** instead: the most recently active one (it read or acknowledged
+mail, set its objective, or a hook saw it working), same workspace first.
+
+- **At send time**, a direct send to a stale session on this machine goes
+  straight to that live session. Network mail is rerouted by the receiving
+  machine as it arrives. Either way the result says
+  `"rerouted": {"from": ..., "to": ...}`, and so does `delivery`.
+- **After delivery**, mail left unread (and unacknowledged) for 5 minutes moves
+  to a live session of the same project. Hooks, wake waiters, `read`, `status`
+  and the network node all check for this, so it also covers mail that came
+  over the network. The live session wakes, and its `read` marks the message
+  `rerouted` (with the session it was addressed to).
+- **Exactly once.** A message has one holder at a time, and moving it is one
+  database transaction. The old session can no longer read or acknowledge it.
+  Mail a session has already read never moves. A message never goes back to a
+  session that held it, and it moves at most 3 times.
+- **Never** to another project, another machine, or another OS account's
+  sessions. Never for `strict=true` sends (`--strict` in the CLI), and never for
+  `mode=all` copies. Rerouted mail keeps its sender, its `authority`, and the
+  sender's signature, which is still verified. The previous holder's session
+  key seals a hop to the new holder (same OS account, the local trust boundary).
+- **A session's own `read` or `status`** never gives away its own mail.
 
 ## Your own agents act for you
 
@@ -276,7 +317,8 @@ does not re-arm the sessions' mail waiters. When the host kills a session's mail
 card in `status` (and in the roster other machines see) shows
 `"waiter": "killed"` until the session is active again, `mode="any"` sends prefer
 live sessions over it, and a send to it still delivers but returns
-`"wakes": false`. That is the signal to revive it. Reviving it is a known recipe, not a built-in tool. Agent **A** (on any
+`"wakes": false`. If that mail sits unread for 5 minutes and another session of
+the same project is live, it [moves there](#mail-reaches-a-session-that-reads-it). That is the signal to revive it. Reviving it is a known recipe, not a built-in tool. Agent **A** (on any
 machine) asks agent **B** (on the stopped session's machine) to revive session
 **C**. B does the steps below, C answers A over DarkMatter as itself, and B tells
 A which session it revived and how it went.
@@ -694,7 +736,7 @@ Protect `.darkmatter/passport`, use private hosted repositories when metadata ma
 darkmatter                         # print identity, visibility, and locators
 darkmatter install-mcp --all --collaborate  # MCP + session hooks for every client
 darkmatter network status            # is this network shared, and who is on it
-darkmatter network doctor            # test every peer (UDP + TCP) and show why queued mail waits
+darkmatter network doctor            # test every peer (UDP + TCP), each UDP path, and why queued mail waits
 darkmatter network auto|on|off       # password-protected only (default) / always / never
 darkmatter network run               # run the network node without an MCP server
 darkmatter space init                # reach this project's agents on other machines

@@ -411,3 +411,182 @@ def test_host_match_survives_a_bonjour_clash_rename():
     assert not matches({**renamed, "host": "Daniels-Mac-mini"}, {"host": "Daniels-MacBook-Pro-130"})
     assert base_host("Daniels-MacBook-Pro-192.local") == "Daniels-MacBook-Pro"
     assert base_host("build-server") == "build-server"
+
+
+# ---------------------------------------------------------------- rerouting
+# Incident: for a day, mail to a HabbitTracker agent went to a session whose MCP server
+# still heartbeated ("busy", day-old objective) but whose turn never read mail; the user
+# worked in a newer session of the same workspace that received nothing.
+
+def _age(board, *, seen=None, mail=None):
+    """Make a session look offline (seen seconds ago) or its mail delivered `mail` seconds ago."""
+    import time as _time
+    from darkmatter.collaboration import open_database
+    with open_database(board.directory) as db:
+        if seen is not None:
+            db.execute("UPDATE participants SET seen=? WHERE id=?", (_time.time() - seen, board.agent_id))
+        if mail is not None:
+            db.execute("UPDATE messages SET created=?, held_at=0 WHERE recipient=?", (_time.time() - mail, board.agent_id))
+
+
+@pytest.fixture
+def tracker(tmp_path, monkeypatch):
+    """Two sessions of one project (stale, then the one the user works in) and a sender elsewhere."""
+    monkeypatch.setenv("DARKMATTER_LOCAL_DIR", str(tmp_path / "private"))
+    root = tmp_path / "HabbitTracker"
+    (root / ".git").mkdir(parents=True)
+    (tmp_path / "Coordinator").mkdir()
+    stale = Collaboration(root, "84eb1193", "claude-code")
+    stale.join("A day-old objective", availability="busy")
+    live = Collaboration(root, "2d2bdf00", "claude-code")
+    live.join(availability="busy")
+    live.read()  # The user's session reads its mail.
+    sender = Collaboration(tmp_path / "Coordinator", "coordinator", "claude-code")
+    sender.join()
+    return sender, stale, live
+
+
+def test_a_send_to_an_offline_session_goes_to_a_live_one_of_its_project(tracker):
+    from darkmatter.collaboration_cli import execute
+    sender, stale, live = tracker
+    _age(stale, seen=1200)  # Its app process is gone.
+    result = execute(sender, "send", recipient=stale.agent_id, content="Fix the streak bug", message_id="r1")
+    assert result["rerouted"] == {"from": stale.agent_id, "to": live.agent_id, "reason": "offline"}
+    assert result["recipient"] == live.agent_id and "strict" in result["note"]
+    [item] = live.read()["messages"]
+    assert (item["id"], item["from"], item["content"]) == ("r1", sender.agent_id, "Fix the streak bug")
+    assert item["rerouted"]["from"] == stale.agent_id and item["authority"] == "owner"
+    assert stale.read()["messages"] == []
+    live.ack(["r1"])
+    receipt = execute(sender, "delivery", message_id="r1")
+    assert receipt["delivery"] == "acknowledged"
+    assert receipt["rerouted"] == {"from": stale.agent_id, "to": live.agent_id}
+    assert execute(sender, "send", recipient=stale.agent_id, content="Fix the streak bug", message_id="r1")["duplicate"]
+
+
+def test_a_session_that_heartbeats_but_never_reads_is_not_live(tracker):
+    from darkmatter.collaboration_cli import execute
+    sender, stale, live = tracker
+    _age(live, seen=1200)  # No live sibling for now: the mail has to wait where it is.
+    sender.send(stale.agent_id, "first", "old-1")
+    _age(stale, mail=600)
+    stale.join()  # Its MCP server heartbeats: online, but nobody reads.
+    cards = {p["id"]: p for p in execute(sender, "status")["peers"]}
+    assert cards[stale.agent_id]["stale"] == "not reading mail" and cards[stale.agent_id]["last_read"] == 0
+    assert cards[live.agent_id]["stale"] == "offline" and cards[live.agent_id]["last_read"] > 0
+    waiting = execute(sender, "send", recipient=stale.agent_id, content="still?", message_id="w-1")
+    assert "rerouted" not in waiting and waiting["recipient_stale"] == "not reading mail"
+    live.join()  # The user opens the newer session.
+    result = execute(sender, "send", recipient=stale.agent_id, content="second", message_id="new-1")
+    assert result["rerouted"]["reason"] == "not reading mail" and result["recipient"] == live.agent_id
+    picked = execute(sender, "send", match={"project": "habbittracker"}, mode="any", content="any")
+    assert [s["to"] for s in picked["sent"]] == [live.agent_id]  # mode=any ranks it last too.
+    assert {m["id"] for m in live.read()["messages"]} >= {"old-1", "new-1"}  # The backlog followed.
+
+
+def test_strict_sends_target_exactly_that_session_and_never_move(tracker):
+    from darkmatter.collaboration import reroute_stale
+    from darkmatter.collaboration_cli import execute, main
+    sender, stale, live = tracker
+    _age(stale, seen=1200)
+    result = execute(sender, "send", recipient=stale.agent_id, content="only you", message_id="s1", strict=True)
+    assert "rerouted" not in result and result["recipient"] == stale.agent_id
+    _age(stale, mail=3600)
+    assert reroute_stale(stale.directory) == []
+    assert live.read()["messages"] == []
+    assert [m["id"] for m in stale.read()["messages"]] == ["s1"]
+    assert stale.read()["messages"][0]["addressed"]["strict"] is True
+    assert main(["send", "--session", "coordinator", "--client", "claude-code", "--project-dir",
+                 str(sender.root), "--recipient", stale.agent_id, "--content", "cli", "--strict"]) == 0
+
+
+def test_unread_mail_moves_once_to_a_live_session_and_the_stale_one_never_sees_it(tracker, monkeypatch, capsys):
+    from darkmatter import wakeup
+    from darkmatter.collaboration import REROUTE_SECONDS, reroute_stale
+    from darkmatter.collaboration_cli import execute
+    sender, stale, live = tracker
+    sent = execute(sender, "send", recipient=stale.agent_id, content="Ship the widget", message_id="m1")
+    assert "rerouted" not in sent  # It looked live when this was sent.
+    assert reroute_stale(stale.directory) == []  # Not yet: unread for less than REROUTE_SECONDS.
+    _age(stale, mail=REROUTE_SECONDS + 1)
+    stale.join(availability="busy")  # Heartbeats and a "busy" flag are not reading mail.
+    with ThreadPoolExecutor(4) as pool:  # Concurrent sweeps (hooks, waiters, the node) move it once.
+        moved = [m for batch in pool.map(lambda _: reroute_stale(stale.directory), range(4)) for m in batch]
+    assert moved == [{"id": "m1", "from": stale.agent_id, "to": live.agent_id}]
+    assert stale.read()["messages"] == []  # The stale session can't also take it as fresh.
+    stale.ack(["m1"])  # Nor acknowledge it for the session that has it.
+    assert execute(sender, "delivery", message_id="m1")["delivery"] == "queued"
+    notice = wakeup.session_mail_notice(live.root, "2d2bdf00", "claude-code")
+    assert notice["unread_ids"] == ["m1"]  # The live session's waiter wakes it.
+    [item] = live.read()["messages"]
+    assert item["content"] == "Ship the widget" and item["from"] == sender.agent_id
+    assert item["rerouted"]["from"] == stale.agent_id and item["authority"] == "owner"
+    _age(live, mail=REROUTE_SECONDS * 5)
+    assert reroute_stale(stale.directory) == []  # Read mail never moves again.
+    live.ack(["m1"])
+    receipt = execute(sender, "delivery", message_id="m1")
+    assert receipt["delivery"] == "acknowledged" and receipt["rerouted"]["to"] == live.agent_id
+
+
+def test_a_hook_in_the_live_session_pulls_mail_its_sibling_left_unread(tracker, monkeypatch, capsys):
+    from darkmatter.collaboration import REROUTE_SECONDS
+    from darkmatter.collaboration_cli import main
+    sender, stale, live = tracker
+    sender.send(stale.agent_id, "hello", "h1")
+    _age(stale, mail=REROUTE_SECONDS + 1)
+    event = {"cwd": str(live.root), "session_id": "2d2bdf00", "hook_event_name": "PostToolUse"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["hook", "--client", "claude-code"]) == 0
+    context = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert '"unread_ids":["h1"]' in context
+    assert live.read(mark=False)["messages"][0]["id"] == "h1"
+
+
+def test_mail_already_read_or_explicitly_held_is_never_moved(tracker):
+    from darkmatter.collaboration import REROUTE_SECONDS, reroute_stale
+    sender, stale, live = tracker
+    sender.send(stale.agent_id, "working on it", "w1")
+    assert stale.read()["messages"]  # Read, being handled, not yet acknowledged.
+    _age(stale, mail=REROUTE_SECONDS * 3)
+    assert reroute_stale(stale.directory) == []
+    sender.send(stale.agent_id, "another", "w2")
+    _age(stale, mail=REROUTE_SECONDS * 3)
+    assert reroute_stale(stale.directory, keep=stale.agent_id) == []  # Its own read/status keeps its mail.
+    assert {m["id"] for m in stale.read()["messages"]} == {"w1", "w2"}
+
+
+def test_rerouting_never_crosses_projects_or_returns_to_a_previous_holder(tracker, tmp_path):
+    from darkmatter.collaboration import MAX_REROUTES, REROUTE_SECONDS, open_database, reroute_stale
+    sender, stale, live = tracker
+    other = Collaboration(tmp_path / "Coordinator", "other-project", "claude-code")
+    other.read()  # Live, active, but a different project.
+    _age(live, seen=1200)  # The only same-project sibling is offline.
+    sender.send(stale.agent_id, "for tracker", "x1")
+    _age(stale, mail=REROUTE_SECONDS + 1)
+    assert reroute_stale(stale.directory) == []
+    assert other.read()["messages"] == [] and sender.read()["messages"] == []
+    live.join()  # Back online: it gets the mail, but it, too, never reads it.
+    assert reroute_stale(stale.directory)[0]["to"] == live.agent_id
+    _age(live, mail=REROUTE_SECONDS + 1)
+    stale.join()  # Online, nothing pending: yet it already left this message unread.
+    assert reroute_stale(live.directory) == []  # Never back to a previous holder.
+    with open_database(live.directory) as db:
+        record = json.loads(db.execute("SELECT envelope FROM messages WHERE id='x1'").fetchone()[0])
+    assert record["held_by"] == [stale.agent_id, live.agent_id] and MAX_REROUTES == 3
+
+
+def test_mode_all_copies_and_tampered_reroutes_are_never_taken_as_fresh(tracker):
+    from darkmatter.collaboration import REROUTE_SECONDS, open_database, reroute_stale
+    from darkmatter.collaboration_cli import execute
+    sender, stale, live = tracker
+    execute(sender, "send", match={"project": "habbittracker"}, mode="all", content="everyone", message_id="all")
+    sender.send(stale.agent_id, "signed by the coordinator", "t1")
+    _age(stale, mail=REROUTE_SECONDS + 1)
+    moved = reroute_stale(stale.directory)
+    assert [m["id"] for m in moved] == ["t1"]  # Each mode=all copy stays with its own session.
+    with open_database(live.directory) as db:
+        record = json.loads(db.execute("SELECT envelope FROM messages WHERE id='t1'").fetchone()[0])
+        record["envelope"]["signature"] = "00" * 64  # The original sender's signature must still hold.
+        db.execute("UPDATE messages SET envelope=? WHERE id='t1'", (json.dumps(record),))
+    inbox = live.read()
+    assert "t1" in inbox["invalid"] and all(m["id"] != "t1" for m in inbox["messages"])

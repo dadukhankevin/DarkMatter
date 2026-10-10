@@ -30,7 +30,8 @@ import time
 import uuid
 from pathlib import Path
 
-from darkmatter.collaboration import MAX_PENDING, MESSAGE_SECONDS, PRESENCE_SECONDS, local_directory, open_database
+from darkmatter.collaboration import (LIVE_SECONDS, MAX_PENDING, MESSAGE_SECONDS, PRESENCE_SECONDS, _backlogged,
+                                      local_directory, open_database, reroute_arrival, reroute_stale)
 from darkmatter.contract.envelope import validate_envelope_id, verify_envelope_signature
 from darkmatter.facts import host_name, valid_facts
 from darkmatter.identity import derive_public_key_hex, generate_keypair
@@ -72,6 +73,13 @@ LOG_REPEAT_SECONDS = 60  # The same error is logged at most once a minute.
 POLICY_SECONDS = 15
 # Send errors meaning the socket's interface binding is gone, not that one peer is down.
 STALE_SOCKET_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EADDRNOTAVAIL}
+# Such an error reopens the sockets at most this often: on a network that simply blocks
+# multicast (EHOSTUNREACH on every send) reopening every policy pass would churn the TCP
+# listener while broadcast and unicast work fine.
+REOPEN_SECONDS = 300
+# A UDP path (multicast, broadcast, unicast) counts as working or failing on its last
+# outcome within this window.
+PATH_SECONDS = 300
 STATE_SECONDS = 60
 CLOCK_SKEW = 120
 RATE_WINDOW, RATE_LIMIT = 10.0, 1000  # Flood guard per source address, far above normal use.
@@ -299,6 +307,7 @@ def _valid_roster(sessions) -> bool:
                and _text(m.get("client"), 80) and _text(m.get("objective", ""), 512)
                and _text(m.get("project", ""), 128) and m.get("availability") in ("busy", "idle", "unknown")
                and type(m.get("objective_at", 0)) in (int, float) and valid_facts(m.get("facts"))
+               and type(m.get("last_read", 0)) in (int, float) and _text(m.get("stale", ""), 32)
                for m in sessions)
 
 
@@ -332,6 +341,8 @@ def _compact(sessions: list[dict], objective: int) -> list[dict]:
         facts = {} if objective == 0 else dict(card.get("facts") or {})
         facts.pop("changed", None)
         card["facts"] = facts
+        if objective == 0:
+            card.pop("last_read", None)
         out.append(card)
     return out
 
@@ -371,15 +382,25 @@ class _Endpoint:
     def _roster(self) -> list[dict]:
         with open_database(self.directory) as db:
             rows = db.execute("SELECT id, workspace, client, objective, objective_at, availability, facts, "
-                              "active_at, waiter_killed_at FROM participants "
+                              "active_at, waiter_killed_at, read_at, seen FROM participants "
                               "WHERE seen > ? ORDER BY seen DESC LIMIT ?",
                               (time.time() - PRESENCE_SECONDS, MAX_SESSIONS)).fetchall()
+            now = time.time()
+            backlogged = _backlogged(db, now)
+
+        def stale(row):
+            if row["id"] in backlogged:
+                return {"stale": "not reading mail"}
+            return {"stale": "offline"} if row["seen"] <= now - LIVE_SECONDS else {}
+
         return [{"id": row["id"], "client": (row["client"] or "")[:80],
                  "objective": (row["objective"] or "")[:512], "project": Path(row["workspace"]).name[:128],
                  "availability": row["availability"] if row["availability"] in ("busy", "idle") else "unknown",
                  "objective_at": row["objective_at"] or 0, "facts": self._facts(row["facts"]),
                  # An extra key older receivers ignore: this session can't be woken right now.
-                 **({"waiter": "killed"} if (row["waiter_killed_at"] or 0) > (row["active_at"] or 0) else {})}
+                 **({"waiter": "killed"} if (row["waiter_killed_at"] or 0) > (row["active_at"] or 0) else {}),
+                 # More extra keys: when it last read mail, and whether it is reading it at all.
+                 "last_read": int(row["read_at"] or 0), **stale(row)}
                 for row in rows]
 
     @staticmethod
@@ -528,6 +549,8 @@ def deliver_pending(endpoint, *, route: str | None = None, backoff: dict | None 
             backoff.pop(device, None)
         endpoint._accept_reply(response, device, peer["address"])
         accepted, rejected = set(response.get("accepted", [])), response.get("rejected", {})
+        rerouted = response.get("rerouted") if isinstance(response.get("rerouted"), dict) else {}
+        roster = {member.get("id") for member in json.loads(peer["sessions"]) if isinstance(member, dict)}
         with open_database(endpoint.directory) as db:
             for row in batch:
                 if row["origin"] == "network-receipt":
@@ -535,6 +558,11 @@ def deliver_pending(endpoint, *, route: str | None = None, backoff: dict | None 
                     db.execute("DELETE FROM messages WHERE id=?", (row["id"],))
                 elif row["id"] in accepted:
                     db.execute("UPDATE messages SET delivered=1, last_error='' WHERE id=?", (row["id"],))
+                    target = rerouted.get(row["id"])
+                    if isinstance(target, str) and target in roster and target != row["recipient"]:
+                        # That machine gave it to a live session of the same project (informational).
+                        db.execute("UPDATE messages SET rerouted_from=?, recipient=? WHERE id=?",
+                                   (row["rerouted_from"] or row["recipient"], target, row["id"]))
                     sent += 1
                 elif row["id"] in rejected:
                     db.execute("UPDATE messages SET delivered=2, last_error=? WHERE id=?",
@@ -577,6 +605,10 @@ class NetworkNode(_Endpoint):
         # same address leaves the multicast binding dead (EHOSTUNREACH on every send),
         # and the address check alone would never reopen it.
         self.sockets_stale = False
+        self.reopened_at = -1e18  # Monotonic time of the last reopen for a stale binding.
+        # Last outcome per UDP path (multicast, broadcast, unicast): (time, error or None).
+        # A network that blocks multicast while broadcast works must not read as "failing".
+        self.paths: dict[str, tuple[float, str | None]] = {}
         self.heartbeat_error: tuple[float, str] | None = None
         self.full_at: dict[str, float] = {}
         # TCP heartbeats: at most one in flight per machine, each on its own daemon
@@ -608,6 +640,12 @@ class NetworkNode(_Endpoint):
                     cycle += 1
                     self._expire_peers()
                     self._heartbeats()
+                    try:
+                        # Mail that arrived for a session here that never read it moves to a
+                        # live session of its project, even when no session hook runs.
+                        reroute_stale(self.directory)
+                    except Exception as exc:  # noqa: BLE001  Never take the node down over it.
+                        self._log(f"reroute sweep failed: {type(exc).__name__}: {exc}", key="reroute")
                     next_announce = now + ANNOUNCE_SECONDS
                 if self.trusted:
                     self.pump()
@@ -633,9 +671,13 @@ class NetworkNode(_Endpoint):
         trusted, self.reason = decide(mode, self.network, trust.network_verdict(self.directory, self.fingerprint))
         address = self.network.get("address")
         if trusted and (not self.trusted or address != self.address or self.sockets_stale):
+            # Keep the TCP port across a reopen on the same address: peers have it on file.
+            keep = self.tcp_port if address == self.address else 0
+            if self.sockets_stale:
+                self.reopened_at = time.monotonic()
             self._close()
             try:
-                self._open(address)
+                self._open(address, keep)
             except OSError as exc:
                 trusted, self.reason = False, f"cannot open network sockets: {exc}"
                 self._close()
@@ -653,8 +695,18 @@ class NetworkNode(_Endpoint):
                  "tcp_port": self.tcp_port, "mode": mode or get_mode(self.directory),
                  "fingerprint": self.fingerprint,
                  "send_error": self._recent(self.send_error), "heartbeat_error": self._recent(self.heartbeat_error),
+                 "udp_paths": self.path_summary(),
                  "pid": os.getpid(), "updated": time.time() if running else 0}
         atomic_write_text(self.directory / "network_state.json", _json(state) + "\n", mode=0o600)
+
+    def path_summary(self) -> dict:
+        """Each UDP path's recent outcome, plus which reach peers and which fail."""
+        now, summary = time.time(), {"reachable": [], "failing": []}
+        for kind, (at, error) in sorted(self.paths.items()):
+            if now - at < PATH_SECONDS:
+                summary[kind] = error or "ok"
+                summary["failing" if error else "reachable"].append(kind)
+        return summary
 
     @staticmethod
     def _recent(error: tuple[float, str] | None) -> str | None:
@@ -670,10 +722,16 @@ class NetworkNode(_Endpoint):
         self._logged[key] = now
         log_event(self.directory, text)
 
-    def _open(self, address: str) -> None:
+    def _open(self, address: str, tcp_port: int = 0) -> None:
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp.bind((address, 0))  # LAN interface only, never 0.0.0.0.
+        try:
+            tcp.bind((address, tcp_port))  # LAN interface only, never 0.0.0.0.
+        except OSError:
+            if not tcp_port:
+                tcp.close()
+                raise
+            tcp.bind((address, 0))
         tcp.listen(16)
         tcp.settimeout(0.5)
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -714,7 +772,9 @@ class NetworkNode(_Endpoint):
         self.udp = self.tcp = None
         self.address, self._threads, self.tcp_port = None, [], 0
 
-    def _send(self, message: dict | bytes, targets=None) -> None:
+    def _send(self, message: dict | bytes, targets=None, small=None) -> None:
+        """Send to `targets`, or to multicast, broadcast and extra targets. `small` builds
+        a version that fits one broadcast frame (a roster cut to fit, marked incomplete)."""
         if self.udp is None:
             return
         raw = message if isinstance(message, bytes) else _json(message).encode()
@@ -722,24 +782,32 @@ class NetworkNode(_Endpoint):
         default = [(self.group, self.port)] if self.multicast else []
         if getattr(self, "broadcast", None):
             default.append((self.broadcast, self.port))
-        probe = None
+        fitted = None
         for target in targets or [*default, *self.extra_targets]:
             payload = raw
-            if target[0] == getattr(self, "broadcast", None) and len(raw) > MAX_BROADCAST:
-                # Too big to broadcast: a probe instead. Every node that hears it answers
-                # with its roster by unicast, and we then reach it by unicast and TCP.
-                probe = probe or _json({"p": PROTOCOL, "t": "probe", "device": self.device}).encode()
-                payload = probe
+            kind = ("multicast" if target[0] == self.group else
+                    "broadcast" if target[0] == getattr(self, "broadcast", None) else "unicast")
+            if kind == "broadcast" and len(raw) > MAX_BROADCAST:
+                # macOS won't broadcast more than one frame. Send the roster cut to fit (its
+                # receivers fetch the full one over TCP), or else a bare probe: every node
+                # that hears either answers by unicast, and we then reach it by unicast and TCP.
+                if fitted is None:
+                    fitted = small() if small is not None else b""
+                    if not fitted or len(fitted) > MAX_BROADCAST:
+                        fitted = _json({"p": PROTOCOL, "t": "probe", "device": self.device}).encode()
+                payload = fitted
             try:
                 self.udp.sendto(payload, target)
+                self.paths[kind] = (time.time(), None)
             except OSError as exc:
                 self.send_error = (time.time(), f"{type(exc).__name__}: {exc} ({len(payload)} bytes to {target[0]})")
-                if exc.errno in STALE_SOCKET_ERRNOS:
+                self.paths[kind] = (time.time(), f"{type(exc).__name__}: {exc}")
+                if exc.errno in STALE_SOCKET_ERRNOS and time.monotonic() - self.reopened_at >= REOPEN_SECONDS:
                     self.sockets_stale = True  # The next policy pass reopens the sockets.
                 self._log("UDP send failed: " + self.send_error[1], key=f"udp {target} {exc}")
 
     def announce(self, targets=None) -> None:
-        self._send(self._announcement(), targets)
+        self._send(self._announcement(), targets, small=lambda: self._announcement(MAX_BROADCAST))
 
     def _serve_udp(self, udp) -> None:
         while not self._stop.is_set():
@@ -770,13 +838,18 @@ class NetworkNode(_Endpoint):
                 continue
 
     def _known_targets(self) -> list[tuple[str, int]]:
-        """Unicast destinations for machines still on the roster; forget the rest."""
+        """Unicast destinations for machines still on the roster; forget the rest. Machines
+        heard only over TCP (every datagram from them lost, or multicast blocked) get our
+        roster by unicast to the well-known port at their roster address too."""
         with open_database(self.directory) as db:
-            present = {row["device"] for row in db.execute("SELECT device FROM network_peers")}
+            present = {row["device"]: row["address"] for row in db.execute("SELECT device, address FROM network_peers")}
         for device in list(self.known):
             if device not in present:
                 self.known.pop(device, None)
-        return [target for device, target in list(self.known.items()) if device in present]
+        targets = [target for device, target in list(self.known.items()) if device in present]
+        if self.port:  # Tests bind ephemeral ports; real nodes all listen on PORT.
+            targets += [(address, self.port) for device, address in present.items() if device not in self.known]
+        return targets
 
     def _expire_peers(self) -> None:
         with open_database(self.directory) as db:
@@ -907,9 +980,12 @@ class NetworkNode(_Endpoint):
                 if item.get("kind") == "receipt":
                     mid, sender = item.get("id"), item.get("from")
                     if isinstance(mid, str) and isinstance(sender, str) and sender in roster:
-                        # Only the machine we routed a message to may acknowledge it.
-                        db.execute("UPDATE messages SET acknowledged=1, delivered=1 WHERE id=? AND "
-                                   "origin='network-out' AND route=? AND recipient=?", (mid, device, sender))
+                        # Only the machine we routed a message to may acknowledge it. A session
+                        # of that machine other than the addressee acked it: that machine rerouted it.
+                        db.execute("UPDATE messages SET acknowledged=1, delivered=1, rerouted_from=CASE WHEN "
+                                   "recipient != ? THEN COALESCE(NULLIF(rerouted_from, ''), recipient) "
+                                   "ELSE rerouted_from END, recipient=? WHERE id=? AND origin='network-out' "
+                                   "AND route=?", (sender, sender, mid, device))
                         receipts.append(mid)
                     continue
                 reason, mid = self._accept_message(db, item.get("envelope"), device, roster)
@@ -919,7 +995,17 @@ class NetworkNode(_Endpoint):
                     rejected[mid] = reason
                 else:
                     accepted.append(mid)
+            rerouted = {}
+            for mid in accepted:
+                # Addressed to a session here that is offline or not reading its mail: hand it
+                # to a live session of the same project now, and tell the sender (a retry too).
+                reroute_arrival(db, self.directory, mid)
+                row = db.execute("SELECT recipient, rerouted_from FROM messages WHERE id=?", (mid,)).fetchone()
+                if row is not None and row["rerouted_from"]:
+                    rerouted[mid] = row["recipient"]
         response = {"p": PROTOCOL, "ok": True, "accepted": accepted, "receipts": receipts, "rejected": rejected}
+        if rerouted:
+            response["rerouted"] = rerouted
         if self.tcp_port:
             # Our full roster back: one round trip refreshes both machines, even with all
             # UDP lost. Older senders ignore the field.
@@ -941,9 +1027,9 @@ class NetworkNode(_Endpoint):
             return "sender is not a session on that machine", mid
         if not db.execute("SELECT 1 FROM participants WHERE id=?", (env.to_id,)).fetchone():
             return "unknown recipient", mid
-        existing = db.execute("SELECT sender, recipient FROM messages WHERE id=?", (mid,)).fetchone()
+        existing = db.execute("SELECT sender, recipient, rerouted_from FROM messages WHERE id=?", (mid,)).fetchone()
         if existing:
-            same = existing["sender"] == env.from_id and existing["recipient"] == env.to_id
+            same = existing["sender"] == env.from_id and env.to_id in (existing["recipient"], existing["rerouted_from"])
             return ("" if same else "message id already used"), mid
         pending = db.execute("SELECT COUNT(*) FROM messages WHERE recipient=? AND acknowledged=0 AND expires>?",
                              (env.to_id, time.time())).fetchone()[0]
@@ -969,10 +1055,10 @@ def doctor(directory=None) -> dict:
     report = {"mode": mode, "network": current, "sharing": allowed, "reason": reason,
               "node": {"running": bool(state.get("running")), "address": state.get("address"),
                        "tcp_port": state.get("tcp_port"), "send_error": state.get("send_error"),
-                       "heartbeat_error": state.get("heartbeat_error")},
+                       "heartbeat_error": state.get("heartbeat_error"), "udp_paths": state.get("udp_paths") or {}},
               "log": read_log(directory), "peers": [], "queued": []}
     with open_database(directory) as db:
-        peers = [dict(r) for r in db.execute("SELECT device, host, address, port, seen FROM network_peers")]
+        peers = [dict(r) for r in db.execute("SELECT device, host, address, port, seen, sessions FROM network_peers")]
         queued = [dict(r) for r in db.execute(
             "SELECT id, route, last_error, created FROM messages WHERE origin='network-out' AND delivered=0 "
             "AND acknowledged=0 AND expires>? ORDER BY created LIMIT 20", (time.time(),))]
@@ -999,7 +1085,20 @@ def doctor(directory=None) -> dict:
         report["queued"].append({"id": row["id"], "to_machine": hosts.get(row["route"], row["route"][:12]),
                                  "waiting_seconds": round(time.time() - row["created"]),
                                  "last_error": row["last_error"] or "not attempted yet"})
-    if state.get("send_error"):
+    paths = state.get("udp_paths") or {}
+    reachable = list(paths.get("reachable") or [])
+    if any(peer.get("tcp") == "ok" for peer in report["peers"]):
+        reachable.append("TCP to peers")
+    report["machines"] = []
+    for peer in peers:
+        count = len(json.loads(peer["sessions"] or "[]"))
+        report["machines"].append({"host": peer["host"], "sessions": count,
+                                   "state": f"machine up, {count} session{'' if count == 1 else 's'}"})
+    if state.get("send_error") and reachable:
+        failing = ", ".join(f"{kind} ({paths[kind]})" for kind in paths.get("failing") or []) or state["send_error"]
+        report["hint"] = (f"Peers are reachable: {', '.join(reachable)} OK. Blocked on this network: {failing}. "
+                          "Nothing to fix unless machines are missing (see `peers`).")
+    elif state.get("send_error"):
         report["hint"] = (f"This machine failed to send network traffic: {state['send_error']}. "
                           "Recent failures are in network.log (see `log`).")
     elif not report["peers"]:

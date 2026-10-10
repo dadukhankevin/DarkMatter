@@ -21,7 +21,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from darkmatter.contract.envelope import open_envelope, seal_envelope
+from darkmatter.contract.envelope import open_envelope, seal_envelope, verify_envelope_signature
 from darkmatter.identity import derive_public_key_hex, generate_keypair
 from darkmatter.store.local import atomic_write_text
 
@@ -52,6 +52,20 @@ MESSAGE_SECONDS = 7 * 86400
 MAX_PENDING = 1000
 MAX_CONTENT = 16384
 AVAILABILITY = ("busy", "idle", "unknown")
+# Liveness, for routing mail to a session that will actually handle it. A session
+# seen (any heartbeat: hook, MCP server, wake waiter) this recently is online.
+LIVE_SECONDS = 300
+# A session holding mail it has not read for this long is not live, even when its
+# MCP server still heartbeats (a host process with no turn reading its mail).
+UNREAD_SECONDS = 300
+# Mail unread (and unacknowledged) this long moves, exactly once, to the most recently
+# active live session of the same project on this machine. Never across projects,
+# machines, or OS accounts; never for strict or mode=all mail; at most MAX_REROUTES hops.
+REROUTE_SECONDS = UNREAD_SECONDS
+MAX_REROUTES = 3
+REROUTE_BATCH = 32  # Messages moved per sweep; the next sweep continues.
+REROUTED_NOTE = ("Addressed to another session of this project on this machine that was not reading "
+                 "its mail; delivered to you instead. Handle it as yours. The sender and authority are unchanged.")
 _PROCESS_SESSION = "process-" + uuid.uuid4().hex
 
 
@@ -87,13 +101,19 @@ def _ensure_schema(db) -> None:
     # for example the Claude app pausing an idle session. Until the session is active
     # again or a new waiter starts, mail to it waits: nothing will wake it.
     for name, kind in (("facts", "TEXT DEFAULT ''"), ("facts_at", "REAL DEFAULT 0"),
-                       ("objective_at", "REAL DEFAULT 0"), ("waiter_killed_at", "REAL DEFAULT 0")):
+                       ("objective_at", "REAL DEFAULT 0"), ("waiter_killed_at", "REAL DEFAULT 0"),
+                       ("read_at", "REAL DEFAULT 0")):
         if name not in columns:
             db.execute(f"ALTER TABLE participants ADD COLUMN {name} {kind}")
     columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
     # origin: local | network-in | network-out | network-receipt; route: peer device.
+    # read_at: when the holder's explicit read first returned it; held_at: when a reroute
+    # gave it to its current holder; rerouted_from: the session it was first addressed
+    # to; pinned: never reroute (strict, mode=all, hop limit, or unreadable).
     for name, kind in (("origin", "TEXT DEFAULT 'local'"), ("route", "TEXT DEFAULT ''"),
-                       ("delivered", "INTEGER DEFAULT 0"), ("last_error", "TEXT DEFAULT ''")):
+                       ("delivered", "INTEGER DEFAULT 0"), ("last_error", "TEXT DEFAULT ''"),
+                       ("read_at", "REAL DEFAULT 0"), ("held_at", "REAL DEFAULT 0"),
+                       ("rerouted_from", "TEXT DEFAULT ''"), ("pinned", "INTEGER DEFAULT 0")):
         if name not in columns:
             db.execute(f"ALTER TABLE messages ADD COLUMN {name} {kind}")
 
@@ -169,8 +189,182 @@ def network_sessions(directory: str | Path | None = None) -> tuple[dict, list[di
                                 "project": member.get("project", ""), "facts": member.get("facts") or {},
                                 "availability": member.get("availability", "unknown"),
                                 **({"waiter": "killed"} if member.get("waiter") == "killed" else {}),
+                                **({"last_read": member["last_read"]} if type(member.get("last_read")) in (int, float) else {}),
+                                **({"stale": member["stale"][:32]} if isinstance(member.get("stale"), str) else {}),
                                 "host": row["host"], "device": row["device"], "where": "network"}))
     return state, found
+
+
+def network_machines(directory: str | Path | None = None) -> list[dict]:
+    """Every machine the node hears, with its session count: a machine whose sessions all
+    closed is still up ("0 sessions"), which is not the same as a link that is down."""
+    from darkmatter.network import PEER_SECONDS, read_state
+    state = read_state(directory)
+    if not state.get("running") or not state.get("trusted"):
+        return []
+    with open_database(directory) as db:
+        rows = db.execute("SELECT device, host, sessions, seen FROM network_peers WHERE seen > ? "
+                          "ORDER BY host LIMIT 64", (time.time() - PEER_SECONDS,)).fetchall()
+    machines = []
+    for row in rows:
+        count = len(json.loads(row["sessions"]))
+        machines.append({"host": row["host"], "device": row["device"], "sessions": count,
+                         "last_heard_seconds": round(time.time() - row["seen"]),
+                         "state": f"machine up, {count} session{'' if count == 1 else 's'}"})
+    return machines
+
+
+def _last_active(row) -> float:
+    """Latest sign a turn is running: it read or acknowledged mail, set its objective,
+    or a host hook saw it working."""
+    return max(float(row["read_at"] or 0), float(row["objective_at"] or 0), float(row["active_at"] or 0))
+
+
+def _backlogged(db, now: float, recipient: str | None = None) -> set[str]:
+    """Sessions holding mail they have not read for UNREAD_SECONDS: not live."""
+    query = ("SELECT DISTINCT recipient FROM messages WHERE acknowledged=0 AND read_at=0 AND expires>? "
+             "AND origin IN ('local', 'network-in') AND MAX(created, held_at) < ?")
+    args: list = [now, now - UNREAD_SECONDS]
+    if recipient is not None:
+        query, args = query + " AND recipient=?", args + [recipient]
+    return {row[0] for row in db.execute(query, args)}
+
+
+def _not_live(db, row, now: float) -> str | None:
+    """Why a session can't take mail now (offline, or not reading its mail), else None."""
+    if float(row["seen"] or 0) <= now - LIVE_SECONDS:
+        return "offline"
+    if _backlogged(db, now, row["id"]):
+        return "not reading mail"
+    return None
+
+
+def _live_sessions(db, holder, now: float, exclude=(), cache: dict | None = None) -> list:
+    """Live sessions of the holder's project on this machine (this database, so this OS
+    account), same workspace first, then most recently active. `cache` spares a sweep
+    of many messages for one holder from re-reading the same rows and Git markers."""
+    cache = {} if cache is None else cache
+    if holder["id"] not in cache:
+        roots = cache.setdefault("", {})
+
+        def root(workspace):
+            if workspace not in roots:
+                roots[workspace] = repository_root(workspace)
+            return roots[workspace]
+
+        common = root(holder["workspace"])
+        stale = _backlogged(db, now)
+        rows = db.execute("SELECT * FROM participants WHERE seen > ? AND id != ?",
+                          (now - LIVE_SECONDS, holder["id"])).fetchall()
+        live = [row for row in rows if row["id"] not in stale and not _waiter_state(dict(row))
+                and root(row["workspace"]) == common]
+        cache[holder["id"]] = sorted(live, key=lambda row: (row["workspace"] != holder["workspace"],
+                                                            -_last_active(row)))
+    return [row for row in cache[holder["id"]] if row["id"] not in exclude]
+
+
+def _session_key(directory: Path, row) -> str:
+    """A local session's private key: the OS account is this machine's trust boundary."""
+    if not re.fullmatch(r"[0-9a-f]{64}", row["identity"] or ""):
+        raise ValueError("Malformed session identity")
+    path = directory / (row["identity"] + ".key")
+    if path.is_symlink():
+        raise ValueError("Session key must not be a symlink")
+    key = path.read_text().strip()
+    if derive_public_key_hex(key) != row["id"]:
+        raise ValueError("Session key does not match its participant")
+    return key
+
+
+def _open_record(record: dict, private_key: str, me: str, message_id: str, sender: str) -> tuple[dict, str]:
+    """The body for the message's current holder, and the session it was first sent to.
+
+    The sender's signed envelope is always verified. Rerouted mail also carries a
+    `forward` hop sealed by the previous holder's key to the current one."""
+    original = verify_envelope_signature(record["envelope"])
+    if original.id != message_id or original.from_id != sender:
+        raise ValueError("Envelope and index disagree")
+    hop = record.get("reroute")
+    if hop is None:
+        env = open_envelope(record["envelope"], private_key)
+        if env.to_id != me:
+            raise ValueError("Envelope and index disagree")
+        return env.body, original.to_id
+    held = record.get("held_by")
+    env = open_envelope(hop, private_key)
+    if (env.type != "forward" or env.to_id != me or not isinstance(held, list) or len(held) < 2
+            or held[-1] != me or held[0] != original.to_id or env.from_id != held[-2]
+            or env.body.get("message_id") != message_id or env.body.get("sender") != sender
+            or not isinstance(env.body.get("body"), dict)):
+        raise ValueError("Reroute and index disagree")
+    return env.body["body"], original.to_id
+
+
+def _reroute(db, directory: Path, row, now: float, *, force: bool = False, cache: dict | None = None) -> str | None:
+    """Move one unread message from its holder to a live session of the same project.
+    Returns the new holder's id, or None. Unless `force`, only when the holder is not
+    live. One conditional UPDATE inside the caller's immediate transaction: the message
+    has exactly one holder at a time, so the old one can never also read it as fresh."""
+    holder = db.execute("SELECT * FROM participants WHERE id=?", (row["recipient"],)).fetchone()
+    if holder is None or (not force and _not_live(db, holder, now) is None):
+        return None
+    record = json.loads(row["envelope"])
+    held = record.get("held_by") or []
+    targets = [t for t in _live_sessions(db, holder, now, exclude={row["sender"], *held}, cache=cache)
+               if db.execute("SELECT COUNT(*) FROM messages WHERE recipient=? AND acknowledged=0 AND expires>?",
+                             (t["id"], now)).fetchone()[0] < MAX_PENDING]
+    if not targets:
+        return None  # Nobody better yet; a later sweep tries again.
+    try:
+        key = _session_key(directory, holder)
+        body, first = _open_record(record, key, holder["id"], row["id"], row["sender"])
+        addressed = _addressed(body.get("addressed"))
+    except (OSError, ValueError, KeyError, TypeError):
+        db.execute("UPDATE messages SET pinned=1 WHERE id=?", (row["id"],))  # The holder sees it invalid.
+        return None
+    held = held or [first]
+    if addressed.get("strict") is True or addressed["mode"] == "all" or len(held) > MAX_REROUTES:
+        db.execute("UPDATE messages SET pinned=1 WHERE id=?", (row["id"],))
+        return None
+    target = targets[0]
+    hop = seal_envelope(key, holder["id"], target["id"], "forward",
+                        {"message_id": row["id"], "sender": row["sender"], "body": body})
+    record.update(reroute=hop.to_public_dict(), held_by=[*held, target["id"]])
+    moved = db.execute("UPDATE messages SET recipient=?, envelope=?, held_at=?, read_at=0, rerouted_from=? "
+                       "WHERE id=? AND recipient=? AND acknowledged=0 AND read_at=0",
+                       (target["id"], json.dumps(record), now, row["rerouted_from"] or first,
+                        row["id"], holder["id"])).rowcount
+    return target["id"] if moved else None
+
+
+def reroute_stale(directory: str | Path | None = None, keep: str | None = None) -> list[dict]:
+    """Move mail that sat unread for REROUTE_SECONDS to a live session of its project.
+
+    Runs on this machine wherever its sessions already look at the database: hooks,
+    wake waiters, explicit status/read (which `keep` the caller's own mail: it is
+    evidently reading), and the network node's loop, so mail that arrived over the
+    network for a session here moves too."""
+    directory = local_directory(directory)
+    now, moved = time.time(), []
+    with open_database(directory) as db:
+        rows = db.execute("SELECT * FROM messages WHERE acknowledged=0 AND read_at=0 AND pinned=0 AND expires>? "
+                          "AND origin IN ('local', 'network-in') AND MAX(created, held_at) < ? AND recipient != ? "
+                          "ORDER BY created LIMIT ?",
+                          (now, now - REROUTE_SECONDS, keep or "", REROUTE_BATCH)).fetchall()
+        cache: dict = {}
+        for row in rows:
+            target = _reroute(db, directory, row, now, force=True, cache=cache)
+            if target:
+                moved.append({"id": row["id"], "from": row["recipient"], "to": target})
+    return moved
+
+
+def reroute_arrival(db, directory: str | Path, message_id: str) -> str | None:
+    """Mail just arrived over the network for a session here that is not live: move it
+    now (same rules as reroute_stale). Returns the new holder's id, or None."""
+    row = db.execute("SELECT * FROM messages WHERE id=? AND origin='network-in' AND acknowledged=0 "
+                     "AND read_at=0 AND pinned=0", (message_id,)).fetchone()
+    return _reroute(db, local_directory(directory), row, time.time()) if row is not None else None
 
 
 def workspace_root(path: str | Path) -> Path:
@@ -334,7 +528,7 @@ class Collaboration:
         me = self.join()
         with self._db() as db:
             query = ("SELECT id, workspace, client, objective, objective_at, availability, seen, facts, "
-                     "active_at, waiter_killed_at FROM participants WHERE seen > ?")
+                     "active_at, waiter_killed_at, read_at FROM participants WHERE seen > ?")
             args = [time.time() - PRESENCE_SECONDS]
             if scope == "workspace":
                 query += " AND workspace = ?"
@@ -343,11 +537,19 @@ class Collaboration:
             common = repository_root(self.root)
             from darkmatter.facts import host_name
             host = host_name()
+            now = time.time()
+            backlogged = _backlogged(db, now)
             for peer in peers:
                 peer["same_project"] = repository_root(peer["workspace"]) == common
                 peer.update(host=host, project=Path(peer["workspace"]).name, where="local",
                             facts=json.loads(peer["facts"] or "{}"))
                 state = _waiter_state(peer)
+                # last_read: when it last read or acknowledged mail (0: never), so senders see staleness.
+                peer["last_read"] = peer.pop("read_at") or 0
+                if peer["id"] in backlogged:
+                    state["stale"] = "not reading mail"
+                elif peer["seen"] <= now - LIVE_SECONDS:
+                    state["stale"] = "offline"
                 del peer["active_at"], peer["waiter_killed_at"]
                 peer.update(state)
                 _card(peer)
@@ -367,9 +569,15 @@ class Collaboration:
                 "presence_seconds": PRESENCE_SECONDS, "claims_are_advisory": True}
 
     def send(self, recipient: str, content: str, message_id: str | None = None,
-             addressed: dict | None = None) -> dict:
+             addressed: dict | None = None, strict: bool = False) -> dict:
+        """Seal and queue a message. A direct message to a session on this machine that is
+        offline or not reading its mail goes to the most recently active live session of
+        the same project instead, and the result says so; `strict` targets exactly the
+        recipient. Network mail is rerouted, under the same rules, by the receiving machine."""
         _text(content, "content", MAX_CONTENT)
         addressed = _addressed(addressed)
+        if strict:
+            addressed = {**addressed, "strict": True}
         message_id = _text(message_id or uuid.uuid4().hex, "message_id", 128)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", message_id):
             raise ValueError("message_id must be a plain identifier")
@@ -381,42 +589,58 @@ class Collaboration:
             _, remote = network_sessions(self.directory)
             match = next((m for m in remote if m["id"] == recipient), None)
             if match is None:
-                raise ValueError("Unknown participant; check status for peers on this machine or network")
+                up = [f"{m['host']} ({m['sessions']} session{'' if m['sessions'] == 1 else 's'})"
+                      for m in network_machines(self.directory)]
+                raise ValueError("Unknown participant; check status for peers on this machine or network"
+                                 + (". Machines up on the network: " + ", ".join(up) if up else ""))
             # Other machines see the project name, never this machine's paths.
             route, workspace = match["device"], self.root.name
+        rerouted = None
         with self._db() as db:
-            existing = db.execute("SELECT sender, recipient, envelope FROM messages WHERE id=?", (message_id,)).fetchone()
+            existing = db.execute("SELECT sender, recipient, rerouted_from, envelope FROM messages WHERE id=?",
+                                  (message_id,)).fetchone()
             if existing:
                 # Retry only your own immutable message, addressed to the same recipient.
-                if existing["sender"] != self.agent_id or existing["recipient"] != recipient:
+                if existing["sender"] != self.agent_id or recipient not in (existing["recipient"], existing["rerouted_from"]):
                     raise ValueError("message_id already belongs to another message")
                 old = json.loads(existing["envelope"])
                 if old["content_digest"] != hmac.new(bytes.fromhex(self.private_key), content.encode(), "sha256").hexdigest():
                     raise ValueError("message_id retry has different content")
                 return {"success": True, "id": message_id, "duplicate": True}
+            target = recipient
+            if not route and not strict and addressed["mode"] == "direct":
+                now = time.time()
+                row = db.execute("SELECT * FROM participants WHERE id=?", (recipient,)).fetchone()
+                reason = _not_live(db, row, now)
+                live = _live_sessions(db, row, now, exclude={self.agent_id}) if reason else []
+                if live:
+                    target = live[0]["id"]
+                    rerouted = {"from": recipient, "to": target, "reason": reason}
             count = db.execute("SELECT COUNT(*) FROM messages WHERE recipient=? AND acknowledged=0 AND expires>?",
-                               (recipient, time.time())).fetchone()[0]
+                               (target, time.time())).fetchone()[0]
             if count >= MAX_PENDING:
                 raise ValueError("Recipient inbox is full; wait for acknowledgement")
-            env = seal_envelope(self.private_key, self.agent_id, recipient, "message",
+            env = seal_envelope(self.private_key, self.agent_id, target, "message",
                                 {"content": content, "workspace": workspace, "addressed": addressed},
                                 envelope_id=message_id)
             record = {"envelope": env.to_public_dict(),
                       "content_digest": hmac.new(bytes.fromhex(self.private_key), content.encode(), "sha256").hexdigest()}
-            db.execute("INSERT INTO messages(id,sender,recipient,envelope,created,expires,origin,route) "
-                       "VALUES(?,?,?,?,?,?,?,?)",
-                       (message_id, self.agent_id, recipient, json.dumps(record), time.time(),
-                        time.time() + MESSAGE_SECONDS, "network-out" if route else "local", route))
+            db.execute("INSERT INTO messages(id,sender,recipient,envelope,created,expires,origin,route,rerouted_from) "
+                       "VALUES(?,?,?,?,?,?,?,?,?)",
+                       (message_id, self.agent_id, target, json.dumps(record), time.time(),
+                        time.time() + MESSAGE_SECONDS, "network-out" if route else "local", route,
+                        recipient if rerouted else ""))
         if not route:
-            return {"success": True, "id": message_id, "recipient": recipient, "delivery": "queued"}
+            return {"success": True, "id": message_id, "recipient": target, "delivery": "queued",
+                    **({"rerouted": rerouted} if rerouted else {})}
         from darkmatter.network import deliver_now
         try:
             outcome = deliver_now(self.directory, route)
         except (OSError, ValueError, sqlite3.Error) as exc:
             outcome = {"errors": {route: str(exc)}}
         status = self.delivery(message_id)
-        result = {"success": True, "id": message_id, "recipient": recipient, "via": "network",
-                  "delivery": status["delivery"]}
+        result = {"success": True, "id": message_id, "recipient": status["recipient"], "via": "network",
+                  "delivery": status["delivery"], **({"rerouted": status["rerouted"]} if "rerouted" in status else {})}
         if status["delivery"] == "queued" and outcome.get("errors"):
             result["error"] = next(iter(outcome["errors"].values()))
             result["note"] = "Queued; the network node keeps retrying."
@@ -426,36 +650,51 @@ class Collaboration:
         """Inspect your own retained delivery receipt without exposing other messages."""
         _text(message_id, "message_id", 128)
         with self._db() as db:
-            row = db.execute("SELECT recipient, acknowledged, expires, origin, delivered, last_error FROM messages "
-                             "WHERE id=? AND sender=?", (message_id, self.agent_id)).fetchone()
+            row = db.execute("SELECT recipient, acknowledged, expires, origin, delivered, last_error, rerouted_from "
+                             "FROM messages WHERE id=? AND sender=?", (message_id, self.agent_id)).fetchone()
         if row is None:
             return {"success": False, "error": "Unknown or no longer retained sent message"}
         state = ("acknowledged" if row["acknowledged"] else "expired" if row["expires"] <= time.time()
                  else "rejected" if row["delivered"] == 2 else "delivered" if row["delivered"] == 1
                  else "queued")
         extra = {"last_error": row["last_error"]} if state in ("queued", "rejected") and row["last_error"] else {}
+        if row["rerouted_from"]:
+            # The addressed session was not reading mail; one of its project's live sessions has it.
+            extra["rerouted"] = {"from": row["rerouted_from"], "to": row["recipient"]}
         return {"success": True, "id": message_id, "recipient": row["recipient"], "delivery": state, **extra,
                 "meaning": "Acknowledged means the recipient explicitly acknowledged handling; it does not prove task completion."}
 
-    def read(self, limit: int = 20) -> dict:
+    def read(self, limit: int = 20, mark: bool = True) -> dict:
+        """Unread mail. An explicit read (`mark`) records that this session reads its mail;
+        hooks and wake waiters peek with mark=False so they never count as reading."""
         if not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("limit must be between 1 and 20")
         self.join()
+        if mark:
+            reroute_stale(self.directory, keep=self.agent_id)  # Stale siblings' mail may come here.
         with self._db() as db:
             rows = db.execute("SELECT * FROM messages WHERE recipient=? AND acknowledged=0 AND expires>? "
                               "AND origin IN ('local', 'network-in') ORDER BY created, id LIMIT ?",
                               (self.agent_id, time.time(), limit)).fetchall()
+            if mark:
+                now = time.time()
+                db.execute("UPDATE participants SET read_at=? WHERE id=?", (now, self.agent_id))
+                db.executemany("UPDATE messages SET read_at=? WHERE id=? AND recipient=? AND read_at=0",
+                               [(now, row["id"], self.agent_id) for row in rows])
         from darkmatter import trust
         trusted = trust.summary(self.directory)
         messages, invalid = [], []
         for row in rows:
             try:
-                env = open_envelope(json.loads(row["envelope"])["envelope"], self.private_key)
-                if env.id != row["id"] or env.from_id != row["sender"] or env.to_id != self.agent_id:
-                    raise ValueError("Envelope and index disagree")
-                item = {"id": env.id, "from": env.from_id, "type": env.type,
-                        "content": env.body["content"], "workspace": env.body["workspace"],
-                        "addressed": _addressed(env.body.get("addressed"))}
+                body, _ = _open_record(json.loads(row["envelope"]), self.private_key, self.agent_id,
+                                       row["id"], row["sender"])
+                if not isinstance(body.get("content"), str) or not isinstance(body.get("workspace"), str):
+                    raise ValueError("Malformed message body")
+                item = {"id": row["id"], "from": row["sender"], "type": "message",
+                        "content": body["content"], "workspace": body["workspace"],
+                        "addressed": _addressed(body.get("addressed"))}
+                if row["rerouted_from"]:
+                    item["rerouted"] = {"from": row["rerouted_from"], "note": REROUTED_NOTE}
                 if row["origin"] == "network-in":
                     item["via"] = "network"
                 item["authority"] = trust.authority(self.directory, row["origin"], trusted)
@@ -474,6 +713,8 @@ class Collaboration:
         if not isinstance(ids, list) or len(ids) > MAX_PENDING or any(not isinstance(i, str) for i in ids):
             raise ValueError("ids must be a bounded list of message ids")
         with self._db() as db:
+            if ids:
+                db.execute("UPDATE participants SET read_at=? WHERE id=?", (time.time(), self.agent_id))
             for message_id in ids:
                 row = db.execute("SELECT sender, origin, route, acknowledged FROM messages WHERE id=? AND recipient=?",
                                  (message_id, self.agent_id)).fetchone()
@@ -536,11 +777,12 @@ class Collaboration:
         """
         snapshot = self.status("device")
         peers = [p for p in snapshot["peers"] if p["id"] != self.agent_id]
-        inbox = self.read()
+        inbox = self.read(mark=False)
         _, lan = network_sessions(self.directory)
-        # Busy/idle flips are not news; arrivals, departures, claims and mail are.
+        # Busy/idle flips and reading activity are not news; arrivals, departures, claims and mail are.
         payload = {"self": snapshot["self"],
-                   "peers": [{k: v for k, v in p.items() if k not in ("seen", "availability")} for p in peers],
+                   "peers": [{k: v for k, v in p.items() if k not in ("seen", "availability", "last_read", "stale")}
+                             for p in peers],
                    "claims": snapshot["claims"], "unread_ids": [m["id"] for m in inbox["messages"]],
                    "invalid_ids": inbox["invalid"], "network": sorted(m["id"] for m in lan)}
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
