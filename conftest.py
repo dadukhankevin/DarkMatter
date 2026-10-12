@@ -12,3 +12,5 @@ def isolated_discovery(tmp_path, monkeypatch):
     monkeypatch.setenv("DARKMATTER_SPACE_SYNC_SECONDS", "0")
     # Tests never announce on the real network; network tests run loopback nodes explicitly.
     monkeypatch.setenv("DARKMATTER_NETWORK_MODE", "off")
+    # A test run from inside a Claude Code session inherits its project; hooks would follow it.
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)

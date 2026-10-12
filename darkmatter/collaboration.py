@@ -423,6 +423,54 @@ def workspace_root(path: str | Path) -> Path:
     return path
 
 
+def session_identity(root: str | Path, client: str, session_id: str) -> str:
+    """The local identity of one host session in one project (see Collaboration)."""
+    return hashlib.sha256(json.dumps(
+        [str(root), client, session_id], separators=(",", ":")
+    ).encode()).hexdigest()
+
+
+def host_project_dir(client: str | None) -> str | None:
+    """The project directory the host started the session in, when it says so.
+    Claude Code gives hooks CLAUDE_PROJECT_DIR; a hook's `cwd` is only the shell's."""
+    return (os.environ.get("CLAUDE_PROJECT_DIR") or None) if client == "claude-code" else None
+
+
+def session_root(path: str | Path, session_id: str, client: str, *,
+                 project_dir: str | Path | None = None,
+                 directory: str | Path | None = None) -> Path:
+    """The project a host session's hooks and mail waiter act for.
+
+    Mail goes to the identity the session's MCP server holds, named by the project it
+    started in. A hook's `cwd` follows the session's shell instead: after a `cd` into
+    a nested checkout (a sub-agent's Git worktree under .claude/worktrees) it names
+    another project. Keyed by that, the waiter watched an identity nobody writes to,
+    while the one holding the session's mail stayed "busy" and never woke (2026-10-12).
+
+    Candidates are the host's project directory (Claude Code's CLAUDE_PROJECT_DIR),
+    then every enclosing checkout of `path`, innermost first. The one whose identity
+    this session's reader has used (an MCP server set its objective, read mail, or
+    heartbeated) wins; otherwise the first candidate, as before."""
+    start = Path(path).expanduser().resolve()
+    candidates = [workspace_root(project_dir)] if project_dir else []
+    candidates += [c for c in (start, *start.parents) if (c / ".git").exists()]
+    candidates = list(dict.fromkeys(candidates)) or [start]
+    if len(candidates) > 1:
+        names = {session_identity(c, client, session_id): c for c in candidates}
+        try:
+            with open_database(directory) as db:
+                marks = db.execute(
+                    "SELECT identity, MAX(COALESCE(rerouting_at, 0), COALESCE(read_at, 0), "
+                    "COALESCE(objective_at, 0)) AS at FROM participants WHERE identity IN "
+                    f"({','.join('?' * len(names))})", list(names)).fetchall()
+        except (OSError, ValueError, sqlite3.Error):
+            marks = []
+        used = [(row["at"], names[row["identity"]]) for row in marks if (row["at"] or 0) > 0]
+        if used:
+            return max(used, key=lambda item: item[0])[1]
+    return candidates[0]
+
+
 def repository_root(path: str | Path) -> Path:
     """Group local Git worktrees by their common directory without executing Git."""
     root = workspace_root(path)
@@ -476,9 +524,7 @@ class Collaboration:
         self.client = _text(client or os.environ.get("DARKMATTER_CLIENT") or "cli", "client", 80)
         self.directory = local_directory(directory)
         self.path = self.directory / "sessions.sqlite3"
-        self.identity = hashlib.sha256(json.dumps(
-            [str(self.root), self.client, self.session_id], separators=(",", ":")
-        ).encode()).hexdigest()
+        self.identity = session_identity(self.root, self.client, self.session_id)
         with self._db():
             key_path = self.directory / (self.identity + ".key")
             if key_path.is_symlink():
@@ -564,8 +610,9 @@ class Collaboration:
             db.execute("UPDATE participants SET waiter_killed_at=0 WHERE id=?", (self.agent_id,))
 
     def mark_waiter_killed(self) -> None:
-        """The host killed this session's mail waiter: until it is active again or a new
-        waiter starts, status and rosters say so, and mail to it waits."""
+        """No mail waiter listens for this session any more (its host killed it, or it timed
+        out): until it is active again or a new waiter starts, status and rosters say so
+        ("waiter": "killed", a value older machines already understand), and mail to it waits."""
         with self._db() as db:
             db.execute("UPDATE participants SET waiter_killed_at=? WHERE id=?", (time.time(), self.agent_id))
 

@@ -325,6 +325,14 @@ def _wait_loop(root, session_id, client, mailbox, deadline, generation, board, s
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             log.event("timeout")
+            # Nothing re-arms a waiter that gives up: the next Stop starts one. An idle
+            # session would otherwise keep looking present and idle (its MCP server still
+            # heartbeats) while mail to it never wakes it (2026-10-12, after a 24 h wait).
+            if not busy and not (generation and current_generation(root, session_id) != generation):
+                try:
+                    board.mark_waiter_killed()
+                except Exception:  # noqa: BLE001
+                    pass
             return None
         # Sleep in short steps even while backing off, so a newer waiter waiting to
         # take over is never left waiting longer than it will wait.

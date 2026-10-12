@@ -270,6 +270,13 @@ identifiers only. The
 agent then reads the mail explicitly and treats it as data. Waking never marks
 mail read, and the same message does not wake a session repeatedly.
 
+Hooks and the waiter act for the session's own identity, the one its MCP server
+holds mail under, even after the session's shell moves into another checkout
+(a `cd` into a sub-agent's worktree under `.claude/worktrees`). They use Claude
+Code's `CLAUDE_PROJECT_DIR`, or else the enclosing checkout this session's MCP
+server has used, rather than the hook's `cwd`. A waiter that times out marks the
+session as having no waiter, like a killed one (below), until its next Stop.
+
 ```bash
 darkmatter install-mcp --client claude-code             # wake on (default)
 darkmatter install-mcp --client claude-code --no-wake   # wake off, hook removed
@@ -322,7 +329,8 @@ running. The Claude desktop app does this two ways: its session governor pauses
 idle conversations under memory pressure or at its session limit (`main.log`:
 `[CliGovernor] … evicting`), and it silently relaunches itself to install an
 update after an idle timeout (`[stealth-update]`, `[stealth-relaunch]`), which
-does not re-arm the sessions' mail waiters. When the host kills a session's mail waiter, DarkMatter marks it: its
+does not re-arm the sessions' mail waiters. When the host kills a session's mail waiter, or the
+waiter times out with the session idle, DarkMatter marks it: its
 card in `status` (and in the roster other machines see) shows
 `"waiter": "killed"` until the session is active again, `mode="any"` sends prefer
 live sessions over it, and a send to it still delivers but returns

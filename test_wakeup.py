@@ -258,3 +258,135 @@ def test_agents_are_given_the_revive_recipe():
                    "own machine", "C stays up", "Don't stop", "DARKMATTER_REVIVE=once"):
         assert needle in MCP_INSTRUCTIONS, needle
     assert "DARKMATTER_REVIVE=1" not in MCP_INSTRUCTIONS
+
+
+def _project_with_worktree(tmp_path):
+    """A checkout, and a sub-agent's Git worktree nested inside it (a .git file)."""
+    project = tmp_path / "codex-web"
+    (project / ".git").mkdir(parents=True)
+    worktree = project / ".claude" / "worktrees" / "agent-a5f9"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: ../../../.git/worktrees/agent-a5f9\n")
+    return project, worktree
+
+
+@pytest.mark.parametrize("host_dir", [True, False])
+def test_waiter_watches_the_session_identity_after_its_shell_moves_into_a_worktree(
+        tmp_path, monkeypatch, capsys, host_dir):
+    """Regression (2026-10-12): a `cd` into a sub-agent's worktree moved the hook's cwd, so
+    the Stop hook's waiter watched a new identity. Mail to the session's real identity (its
+    MCP server's) never woke it, and that identity stayed "busy" for 2.5 hours."""
+    from darkmatter.collaboration import Collaboration
+    project, worktree = _project_with_worktree(tmp_path)
+    session = Collaboration(project, "claude-1", "claude-code")  # Its MCP server.
+    sender = Collaboration(tmp_path / "jeeves", "jeeves", "claude-code")
+    if host_dir:
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+        session.join(availability="busy")  # Even before its MCP server has said anything.
+    else:
+        session.join(objective="Working", availability="busy")
+        session.mark_reader()
+    monkeypatch.setattr("darkmatter.gitbox.mailbox.get_mailbox", lambda root=None: _Mailbox())
+
+    def stop():
+        payload = {"cwd": str(worktree), "session_id": "claude-1"}
+        monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(payload)))
+        return cli._wait_hook(["--timeout-seconds", "0"])
+
+    time.sleep(0.01)
+    assert stop() == 0
+    card = next(p for p in sender.status("device")["peers"] if p["id"] == session.agent_id)
+    assert card["availability"] == "idle"  # The turn ended: idle, not "busy" for hours.
+    assert len(sender.status("device")["peers"]) == 2  # No second card for the worktree.
+    # A background sub-agent working in that worktree keeps the session present, not busy.
+    from darkmatter.collaboration_cli import main
+    event = {"cwd": str(worktree / "src"), "session_id": "claude-1", "hook_event_name": "PostToolUse"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["hook", "--client", "claude-code"]) == 0
+    card = next(p for p in sender.status("device")["peers"] if p["id"] == session.agent_id)
+    assert card["availability"] == "idle" and len(sender.status("device")["peers"]) == 2
+    sent = sender.send(session.agent_id, "status check")
+    assert stop() == 2
+    assert sent["id"] in capsys.readouterr().err
+
+
+def test_hooks_follow_the_session_not_its_shell(tmp_path, monkeypatch):
+    """Tool hooks from a session whose shell sits in a nested worktree refresh the session's
+    own identity instead of creating a stray one that steals its presence."""
+    from darkmatter.collaboration import Collaboration
+    from darkmatter.collaboration_cli import main
+    project, worktree = _project_with_worktree(tmp_path)
+    session = Collaboration(project, "claude-1", "claude-code")
+    session.join(objective="Working")
+    session.mark_reader()
+    observer = Collaboration(tmp_path / "other", "observer", "codex")
+    event = {"cwd": str(worktree), "session_id": "claude-1", "hook_event_name": "UserPromptSubmit"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["hook", "--client", "claude-code"]) == 0
+    peers = {p["id"]: p for p in observer.status("device")["peers"]}
+    assert set(peers) == {session.agent_id, observer.agent_id}
+    assert peers[session.agent_id]["availability"] == "busy"
+
+
+def test_a_session_started_in_a_worktree_keeps_that_worktree(tmp_path, monkeypatch):
+    """Without any sign of a session elsewhere, a checkout is its own project, as before."""
+    from darkmatter.collaboration import Collaboration, session_root
+    project, worktree = _project_with_worktree(tmp_path)
+    assert session_root(worktree / "src", "claude-2", "claude-code") == worktree.resolve()
+    Collaboration(project, "claude-2", "codex").join(objective="x")  # Another client's session.
+    assert session_root(worktree, "claude-2", "claude-code") == worktree.resolve()
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(worktree))
+    from darkmatter.collaboration import host_project_dir
+    assert session_root(worktree, "claude-2", "claude-code",
+                        project_dir=host_project_dir("claude-code")) == worktree.resolve()
+    assert host_project_dir("codex") is None  # Only Claude Code's hooks get that variable.
+
+
+def test_a_waiter_that_times_out_says_nothing_is_listening(tmp_path):
+    """Regression (2026-10-12): a 24 h waiter timed out; the session kept looking idle and
+    present (its MCP server heartbeats), and mail sent to it never woke it."""
+    from darkmatter.collaboration import Collaboration
+    from darkmatter.collaboration_cli import execute
+    from darkmatter.wakeup import wait_for_session_activity
+    session = Collaboration(tmp_path, "s", "claude-code")
+    sender = Collaboration(tmp_path / "jeeves", "jeeves", "claude-code")
+    assert wait_for_session_activity(tmp_path, "s", "claude-code", None, 0) is None
+
+    def card():
+        return next(p for p in sender.status("device")["peers"] if p["id"] == session.agent_id)
+
+    assert card()["waiter"] == "killed"
+    sent = execute(sender, "send", recipient=session.agent_id, content="anyone there?")
+    assert sent["success"] and sent["wakes"] is False and "timed out" in sent["note"]
+    time.sleep(0.01)
+    session.mark_idle(time.time())  # The next Stop starts a new waiter: listening again.
+    assert "waiter" not in card()
+
+
+def test_a_waiter_that_times_out_mid_turn_or_superseded_marks_nothing(tmp_path):
+    from darkmatter import wakeup
+    from darkmatter.collaboration import Collaboration
+    session = Collaboration(tmp_path, "s", "claude-code")
+    session.join()
+    with open_db(session) as db:  # A turn is running: a hook saw it just now.
+        db.execute("UPDATE participants SET active_at=? WHERE id=?", (time.time() + 5, session.agent_id))
+    # The Stop that ends this turn arms the next waiter; this one only stood by.
+    assert wakeup.wait_for_session_activity(tmp_path, "s", "claude-code", None, 0) is None
+    assert _killed_at(session) == 0
+    with open_db(session) as db:
+        db.execute("UPDATE participants SET active_at=0 WHERE id=?", (session.agent_id,))
+    with wakeup.wake_lease(tmp_path, "s", generation="newer"):
+        pass
+    assert wakeup.wait_for_session_activity(tmp_path, "s", "claude-code", None, 0, "older") is None
+    assert _killed_at(session) == 0  # A newer waiter took over; it listens.
+
+
+def open_db(board):
+    from darkmatter.collaboration import open_database
+    return open_database(board.directory)
+
+
+def _killed_at(board):
+    with open_db(board) as db:
+        return db.execute("SELECT waiter_killed_at FROM participants WHERE id=?",
+                          (board.agent_id,)).fetchone()[0]

@@ -30,15 +30,8 @@ def _wait_hook(argv: list[str]) -> int:
         except json.JSONDecodeError:
             pass
 
-    from darkmatter.collaboration import workspace_root
+    from darkmatter.collaboration import host_project_dir, session_root, workspace_root
 
-    # The project, not the current subdirectory: the lease must be the same file
-    # from every Stop of this session, or an old waiter is never taken over.
-    root = workspace_root(Path(
-        os.environ.get("DARKMATTER_PROJECT_DIR")
-        or hook_input.get("cwd")
-        or os.getcwd()
-    ))
     session_id = hook_input.get("session_id")
     # Claude Code sets stop_hook_active on the Stop that ends a turn a wake started.
     # Bailing there left the session deaf until a human typed. Wake loops are
@@ -46,6 +39,14 @@ def _wait_hook(argv: list[str]) -> int:
     # woken this session wakes it.
     if not isinstance(session_id, str) or not session_id:
         return 0
+    # The session's project, not wherever its shell has wandered: the waiter must watch
+    # the identity mail is sent to, and the lease must be the same file from every Stop
+    # of this session, or an old waiter is never taken over.
+    if os.environ.get("DARKMATTER_PROJECT_DIR"):
+        root = workspace_root(Path(os.environ["DARKMATTER_PROJECT_DIR"]))
+    else:
+        root = session_root(hook_input.get("cwd") or os.getcwd(), session_id, args.client,
+                            project_dir=host_project_dir(args.client))
     # A revived session normally stays up and keeps listening, like any session. Only an
     # explicit one-shot revive (DARKMATTER_REVIVE=once, see "Reviving a session") ends
     # after answering instead of being kept alive by the waiter.
