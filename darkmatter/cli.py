@@ -48,7 +48,7 @@ def _wait_hook(argv: list[str]) -> int:
         root = session_root(hook_input.get("cwd") or os.getcwd(), session_id, args.client,
                             project_dir=host_project_dir(args.client))
     # A revived session normally stays up and keeps listening, like any session. Only an
-    # explicit one-shot revive (DARKMATTER_REVIVE=once, see "Reviving a session") ends
+    # explicit one-shot revive (DARKMATTER_REVIVE=once, see "Resurrection protocol") ends
     # after answering instead of being kept alive by the waiter.
     if os.environ.get("DARKMATTER_REVIVE") == "once":
         return 0

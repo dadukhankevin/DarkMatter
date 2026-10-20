@@ -60,7 +60,7 @@ SEND_ERROR_HINT = ("This machine's network node is failing to send ({}), so othe
                    "it. Run `darkmatter network doctor`; recent failures are in network.log.")
 WAITER_KILLED_NOTE = ("Delivered, but no mail waiter is listening for this session (its host stopped it, "
                       "for example the Claude app paused it, or it timed out after a long idle), so it will "
-                      "not wake until it is opened or revived (see 'Reviving a session').")
+                      "not wake until it is opened or revived (see 'Resurrection protocol').")
 MATCH_KEYS = ("host", "project", "client", "branch", "session")
 MAX_FANOUT = 64
 _TIER = {"local": 0, "network": 1, "remote": 2}

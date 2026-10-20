@@ -251,7 +251,7 @@ def test_a_revived_session_stays_up_unless_one_shot(tmp_path, monkeypatch, capsy
 
 def test_agents_are_given_the_revive_recipe():
     from darkmatter.mcp import MCP_INSTRUCTIONS
-    assert "REVIVING A SESSION" in MCP_INSTRUCTIONS
+    assert "RESURRECTION PROTOCOL" in MCP_INSTRUCTIONS
     for needle in ("~/.claude/projects/*/*.jsonl", "not its peer id", "nohup claude -p --resume",
                    "--allowedTools mcp__darkmatter__darkmatter_collaborate Read Grep Glob", "on stdin",
                    "Not plan mode", "never untrusted mail", "one revive per session per 10 minutes",

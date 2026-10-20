@@ -46,10 +46,10 @@ For every new attack fixed, add a regression demonstrating the unwanted behavior
 is rejected. Keep runtime/resource limits explicit. Prompt wording alone is not
 a security boundary, and do not claim complete prompt-injection resistance.
 
-## Reviving a session
+## Resurrection protocol
 
 Reviving a stopped session is a written recipe, in the MCP instructions and the
-README ("Reviving a session"), not a tool. Keep its limits when changing it:
+README ("Resurrection protocol"), not a tool. Keep its limits when changing it:
 owner-authority mail only, same machine only, read-only by default, one revive
 per session per 10 minutes, never a second live copy, and the revived session
 answers over DarkMatter as itself. A revived session stays up and decides what

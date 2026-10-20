@@ -322,7 +322,7 @@ never starts automatically and never moves funds. Change the cadence with
 }
 ```
 
-## Reviving a session
+## Resurrection protocol
 
 A session can be closed or paused, and then mail can't wake it: nothing is
 running. The Claude desktop app does this two ways: its session governor pauses
@@ -335,7 +335,7 @@ card in `status` (and in the roster other machines see) shows
 `"waiter": "killed"` until the session is active again, `mode="any"` sends prefer
 live sessions over it, and a send to it still delivers but returns
 `"wakes": false`. If that mail sits unread for 5 minutes and another session of
-the same project is live, it [moves there](#mail-reaches-a-session-that-reads-it). That is the signal to revive it. Reviving it is a known recipe, not a built-in tool. Agent **A** (on any
+the same project is live, it [moves there](#mail-reaches-a-session-that-reads-it). That is the signal to revive it. Reviving it follows the resurrection protocol, a written recipe, not a built-in tool. Agent **A** (on any
 machine) asks agent **B** (on the stopped session's machine) to revive session
 **C**. B does the steps below, C answers A over DarkMatter as itself, and B tells
 A which session it revived and how it went.
